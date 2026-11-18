@@ -440,10 +440,10 @@ impl Rel {
                     depth,
                     transient: self.state.snap_durability(k)
                         == Some(crate::state::SnapDurability::Transient),
-                    class: self
+                    role: self
                         .state
-                        .snap_class(k)
-                        .unwrap_or(crate::state::SnapClass::Extra),
+                        .snap_role(k)
+                        .unwrap_or(crate::state::SnapRole::History),
                 }
             })
             .collect()

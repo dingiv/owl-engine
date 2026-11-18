@@ -44,7 +44,6 @@ use crate::{BlockClass, BlockLeg, ChainCursor, LegConfig, PoolLayout, Rel};
 /// 会话账错误（契约面 `ModelError`；不是存储 I/O 的 `StoreError`）。
 type Result<T> = std::result::Result<T, ModelError>;
 
-
 /// 一段图像占位(**含** `<|vision_start|>` / `<|vision_end|>` 标记)的坐标账。
 ///
 /// 两套坐标(必须同时记):
@@ -144,25 +143,26 @@ pub struct AgentSession {
     //  与 `StateStore::{borrow_row, return_row}`;会话只剩身份 + token 历史)
     /// E5:LRU 触达时间(SessionTable.tick;越小越老,逐出候选)
     pub last_use: u64,
-    /// **会话尾锚点快照**(L1 资产;2026-11-12)。
+    /// **会话尾锚点快照**（L1 资产；v4）。
     ///
-    /// 上轮 turn 的最新边界快照。跨 turn 保留 —— 空闲会话的尾部锚点是
-    /// **Dense 档**(最后淘汰,但空间不足时可逐出;不是 pin),append 的
-    /// 100% 命中靠它。前缀失配 `rebase()` 时清空。
+    /// 最近一次 turn 结束/中断的最后完整页边界。跨 turn 保留 —— 空闲会话的
+    /// 尾锚点是 **Tail 角色**（最后淘汰，但空间不足时可逐出；不是 pin）。
+    /// 前缀失配 `rebase()` 时清空。
     pub tail_snap: Option<crate::SnapKey>,
-    /// **最近 K 个 turn 尾快照**（L1 资产；`snap_msg_recent`；不是 pin，
-    /// 只是 `Dense` 档优先保留；超出 K 的旧尾降为 `Extra`）。
-    pub recent_tails: Vec<crate::SnapKey>,
-    /// **上轮 prompt 的消息边界**(页对齐 token offset;L1 资产)。
+    /// **尾锚点的 token offset**（页对齐；与 `tail_snap` 同源）。
     ///
-    /// turn 收口时从 `ActiveTurn.msg_snaps` 写回,跨 turn 保留;下一轮用于
-    /// 回撤定位（Dense 档 / Binary 稀疏锚点）。前缀失配 `rebase()` 时清空。
+    /// v4 的 Tail/History 布局按 token 位置重算，必须知道尾快照落在哪。
+    pub tail_at: Option<usize>,
+    /// **当前持久快照布局点**（Tail + History；页对齐 token offset，升序）。
+    ///
+    /// turn 收口时从 `ActiveTurn.msg_snaps` 写回，跨 turn 保留；下一轮
+    /// submit 用它携带同 offset 的键并重算 Tail/History。
     pub msg_snaps: Vec<usize>,
-    /// **与 `msg_snaps` 同序的快照键**(L1 资产;2026-11-12 二刀)。
+    /// **与 `msg_snaps` 同序的角色**（Tail / History）。
+    pub msg_snap_roles: Vec<crate::SnapRole>,
+    /// **与 `msg_snaps` 同序的快照键**（L1 资产）。
     ///
-    /// 会话增长后旧的 dense 尾巴要降级为 Binary/Extra —— 没有键就只能
-    /// 重拍 159MiB 才能改档。这里记录每个边界实际拍到的 `SnapKey`,
-    /// 下一轮 submit 只做**重分类**(不搬内容)。`None` = 该边界没拍/已被逐出。
+    /// 布局重算只改角色，不搬内容；`None` = 该边界没拍/已被逐出。
     pub msg_snap_keys: Vec<Option<crate::SnapKey>>,
     /// **上一轮 prompt 段的 padded 长度**（生成段接在其后）。
     ///
@@ -191,8 +191,9 @@ impl AgentSession {
             mtp_block_table: Vec::new(),
             last_use: 0,
             tail_snap: None,
-            recent_tails: Vec::new(),
+            tail_at: None,
             msg_snaps: Vec::new(),
+            msg_snap_roles: Vec::new(),
             msg_snap_keys: Vec::new(),
             chain: ChainCursor::new(),
             prompt_boundary: 0,
@@ -210,8 +211,7 @@ impl AgentSession {
     /// **不再把“历史长度”当“设备驻留长度”**：命中面由 store 内容树回答；
     /// 本函数只回答历史是否连续，用于诊断/旧键降级。
     pub fn guard(&self, prompt: &[u32]) -> bool {
-        prompt.len() >= self.tokens.len()
-            && self.tokens == prompt[..self.tokens.len()]
+        prompt.len() >= self.tokens.len() && self.tokens == prompt[..self.tokens.len()]
     }
 
     /// **上一轮 prompt 段的可见长度**（unpadded；内容身份的参考长度）。
@@ -284,7 +284,7 @@ impl AgentSession {
     /// **不清 L1 资产**(`tail_snap` / `msg_snaps` / `msg_snap_keys`):
     /// 前缀命中的续写路径走 `reopen_chain`(内部调本函数),那一次不是重建;
     /// L1 资产要到 turn 收口/fresh 重建时才由 `rebase` 处理。否则每轮命中都会
-    /// 把旧 tail 的 Dense 归属丢掉(旧 key 永久留在 Dense 档,见 2026-11-13
+    /// 把旧 tail 的 Tail 归属丢掉(旧 key 永久留在 Tail 角色,见 2026-11-13
     /// 前置评审)。
     fn reset(&mut self) {
         // 内容身份的参考边界随账清零（历史长度唯一真源 = `tokens.len()`）
@@ -310,28 +310,6 @@ impl AgentSession {
         self
     }
 
-    /// **记录 turn 尾快照**：最近 `keep` 个保持 `Dense` 档；更老的返回给
-    /// 调用方降为 `Extra`。只是淘汰优先级，不是 pin。
-    pub fn push_recent_tail(&mut self, key: crate::SnapKey, keep: usize) -> Option<crate::SnapKey> {
-        let keep = keep.max(1);
-        if self.recent_tails.last().copied() == Some(key) {
-            return None;
-        }
-        if let Some(old) = self.tail_snap {
-            if old != key && !self.recent_tails.contains(&old) {
-                self.recent_tails.push(old);
-            }
-        }
-        if !self.recent_tails.contains(&key) {
-            self.recent_tails.push(key);
-        }
-        let mut demoted = None;
-        while self.recent_tails.len() > keep {
-            demoted = Some(self.recent_tails.remove(0));
-        }
-        demoted
-    }
-
     /// **整段重建**(前缀失配 / 位置压实):消费旧会话,返回全新账。
     ///
     /// 不再提供 `&mut self` 的 rebase:调用方必须把旧值销毁、把新值放回
@@ -339,10 +317,11 @@ impl AgentSession {
     /// 一并清掉;前缀命中的续写路径**不得**走本函数。
     pub fn rebase(mut self) -> Self {
         self.reset();
-        // 旧 tail/消息边界属于旧链;内容仍可由 L2/L3 按 LRU/档位回收。
+        // 旧 tail/布局点属于旧链;内容仍可由 L2/L3 按 LRU/角色回收。
         self.tail_snap = None;
-        self.recent_tails.clear();
+        self.tail_at = None;
         self.msg_snaps.clear();
+        self.msg_snap_roles.clear();
         self.msg_snap_keys.clear();
         self.local_chain = false;
         self.position_epoch = self.position_epoch.wrapping_add(1);
@@ -380,11 +359,7 @@ impl AgentSession {
     ///
     /// 只由 `commit_turn` 的调用点写(单一产地):spans 与 `tokens` 必须
     /// 描述同一份 prompt —— 两处各写一份 = 下一轮删除识别拿错坐标。
-    pub fn set_img_spans(
-        &mut self,
-        spans: Vec<ImgSpan>,
-        pads: Vec<(usize, usize)>,
-    ) {
+    pub fn set_img_spans(&mut self, spans: Vec<ImgSpan>, pads: Vec<(usize, usize)>) {
          // FIXME:  不推荐可变范式。
         self.img_spans = spans;
         self.pads = pads;
@@ -476,9 +451,13 @@ pub struct SessionAssets {
     pub history_len: usize,
     /// 本会话的尾锚点快照(L1 资产;`None` = 无/已逐出)。
     pub tail_snap: Option<crate::SnapKey>,
-    /// 消息边界快照点(页对齐 token offset;升序)。
+    /// 尾锚点 offset（页对齐 token）。
+    pub tail_at: Option<usize>,
+    /// 持久快照布局点（Tail + History；页对齐 token offset；升序）。
     pub msg_snaps: Vec<usize>,
-    /// 与 `msg_snaps` 同序的快照键（`None` = 未拍/已逐出；2026-11-12 二刀）
+    /// 与 `msg_snaps` 同序的角色。
+    pub msg_snap_roles: Vec<crate::SnapRole>,
+    /// 与 `msg_snaps` 同序的快照键（`None` = 未拍/已逐出）
     pub msg_snap_keys: Vec<Option<crate::SnapKey>>,
     /// 是否为 leave-gap 后的本地链（仅 turn 内）
     pub local_chain: bool,
@@ -509,30 +488,29 @@ pub struct SessionTable {
 impl SessionTable {
     /// **会话账查询**(显式 `Result`;2026-10-17 裁决:账缺失**不 panic**)。
     pub fn session(&self, id: u64) -> Result<&AgentSession> {
-        self.sessions.get(&id).ok_or_else(|| owl_iface::contract::ModelError::EngineInvariant {
+        self.sessions
+            .get(&id)
+            .ok_or_else(|| owl_iface::contract::ModelError::EngineInvariant {
             what: format!("会话账缺失(会话 {id} 不在账)"),
         })
     }
 
     /// 同上(可变)。
-    pub fn session_mut(
-        &mut self,
-        id: u64,
-    ) -> Result<&mut AgentSession> {
-        self.sessions.get_mut(&id).ok_or_else(|| {
-            owl_iface::contract::ModelError::EngineInvariant {
+    pub fn session_mut(&mut self, id: u64) -> Result<&mut AgentSession> {
+        self.sessions
+            .get_mut(&id)
+            .ok_or_else(|| owl_iface::contract::ModelError::EngineInvariant {
                 what: format!("会话账缺失(会话 {id} 不在账)"),
-            }
         })
     }
 
     /// 把会话从账中取出（所有权转移；用于"销毁旧账 → 新建替换"路径）。
     /// 取出后调用方必须在所有成功/失败路径把新账 `put` 回来。
     pub fn take(&mut self, id: u64) -> Result<AgentSession> {
-        self.sessions.remove(&id).ok_or_else(|| {
-            owl_iface::contract::ModelError::EngineInvariant {
+        self.sessions
+            .remove(&id)
+            .ok_or_else(|| owl_iface::contract::ModelError::EngineInvariant {
                 what: format!("会话账缺失(会话 {id} 不在账)"),
-            }
         })
     }
 
@@ -575,7 +553,10 @@ impl SessionTable {
             unreachable!("contains_key 已判定");
         }
         let next = self.next_id;
-        let s = self.sessions.entry(id).or_insert_with(|| AgentSession::new(id, 0));
+        let s = self
+            .sessions
+            .entry(id)
+            .or_insert_with(|| AgentSession::new(id, 0));
         s.last_use = tick;
         self.next_id = next.max(id + 1);
         Ok((id, s))
@@ -623,12 +604,12 @@ impl SessionTable {
             }
             // 参考长 = **上一轮 prompt 段**（不含生成段）。账不可信（未收口/
             // pad 坏）⇒ 该会话退出身份匹配，不猜一个数字。
-            let Some(ref_len) = s.prompt_visible_len() else { continue };
+            let Some(ref_len) = s.prompt_visible_len() else {
+                continue;
+            };
             let n = s.common_prefix_text(prompt);
             // 短的一方必须被完整覆盖（接缝处允许 `MATCH_TAIL_TOLERANCE`）
-            if n < min_tokens
-                || n + MATCH_TAIL_TOLERANCE < ref_len.min(prompt.len())
-            {
+            if n < min_tokens || n + MATCH_TAIL_TOLERANCE < ref_len.min(prompt.len()) {
                 continue;
             }
             let better = match best {
@@ -665,10 +646,7 @@ impl SessionTable {
     /// **LRU 淘汰候选（排除忙碌会话）**：`busy` 至少包含活跃/排队 turn 的
     /// 会话 id；空闲会话才可被淘汰（设备表在 turn 收口已归还，淘汰只丢
     /// host token 历史 ⇒ 下轮全量重算，正确性不变）。
-    pub fn lru_victim_excluding(
-        &self,
-        busy: &std::collections::HashSet<u64>,
-    ) -> Option<u64> {
+    pub fn lru_victim_excluding(&self, busy: &std::collections::HashSet<u64>) -> Option<u64> {
         self.sessions
             .values()
             .filter(|s| !busy.contains(&s.id))
@@ -701,7 +679,9 @@ impl SessionTable {
                 id: s.id,
                 history_len: s.tokens.len(),
                 tail_snap: s.tail_snap,
+                tail_at: s.tail_at,
                 msg_snaps: s.msg_snaps.clone(),
+                msg_snap_roles: s.msg_snap_roles.clone(),
                 msg_snap_keys: s.msg_snap_keys.clone(),
                 local_chain: s.local_chain,
                 last_use: s.last_use,
@@ -873,7 +853,11 @@ impl SessionBank {
         let mut leg_mtp = BlockLeg::open(LegConfig {
             slots: if plan.mtp && !mtp_ring { plan.nb } else { 0 },
             block_tokens: plan.page,
-            block_bytes: if plan.mtp && !mtp_ring { plan.mtp_block_bytes } else { 1 },
+            block_bytes: if plan.mtp && !mtp_ring {
+                plan.mtp_block_bytes
+            } else {
+                1
+            },
             cache: crate::CachePolicy::Off,
             host_bytes: 0,
             class: BlockClass::KvPage,
@@ -884,7 +868,12 @@ impl SessionBank {
                 leg_mtp.attach_pool(l)?;
             }
         }
-        Ok(Self { sessions: SessionTable::new(), rel, leg_mtp, mtp_ring })
+        Ok(Self {
+            sessions: SessionTable::new(),
+            rel,
+            leg_mtp,
+            mtp_ring,
+        })
     }
 
     // （块腿的复合口做成**自由函数**:借用只落在 `&mut KvStore` 那一个字段上
@@ -934,10 +923,7 @@ impl SessionBank {
         // **两条链都尝试**：target 失败不许截断 MTP 归还；失败时把未动的表
         // 放回会话，保证下次 close/burn 还能重试（release_table 已做全量校验，
         // 失败时表内容不变）。
-        let target = self
-            .rel
-            .release_table(&mut table)
-            .map_err(ModelError::from);
+        let target = self.rel.release_table(&mut table).map_err(ModelError::from);
         if target.is_err() {
             if let Some(s) = self.sessions.get_mut(id) {
                 s.block_table = table;
@@ -981,19 +967,16 @@ impl SessionBank {
         let known_width = self.rel.admission().slot_bytes();
         if known_width != 0 && known_width != block_bytes {
             return Err(ModelError::EngineInvariant {
-                what: format!(
-                    "sync_pool_account: 槽宽漂移 {known_width} ≠ {block_bytes}"
-                ),
+                what: format!("sync_pool_account: 槽宽漂移 {known_width} ≠ {block_bytes}"),
             });
         }
         let mut per_turn: Vec<(u64, Vec<u32>)> = Vec::with_capacity(active.len());
         for (turn, session) in active {
-            let s = self.sessions.get(*session).ok_or_else(|| {
-                ModelError::EngineInvariant {
-                    what: format!(
-                        "sync_pool_account: 活跃 turn {turn} 的会话 {session} 不在账"
-                    ),
-                }
+            let s = self
+                .sessions
+                .get(*session)
+                .ok_or_else(|| ModelError::EngineInvariant {
+                    what: format!("sync_pool_account: 活跃 turn {turn} 的会话 {session} 不在账"),
             })?;
             if !self.rel.admission().has_active(*turn) {
                 return Err(ModelError::EngineInvariant {
@@ -1024,7 +1007,9 @@ impl SessionBank {
                 ),
             });
         }
-        self.rel.admission_mut().set_session_held(occupied - accounted);
+        self.rel
+            .admission_mut()
+            .set_session_held(occupied - accounted);
         Ok(())
     }
 
@@ -1145,7 +1130,9 @@ mod tests {
         assert!(s.guard(&bad), "重置后零缓存守卫恒真(全量重算)");
 
         // 截短的历史(prompt 比账本还短)也拒
-        let pos2: Vec<[i32;3]> = (0..p2.len()).map(|i| [i as i32,i as i32,i as i32]).collect();
+        let pos2: Vec<[i32; 3]> = (0..p2.len())
+            .map(|i| [i as i32, i as i32, i as i32])
+            .collect();
         s.commit_turn(&p2, &[], &pos2).expect("收口 turn3");
         assert!(!s.guard(&p2[..8]));
     }
@@ -1273,7 +1260,10 @@ mod bank_tests {
         let err = bank
             .sync_pool_account(&[(1, 0xDEAD)])
             .expect_err("缺失会话必须拒");
-        assert!(matches!(err, ModelError::EngineInvariant { .. }), "得 {err:?}");
+        assert!(
+            matches!(err, ModelError::EngineInvariant { .. }),
+            "得 {err:?}"
+        );
     }
 
     /// **close 必须释放快照归属**（会话 id 可复用，旧归属不能串台）。
@@ -1341,12 +1331,20 @@ mod bank_tests {
         let (id, s) = bank.sessions.get_or_create(Some(7)).expect("建会话");
         assert_eq!(id, 7);
         // target 链 2 块(24 tok / 块 8)+ MTP 链 1 块(9 tok)
-        bank.rel.ensure_for_len_unreserved(&mut s.block_table, 24).expect("target 块");
-        bank.leg_mtp.ensure_for_len(&mut s.mtp_block_table, 9).expect("mtp 块");
+        bank.rel
+            .ensure_for_len_unreserved(&mut s.block_table, 24)
+            .expect("target 块");
+        bank.leg_mtp
+            .ensure_for_len(&mut s.mtp_block_table, 9)
+            .expect("mtp 块");
         assert!(bank.leg_mtp.report().slots_free < mtp_before, "mtp 已占用");
 
         bank.close(id).expect("close");
-        assert_eq!(bank.leg_mtp.report().slots_free, mtp_before, "MTP 链必须归还");
+        assert_eq!(
+            bank.leg_mtp.report().slots_free,
+            mtp_before,
+            "MTP 链必须归还"
+        );
         assert_eq!(bank.rel.slots_free(), tgt_before, "target 链归还");
         assert!(bank.sessions.get(id).is_none(), "账本移除");
     }
@@ -1356,7 +1354,9 @@ mod bank_tests {
     fn close_without_mtp_is_noop_on_empty_chain() {
         let mut bank = bank_of(plan(32, 8, false, true));
         let (id, s) = bank.sessions.get_or_create(Some(1)).expect("建会话");
-        bank.rel.ensure_for_len_unreserved(&mut s.block_table, 8).expect("target 块");
+        bank.rel
+            .ensure_for_len_unreserved(&mut s.block_table, 8)
+            .expect("target 块");
         bank.close(id).expect("close");
         assert!(bank.sessions.get(id).is_none());
     }
@@ -1524,27 +1524,32 @@ mod bank_tests {
     }
 
     /// **前缀命中路径的 reset 必须保留 L1 资产**；只有 `rebase`（真换链）
-    /// 才清 tail/msg keys。否则旧 tail 永远等不到降级，Dense 档会积累。
+    /// 才清 tail/msg keys。否则旧 tail 永远等不到降级，Tail 角色会积累。
     #[test]
     fn reset_preserves_l1_assets_but_rebase_clears_them() {
         let mut st = SessionTable::new();
         let (_, s) = st.get_or_create(Some(7)).expect("建会话");
         let k = crate::SnapKey::at_boundary(crate::ChainHash::new(9));
         s.tail_snap = Some(k);
+        s.tail_at = Some(64);
         s.msg_snaps = vec![32, 64];
+        s.msg_snap_roles = vec![crate::SnapRole::History, crate::SnapRole::Tail];
         s.msg_snap_keys = vec![Some(k), None];
         s.local_chain = true;
 
         s.reset();
         assert_eq!(s.tail_snap, Some(k), "命中续写不得丢 tail 归属");
-        assert_eq!(s.msg_snaps, vec![32, 64], "命中续写不得丢消息边界");
+        assert_eq!(s.tail_at, Some(64), "命中续写不得丢 tail offset");
+        assert_eq!(s.msg_snaps, vec![32, 64], "命中续写不得丢布局点");
         assert_eq!(s.msg_snap_keys, vec![Some(k), None], "键沿用不得断");
         assert!(s.local_chain, "命中续写仍持 gapped 链");
 
         let s = s.clone().rebase();
         assert!(!s.local_chain, "真换链必须解除 gapped 表保留");
         assert!(s.tail_snap.is_none(), "真换链清 tail");
-        assert!(s.msg_snaps.is_empty(), "真换链清消息边界");
+        assert!(s.tail_at.is_none(), "真换链清 tail offset");
+        assert!(s.msg_snaps.is_empty(), "真换链清布局点");
+        assert!(s.msg_snap_roles.is_empty(), "真换链清角色");
         assert!(s.msg_snap_keys.is_empty(), "真换链清键");
     }
 }

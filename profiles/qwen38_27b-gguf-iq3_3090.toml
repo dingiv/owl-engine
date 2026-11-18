@@ -38,9 +38,8 @@ host_cache_mb = 10240
 [store.gdn]
 snap_max = 1
 snap_msg_delim = ""
-snap_msg_recent = 4
-snap_session_cap = 20
-snap_structural_reserve = 4
+snap_session_cap = 4
+snap_tail = 2
 
 [vision]
 enabled = true

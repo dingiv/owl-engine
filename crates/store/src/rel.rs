@@ -298,8 +298,8 @@ pub struct SnapEvictPreview {
     pub depth: usize,
     /// 是否为生成段(逐出即丢)。
     pub transient: bool,
-    /// 淘汰优先级档(Dense/Binary/Extra/Transient;2026-11-12)。
-    pub class: crate::state::SnapClass,
+    /// 持久角色（Tail / History；Transient 看 `transient`）。
+    pub role: crate::state::SnapRole,
 }
 
 /// **盘上链索引重建报告**(S6.1;boot)。

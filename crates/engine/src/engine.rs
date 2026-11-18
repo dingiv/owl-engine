@@ -61,12 +61,6 @@ pub const PREFILL_TAIL_MERGE: usize = 0;
 /// 节流语义仍有单一产地。
 pub const DECODE_SNAP_STRIDE: usize = 1;
 
-/// **消息边界快照的稀疏间距**（token）。
-///
-/// 2026-11-17：`[store.gdn] snap_msg_min_gap` 键退休。全档实测都是 2048，
-/// 且它只控制“同一段消息里别拍太密”，属于引擎策略。
-pub const SNAP_MSG_MIN_GAP: usize = 2048;
-
 /// **消息边界切块最小步长**（token；0 = 不设下限）。
 ///
 /// 2026-11-17：`[store.gdn] snap_msg_min_span` 键退休。全档实测 0，
@@ -346,12 +340,10 @@ pub struct EngineKnobs {
     /// 门 = **消费者存在**（`image_evict && prefix_cache && snap_max>0`）。
     /// 消息开启标记文本覆盖(空 = 模型 `ChatFormat.im_open`)
     pub snap_msg_delim: String,
-    /// 最近 K 条消息边界无条件保留（dense tail；`[store.gdn].snap_msg_recent`）
-    pub snap_msg_recent: usize,
-    /// **每会话快照上限**（`[store.gdn].snap_session_cap`；必须 >= 1）
+    /// **每会话持久快照上限**（Tail + History；`[store.gdn].snap_session_cap`；必须 >= 1）
     pub snap_session_cap: usize,
-    /// **结构档保留位**（`[store.gdn].snap_structural_reserve`；仅 cap > 0 生效）
-    pub snap_structural_reserve: usize,
+    /// **尾部连续保留张数**（`[store.gdn].snap_tail`）
+    pub snap_tail: usize,
     /// **显存治理占比**(`[store].vram_budget`;缺省 0.97;0 = 治理禁用)
     pub vram_budget: f64,
     /// **单值总预留 MiB**(缺省 714;含图执行/warmup/碎片)。
@@ -435,9 +427,8 @@ impl Default for EngineKnobs {
             max_batch: 1,
             snap_max: 4,
             snap_msg_delim: String::new(),
-            snap_msg_recent: 4,
-            snap_session_cap: 20,
-            snap_structural_reserve: 4,
+            snap_session_cap: 30,
+            snap_tail: 12,
             vram_budget: 0.97,
             vram_activation_reserve: 714,
             raw_completion: false,
@@ -544,9 +535,7 @@ impl EngineKnobs {
             knobs.select_recent = knobs.select_recent_tokens.div_ceil(page);
         }
         // 保底 = sink + recent + **分层抽样**(三者同级先占预算;分层为 0 时逐位回退)
-        let keep = knobs.select_sink
-            + knobs.select_recent
-            + knobs.select_stratified;
+        let keep = knobs.select_sink + knobs.select_recent + knobs.select_stratified;
         if ws_pages < keep {
             return Err(owl_iface::contract::ModelError::Msg(format!(
                 "boot: 每 turn 工作集不自洽 —— workspace_per_req={} tok = {} 页 < 保底                  (sink {} + recent {} + 分层 {} = {} 页);要么调大工作集,要么调小保底",
@@ -796,9 +785,8 @@ impl EngineKnobs {
             // 快照池容量 = 配置单源（F-03；不再读 `OWL_SNAP_MAX`）
             snap_max: cfg.store.gdn.snap_max,
             snap_msg_delim: cfg.store.gdn.snap_msg_delim.clone(),
-            snap_msg_recent: cfg.store.gdn.snap_msg_recent,
             snap_session_cap: cfg.store.gdn.snap_session_cap,
-            snap_structural_reserve: cfg.store.gdn.snap_structural_reserve,
+            snap_tail: cfg.store.gdn.snap_tail,
             vram_budget: cfg.store.vram_budget,
             vram_activation_reserve: cfg.store.vram_activation_reserve,
             raw_completion: cfg.probes.raw_completion,
@@ -1084,8 +1072,7 @@ fn assemble_budget(
         // 有设备账却算出权重 0 = 测量病（不是"没权重"）。A5.1：没有数字的项
         // 不许进预算式 —— 旧行为只 WARN，预算会按 0 权重放宽（F-08）。
         return Err(owl_iface::contract::ModelError::Msg(
-            "准入预算:权重字节实测为 0(引擎 live 账未动?装载路径绕过账本?)—— 拒绝启动"
-                .into(),
+            "准入预算:权重字节实测为 0(引擎 live 账未动?装载路径绕过账本?)—— 拒绝启动".into(),
         ));
     }
     let snap_pool = plan
@@ -1299,7 +1286,9 @@ impl<D: DeviceClient + 'static> Engine<D> {
             "rope 位置容量：max_seq={} + gap 预留={} ⇒ 表长 ≥ {}（预留只给 image leave-gap）",
             self.cfg.max_seq_tokens,
             self.cfg.knobs.gap_reserve,
-            self.cfg.max_seq_tokens.saturating_add(self.cfg.knobs.gap_reserve)
+            self.cfg
+                .max_seq_tokens
+                .saturating_add(self.cfg.knobs.gap_reserve)
         );
         ModelLoader::new(&mut self.face, self.cfg.knobs.load.clone())
             .mtp_override(self.cfg.knobs.draft.mtp_dir.clone())
@@ -1403,8 +1392,8 @@ pub(crate) fn into_running<D: DeviceClient>(
     // 草稿权重实测:事件账里按唯一词表统计(两 rank 共享一本账 ⇒ 先合计再
     // 摊到每卡;与 `weights_bytes` 的 per-card 口径一致)。
     let rank_count = if peer.is_some() { 2usize } else { 1usize };
-    let draft_weights_total = owl_store::book_lock(&ledger)
-        .open_bytes_by_prefixes(crate::DRAFT_WEIGHT_PREFIXES);
+    let draft_weights_total =
+        owl_store::book_lock(&ledger).open_bytes_by_prefixes(crate::DRAFT_WEIGHT_PREFIXES);
     let draft_weights_per_card = draft_weights_total / rank_count;
     let memory_plan = build_memory_plan(
         &boot,
@@ -1452,9 +1441,13 @@ pub(crate) fn into_running<D: DeviceClient>(
             b.parts_mut().rel.attach_pool_peer(pr.pool.pool_layout(0))?;
         }
         // **B-4 驱逐策略装配**(boot 一次;缺省 LRU ⇒ 与历史逐字一致)
-        b.parts_mut().rel.set_evict_policy(cfg.knobs.evict_policy.build());
+        b.parts_mut()
+            .rel
+            .set_evict_policy(cfg.knobs.evict_policy.build());
         // 整枝塌缩(2026-10-23):宿主/磁盘**装不下整链**时允许一张票丢整段
-        b.parts_mut().rel.set_bulk_drop_when_tier_full(cfg.knobs.bulk_drop_when_tier_full);
+        b.parts_mut()
+            .rel
+            .set_bulk_drop_when_tier_full(cfg.knobs.bulk_drop_when_tier_full);
         owl_shared::log_info!("store", "驱逐策略 = {}", b.parts().rel.evict_policy_name());
         if cfg.knobs.index_probe {
             // B 轴索引几何:层 = 全注意力层数,头 = KV 头数,dim = head_dim
@@ -1473,9 +1466,14 @@ pub(crate) fn into_running<D: DeviceClient>(
             );
         }
         if dev.pool.geom.paged && dev.pool.snap_capacity() > 0 {
-            let epoch = b.parts_mut().rel.attach_snap_layout(dev.pool.snap_pool_layout(0))?;
+            let epoch = b
+                .parts_mut()
+                .rel
+                .attach_snap_layout(dev.pool.snap_pool_layout(0))?;
             if let Some(pr) = peer.as_ref() {
-                b.parts_mut().rel.attach_snap_layout_peer(pr.pool.snap_pool_layout(0))?;
+                b.parts_mut()
+                    .rel
+                    .attach_snap_layout_peer(pr.pool.snap_pool_layout(0))?;
             }
             owl_shared::log_info!(
                 "boot",
@@ -1637,7 +1635,10 @@ pub(crate) fn into_running<D: DeviceClient>(
             );
             {
                 let kept: std::collections::HashSet<_> = rep.kept.iter().copied().collect();
-                let orphans: Vec<owl_store::ChainHash> = b.parts().rel.kv_disk_resident_keys()
+                let orphans: Vec<owl_store::ChainHash> = b
+                    .parts()
+                    .rel
+                    .kv_disk_resident_keys()
                     .into_iter()
                     .filter(|k| !kept.contains(k))
                     .collect();
@@ -1705,7 +1706,9 @@ pub(crate) fn into_running<D: DeviceClient>(
         b
     };
     // **V0/V1:计划与准入账交叉校验**（plan 投影必须与 Rel::open 的入参逐字一致）。
-    bank.parts_mut().rel.attach_memory_plan(memory_plan.clone())?;
+    bank.parts_mut()
+        .rel
+        .attach_memory_plan(memory_plan.clone())?;
 
     // **前缀无感删除的 boot 门**(2026-10-23;2026-10-26 只保留 leave-gap):
     // 开了就必须具备执行面 —— ① 视觉塔(图像段识别 / m-RoPE 位置自证)
@@ -1714,16 +1717,15 @@ pub(crate) fn into_running<D: DeviceClient>(
     if cfg.knobs.image_evict {
         if dev.boot.vlm.is_none() {
             return Err(ModelError::Msg(
-                "[vision] image_evict = true 需要 [vision] enabled = true(图像段识别依赖视觉档)".into(),
+                "[vision] image_evict = true 需要 [vision] enabled = true(图像段识别依赖视觉档)"
+                    .into(),
             ));
         }
         if !dev.pool.geom.paged {
             return Err(ModelError::Msg(format!(
                 "[vision] image_evict = true 需要分页 KV 池（f16/fp8-e4m3/int8）\
                  (paged={} kv_dtype={:?} dtype={:?})",
-                dev.pool.geom.paged,
-                dev.pool.geom.kv_dtype,
-                dev.pool.geom.dims.dtype
+                dev.pool.geom.paged, dev.pool.geom.kv_dtype, dev.pool.geom.dims.dtype
             )));
         }
         // **pad 词校验**(模型敏感项,必须恰 1 token):空串 = 运行时自动挑;
@@ -1799,11 +1801,10 @@ pub(crate) fn into_running<D: DeviceClient>(
             } else {
                 owl_shared::log_info!(
                     "boot",
-                    "消息边界快照:开 · delim={delim:?} → {} token {:?} · min_gap={} · recent={} · min_span={}",
+                    "消息边界快照:开 · delim={delim:?} → {} token {:?} · snap_tail={} · min_span={}",
                     ids.len(),
                     ids,
-                    SNAP_MSG_MIN_GAP,
-                    cfg.knobs.snap_msg_recent,
+                    cfg.knobs.snap_tail,
                     SNAP_MSG_MIN_SPAN
                 );
             }
@@ -1815,9 +1816,9 @@ pub(crate) fn into_running<D: DeviceClient>(
 
     owl_shared::log_info!(
         "boot",
-        "快照准入:每会话上限 {} 张(设备+宿主+盘;结构档保留 {} 格;Transient 不计)",
+        "快照准入:每会话上限 {} 张(Tail {} + History;设备+宿主+盘;Transient 不计)",
         cfg.knobs.snap_session_cap,
-        cfg.knobs.snap_structural_reserve
+        cfg.knobs.snap_tail
     );
 
     let disk = crate::mem::disk_runtime::DiskRuntime::new();
@@ -2667,11 +2668,11 @@ pub(crate) fn boot_kvmem_check(cfg: &EngineConfig) -> Result<()> {
                 .into(),
         ));
     }
-    if cfg.knobs.snap_session_cap < cfg.knobs.snap_msg_recent {
+    if cfg.knobs.snap_session_cap < cfg.knobs.snap_tail {
         return Err(owl_iface::contract::ModelError::Msg(format!(
-            "[store.gdn] snap_session_cap={} < snap_msg_recent={} \
-             —— 最近 K 条边界优先保留不能超过单会话快照总名额",
-            cfg.knobs.snap_session_cap, cfg.knobs.snap_msg_recent
+            "[store.gdn] snap_session_cap={} < snap_tail={} \
+             —— Tail 连续保留不能超过单会话快照总名额",
+            cfg.knobs.snap_session_cap, cfg.knobs.snap_tail
         ))
         .into());
     }
@@ -2752,7 +2753,10 @@ pub(crate) fn boot_kvmem_check(cfg: &EngineConfig) -> Result<()> {
             ));
         }
         if cfg.knobs.draft.depth > 0
-            && matches!(cfg.knobs.env.attn.verify_arm, owl_shared::config::VerifyArm::Xqa)
+            && matches!(
+                cfg.knobs.env.attn.verify_arm,
+                owl_shared::config::VerifyArm::Xqa
+            )
         {
             return Err(owl_iface::contract::ModelError::Msg(
                 "boot: `[kvmem] select_partial = true` + 投机不支持 verify_arm = xqa \
@@ -2796,10 +2800,7 @@ impl TpPoolShare {
     pub(crate) fn pair() -> (Self, Self) {
         let (tx0, rx0) = tokio::sync::watch::channel(None::<u64>);
         let (tx1, rx1) = tokio::sync::watch::channel(None::<u64>);
-        (
-            Self { tx: tx0, rx: rx1 },
-            Self { tx: tx1, rx: rx0 },
-        )
+        (Self { tx: tx0, rx: rx1 }, Self { tx: tx1, rx: rx0 })
     }
 
     async fn exchange(&mut self, free: u64) -> Result<u64> {
@@ -2844,8 +2845,7 @@ pub(crate) async fn boot_rank<D: DeviceClient + 'static>(
         // attn v2 scratch 注入都以**模型 dtype** 为前提(F32 ⇒ 无分页策略
         // ⇒ 走 legacy v1 臂 ⇒ attention.rs 的退役 panic)。所需修法:
         // 让分页策略/scratch 与执行域 dtype 解耦(单独一刀),不在 mock 刀里扫。
-        let (dims, env, fi_quant, spec) =
-            boot_env_and_spec(&mut face, cfg, &rm, tp.as_ref()).await?;
+    let (dims, env, fi_quant, spec) = boot_env_and_spec(&mut face, cfg, &rm, tp.as_ref()).await?;
         // 族装配参数必须在 env 感知之后、任何 plan/图捕获之前下发：
         // `fp8_native` 的唯一真值 = 运行期 `env.hw`（不是编译 feature）。
         let boot_arch = match env.hw {

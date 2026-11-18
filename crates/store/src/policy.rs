@@ -39,9 +39,10 @@ pub struct EvictCandidate {
     /// [`crate::hooks::order_candidates`] 的会话档) —— 保留前缀,不让"头部被逐
     /// ⇒ 后面全变垃圾"。
     pub session: u64,
-    /// **在链上的深度**(块数;快照 = 边界块号,KV 叶 = 从根到该块的块数)。
+    /// **在链上的深度**（块数；快照 = 边界块号，KV 叶 = 从根到该块的块数）。
     ///
-    /// 同会话内**深度大者先逐**(末端先走)。
+    /// v4 快照 Tail 按 **depth 小者先逐**（最老边界先走，最新尾最后）；
+    /// History 交给 `EvictPolicy`（LRU/LRFU）。
     pub depth: usize,
 }
 

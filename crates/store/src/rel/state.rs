@@ -183,12 +183,12 @@ impl Rel {
         // 的"部分前缀"复用面从 ~97% 塔到 29%(7k 共享只复用 2k = 白重算 5k
         // token ≈ 5 s/请求)。
         //
-        // 政策 = **同一份快照出序**(`order_snap_victims`):先按 `SnapClass`
-        // 档位(`Transient → Extra → 老 Binary → Dense`),同档再交给
+        // 政策 = **同一份快照出序**(`order_snap_victims`):先按 `SnapRole`
+        // 角色(`Transient → Extra → 老 Binary → Dense`),同档再交给
         // `EvictPolicy`。只比 `Tier::Host` 的候选,排序后取第一个。
         //
-        // 不能直接 `self.evict.order`:那会绕过 SnapClass,宿主满时可能先丢
-        // 一条 Dense 尾锚点,却留下更冷的 Extra。代价说明:先逐后搬 ⇒ 若接下来
+        // 不能直接 `self.evict.order`:那会绕过角色,宿主满时可能先丢
+        // 一条 Tail 尾锚点,却留下更冷的 History。代价说明:先逐后搬 ⇒ 若接下来
         // 的 DMA 失败(`abort_snap_offload`),被逐条目已丢(比"丢新条目"代价小
         // —— 它本来就在淘汰序最前)。
         let last = self.snap_host.used_bytes();
@@ -511,7 +511,7 @@ impl Rel {
         durability: crate::state::SnapDurability,
         session: u64,
         depth: usize,
-        class: crate::state::SnapClass,
+        role: crate::state::SnapRole,
     ) -> StoreResult<usize> {
         let mut ghosts = 0usize;
         if self.snap_host.get(key).is_some() {
@@ -524,14 +524,14 @@ impl Rel {
                 ghosts += 1;
             }
         }
-        self.state.register_snap_owned_class(
+        self.state.register_snap_owned_role(
             key,
             bytes,
             Tier::Gpu,
             durability,
             session,
             depth,
-            class,
+            role,
         );
         if ghosts > 0 {
             owl_shared::log_debug!(
@@ -550,17 +550,18 @@ impl Rel {
         &self,
         session: u64,
         key: SnapKey,
-        class: crate::state::SnapClass,
+        durability: crate::state::SnapDurability,
         policy: crate::state::SnapAdmitPolicy,
         protect: &[SnapKey],
     ) -> crate::state::SnapAdmit {
-        self.state.admit_snap(session, key, class, policy, protect)
+        self.state
+            .admit_snap(session, key, durability, policy, protect)
     }
 
-    /// **只重分类快照条目的淘汰档**(不搬内容;2026-11-12 二刀)。
+    /// **只重分类快照条目的角色**(不搬内容)。
     /// 返回 `false` = 键已不在账(正常逐出)。
-    pub fn reclassify_snap(&mut self, key: SnapKey, class: crate::state::SnapClass) -> bool {
-        self.state.reclassify_snap(key, class)
+    pub fn reclassify_snap(&mut self, key: SnapKey, role: crate::state::SnapRole) -> bool {
+        self.state.reclassify_snap(key, role)
     }
 
     /// **会话关闭:释放该会话的快照归属**(不丢内容;2026-11-12 二刀)。

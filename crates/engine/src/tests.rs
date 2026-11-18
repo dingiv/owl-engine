@@ -27,6 +27,26 @@ use owl_macros::owl_test;
 #[cfg(test)]
 use owl_shared::config::OwlConfig;
 
+/// v4 快照布局的机械不变量（图像删除后尤其容易两套坐标/两套角色）。
+fn assert_snap_layout_invariants(s: &crate::session::AgentSession) {
+    assert_eq!(s.msg_snaps.len(), s.msg_snap_roles.len(), "布局点/角色不等长");
+    assert_eq!(s.msg_snap_keys.len(), s.msg_snaps.len(), "布局点/键不等长");
+    assert!(
+        s.msg_snaps.windows(2).all(|w| w[0] < w[1]),
+        "布局点必须严格升序: {:?}",
+        s.msg_snaps
+    );
+    if let Some(at) = s.tail_at {
+        assert!(at <= s.tokens.len(), "tail_at={at} 越过会话 token {}", s.tokens.len());
+    }
+    if let Some(k) = s.tail_snap {
+        assert!(
+            s.msg_snap_keys.iter().flatten().any(|x| *x == k),
+            "tail_snap 必须是布局里的实际键"
+        );
+    }
+}
+
 /// **单图捕获 + 双回放门**(原 piecewise 段驱动件门;2026-10-18 W5 改单图)——
 /// **不装模型**,纯 `GraphPlan` 面。
 ///
@@ -7203,6 +7223,7 @@ pub async fn gpu_image_evict_gate() {
     {
         let bank = running.bank.parts_mut();
         let s = bank.sessions.session(sid).expect("会话账");
+        assert_snap_layout_invariants(s);
         let tags = crate::img_evict::block_tags_pos(
             s.tokens.len(),
             page,
@@ -7698,6 +7719,7 @@ pub async fn gpu_image_evict_anchor_gate() {
     {
         let bank = running.bank.parts_mut();
         let s = bank.sessions.session(sid).expect("会话账");
+        assert_snap_layout_invariants(s);
         let tags =
             crate::img_evict::block_tags_pos(s.tokens.len(), page, &s.img_spans, &s.positions);
         let (hit_new, _) = bank
@@ -8311,6 +8333,7 @@ pub async fn gpu_image_evict_multi_gate() {
     {
         let bank = running.bank.parts_mut();
         let s = bank.sessions.session(sid).expect("会话账");
+        assert_snap_layout_invariants(s);
         let tags =
             crate::img_evict::block_tags_pos(s.tokens.len(), page, &s.img_spans, &s.positions);
         let (hit_new, _) = bank

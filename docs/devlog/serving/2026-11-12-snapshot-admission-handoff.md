@@ -1,4 +1,9 @@
-# 交接：单会话 100 消息节点 / 快照上限 20 的“新增一张快照”决策
+# 交接（已废弃）：单会话 100 消息节点 / 快照上限 20 的“新增一张快照”决策
+
+> **2026-11-18 v4 已取代本文件**：`Dense/Binary/Extra`、`structural_reserve`、
+> `snap_msg_recent` 均已退役；现行设计见
+> `2026-11-12-session-aware-kv-snap-设计.md`（v4：Tail 12 + History 18 均匀）。
+> 本文件只作历史归档，不要按它施工。
 
 > 2026-11-12 · 下一会话入口 · 关联：
 > `docs/devlog/serving/2026-11-12-session-aware-kv-snap-设计.md`

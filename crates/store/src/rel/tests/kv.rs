@@ -85,39 +85,39 @@ fn protected_active_turn_floor_is_never_evicted() {
     );
 }
 
-/// **可删图锚点可淘汰门（2026-11-13）**：锚点是 `Extra` 档、不进任何
-/// 保护面 ⇒ 空间不足时**先于 Dense** 被逐出。这是“不搞 pin”的硬门：
+/// **可删图锚点可淘汰门（2026-11-13）**：锚点是 `History` 角色、不进任何
+/// 保护面 ⇒ 空间不足时**先于 Tail** 被逐出。这是“不搞 pin”的硬门：
 /// 谁把锚点提到 `Dense` 或塞进 `Protected`，这里就红。
 #[test]
 fn evict_anchor_snapshot_is_extra_and_evictable() {
-    use crate::state::SnapClass;
+    use crate::state::SnapRole;
     let mut r = rel(2);
     let anchor = SnapKey::at_boundary(ChainHash::new(0xA1));
     let dense = SnapKey::at_boundary(ChainHash::new(0xA2));
-    // 同一会话：锚点 = Extra（capture 路径的 class），尾锚点 = Dense。
-    r.state.register_snap_owned_class(
+    // 同一会话：锚点 = History（capture 路径的角色），尾锚点 = Tail。
+    r.state.register_snap_owned_role(
         anchor,
         BLOCK_BYTES,
         Tier::Gpu,
         SnapDurability::Durable,
         7,
         5,
-        SnapClass::Extra,
+        SnapRole::History,
     );
-    r.state.register_snap_owned_class(
+    r.state.register_snap_owned_role(
         dense,
         BLOCK_BYTES,
         Tier::Gpu,
         SnapDurability::Durable,
         7,
         6,
-        SnapClass::Dense,
+        SnapRole::Tail,
     );
-    assert_eq!(r.state.snap_class(anchor), Some(SnapClass::Extra));
+    assert_eq!(r.state.snap_role(anchor), Some(SnapRole::History));
     assert_eq!(
         r.snap_victim_order(&[]).first(),
         Some(&anchor),
-        "Extra 档的锚点必须先进淘汰序（不是 pin）"
+        "History 角色的锚点必须先进淘汰序（不是 pin）"
     );
     // 锚点不在 `Protected` 面里；只有**正在载入**的 key 才被显式挡住。
     assert_eq!(

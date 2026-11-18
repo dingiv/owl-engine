@@ -185,6 +185,26 @@ Tail 不是永久 pin；它是最后淘汰层。
 - 任何 turn 正常停止都必须拍最后一张，不能只在长生成时拍；
 - 当前 `capture_abort_snap` 只覆盖 prefill 中段，v4 必须扩到 generation。
 
+### 3.6.1 尾块守护页（append TTFT 硬要求）
+
+`prompt_end` 只拍最后一页还不够：assistant→user 追加时，chat 模板会改写
+**最后一个整块**（结束标记/角色边界），`match_prefix` 只能匹配到
+`prompt_end - page`；若该页没有快照，`reuse_face` 会退到 1 块，100 字符级
+append 也会触发数秒级重算。
+
+因此每次请求额外保留 **`prompt_end - page`**：
+
+- 进入 `msg_snaps`（Tail 角色）；
+- 同时进入 `evict_snaps` 的 hard-snap，保证小尾块规则不会跳过它；
+- 前缀命中时从该页快照恢复，最后一页重算。
+
+实测（3080 TP2，4673 tok 基线，append ~104 字符）：
+
+```text
+修复前  cache=32/4699,   ttft=1843ms
+修复后  cache=4640/4699, ttft=305ms
+```
+
 ### 3.7 布局重算时机
 
 在这些事件后重算 Tail/History：
@@ -214,6 +234,32 @@ start = 最近一个 ≤ kv_hit 的快照边界
 
 ---
 
+### 3.9 图像无感删除（leave-gap）的特殊处理
+
+图像删除不是普通“再拍一张”的事件，而是**链坐标变更 + 页删除 + 后缀身份重算**。
+因此 v4 必须额外做四件事：
+
+1. **删除前硬锚点**：每张可删图段起点仍由 `evict_snaps` 强制切块并拍快照
+   （`History` 角色）。这是删除发生后“图前前缀”唯一的恢复面；不能只依赖
+   普通消息边界或尾锚点。
+2. **幸存页键重挂**：leave-gap 只删页、不转 K；旧快照键按
+   `old_page → new_page` 映射重挂到新链身份。被删页、未能重挂的旧键必须
+   **整体释放**（设备槽 + 宿主/盘 + 状态账），不能留下旧链孤儿。
+3. **布局重算**：旧 `msg_snaps` 是旧 token 坐标，不能按 offset 直接沿用。
+   删除后把幸存旧点映射到新坐标，并和**新 prompt 的消息边界 / prompt 末页 /
+   新图硬锚点 / restore 边界**合并，重新跑 `plan_snap_layout`；同时回写
+   `msg_snap_roles`、`msg_snap_keys`、`tail_snap/tail_at`，并把角色回写到
+   `StateStore`（旧 Tail 可能在新布局中变成 History）。幸存页上的**全部持久
+   快照**（含不在 `msg_snaps` 里的图前硬锚点）也扫描并入布局，避免 orphan。
+4. **恢复键校验**：`restore_key` 必须是新链上的边界；旧链 fallback 键
+   不得写回会话。`cached_len` 处的新链尾边界**强制进入布局**（不能被均匀
+   选点挤出），并作为本 turn 的 `last_snap_at`。
+
+一句话：**图像删除是“链变更事件”，拍点只是其中一半；不做坐标/角色重映射，
+快照账会指向旧链。** 对应实现：
+`plan_image_leave_gap{,_multi}` 产出 `new_page_of/drop_keys`，
+`scheduler::remap_snap_layout_after_delete` 重算布局并回写。
+
 ## 4. 代码结构
 
 ### 4.1 存储层
@@ -238,7 +284,7 @@ enum SnapRole { Tail, History }
 - `serve/msg_boundary.rs`：
   - 保留候选扫描；
   - 新增 `uniform_select(points, m)`；
-  - 新增 `plan_snap_layout(candidates, prompt_len, tail_count, cap)`；
+  - 新增 `plan_snap_layout(candidates, tail_count, cap)`；
 - `running.rs`：
   - `msg_snaps` + `msg_snap_classes` 改为一次 layout 计算；
   - 新请求 prompt 结束时调用；
@@ -348,8 +394,24 @@ snap_tail = 12
 
 ---
 
-## 8. 状态
+## 8. 状态（2026-11-18 施工）
 
 - 本文件 = v4 设计基线；v3 施工状态仅作历史参考。
-- 代码尚未按 v4 改造；下一会话按 `roadmap.local/26-11-18-snapshot-tail-history-交接.md`
-  执行。
+- **已落地**（分支 `feat/snap-tail-history`）：
+  - `uniform_select` / `plan_snap_layout` 纯函数与单测；
+  - `SnapRole { Tail, History }`，`admit_snap` / 淘汰 / `detach_session` 改角色顺序；
+  - engine submit 按布局写 `msg_snaps/msg_snap_roles/msg_snap_keys`；
+  - complete / abort(prefill+generation) 拍 Tail，布局重算并删除目标集外历史键；
+  - 配置迁移 `snap_session_cap=30` + `snap_tail=12`，旧键 unknown-field 拒启；
+  - 3080 TP2 / 3090 TP2 真机已验 append 命中、18+12 角色、History 压缩与
+    generation abort；旧键 `snap_msg_recent` 已验 unknown-field 拒启。
+  - 图像 leave-gap 单段/多段/硬锚点/spec identity 四个 e2e 门全绿；
+    删除后布局按新坐标重算，被删页旧键释放。
+  - **尾块守护页**已落地：4673 tok 基线 append ~104 字符，
+    `cache=4640/4699, ttft=305ms`（修复前 `cache=32/4699, ttft=1843ms`）；
+    `agent-ttft-probe` 复测 3 turn 全过，max TTFT 1301ms（首轮冷启动）。
+- **已知边界**：布局选择 30 个逻辑目标，但 prefill 只在 chunk 内切到选中的
+  边界；短 prompt / 大 chunk 下部分历史点会是 `key=None`（尚未实际拍）。
+  这是“目标布局”与“实际资产”的差异，不是静默错值。
+- **待办**：>30 张实际快照压力轮、指标面补齐（capture.request / tool_result）
+  与性能回归。

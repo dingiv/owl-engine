@@ -117,12 +117,10 @@ gdn_slots = 1
 snap_max = 0
 # 消息开启标记覆盖（空 = 模型 ChatFormat.im_open）
 snap_msg_delim = ""
-# 最近 K 条消息边界优先保留
-snap_msg_recent = 4
-# 每会话快照上限（必须 >= 1；0 不再合法）
-snap_session_cap = 20
-# Extra 档之外的 Dense/Binary 保留位
-snap_structural_reserve = 4
+# 每会话持久快照上限（Tail + History；必须 >=1；0 不再合法）
+snap_session_cap = 30
+# 最近 snap_tail 张连续保留；更早的点按 token 位置均匀选 History
+snap_tail = 12
 
 # ---------------------------------------------------------------------------
 # [spec] —— 投机解码
