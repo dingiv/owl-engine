@@ -677,7 +677,7 @@ K.10 把三条律写下来后,按律把配置面收口,**期间发现合并(`5f7
    - **池 ≥ `max_seq`**,且 `Strict` 准入是整 ctx 常驻 ⇒ `131072` 的 prompt 配
      `pool=131328` 差 172 tok 被 `no_memory` 拒。
    ⇒ 本档取 **`max_seq = pool = 34816`**:32k prompt + 256 生成 + 余量全装得下。
-5. **硬预算的实际上限 = 96k**(`vram_budget=1.0` / `vram_reserve_mb=128`):
+5. **硬预算的实际上限 = 96k**(`vram_budget=1.0` / `vram_activation_reserve=128`):
    权重 live 12.96 GiB + 固定 1.17 GiB + 池 6.0 GiB ≈ 20.1 GiB,其余全是
    **per-turn scratch**(实测 34–74 MiB,随 prompt 长度变)与 boot 期 258 MiB。
    池再大就"能启动、不能服务":100k ⇒ 1/3 成功、108k ⇒ 0/3、112k ⇒ 每 turn 必败、
@@ -781,7 +781,7 @@ host staging 32 MiB,构造期预钉),plan 表只是其中一个按键缓存的�
 partial 行 stride 错)。224k 只差 10 MiB 的真凶 = **每 turn 的 prefill 瞬态**
 (`owl_silu_and_mul_f16` 36~50 MiB / `owl_add_f16` 10 MiB / `owl_fused_add_rmsnorm` 10 MiB /
 `owl_gguf_dequant_rows_q3k` 14 MiB,随 `prefill_chunk=1024` 走),不是 plan 表。
-⇒ 若要 224k:降 `vram_reserve_mb` 到 64、或 `prefill_chunk` 减半(各换 ~64 MiB),
+⇒ 若要 224k:降 `vram_activation_reserve` 到 64、或 `prefill_chunk` 减半(各换 ~64 MiB),
 而不是动 plan。
 
 #### M.5 池容量改为**自动**(2026-10-21 用户令:"池子一般不需要手动指定 —— 算出来、把最大 ctx 显示出来")

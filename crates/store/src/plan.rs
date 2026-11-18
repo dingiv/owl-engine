@@ -603,7 +603,7 @@ mod tests {
         .expect("plan");
         let inp = p.to_budget_inputs().expect("projection");
         // runtime_floor = 快照 3MiB + graph 320MiB(固定项;warmup 已并入
-        // `vram_reserve_mb`,不再是 MemoryPlan 的 fixed)
+        // `vram_activation_reserve`,不再是 MemoryPlan 的 fixed)
         assert_eq!(inp.runtime_floor_bytes, (3 << 20) + (320 << 20));
         assert_eq!(inp.weights_bytes, 8 << 30);
         assert_eq!(inp.draft_pool_bytes, 5 << 20);

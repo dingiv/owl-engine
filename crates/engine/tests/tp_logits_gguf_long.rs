@@ -28,7 +28,7 @@ use owl_shared::testkit::{resource, resource_ok};
 fn cfg_of(ordinal: usize, max_seq: usize, chunk: usize) -> EngineConfig {
     let mut knobs = EngineKnobs { sampler_enabled: false, raw_completion: true, ..Default::default() };
     if let Ok(mb) = std::env::var("OWL_GGUF_TP_RESERVE_MB").map(|s| s.parse::<u64>()) {
-        knobs.vram_reserve_mb = mb.expect("OWL_GGUF_TP_RESERVE_MB 非数字");
+        knobs.vram_activation_reserve = mb.expect("OWL_GGUF_TP_RESERVE_MB 非数字");
     }
     knobs.pool_tokens = Some(max_seq);
     knobs.gdn_slots = 1;

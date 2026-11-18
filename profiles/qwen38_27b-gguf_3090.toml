@@ -28,15 +28,19 @@ draft_path = "../models/syvai/Qwen3.8-27B-DFlash2-W4A16"
 lookup = true
 
 [store]
-prefix_cache = true
-vram_reserve_mb = 714
+# 前缀缓存是默认行为（正常服务恒开；仅 ablation/reuse=off 才关）
+# 显式钉死显存预算：全部给 KV 池
+vram_budget = 1.0
+vram_activation_reserve = 714
 host_cache_mb = 10240
-# 单槽快照；宿主面关闭，避免「下沉后再 land」撞块层不变量
-snap_host_mb = 0
+# 单槽快照；宿主面默认关闭，避免「下沉后再 land」撞块层不变量
 
 [store.gdn]
 snap_max = 1
 snap_msg_delim = ""
+snap_msg_recent = 4
+snap_session_cap = 20
+snap_structural_reserve = 4
 
 [vision]
 enabled = true

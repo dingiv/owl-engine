@@ -66,7 +66,7 @@ impl GpuServer {
         // 硬预算(与 alloc 同一条闸;权重/上传块也吃设备内存)
         if let Err(e) = self.vram_guard.check(
             n,
-            self.diag.vram_reserve_mb << 20,
+            self.diag.vram_activation_reserve << 20,
             &self.vram,
         ) {
             self.sink.logf(

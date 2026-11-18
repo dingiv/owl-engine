@@ -209,14 +209,14 @@ fold 族原先按 `m=0..depth-1` 捕 7 张图(每张约 66M 驱动 exec)。fold 
 | base | 23 101 | 23 487 | 113 261 | 209.0 | — |
 | `cuda.graph_flags.upload=false` | 23 101 | 23 487 | 113 261 | 209.0 | **无变化** |
 | `pool.pool_cap_mb=64` | 23 005 | 23 359 | 110 189 | **59.4** | Temp −150M;AL/速度不变 |
-| `pool.vram_reserve_mb=768` | 22 941 | 23 327 | 108 141 | 209.0 | **峰值 −160M** |
+| `pool.vram_activation_reserve=768` | 22 941 | 23 327 | 108 141 | 209.0 | **峰值 −160M** |
 | `cuda.graph=false` | — | — | — | — | ❌ DFlash2 需要 verify 图 |
 | `cuda.capture_slab_mb=256` | — | — | — | — | ❌ 池分配差 4B |
 | `CUBLAS_WORKSPACE_CONFIG=:4096:8` | 22 069 | 22 455 | 79 725 | 209.0 | boot-order 抖动,非稳定收益 |
 | cuBLAS 4MB 预绑(已落码) | 23 229 | 23 615 | 117 357 | 209.0 | free +0.31G;AL 不变 |
 
 > **自动池会把省下的显存全部吃掉**:降 Temp/cuBLAS 只会让 cap 变大,`smi`
-> 峰值基本不变。要峰值真降,只能加 `vram_reserve_mb` 或降 `max_seq`
+> 峰值基本不变。要峰值真降,只能加 `vram_activation_reserve` 或降 `max_seq`
 > (池仍按 cap 预分配;`max_seq` 只影响准入)。`reserve=768` 峰值 −160M,
 > 96k 仍可(cap 108k > 98k);`reserve=1024` cap 64k,67k 档会拒启。
 

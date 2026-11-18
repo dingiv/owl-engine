@@ -4,7 +4,7 @@
 prefix_cache = true
 host_cache_mb = 10240
 snap_host_mb = 1024
-vram_reserve_mb = 1482
+vram_activation_reserve = 1482
 
 # 超卖档「池外瞬态余量」MiB(池 = cap − 本值/per_tok;缺省 1024 = 旧硬编码值)
 [store.gdn]

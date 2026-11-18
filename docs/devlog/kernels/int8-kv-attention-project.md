@@ -2237,7 +2237,7 @@ boot/config 门拒绝；同时保持与 no-spec decode 同源，避免 verify �
 | needle 8k | RETRIEVED，3.76s |
 | needle 32k | RETRIEVED，16.32s |
 | needle 64k | RETRIEVED，37.31s（max_seq=81920） |
-| needle 100k | RETRIEVED，68.67s（max_seq=101376；`vram_reserve_mb=256` + `prefill_chunk=1024`） |
+| needle 100k | RETRIEVED，68.67s（max_seq=101376；`vram_activation_reserve=256` + `prefill_chunk=1024`） |
 | GSM8K n=200 | **194/200 = 97.0%**（4 题 finish=length，7.6min） |
 
 显存/上限：
@@ -2245,7 +2245,7 @@ boot/config 门拒绝；同时保持与 no-spec decode 同源，避免 verify �
 - 24G 单卡 + DFlash2 d7 + f32 verify scratch 时，`max_seq=98304` 下
   64k prompt 会撞 `vram-hard-budget`（chunk 2048 需 136MiB，
   驱动 free−reserve 仅 ~10MiB）；降到 81920 后 64k 通过。
-- 100k 需要约 101376 max_seq；把 `pool.vram_reserve_mb` 从 512 降到 256
+- 100k 需要约 101376 max_seq；把 `pool.vram_activation_reserve` 从 512 降到 256
   且 chunk 1024 后才够 transient。**这是单卡 24G 的容量边界，不是核错误**；
   3080 TP2 / 3090 TP2 应重新做 20G/rank 预算（P3）。
 - verify scratch 改 f32 使 `vattn2` 从 18MiB → ~50MiB（T=8），

@@ -152,22 +152,22 @@ pub fn apply(value: &mut Value, origins: &mut Origins) -> Result<Option<ResolveM
         Goal::MaxContext => {
             b.set("runtime.prefill_chunk", 512i64.into(), "goal=max-context:桶上界 1024");
             b.set("store.vram_budget", 0.99f64.into(), "goal=max-context:贴顶");
-            b.set("store.vram_reserve_mb", 714i64.into(), "goal=max-context:总预留(含图/warmup/碎片)");
+            b.set("store.vram_activation_reserve", 714i64.into(), "goal=max-context:总预留(含图/warmup/碎片)");
         }
         Goal::MaxSpeed => {
             b.set("runtime.prefill_chunk", 1024i64.into(), "goal=max-speed:大块摊薄固定税");
             b.set("store.vram_budget", 0.99f64.into(), "goal=max-speed:贴顶");
-            b.set("store.vram_reserve_mb", 970i64.into(), "goal=max-speed:总预留(含图/warmup/碎片)");
+            b.set("store.vram_activation_reserve", 970i64.into(), "goal=max-speed:总预留(含图/warmup/碎片)");
         }
         Goal::Balanced => {
             b.set("runtime.prefill_chunk", 512i64.into(), "goal=balanced");
             b.set("store.vram_budget", 0.97f64.into(), "goal=balanced");
-            b.set("store.vram_reserve_mb", 970i64.into(), "goal=balanced:总预留");
+            b.set("store.vram_activation_reserve", 970i64.into(), "goal=balanced:总预留");
         }
         Goal::LowMemory => {
             b.set("runtime.prefill_chunk", 512i64.into(), "goal=low-memory:小激活面");
             b.set("store.vram_budget", 0.99f64.into(), "goal=low-memory");
-            b.set("store.vram_reserve_mb", 970i64.into(), "goal=low-memory:总预留");
+            b.set("store.vram_activation_reserve", 970i64.into(), "goal=low-memory:总预留");
         }
     }
 
@@ -366,7 +366,7 @@ pub fn apply(value: &mut Value, origins: &mut Origins) -> Result<Option<ResolveM
     let inp = MemoryInputs {
         total_bytes: hw.total_bytes,
         vram_budget: get_f64(&out, "store.vram_budget").unwrap_or(0.97),
-        reserve_bytes: (get_usize(&out, "store.vram_reserve_mb").unwrap_or(714) as u64) << 20,
+        reserve_bytes: (get_usize(&out, "store.vram_activation_reserve").unwrap_or(714) as u64) << 20,
         model,
         spec_dflash: intent.spec == SpecIntent::Dflash,
         // 内存模型只关心"每元素几字节"——直接给字节数,不再用布尔表达格式。
@@ -705,7 +705,7 @@ mode = "greedy"
         assert_eq!(c.store.gdn.gdn_slots, 1);
         assert_eq!(c.store.kv.kv_dtype, super::super::KvDtype::Fp8, "kv=fp8");
         assert_eq!(c.store.vram_budget, 0.99);
-        assert_eq!(c.store.vram_reserve_mb, 714);
+        assert_eq!(c.store.vram_activation_reserve, 714);
 
         // 投机关(spec=off)
         assert_eq!(c.spec.depth, 0, "spec=off ⇒ 深度 0");

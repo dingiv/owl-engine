@@ -53,9 +53,9 @@ pub struct DiagOpts {
     /// **显存硬预算:预留 MiB**(2026-10-16):判据 = 驱动账 `free − reserve ≥ 请求`,
     /// 否则**主动拒发**(不让 `cudaMallocAsync` 去抛错 —— 那是"已经太晚"的现场)。
     /// reserve 覆盖未入账面:CUDA ctx(~430MB)/池保留页/瞬态。
-    /// 缺省 0（测试面）；生产经 `from_config` 取 `[store].vram_reserve_mb`
+    /// 缺省 0（测试面）；生产经 `from_config` 取 `[store].vram_activation_reserve`
     /// —— 与引擎池治理**同一个预留**，不是第二个池容量。
-    pub vram_reserve_mb: u64,
+    pub vram_activation_reserve: u64,
     /// **发射账容量**(cuda.trace_ring;0 = 关)。>0 ⇒ server 记最近 N 条
     /// 命令(launch/htod/dtoh/alloc/free/memset/copy;见 `crate::trace`)。
     pub trace_ring: usize,
@@ -83,7 +83,7 @@ impl Default for DiagOpts {
             graph_flags: 0,
             fi_plan_restore: false,
             capture_slab_mb: None,
-            vram_reserve_mb: 0,
+            vram_activation_reserve: 0,
             trace_ring: 0,
             tag_filter: owl_kernels::tag_filter::TagFilter::wildcard(),
         }
@@ -109,11 +109,11 @@ impl DiagOpts {
             free_legacy: c.free_legacy,
             sync_mask: mask,
             launch_time: c.launch_time,
-            // 硬预算只扣**运行时真余量**:`vram_reserve_mb` 里图/warmup
+            // 硬预算只扣**运行时真余量**:`vram_activation_reserve` 里图/warmup
             // 已经分配,再扣一次会把 2×112k 首 chunk 拒掉(2026-11-16)。
-            vram_reserve_mb: cfg
+            vram_activation_reserve: cfg
                 .store
-                .vram_reserve_mb
+                .vram_activation_reserve
                 .saturating_sub(owl_shared::config::POOL_GRAPH_WARMUP_RESERVE_MB)
                 // **prefill 瞬态是 reserve 的一部分，guard 必须允许它花掉**
                 // （2026-11-16 图像 prefill 自旋立案）：池吃满后 free 正好

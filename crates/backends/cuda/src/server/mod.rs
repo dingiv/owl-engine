@@ -1203,7 +1203,7 @@ impl GpuServer {
                            vram: &VramAccount,
                            reserve: u64|
          -> Result<(), ModelError> { g.check(n_bytes, reserve, vram) };
-        let reserve_b = self.diag.vram_reserve_mb << 20;
+        let reserve_b = self.diag.vram_activation_reserve << 20;
         let first = guard_check(&mut self.vram_guard, &self.vram, reserve_b);
         if let Err(e) = first {
             // **池缓存应急回收(2026-10-20 §23.9)**:`RELEASE_THRESHOLD=∞` 下

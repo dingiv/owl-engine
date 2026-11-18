@@ -235,11 +235,11 @@ pub(crate) struct PoolPlan {
     /// **显存治理占比**(0 = 治理禁用;1.0 = 吃满驱动 free)
     pub vram_budget: f64,
     /// 单值总预留 MiB(图执行/warmup/碎片;prefill 瞬态另算)
-    pub vram_reserve_mb: u64,
+    pub vram_activation_reserve: u64,
     /// **prefill 瞬态预算 MiB**(**代码派生，不配置**)。
     ///
     /// 口径 = `chunk × 11/32 + 192`(2048 chunk ⇒ 896MiB)。192 覆盖图执行
-    /// 超出 `vram_reserve_mb` 的尾差、分配器/碎片;池 = `cap − 本值/per_tok`。
+    /// 超出 `vram_activation_reserve` 的尾差、分配器/碎片;池 = `cap − 本值/per_tok`。
     /// 不再从配置读取;改 `prefill_chunk` 自动跟随。
     pub prefill_transient_mb: u64,
     /// **选择层视图块表槽**(B-2;`OWL_COVERAGE_PROBE=1` = 召回点探针档)。
@@ -697,7 +697,7 @@ fn per_tok_terms(
 /// 历史:2026-10-19 为桶族(296.5)+ 尾档 t1024(502.3)把 262 抬到 640;
 /// 桶已删除,非桶图族(spec-dflash 实测 261MiB)回到 320 = 262 + 58MiB 余量。
 /// **2026-11-16 起本常数只服务 GraphFleet 捕获后对账**；`PoolFixedTerms` 不再
-/// 扣它（图执行/warmup 已并入 `vram_reserve_mb`）。
+/// 扣它（图执行/warmup 已并入 `vram_activation_reserve`）。
 pub(crate) const GRAPH_SLAB_BUDGET: usize = 320 << 20;
 
 /// **治理器之后的固定分配项**(模型几何 → store 预算项)。
@@ -2337,7 +2337,7 @@ fn pool_cap(
     per_tok: &PoolTokenTerms,
     fixed_after: &PoolFixedTerms,
 ) -> Result<Option<usize>> {
-    let vram_reserve = plan.vram_reserve_mb << 20;
+    let vram_reserve = plan.vram_activation_reserve << 20;
     let vram_total = plan.vram.total;
     // ★ **按卡账**(2026-10-24):本 rank 的 total/free/live 全部来自
     // `PoolPlan.vram`(设备 account 快照),不再有进程级 LIVE 摊分。
@@ -3121,7 +3121,7 @@ mod vram_budget_tests {
     }
 
     /// 固定项只剩**真实分配**:GDN 格/快照/spec/replay/草稿 ring。
-    /// 图执行/warmup 已并入 `vram_reserve_mb`，不再进 `PoolFixedTerms`。
+    /// 图执行/warmup 已并入 `vram_activation_reserve`，不再进 `PoolFixedTerms`。
     #[test]
     fn fixed_after_contains_only_real_allocations() {
         let f = fixed_terms(48, 1, gdn_slot_elems(&dims_27b()), 1, 0, false, false);

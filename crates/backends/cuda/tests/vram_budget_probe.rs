@@ -33,7 +33,7 @@ async fn driver_free_minus_reserve_refuses() {
         owl_shared::testkit::report::skip("OWL_TEST_DEVICE 未设");
         return;
     }
-    let mut c = client_with(DiagOpts { vram_reserve_mb: 1 << 20, ..Default::default() }).await;
+    let mut c = client_with(DiagOpts { vram_activation_reserve: 1 << 20, ..Default::default() }).await;
     let err = c
         .alloc(Dtype::F32, 1024, "probe")
         .await

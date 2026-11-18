@@ -3,14 +3,14 @@
 # 目标：262144 上下文 + 视觉 + 前缀缓存 + DFlash2 d7 同时可用。
 # 形状：W4A8 主干 · INT8 KV · TP2 + 词表切分 · eager prefill + FI 图 decode。
 #
-# 速度/显存取舍（2026-11-16 现场实测）：
+# 满池姿态（2026-11-18 现场实测）：
+#   · max_batch=2 / gdn_slots=2 / snap_max=6：池按 cap−prefill 瞬态拉满，
+#     双会话共享；单请求上限仍是模型 native 262144。
 #   · prefill_chunk = 1024：2048 的 Marlin 工作区 + 图像 scatter 会把
-#     20G 卡压到 vram-guard 拒绝（PoolExhausted）；1024 在 193k prompt
-#     实测 1473 t/s，且能稳定跑完整上下文。
-#   · max_batch = 1 / gdn_slots = 1：DFlash2 d7 的批 decode 门恒关，
-#     多活跃只会翻倍预留；并发请求走引擎队列。
-#   · snap_max = 4：单活跃 + 刚收口尾边界；双会话才需要 6。
-#   · vram_reserve_mb = 2560：覆盖图执行、warmup、Marlin/图像 scratch。
+#     20G 卡压到 vram-guard 拒绝（PoolExhausted）。
+#   · vram_activation_reserve 实测：256 → 8k prompt 差 ~5MiB 拒发；
+#     512 → 64k prompt 在 60MiB alloc OOM；1024 → 200k prompt 通过。
+#     1024 是当前能跑长 prefill 的最低垫，别再往下砍。
 #
 # 卡位按名字子串消费；生产部署建议显式写 UUID。
 extends = [
@@ -42,7 +42,7 @@ quant = "w4a8"
 admission_on_full = "reject"
 # 模型 native 上限；再高需要 YaRN
 max_seq = 262144
-max_batch = 1
+max_batch = 2
 # 20G 卡的稳定点；2048 会撞 scratch 预算
 prefill_chunk = 1024
 
@@ -65,15 +65,17 @@ tp_draft = true
 draft_path = "../models/syvai/Qwen3.8-27B-DFlash2-W4A16"
 
 [store]
-prefix_cache = true
+# 前缀缓存是默认行为（正常服务恒开；仅 ablation/reuse=off 才关）
+# 显式钉死显存预算：全部给 KV 池
+vram_budget = 1.0
 host_cache_mb = 10240
 snap_host_mb = 3072
-# 覆盖图执行 + warmup + Marlin/图像 scratch
-vram_reserve_mb = 2560
+# 满池：池 = cap−prefill瞬态；本垫是长 prefill 的实测下限（见文件头）
+vram_activation_reserve = 1024
 
 [store.gdn]
-gdn_slots = 1
-snap_max = 4
+gdn_slots = 2
+snap_max = 6
 snap_msg_delim = ""
 snap_msg_recent = 4
 snap_session_cap = 20

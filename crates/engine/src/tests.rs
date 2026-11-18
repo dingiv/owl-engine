@@ -851,7 +851,7 @@ async fn mock_engine_with(
 }
 
 /// **P2-2 图 slab 实测回填门**：GraphFleet 捕获后，MemoryPlan 的 GraphSlab
-/// 必须标为 `Measured`。warmup 已并入 `vram_reserve_mb`，不再是 fixed 项。
+/// 必须标为 `Measured`。warmup 已并入 `vram_activation_reserve`，不再是 fixed 项。
 #[cfg(test)]
 #[tokio::test]
 async fn memory_plan_uses_measured_graph_slab_after_capture() {
@@ -3060,7 +3060,7 @@ async fn select_27b_scenario() {
         "view" => (true, true, false),
         _ => (knobs.index_probe, knobs.select_decode, knobs.select_partial),
     };
-    knobs.vram_reserve_mb = owl_shared::env_reader::parse::<u64>("OWL_27B_RESERVE_MB")
+    knobs.vram_activation_reserve = owl_shared::env_reader::parse::<u64>("OWL_27B_RESERVE_MB")
         .unwrap_or(128)
         + owl_shared::config::POOL_GRAPH_WARMUP_RESERVE_MB;
     knobs.index_probe = ix;
@@ -3650,7 +3650,7 @@ runtime_floor_bytes={runtime_floor} draft_pool_bytes={draft_pool} gdn_row_bytes=
     {
         let mut knobs = EngineKnobs::default();
         // 绝对上限键已退休；用拉满 reserve 模拟同一道硬预算门。
-        knobs.cuda.vram_reserve_mb = 1 << 20;
+        knobs.cuda.vram_activation_reserve = 1 << 20;
         let mut e2 = Engine::new(EngineConfig {
             device_ordinal: ordinal,
             max_seq_tokens: 4096,

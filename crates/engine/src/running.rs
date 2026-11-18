@@ -2790,7 +2790,7 @@ impl<D: DeviceClient> RunningEngine<D> {
                 .boot
                 .cfg
                 .knobs
-                .vram_reserve_mb
+                .vram_activation_reserve
                 .saturating_sub(owl_shared::config::POOL_GRAPH_WARMUP_RESERVE_MB)
                 << 20,
         }

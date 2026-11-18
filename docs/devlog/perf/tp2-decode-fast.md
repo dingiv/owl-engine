@@ -217,9 +217,9 @@ stamp 命中，改 `marlin_host.cu` 不会触发 build.rs 重跑，旧 `.a` 静�
 
 ring 前（1800MiB 草稿池）的失败现场：
 
-- `vram_reserve_mb=256`：池 `19383 MiB`、驱动 free `242–274 MiB`；请求级
+- `vram_activation_reserve=256`：池 `19383 MiB`、驱动 free `242–274 MiB`；请求级
   5/30 MiB 瞬态被 `vram-hard-budget` 拒发（512 出 0 token；2048 170s 失败）。
-- `vram_reserve_mb=64` 能服务 512/2048，但每步刷 N6 压力；8192 未测。
+- `vram_activation_reserve=64` 能服务 512/2048，但每步刷 N6 压力；8192 未测。
 
 ring 后（草稿池 20MiB，`per_tok 16384`）：
 
@@ -229,7 +229,7 @@ ring 后（草稿池 20MiB，`per_tok 16384`）：
   decode 138.1 / prefill 1616.8（与非 VLM 主档持平）。**262k 视觉档现在
   与主档同配方、同性能**；旧 int8/词表切版本（decode 86）已退役。
 - 残留：真正的**图像请求** smoke 未在本轮跑（文本 262k 已过）；图像 × 长 ctx
-  的显存/正确性需另立门。`vram_reserve_mb=256` 维持（ring 后余量足够）。
+  的显存/正确性需另立门。`vram_activation_reserve=256` 维持（ring 后余量足够）。
 
 ## 7. 复现
 

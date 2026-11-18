@@ -105,7 +105,7 @@ cap    = budget / per_tok
 | 项 | 旧 | 新 | 位置 | 依据 |
 |---|---|---|---|---|
 | `vram_budget` | 0.99（int8/fp8）· 0.97（f16） | **1.0** | `parts/pool/{int8,fp8,f16}.toml` | `1.0` 是合法档（`base` 直接用驱动 free）；runtime 闸仍以 `reserve` 兜底 |
-| `vram_reserve_mb` | f16 `1024` · 测量档 `512` | **f16 512 · 测量档 384** | 同上 + 两个测量档 | 池外瞬态实测峰值 **20~25 MiB/块**（`gdn_conv`/`narrow_strided`/`embed`）⇒ 384~512 已是 15~20× |
+| `vram_activation_reserve` | f16 `1024` · 测量档 `512` | **f16 512 · 测量档 384** | 同上 + 两个测量档 | 池外瞬态实测峰值 **20~25 MiB/块**（`gdn_conv`/`narrow_strided`/`embed`）⇒ 384~512 已是 15~20× |
 | `transient_reserve_mb` | 1024 | **512** | 同上 | 该项只服务 `[kvmem]` **超卖档**；非超卖档本来就无感（§代码注 2026-10-28） |
 | `snap_max` | 2（测量档） | **1** | `measurement/qwen38_27b-3090-{int8,fp8}.toml` | GDN 快照池 297→148 MiB；单流测量用不到第二槽（`prefix_cache=false` 时更用不到） |
 | `pool_cap_mb` | 256 | **64** | 同上 | store 搬运复用池（设备面）；单流 64 MiB 足够（超限逐块顶出回驱动，只慢不错） |

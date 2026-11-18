@@ -185,7 +185,7 @@ OUT=perf-runs/metrics-optimize/kvmem-dflash2-verify/repro-80k
 ./target/release/server \
   -p profiles/qwen38_27b-3090-w4a16-dflash-kvmem.toml \
   --set spec.depth=0 \
-  --set pool.vram_reserve_mb=2950 \
+  --set pool.vram_activation_reserve=2950 \
   --set probes.dflash_probe=true \
   --log-level info > $OUT/server.log 2>&1 &
 ```
@@ -193,7 +193,7 @@ OUT=perf-runs/metrics-optimize/kvmem-dflash2-verify/repro-80k
 ### 7.2 76k 档（连贯）
 
 ```bash
---set pool.vram_reserve_mb=3072
+--set pool.vram_activation_reserve=3072
 ```
 
 ### 7.3 固定 prompt
@@ -275,7 +275,7 @@ grep -E "视图页失守|视图页不在设备" $OUT/server.log
 5. `xqa_pt` 长度必须 ≤ 池页数。
 6. 视图态 `write_bt` 必须跳过，否则撞占位符。
 7. `carrier_of` 返回 page id；不要当 flat slot。
-8. 80k 档不要用 `vram_reserve_mb=512` 做“正确性”结论；它是已知退化轨迹。
+8. 80k 档不要用 `vram_activation_reserve=512` 做“正确性”结论；它是已知退化轨迹。
 9. 随机词 prompt 的分数接近，top-k 对微小差异敏感；质量门最好用真实任务 prompt 复核。
 10. `snap_host_mb=0` 会刷“快照下沉失败”WARN；profile 已设 1024。
 

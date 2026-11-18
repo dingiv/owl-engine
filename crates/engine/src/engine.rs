@@ -348,7 +348,7 @@ pub struct EngineKnobs {
     pub snap_msg_delim: String,
     /// 最近 K 条消息边界无条件保留（dense tail；`[store.gdn].snap_msg_recent`）
     pub snap_msg_recent: usize,
-    /// **每会话快照上限**（`[store.gdn].snap_session_cap`；0 = 不限）
+    /// **每会话快照上限**（`[store.gdn].snap_session_cap`；必须 >= 1）
     pub snap_session_cap: usize,
     /// **结构档保留位**（`[store.gdn].snap_structural_reserve`；仅 cap > 0 生效）
     pub snap_structural_reserve: usize,
@@ -356,7 +356,7 @@ pub struct EngineKnobs {
     pub vram_budget: f64,
     /// **单值总预留 MiB**(缺省 714;含图执行/warmup/碎片)。
     /// prefill 瞬态不在这里:由 `prefill_chunk` 代码派生。
-    pub vram_reserve_mb: u64,
+    pub vram_activation_reserve: u64,
     /// 裸续写输出,绕过 chat 模板(原 OWL_RAW_COMPLETION)
     pub raw_completion: bool,
     /// 采样开关(缺省开;OWL_SAMPLER=greedy → false)
@@ -436,10 +436,10 @@ impl Default for EngineKnobs {
             snap_max: 4,
             snap_msg_delim: String::new(),
             snap_msg_recent: 4,
-            snap_session_cap: 0,
+            snap_session_cap: 20,
             snap_structural_reserve: 4,
             vram_budget: 0.97,
-            vram_reserve_mb: 714,
+            vram_activation_reserve: 714,
             raw_completion: false,
             sampler_enabled: true,
             sampler: crate::sampler::SamplerCfg::default(),
@@ -800,7 +800,7 @@ impl EngineKnobs {
             snap_session_cap: cfg.store.gdn.snap_session_cap,
             snap_structural_reserve: cfg.store.gdn.snap_structural_reserve,
             vram_budget: cfg.store.vram_budget,
-            vram_reserve_mb: cfg.store.vram_reserve_mb,
+            vram_activation_reserve: cfg.store.vram_activation_reserve,
             raw_completion: cfg.probes.raw_completion,
             sampler_enabled: cfg.sampling.mode == owl_shared::config::SamplerMode::Sampling,
             sampler: crate::sampler::SamplerCfg::from_sampling(&cfg.sampling),
@@ -1022,7 +1022,7 @@ fn build_memory_plan(
         owl_store::CardPlan {
             total_bytes: boot.total_bytes as usize,
             free_at_boot_bytes: boot.v_card_bytes as usize,
-            reserve_bytes: (cfg.knobs.vram_reserve_mb << 20) as usize,
+            reserve_bytes: (cfg.knobs.vram_activation_reserve << 20) as usize,
         },
         fixed,
         owl_store::PoolPlan {
@@ -1813,14 +1813,12 @@ pub(crate) fn into_running<D: DeviceClient>(
         Vec::new()
     };
 
-    if cfg.knobs.snap_session_cap > 0 {
-        owl_shared::log_info!(
-            "boot",
-            "快照准入:每会话上限 {} 张(设备+宿主+盘;结构档保留 {} 格;Transient 不计)",
-            cfg.knobs.snap_session_cap,
-            cfg.knobs.snap_structural_reserve
-        );
-    }
+    owl_shared::log_info!(
+        "boot",
+        "快照准入:每会话上限 {} 张(设备+宿主+盘;结构档保留 {} 格;Transient 不计)",
+        cfg.knobs.snap_session_cap,
+        cfg.knobs.snap_structural_reserve
+    );
 
     let disk = crate::mem::disk_runtime::DiskRuntime::new();
     let boot = crate::running::BootCtx {
@@ -2649,7 +2647,7 @@ fn boot_pool_plan(
         max_batch: cfg.knobs.max_batch,
         snap_max: cfg.knobs.snap_max,
         vram_budget: cfg.knobs.vram_budget,
-        vram_reserve_mb: cfg.knobs.vram_reserve_mb,
+        vram_activation_reserve: cfg.knobs.vram_activation_reserve,
         // prefill 瞬态 = 代码派生;旧档显式值仅作兼容覆盖。
         // prefill 瞬态 = 代码派生(不配置):chunk × 11/32 + 192。
         prefill_transient_mb: crate::state::prefill_transient_mb(cfg.prefill_chunk),
@@ -2662,6 +2660,21 @@ fn boot_pool_plan(
 
 /// **KVMem 前置校验**(S6a):虚拟化三件套的自洽门(响亮拒,不静默降级)。
 pub(crate) fn boot_kvmem_check(cfg: &EngineConfig) -> Result<()> {
+    if cfg.knobs.snap_session_cap == 0 {
+        return Err(owl_iface::contract::ModelError::Msg(
+            "[store.gdn] snap_session_cap = 0 不再合法:0 会变成单会话无限快照 \
+             ⇒ 长会话可吃光缓存池;必须显式给 >= 1 的每会话上限"
+                .into(),
+        ));
+    }
+    if cfg.knobs.snap_session_cap < cfg.knobs.snap_msg_recent {
+        return Err(owl_iface::contract::ModelError::Msg(format!(
+            "[store.gdn] snap_session_cap={} < snap_msg_recent={} \
+             —— 最近 K 条边界优先保留不能超过单会话快照总名额",
+            cfg.knobs.snap_session_cap, cfg.knobs.snap_msg_recent
+        ))
+        .into());
+    }
     // **前缀复用的快照面自洽门(2026-10-24)**:
     // `reuse_face` 的可复用边界必须有一张 GDN 快照;混合模型(Qwen3.8 的
     // GDN 层)不能从 KV 反推这个递推态。因此 `prefix_cache=true` 却让

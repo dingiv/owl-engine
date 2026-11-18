@@ -102,7 +102,7 @@ snap_disk_mb = 0
 disk_dir = ""
 # 显存治理：驱动 total 的占比；以及池外固定预留 MiB
 vram_budget = 0.99
-vram_reserve_mb = 714
+vram_activation_reserve = 714
 
 [store.kv]
 # 主 KV 池 dtype：f16 | fp8 | int8
@@ -117,10 +117,10 @@ gdn_slots = 1
 snap_max = 0
 # 消息开启标记覆盖（空 = 模型 ChatFormat.im_open）
 snap_msg_delim = ""
-# 最近 K 条消息边界无条件保留
+# 最近 K 条消息边界优先保留
 snap_msg_recent = 4
-# 每会话快照上限（0 = 不限）
-snap_session_cap = 0
+# 每会话快照上限（必须 >= 1；0 不再合法）
+snap_session_cap = 20
 # Extra 档之外的 Dense/Binary 保留位
 snap_structural_reserve = 4
 

@@ -264,7 +264,7 @@ prefix_cache = true
 kv_fp8 = true
 host_cache_mb = 10240
 snap_max = 1
-vram_reserve_mb = 512
+vram_activation_reserve = 512
 
 [kvmem]
 select_decode = true

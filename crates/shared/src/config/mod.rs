@@ -68,7 +68,7 @@
 //! | model | head_quant | HeadQuant 枚举("off"\|"rtn-int4-g32"\|"rtn-int8-row")/ off |
 //! | store.kv | kv_dtype | KvDtype 枚举 `f16\|fp8\|int8` / f16(主 KV 池存储格式;2026-11-04 由两个布尔合成单键) |
 //! | store.gdn | gdn_slots / snap_max | usize / 8、4 |
-//! | store | vram_budget / vram_reserve_mb | f64、u64 / 0.97、714 |
+//! | store | vram_budget / vram_activation_reserve | f64、u64 / 0.97、714 |
 //! | store | prefix_cache | bool / true(缓存可占整池;逐出到 host/disk) |
 //! | vision | enabled | bool / false(视觉塔开关;GGUF 档另有 `path` 指向 `mmproj-*.gguf`) |
 //! | vision | image_evict | bool / false(**前缀无感删除**:图像段打标记 ⇒ 页对齐 + 删除即位置帧平移,需 `[store] prefix_cache`) |
@@ -749,13 +749,13 @@ pub struct ModelCfg {
     pub quant: QuantScheme,
 }
 
-/// **`vram_reserve_mb` 中属于图执行/warmup 的派生部分**(MiB)。
+/// **`vram_activation_reserve` 中属于图执行/warmup 的派生部分**(MiB)。
 ///
-/// 单值 `vram_reserve_mb` 同时服务两件事:
+/// 单值 `vram_activation_reserve` 同时服务两件事:
 /// - 池 cap 预算:整值(含图执行 320 + warmup 138 + 运行时余量);
 /// - `vram-guard` 运行时硬预算:只该扣**真余量** —— 图/warmup 已经分配,
 ///   再扣一次会让 2×112k 首 chunk 撞 `vram-hard-budget`(2026-11-16 实测)。
-/// 运行时余量 = `vram_reserve_mb - 本常数`。
+/// 运行时余量 = `vram_activation_reserve - 本常数`。
 pub const POOL_GRAPH_WARMUP_RESERVE_MB: u64 = 458;
 
 /// **KV 池子域**（`[store.kv]`；2026-11-16 用户裁决：kv 作为 store 的子域）。
@@ -816,9 +816,10 @@ pub struct StoreGdnCfg {
     /// Agent 前端只在消息末尾追加；最近几条消息可能回撤，且对 TTFT 最敏感。
     /// 这几条边界即使距上一条不足引擎常数 `SNAP_MSG_MIN_GAP` 也要拍快照
     /// （并在 L1 会话资产里记录）——它们正是"新增一条消息 → 前面 100% 命中"
-    /// 的锚点。0 = 旧行为（仅第一条无条件 + 固定间距）。
+    /// 的锚点。**必须 <= `snap_session_cap`**（否则优先保留本身就越界）。
+    /// 0 = 旧行为（仅第一条无条件 + 固定间距）。
     pub snap_msg_recent: usize,
-    /// **每会话快照上限**（2026-11-12；0 = 不限）。
+    /// **每会话快照上限**（2026-11-12；**必须 >= 1**）。
     ///
     /// **不是 LRU 的重复**：全局 LRU 只排序“谁先被逐”，一条活跃长会话仍可
     /// 吃满 `snap_max` 设备槽与整条宿主腿；本键是单会话资产护栏。只数
@@ -826,6 +827,9 @@ pub struct StoreGdnCfg {
     /// decode/spec rollback 的页边界快照，设备槽内自限、逐出零成本，不计入。
     /// 超限时按 `SnapClass` 档位选 victim：`Extra` → 老 `Binary` → 最老
     /// `Dense`；新条目档位不高于 victim 才替换，否则**跳过拍摄**（不拷贝）。
+    /// **0 不是“无限”**：0 = 无护栏，单会话可吃光缓存池，已在 validate 拒启。
+    /// 还必须满足 `snap_session_cap >= snap_msg_recent`（最近 K 条优先保留
+    /// 不能超过单会话总名额）。
     pub snap_session_cap: usize,
     /// **结构档保留位**（2026-11-12；仅 `snap_session_cap > 0` 时生效）。
     ///
@@ -843,7 +847,7 @@ impl Default for StoreGdnCfg {
             snap_max: 4,
             snap_msg_delim: String::new(),
             snap_msg_recent: 4,
-            snap_session_cap: 0,
+            snap_session_cap: 20,
             snap_structural_reserve: 4,
         }
     }
@@ -882,9 +886,10 @@ pub struct StoreCfg {
     /// **运行时激活/固定预留 MiB**：图执行 320 + warmup 138 + 运行时余量。
     /// 用于池 cap 与 CUDA 硬预算 `free − reserve`；**不是** KV 池容量，
     /// 也不是 `vram_budget` 的重复（占比管总量，本键管池外瞬态/碎片）。
-    pub vram_reserve_mb: u64,
+    pub vram_activation_reserve: u64,
     /// **关掉解释器活性中途回收**(诊断/对照臂;缺省 false = 开回收)。
     /// 原 `OWL_NO_RECLAIM` env。⚠️ 开会无界常驻(长请求 OOM),只作取证。
+    #[serde(default, skip_serializing_if = "is_false")]
     pub no_reclaim: bool,
     /// 主 KV 池子域（`[store.kv]`）。
     pub kv: StoreKvCfg,
@@ -902,7 +907,7 @@ impl Default for StoreCfg {
             snap_disk_mb: 0,
             disk_dir: String::new(),
             vram_budget: 0.97,
-            vram_reserve_mb: 714,
+            vram_activation_reserve: 714,
             no_reclaim: false,
             kv: StoreKvCfg::default(),
             gdn: StoreGdnCfg::default(),
@@ -1193,6 +1198,7 @@ pub struct KvmemCfg {
     /// 扫**全 ctx**)+ 论文口径对照 + 方案 A/B 对照 + 覆盖率/上界报告。
     /// 单边界成本**含 ctx 因子** ⇒ 全军 O(ctx²)(27B/8k 实测单次 6.3s = 墙钟 32%)。
     /// 🔴 **测性能不要开它** —— 生产面只需 `select_decode`。
+    #[serde(default, skip_serializing_if = "is_false")]
     pub coverage_probe: bool,
     /// **分析边界目标 ctx**(诊断面;0/未设 = **最后一个边界**)。
     ///
@@ -1201,13 +1207,17 @@ pub struct KvmemCfg {
     /// (实测 chunk 1024/512/256 ⇒ 分析@3072/3584/3840 ⇒ top8 87.5%/12.4%/6.8%)。
     /// 钉住 ctx 后:query 面 `[ctx−8, ctx)` 与块数 `ctx/page` **都与 chunk 无关**
     /// ⇒ 读数逐位可比。要求该 ctx 是 chunk 的整数倍(否则取不到该边界)。
+    #[serde(default, skip_serializing_if = "is_zero_usize")]
     pub analyze_at_ctx: usize,
     /// **方案 A/B 对照档**（诊断面；2026-11-05 从 env 收编）：多读一份 V +
     /// host 侧算 A/B/dense。只在 `coverage_probe` 时有意义。
+    #[serde(default, skip_serializing_if = "is_false")]
     pub coverage_scheme_probe: bool,
     /// 方案对照的最小 ctx（0 = 每个边界都算）。
+    #[serde(default, skip_serializing_if = "is_zero_usize")]
     pub coverage_scheme_min_ctx: usize,
     /// **重诊断步进**（0 = 每个边界都诊断；诊断面）。
+    #[serde(default, skip_serializing_if = "is_zero_usize")]
     pub coverage_analyze_every: usize,
     /// **驱逐策略**(缺省 `lru`):`lru` = 纯近期;`lrfu[:λ]` = attention-aware
     /// LRFU(召回点选中的块抬 keep-score)⇒ 出序时"又冷又没被注意力用过"的先下沉。
@@ -1423,7 +1433,9 @@ pub struct SamplingCfg {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct LoadCfg {
+    #[serde(default, skip_serializing_if = "is_false")]
     pub verify: bool,
+    #[serde(default, skip_serializing_if = "is_false")]
     pub debug_tap: bool,
     /// **暂存槽上限 MiB**(原 `OWL_LOAD_STAGING_MB`;缺省 128)。
     /// 单键超过它就按段流式装载(`0` = 不设上限)。**从配置来,不读 env**(用户裁决 2026-10-19)。
@@ -1432,6 +1444,7 @@ pub struct LoadCfg {
     /// 装载旋钮入配置面(此前只有隐式裁决,无显式入口)。
     pub repack: String,
     /// 逐键字节 dump(原 `OWL_LOAD_DUMP`;诊断面)
+    #[serde(default, skip_serializing_if = "is_false")]
     pub dump: bool,
 }
 
@@ -1603,6 +1616,7 @@ pub struct KernelCfg {
     /// 诊断二分:强制 naive 回退(paged 数值质量 A/B)。
     /// (原 `prefill_split` 已退役:2026-10-19 审计定谳"主路走 FI,
     ///  split 只在 FI 缺席时上阵";FI 面自 2026-10-13 起恒在 ⇒ 分支不可达。)
+    #[serde(default, skip_serializing_if = "is_false")]
     pub force_naive_prefill: bool,
     /// verify(T=depth+1)走的注意力臂 —— **单键、有序、互斥**(2026-10-21)。
     ///
@@ -1675,12 +1689,15 @@ pub struct KernelCfg {
     pub gguf_mmq: bool,
     /// smem 复用臂(`m ≥ 64`)
     pub gguf_smem: bool,
+    #[serde(default, skip_serializing_if = "is_false")]
     pub resolve_trace: bool,
+    #[serde(default, skip_serializing_if = "is_false")]
     pub host_argmax: bool,
+    #[serde(default, skip_serializing_if = "is_false")]
     pub ts_probe: bool,
     /// **tag 过滤通配符**(诊断/兜底;`true` = `*`,全部放行)。
     /// 生产缺省 false;配置派生 `TagFilter` 仍按 W4A16/GGUF/KV/feature 过滤。
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "is_false")]
     pub tag_wildcard: bool,
 }
 
@@ -1771,6 +1788,15 @@ fn default_true() -> bool {
     true
 }
 
+/// 诊断/内部键的默认值判定：默认时不出现在公开 schema。
+fn is_false(v: &bool) -> bool {
+    !*v
+}
+
+fn is_zero_usize(v: &usize) -> bool {
+    *v == 0
+}
+
 /// 诊断探针族(boot 一次解析,热路径零 env)
 ///
 /// ⚠️ 非 `Copy`(2026-10-21):`gdn_touch`/`gdn_zero_scratch` 是名单串,
@@ -1840,6 +1866,13 @@ pub struct ProbesCfg {
     pub step_gate_every: u64,
 }
 
+impl ProbesCfg {
+    /// 全默认 ⇒ 公开模板不显示 `[probes]`；需要诊断时用 `--set`。
+    fn is_default(&self) -> bool {
+        self == &Self::default()
+    }
+}
+
 fn default_step_gate_ms() -> u64 {
     50
 }
@@ -1882,6 +1915,13 @@ pub struct CudaCfg {
     // 显式暴露"该档还在用已退役旋钮")。
 }
 
+impl CudaCfg {
+    /// 全默认（`graph = true`，其余诊断关闭）⇒ 公开模板不显示本段。
+    fn is_default(&self) -> bool {
+        self == &Self::default()
+    }
+}
+
 impl Default for CudaCfg {
     /// 手写(derive 会把 `graph` 落成 false):`cuda.graph` 缺省 **true**,
     /// 与 `#[serde(default = "default_true")]` 同值 —— `OwlConfig::default()`
@@ -1898,7 +1938,9 @@ impl Default for CudaCfg {
             gpu_prof: false,
             free_legacy: false,
             graph_flags: GraphInstantiateFlags::default(),
-            capture_slab_mb: None,
+            // Some(0) = 固定档语义：graph_begin 走 64MiB 兜底，避免动态定尺
+            // 在 DFlash2 propose 图上少算（旧 full.toml 的 capture_slab_mb = 0 同义）。
+            capture_slab_mb: Some(0),
             trace_ring: 0,
         }
     }
@@ -1989,7 +2031,11 @@ pub struct OwlConfig {
     pub load: LoadCfg,
     pub kernel: KernelCfg,
     pub parallel: ParallelCfg,
+    /// 诊断探针：全默认时不进入公开 schema / `full.toml`；高级用户仍可 `--set`。
+    #[serde(default, skip_serializing_if = "ProbesCfg::is_default")]
     pub probes: ProbesCfg,
+    /// CUDA 诊断/调优：全默认时不进入公开 schema / `full.toml`；`graph` 缺省即生产值。
+    #[serde(default, skip_serializing_if = "CudaCfg::is_default")]
     pub cuda: CudaCfg,
     pub server: ServerCfg,
     pub log: LogCfg,
@@ -3186,9 +3232,21 @@ impl OwlConfig {
                     .to_string(),
             );
         }
-        if self.store.gdn.snap_session_cap > 0
-            && self.store.gdn.snap_structural_reserve > self.store.gdn.snap_session_cap
-        {
+        if self.store.gdn.snap_session_cap == 0 {
+            return Err(
+                "[store.gdn] snap_session_cap = 0 不再合法:0 会变成\"单会话无限快照\" ⇒ \
+                 长会话可吃光缓存池。必须显式给 >= 1 的每会话上限"
+                    .to_string(),
+            );
+        }
+        if self.store.gdn.snap_session_cap < self.store.gdn.snap_msg_recent {
+            return Err(format!(
+                "[store.gdn] snap_session_cap={} < snap_msg_recent={} —— \
+                 最近 K 条边界优先保留不能超过单会话快照总名额",
+                self.store.gdn.snap_session_cap, self.store.gdn.snap_msg_recent
+            ));
+        }
+        if self.store.gdn.snap_structural_reserve > self.store.gdn.snap_session_cap {
             return Err(format!(
                 "[store.gdn] snap_structural_reserve={} > snap_session_cap={} —— \
                  保留位不能超过会话快照上限(否则 Extra 永远拍不了)",
@@ -3462,13 +3520,27 @@ mod tests {
             e.contains("snap_structural_reserve") && e.contains("snap_session_cap"),
             "拒语应可行动: {e}"
         );
+        let e = OwlConfig::from_toml_str("[store.gdn]\nsnap_session_cap = 0\n")
+            .expect_err("snap_session_cap = 0 必须拒启(0 不是无限)");
+        assert!(
+            e.contains("snap_session_cap") && e.contains("0"),
+            "拒语应点名 0: {e}"
+        );
+        let e = OwlConfig::from_toml_str(
+            "[store.gdn]\nsnap_session_cap = 2\nsnap_msg_recent = 4\n",
+        )
+        .expect_err("cap < recent 必须拒");
+        assert!(
+            e.contains("snap_session_cap") && e.contains("snap_msg_recent"),
+            "拒语应点名 cap/recent: {e}"
+        );
         OwlConfig::from_toml_str(
             "[store.gdn]\nsnap_session_cap = 20\nsnap_structural_reserve = 4\n",
         )
         .expect("20/4 = 合规");
         OwlConfig::default()
             .validate()
-            .expect("缺省 cap=0(不启用 per-session 上限)");
+            .expect("缺省 cap=20(必须有限)");
     }
 
     /// **`max_new_cap = 0` 拒启**（2026-11-17 A：请求上限被夹到 0 = 空回复）。
