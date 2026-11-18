@@ -83,8 +83,8 @@ pub fn profile_path(name: &str) -> Result<PathBuf, String> {
 mod tests {
     use super::*;
 
-    /// **常驻档门**(2026-10-24 用户裁决"只留唯二硬件档";2026-10-27 增补第三档):
-    /// `profiles/` 顶层入口档只允许三个 ——
+    /// **常驻档门**(2026-10-24 用户裁决只留硬件形状;后续增补 GGUF/4080 档):
+    /// `profiles/` 顶层入口档只允许当前五档 ——
     ///   ① 单 3090 / 27B **AWQ-INT4**(视觉 + image_evict 全特性);
     ///   ② 双 3080 TP2 / 27B AWQ-INT4(长上下文 + 大图窗口);
     ///   ③ 单 3090 / 27B **GGUF UD-IQ4_XS + mmproj-F16**(14.3GB 权重 ⇒ **168k 上下文**,

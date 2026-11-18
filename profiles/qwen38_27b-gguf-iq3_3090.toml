@@ -24,8 +24,7 @@
 extends = [
   "full.toml",
   "parts/model/27b-gguf-iq3s.toml",
-  "parts/hardware/3090-single.toml",
-  "parts/kernel/fi-graph.toml",
+  "parts/feature/fi-graph.toml",
   "parts/pool/fp8.toml",
 ]
 
@@ -33,6 +32,10 @@ extends = [
 # 8137:**单卡 3090 的统一端口**(2026-11-03 用户裁决);本档与 AWQ 档 / IQ4 档
 # 互斥(同一张卡)⇒ 同时起会先撞 bind,再撞选卡拒。
 bind = "0.0.0.0:8137"
+
+[parallel]
+mode = "single"
+device = ["3090"]
 
 [model]
 # 视觉塔(GGUF 主干不含 model.visual.*)

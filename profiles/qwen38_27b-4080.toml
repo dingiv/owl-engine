@@ -68,13 +68,16 @@ extends = [
   "parts/model/27b-awq.toml",
   "parts/feature/vision.toml",
   "parts/feature/dflash2-27b.toml",
-  "parts/hardware/4080-single.toml",
-  "parts/kernel/fi-graph.toml",
+  "parts/feature/fi-graph.toml",
   "parts/pool/fp8.toml",
 ]
 
 [server]
 bind = "0.0.0.0:8138"
+
+[parallel]
+mode = "single"
+device = ["4080"]
 
 [model]
 # W4A8 主干(与 ① 同口径:激活 per-token int8 × 权重 int4)。

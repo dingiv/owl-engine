@@ -28,8 +28,7 @@
 extends = [
   "full.toml",
   "parts/model/27b-gguf-iq4xs.toml",
-  "parts/hardware/3090-single.toml",
-  "parts/kernel/fi-graph.toml",
+  "parts/feature/fi-graph.toml",
   "parts/pool/int8.toml",
 ]
 
@@ -39,6 +38,10 @@ extends = [
 # 自动挑;先起谁谁先占).要钉死物理卡用 UUID:
 #   --set parallel.device='["GPU-…"]'
 bind = "0.0.0.0:8137"
+
+[parallel]
+mode = "single"
+device = ["3090"]
 
 [model]
 # **视觉塔**:GGUF 主干不含 `model.visual.*`,必须指 mmproj。

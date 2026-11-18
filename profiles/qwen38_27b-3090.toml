@@ -31,13 +31,16 @@ extends = [
   "parts/model/27b-awq.toml",
   "parts/feature/vision.toml",
   "parts/feature/dflash2-27b.toml",
-  "parts/hardware/3090-single.toml",
-  "parts/kernel/fi-graph.toml",
+  "parts/feature/fi-graph.toml",
   "parts/pool/int8.toml",
 ]
 
 [server]
 bind = "0.0.0.0:8137"
+
+[parallel]
+mode = "single"
+device = ["3090"]
 
 [model]
 # **W4A8 主干**(2026-10-27 用户裁决默认):激活 per-token int8 × 权重 int4,

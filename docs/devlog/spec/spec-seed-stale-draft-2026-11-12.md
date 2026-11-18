@@ -15,7 +15,7 @@
 > **冷启动 AL 6.50 → 7.91**(热态 7.97),轮数 **38 → 32**,输出 sha 逐字节不变;
 > 残留差 = 2 个播种裸步(≈36 ms)+ 冷 prefill,不再是 m=0 轮。
 
-档位:双 3090 Ti / TP2 / 27B AWQ-INT4 / DFlash2 d7(`parts/hardware/3090-tp2.toml` 的本地档),8136。
+档位:双 3090 Ti / TP2 / 27B AWQ-INT4 / DFlash2 d7（本地档，`[parallel]` 内联）,8136。
 
 ---
 

@@ -7,8 +7,8 @@
 # 2026-11-04 INT8 默认验收：1k/8k 文本绿；视觉 grounding + image_evict
 # 36/36、hit@16px 100%；max_seq 262144 boot/池账通过。
 #
-# 卡位:靠 `parts/hardware/3080-tp2.toml` 的名字子串("3080"×2)去重消费;
-#       **禁 CUDA 序号**(本机 nvidia-smi 序 ≠ CUDA 序,数字序会被重解释成混插对)。
+# 卡位:名字子串("3080"×2)去重消费; **禁 CUDA 序号**
+#       (本机 nvidia-smi 序 ≠ CUDA 序,数字序会被重解释成混插对)。
 #       要钉死物理卡用 UUID:--set parallel.device='["GPU-…","GPU-…"]'
 #
 # 上下文:262144 = 模型 `max_position_embeddings`(再高要 YaRN,别在这档里改)。
@@ -32,13 +32,19 @@ extends = [
   "parts/model/27b-awq.toml",
   "parts/feature/vision.toml",
   "parts/feature/dflash2-27b.toml",
-  "parts/hardware/3080-tp2.toml",
-  "parts/kernel/fi-graph.toml",
+  "parts/feature/fi-graph.toml",
   "parts/pool/int8.toml",
 ]
 
 [server]
 bind = "0.0.0.0:8135"
+
+[parallel]
+mode = "tensor"
+device = ["3080", "3080"]
+tp_ar = "ar2"
+tp_ar_f8 = true
+tp_vocab_split = true
 
 [model]
 path = "../models/bytkim/Qwen3.8-27B-pi-AWQ-INT4"
