@@ -95,9 +95,7 @@ attention_factor = 1.0
 prefix_cache = true
 # 宿主/快照/磁盘腿（MiB；0 = 关层）
 host_cache_mb = 0
-snap_host_mb = 0
 disk_cache_mb = 0
-snap_disk_mb = 0
 # 磁盘目录：给了磁盘配额就必须给，且必须独占
 disk_dir = ""
 # 显存治理：驱动 total 的占比；以及池外固定预留 MiB

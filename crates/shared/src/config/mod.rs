@@ -853,12 +853,14 @@ pub struct StoreCfg {
     pub host_cache_mb: usize,
     /// **宿主状态腿**(MiB;0 = 关层)。GDN 快照下沉的落点 ——
     /// ⚠️ 超卖档会把压力推给它(实测 27B 单快照 607 MiB),别只给 KV 腿留量。
+    #[serde(default, skip_serializing_if = "is_zero_usize")]
     pub snap_host_mb: usize,
     /// **磁盘 KV 腿**(MiB;0 = 关层;S6)。宿主装不下时的第二落点(内容不丢)。
     ///
     /// 目录由 `disk_dir` 指定;进程重启后**扫目录回填账**(内容惰性读回)。
     pub disk_cache_mb: usize,
     /// **磁盘状态腿**(MiB;0 = 关层;与 [`Self::disk_cache_mb`] 同属盘层总账的两个分片)。
+    #[serde(default, skip_serializing_if = "is_zero_usize")]
     pub snap_disk_mb: usize,
     /// **磁盘内容目录**(空 = 关层;两腿子目录 `kv/` 与 `snap/` 自动分)。
     ///
