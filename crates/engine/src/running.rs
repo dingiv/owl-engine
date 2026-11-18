@@ -2092,7 +2092,7 @@ impl<D: DeviceClient> RunningEngine<D> {
 
     async fn store_acquire(&mut self, acquire: Acquire) -> Result<StoreOutcome> {
         match acquire {
-            Acquire::Capacity { need, reserve } => {
+            Acquire::Capacity { need } => {
                 match need.why {
                     owl_store::NeedWhy::Admit | owl_store::NeedWhy::Grow => {}
                     other => {
@@ -2103,24 +2103,9 @@ impl<D: DeviceClient> RunningEngine<D> {
                         });
                     }
                 }
-                if reserve.is_some() && need.why != owl_store::NeedWhy::Admit {
-                    return Err(ModelError::EngineInvariant {
-                        what: "store_hook: 只有 Admit 能新开 Grant".into(),
-                    });
-                }
                 let applied = self.pool_housekeeping(need, &[]).await?;
-                let grant = match reserve {
-                    Some(r) => Some(self.bank.parts_mut().rel.reserve_capacity(
-                        r.turn,
-                        r.slots,
-                        r.alloc_slots,
-                        r.kind,
-                    )?),
-                    None => None,
-                };
                 Ok(StoreOutcome {
                     applied,
-                    grant,
                     ..StoreOutcome::default()
                 })
             }
@@ -3041,10 +3026,11 @@ impl<D: DeviceClient> RunningEngine<D> {
     /// 准入分支要查一次命中面(纯 host、与 `schedule` 同一条匹配路):
     /// Δ_j = `ceil(N_j/page) − 设备已驻留的命中块数`(§12.1)—— **host 命中的
     /// 块不算省槽**(回灌时照样占槽,少算就是回灌 Exhausted)。
-    // H1(Admit) 与 H2(Grow) 共用一个 Need；两层判决是**有意保留**的：
-    // - `scheduler::admission.decide` = 批量准入策略（会话守卫/槽位/生成预算/退避）；
-    // - `admission_gate` 的 `Rel::check` = 单 turn VRAM 地板（dense floor/EvictThen）。
-    // 两者共享 store facts，但判据不同；合并会把预算内部暴露给策略状态机。
+    // H1(Admit) 与 H2(Grow) 共用一个 Need；现行分工：
+    // - `admission_gate`（pump 循环头）= 单 turn VRAM 地板（dense floor/EvictThen）；
+    // - `scheduler::Admission::decide_slots` = 槽位/同会话/退避；
+    // - `scheduler::plan_admission_start` = store `plan_admission → commit_admission`
+    //   （容量/腾位/票都在 store plan 里，策略模块不再算第二套预算）。
     //
     // **Phase 2**:生成相位的目标必须覆盖**本 pump 内 spec 轮的 propose**,
     // 不能只算 verify 的 `pos+depth+1`;否则 ⑦ 轮末 propose 的 `ensure_for_len`
@@ -3076,7 +3062,7 @@ impl<D: DeviceClient> RunningEngine<D> {
                 // `dev`（复用面里在设备的块）与 `have`（会话当前表）可能指向
                 // **同一批前缀**：直接相减会双重扣减（2026-11-06 真机：need=0
                 // ⇒ 一拍不腾位 ⇒ ensure 撞墙）。取两者上限（安全下界；精确缺口
-                // 由 `start_one → ensure_start_chain` 在 plan 之后补算）。
+                // 由 `start_one_planned → ensure_start_chain` 在 plan 之后补算）。
                 return Ok(owl_store::Need::kv(
                     slots_for(plen).saturating_sub(dev.max(have)),
                     NeedWhy::Admit,
@@ -3406,19 +3392,12 @@ impl<D: DeviceClient> RunningEngine<D> {
     /// 为什么先于 `ensure_for_len`:那条路是"**占了槽**才发现不够"(Exhausted,
     /// 中后段才炸,且已写半截账);本判决是"**判在前**"——不够就先腾,
     /// 腾不够就带数字拒。
-    // H1 的地板层（有意保留）：scheduler 的 `turns.admission.decide` 管批量策略，
-    // 本函数只管单 turn VRAM 地板；两层共享 store facts，不合并。
-    /// **准入第一段：地板/腾位判决**（F-20 的分工注释）。
-    ///
-    /// 两套判决并存且顺序固定：
-    /// 1. 本函数（pump 循环头）= `rel.check`：**per-turn 显存地板**
-    ///    （Admit / EvictThen / Queue / Reject）；
-    /// 2. `sched_policy::Admission::decide`（`schedule` 内）= **槽位/同会话/
-    ///    退避**（Admit / Hold / Reject）。
-    ///
-    /// 本函数 Reject/Queue 后本拍不再进 `decide`；本函数 Admit 只表示
-    /// "地板可兑现"，槽位仍可能 Hold。合并两套状态机是挂账（F-20），
-    /// 在合并前不许在别处再加第三处准入判据。
+    // 现行准入分层（2026-11-18）：
+    // - 本函数（pump 循环头）= 单 turn VRAM 地板预检（Admit/EvictThen/Queue/Reject）；
+    // - `scheduler::Admission::decide_slots` = 槽位/同会话/退避；
+    // - `scheduler::plan_admission_start` = store plan →（EvictThen 时搬）→ commit。
+    // 本函数负责“先腾位/地板”；scheduler 负责“槽位 + store 计划提交”。
+    /// **准入第一段：地板/腾位预检**。
     fn admission_gate(&mut self, need: &mut owl_store::Need) -> Result<()> {
         use owl_store::AdmissionVerdict;
         if need.why != owl_store::NeedWhy::Admit {
@@ -3467,6 +3446,7 @@ impl<D: DeviceClient> RunningEngine<D> {
                 turn_id,
                 "no_memory",
                 format!("准入拒绝：{reason}"),
+                None,
             )?;
             return Ok(());
         }
@@ -3525,6 +3505,7 @@ impl<D: DeviceClient> RunningEngine<D> {
                         turn_id,
                         "queue_timeout",
                         format!("准入拒绝：排队 {waited}ms 仍无法腾位（{reason}）"),
+                        None,
                     )?;
                 }
             }
@@ -3533,6 +3514,7 @@ impl<D: DeviceClient> RunningEngine<D> {
                     turn_id,
                     "no_memory",
                     format!("准入拒绝：{reason}"),
+                    None,
                 )?;
             }
         }
@@ -3556,12 +3538,13 @@ impl<D: DeviceClient> RunningEngine<D> {
     /// 那是"prompt + max_tokens > max_seq"的专用标记(服务面据此归一化成
     /// `context_length_exceeded` 触发客户端自动 compact);池墙拒是另一类,
     /// 客户端该做的是降并发/重试。
-    fn reject_queued_turn(
+    pub(crate) fn reject_queued_turn(
         &mut self,
         turn_id: u64,
         // 码是静态词表（与调度判决 `Reason::code()` 同一套）；调用点全是字面量
         code: &'static str,
         why: String,
+        retry_after_ms: Option<u64>,
     ) -> Result<()> {
         let Some(pos) = self.turns.queue.iter().position(|t| t.id == turn_id) else {
             return Ok(()); // 已被别处取走(幂等)
@@ -3579,7 +3562,9 @@ impl<D: DeviceClient> RunningEngine<D> {
         self.turns.pending_events.push_back(TurnEvent::Failed {
             turn: turn_id,
             err: crate::turn::TurnError::rejected(crate::turn::AdmissionReject::new(
-                code, None, why,
+                code,
+                retry_after_ms,
+                why,
             )),
         });
         self.sync_pool_account()?;

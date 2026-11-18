@@ -12,7 +12,8 @@
 //!    (超出 `free_cap` 的缓冲直接 drop ⇒ RAM 真释放,不留影)。
 //!
 //! 本文件只做**账与容器**(方法自肃);真搬运(`dtoh`/`upload_pinned`)在
-//! [`crate::moves`] 的自由函数里 —— 见 `arch.md` 律⑦。
+//! **engine 的 `io::moves`** 执行 —— store 只描述（`SwapPiece`/`SlotTable`），
+//! 见 `arch.md` 律⑦ 与 2026-11-18 S1 边界裁决。
 
 use std::collections::BTreeMap;
 

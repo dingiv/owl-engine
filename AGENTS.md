@@ -24,7 +24,7 @@ owl = **在消费级硬件上跑本地模型的推理引擎**(立项 2026-09-22)
 | `docs/devlog/canon/requirements.md` | 需求基线(xinfer v1.0 全量继承;三大指标三线) |
 | `docs/devlog/dev/README.md` | 开发者入口:配置 / 测试 / 调试 / 性能 四件套 + 新工作树开箱 |
 | `docs/devlog/graph/graph-model-seam.md` | 图 × 模型层接缝(改执行路径前先看) |
-| `docs/devlog/memory/store.md` | 状态存储三层(GPU 池 → host pinned → 磁盘) |
+| `docs/devlog/memory/store.md` | store = 账本/策略状态机：三层账 + `plan_*` 描述 + `commit_*` 按实际结果改账（engine 执行 I/O） |
 | `crates/backends/README.md` | **第三方 CUDA 准入铁律**:能触 CUDA 的库必须源码审核账外分配;会私自 cudaMalloc 的库不用,或 copy 进来改造 |
 | `THIRD_PARTY.md` | **Cargo 未声明的第三方**:树内 vendored(A4 四分类)· 移植派生 · 引用来源 + 维护纪律(Cargo 依赖见 `Cargo.lock`/`deny.toml`) |
 
@@ -33,6 +33,10 @@ owl = **在消费级硬件上跑本地模型的推理引擎**(立项 2026-09-22)
 ### A. 代码与架构
 
 1. 上层代码只 import `owl-iface`,禁止直接 include 后端内部类型;
+1a. **`owl-store` 是账本 + 策略状态机，不是 I/O 层**：它只出 `plan_*` 描述
+    （搬哪些块/腾多少/丢谁），engine 执行真正的 swap/文件 I/O，成功后 engine 把
+    **实际结果**交回 `commit_*` 改账。store 生产代码禁止 `DeviceClient`、文件 I/O、
+    事务对象（open/commit/abort 三态）与回滚日志；`abort_*` 只是失败后的账回滚函数。
 2. **一切设备分配过 `owl-cuda` Governor 账本**(A5.2),且**每个分配点必须报语义名**
    (零未命名是硬不变式,`debug_assert` 拒空名);池外原语(cuBLAS workspace 等)必须预分配并登记;
 3. FROZEN 快照(`candle-gb`(外部存档)、`attention.rs`、`cudarc-gb`)只读;
@@ -137,7 +141,7 @@ cargo test -p owl-engine --lib -- --test-threads=1    # GPU 面(必须串行)
 | `kernels/` | 加 / 换算子 | kernel-admission · operator-contract · w4a8-family · kernel-error-ledger |
 | `models/` | 加模型 / 格式 / 装载 | loader-interpreter · gguf-format · new-format-checklist · vision-wiring |
 | `spec/` | 投机解码 | dflash2-design · mtp-design · mtp-longctx-* · spec-decode-survey |
-| `memory/` | KV / 存储 / 长 ctx | store · kvmem-selection · longctx-attribution · prefix-deletion |
+| `memory/` | KV / 存储 / 长 ctx | **store（账本/状态机，零 I/O）** · kvmem-selection · longctx-attribution · prefix-deletion |
 | `serving/` | 服务面 / 会话 / 配置 | agent-surface · multi-session · cross-session-batch · config-ux · **spec-tailcap-gpu-spin(未修 P0)** |
 | `perf/` | **调性能 / 工程纪律 / 看实测数字**(先看这张表) | **optimization-candidates(工作清单)** · perf-framework · decode-cycle · device-command-ledger · stream-ordering · log-framework · pitfalls-general · pitfalls-cuda · qwen38-single-3090 · v1-fi-switch |
 | `dev/` | 上手干活 | config · testing · debug-tools · profiling · fixtures |

@@ -50,8 +50,9 @@
 
 要点：
 
-- `Need` 一个调用点承担 **H1 Admit + H2 Grow**；H1 还分裂为
-  `scheduler` 的 `turns.admission.decide` 与 `admission_gate` 的 `Rel::check` 两层判决。
+- `Need` 一个调用点承担 **H1 Admit + H2 Grow**；H1 现行分工：
+  `admission_gate` 做地板预检，`scheduler` 调 `decide_slots`（槽位/会话/退避）
+  + store `plan_admission → commit_admission`（容量/腾位/票）。
 - `Pressure` 有两个调用点，且只带 KV 槽目标（`Need::kv`），**不搬快照**。
 - `TurnEnd` 不是容量钩子；H3 的链登记在它之前由 `register_chain_owned` 完成。
 
@@ -337,11 +338,9 @@ pub struct Maintain {
 
 ## 5. 待决问题
 
-1. **Admission 两套判决**：`turns.admission.decide`（策略）与 `Rel::check`
-   （store 地板）是否合并为 `Acquire(Admit)` 一个出口？
-   **状态：已评审，保留两层**（Phase 4）：前者是批量状态机（会话守卫/槽位/
-   生成预算/退避），后者是单 turn VRAM 地板（dense floor/EvictThen）；
-   两者共享 store facts，但合并会把预算内部暴露给策略状态机。
+1. **Admission 判决**：2026-11-18 已收口——生产路径 = `decide_slots`
+   （槽位/同会话/退避）+ store `plan_admission → commit_admission`
+   （容量/腾位/票）；旧 `Admission::decide`/`capacity` 只作测试与 `/debug` 诊断。
 2. **Draft/MTP 增长**：并入 `step_need` 的上界，还是在 draft 前单独
    `Acquire(Grow)`？前者简单，后者精确。
    **状态：已完成（Phase 2）**；采用前者：`step_need::generation_target`
@@ -667,14 +666,14 @@ ctx 上限被高估。现在 `pool_cap` 与 `snapshot_pool_bytes` 都按真分�
   `host_pressure_request_snaps`（快照）；8 并发最坏总量 = 8× 各自配额。
 - server actor 的注释已同步为“池排空 + trim + 压力/宿主收缩”。
 
-### 10.3 Admission 两层判决（评审结论：保留）
+### 10.3 Admission 判决（2026-11-18 收口）
 
-- `scheduler::admission.decide` = **批量准入策略**：同会话守卫、槽位上限、
-  生成预算、newcomer reserve、退避；
-- `admission_gate` 的 `Rel::check` = **单 turn VRAM 地板**：dense floor /
-  `EvictThen` / `Queue` / `Reject`；
-- 两者共享 `StoreFacts`，但判据不同；合并会把 `Budget/Admission` 内部
-  暴露给策略状态机，收益低、回归面大 ⇒ **不合并**，只在注释中写明分工。
+- `scheduler::Admission::decide_slots` = 槽位/同会话/退避；
+- store `plan_admission` = 容量/腾位计划（纯 dry-run）；
+- store `commit_admission` = 按实际值落 Grant + admission + GDN 行；
+- `admission_gate` 的 `Rel::check` 仍做 pump 循环头的单 turn 地板预检；
+- `Admission::capacity` / `decide` 只保留为 `/debug` 诊断与测试对照，不再进入
+  生产决策。`StoreHook::Capacity` 不再发 Grant。
 - 原 H1 的两个 `FIXME(store-hook)` 已删除；`FIXME(store-hook)` 全局归零。
 
 ### 10.4 metrics

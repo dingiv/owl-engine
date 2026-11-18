@@ -32,6 +32,16 @@ const MSG_SPLIT_MIN_REMAINING: usize = 1024;
 
 type Result<T> = std::result::Result<T, ModelError>;
 
+/// **准入 plan 的生产结果**：只有这三种去向；没有事务对象/中间态。
+enum PlannedAdmission {
+    /// plan 为 Admit，且状态已按实际值提交。
+    Committed(owl_store::AdmissionApplied),
+    /// 本拍留队（资源暂时不够/仍在腾位）。
+    Queue(String),
+    /// 本拍拒收（容量/提交前置失败）。
+    Reject(String),
+}
+
 /// 一次 pump 的调度决策(执行器照办的完整计划)
 // 结构性豁免(2026-11-02 clippy 清理):枚举变体大小差是**形状事实**(工作单元 vs 标量);装箱会把热路径变成间接访存
 #[allow(clippy::large_enum_variant)]
@@ -575,6 +585,8 @@ impl<D: DeviceClient> RunningEngine<D> {
     /// 从 `schedule()` 抽出（2026-10-20）：准入判决必须**在启动之外**做
     /// `Hold/Reject` —— 判决嵌在启动体里时，Hold 早退会停摆已有活跃、
     /// 不早退则队首照常被弹起（准入形同虚设）。**行为逐字节不变**。
+    /// **测试专用旧路径**（历史 Grant 三步落账）。生产走 `start_one_planned`。
+    #[cfg(test)]
     pub(crate) async fn start_one(
         &mut self,
         turn: crate::turn::Turn,
@@ -610,6 +622,28 @@ impl<D: DeviceClient> RunningEngine<D> {
             }
         };
         debug_assert_eq!(row_grant.kind, owl_store::ReservationKind::Row);
+        self.start_one_committed(turn, grant_id, gdn_row).await
+    }
+
+    /// **已提交准入后的启动**（plan/commit 路径）：
+    /// `commit_admission` 已把 Grant + admission + GDN 行一次落账；这里只做
+    /// 前缀计划/块链/GDN 行使用，不再重复改准入账。
+    pub(crate) async fn start_one_planned(
+        &mut self,
+        turn: crate::turn::Turn,
+        applied: owl_store::AdmissionApplied,
+    ) -> Result<BeginPlan> {
+        self.turns.admit_wait = None;
+        self.start_one_committed(turn, applied.grant.id, applied.gdn_row)
+            .await
+    }
+
+    async fn start_one_committed(
+        &mut self,
+        turn: crate::turn::Turn,
+        grant_id: owl_store::ReservationId,
+        gdn_row: usize,
+    ) -> Result<BeginPlan> {
         // E2c 复用形态:**PrefixHit(内容寻址,块链复用 + 快照恢复)/ Fresh(全量)**
         //
         // **S2(§25.1①)删掉 GuardHit 快路**:idle 会话不再持设备表 ⇒
@@ -2115,13 +2149,92 @@ impl<D: DeviceClient> RunningEngine<D> {
         }
     }
 
+    /// **准入 plan 的生产路径**：plan →（EvictThen 时执行搬迁）→ 重新 plan
+    /// → commit。返回 Committed/Queue/Reject，调度器只负责队列终局。
+    ///
+    /// 所有 store 状态变更都经 `plan_admission` / `commit_admission`；
+    /// 这里不另算容量，也不持有事务对象。
+    async fn plan_admission_start(
+        &mut self,
+        turn: u64,
+        floor: owl_store::TurnFloor,
+        ctx_tokens: usize,
+        reserved_slots: usize,
+        alloc_slots: usize,
+    ) -> Result<PlannedAdmission> {
+        // plan 读的是 Admission 快照（cache/session/floor），而 pump 的
+        // `store_hook` 已经搬过块；进 plan 前先按腿账重算，避免用旧 cache
+        // 把“已经腾够”误判成 EvictThen。
+        self.sync_pool_account()?;
+        let plan = self.bank.parts().rel.plan_admission(
+            turn,
+            floor,
+            ctx_tokens,
+            reserved_slots,
+            alloc_slots,
+        );
+        let plan = match plan.verdict.clone() {
+            owl_store::AdmissionVerdict::EvictThen { need_bytes, .. } => {
+                // store 说“先腾位”：engine 按 need 执行搬迁/下沉；
+                // store_hook 内部仍是 plan_capacity → swap/drop → commit_*。
+                let block = self.dev.pool.block_bytes().max(1);
+                let want = need_bytes
+                    .div_ceil(block)
+                    .saturating_add(self.bank.parts().rel.slots_free());
+                let _ = self
+                    .store_hook(crate::store_hook::StoreHook::capacity(
+                        owl_store::Need::kv(want, owl_store::NeedWhy::Admit),
+                    ))
+                    .await?;
+                // 账变了，旧 plan 失效；同步 cache/floor 后再 dry-run。
+                // 这一步不能省：`store_hook` 只改 store 腿账，`Admission`
+                // 的 cache_bytes 要等 `sync_pool_account` 才更新。
+                self.sync_pool_account()?;
+                self.bank.parts().rel.plan_admission(
+                    turn,
+                    floor,
+                    ctx_tokens,
+                    reserved_slots,
+                    alloc_slots,
+                )
+            }
+            _ => plan,
+        };
+        match plan.verdict.clone() {
+            owl_store::AdmissionVerdict::Admit { .. } => {
+                match self.bank.parts_mut().rel.commit_admission(
+                    turn,
+                    plan.floor_bytes(),
+                    plan.reserved_slots,
+                    plan.alloc_slots,
+                ) {
+                    Ok(applied) => Ok(PlannedAdmission::Committed(applied)),
+                    // 资源耗尽/策略拒绝 = 本 turn 的准入终局；账本不变量/
+                    // 预算错是引擎级错误，不能伪装成 429/no_memory。
+                    Err(owl_store::StoreError::Exhausted(reason))
+                    | Err(owl_store::StoreError::Reject(reason)) => {
+                        Ok(PlannedAdmission::Reject(reason))
+                    }
+                    Err(e) => Err(ModelError::EngineInvariant {
+                        what: format!("commit_admission: {e}"),
+                    }),
+                }
+            }
+            owl_store::AdmissionVerdict::Queue { reason } => Ok(PlannedAdmission::Queue(reason)),
+            owl_store::AdmissionVerdict::Reject { reason } => Ok(PlannedAdmission::Reject(reason)),
+            owl_store::AdmissionVerdict::EvictThen { .. } => Ok(PlannedAdmission::Queue(
+                "搬迁后仍为 EvictThen（账未变化）".into(),
+            )),
+        }
+    }
+
     /// 调度决策(主机侧)：turn 启动判定(会话守卫/前缀匹配/快照
     /// 边界)+ 相位决策(prefill chunk / decode 步,host 派生量备齐)。
     /// 只动账(队列/会话账/块账房/活跃 turn)。
     ///
-    /// **P0-4**：准入 Admit 后、启动之前经 `Acquire::Capacity { reserve }`
-    /// 向 store 领一张 Grant；`start_one`/后续 `ensure_for_len` 只消费这张票。
-    /// 因此本函数是 `async`（只多一次“零 I/O”的 grant 发放；搬位仍在 pump）。
+    /// **P0-4（2026-11-18）**：准入 = `plan_admission →（EvictThen 先执行）→
+    /// commit_admission`；Grant 由 commit 一次发放，`start_one_planned` /
+    /// `ensure_for_len` 只消费它。`StoreHook::Capacity` 只做保洁，不发 Grant。
     pub(crate) async fn schedule(&mut self) -> Result<SchedulerOutput> {
         let mut begin = None;
         // B5.1:多活跃 —— 有空位才允许起新 turn(其余逻辑不变)。
@@ -2138,12 +2251,12 @@ impl<D: DeviceClient> RunningEngine<D> {
             _ => false,
         };
         if self.turns.active.len() < self.boot.cfg.knobs.max_batch.max(1) && !admit_blocked {
-            // **准入（唯一放行口）**：纯状态机 + store 事实注入。
-            // · Admit  → 领 grant → 启动（`start_one`）并入账；
+            // **准入（唯一放行口）**：槽位状态机 + store plan/commit。
+            // · Admit  → plan_admission → commit_admission → 启动；
             // · Hold   → 队首**留原位**，本拍只推已有活跃（不许停摆）；
             // · Reject → 出队 + `Failed{admission:<code>}`（服务面翻 429）。
             let mut start_ok = true;
-            let mut admission_grant: Option<owl_store::Grant> = None;
+            let mut planned_start: Option<owl_store::AdmissionApplied> = None;
             if let Some(head_facts) =
                 cand.map(|ci| Self::facts_of_queued(&self.turns.queue[ci]))
             {
@@ -2170,7 +2283,7 @@ impl<D: DeviceClient> RunningEngine<D> {
                 match self
                     .turns
                     .admission
-                    .decide(&l, &s, &running, &head_facts, now_ms)
+                    .decide_slots(&l, &s, &head_facts, now_ms)
                 {
                     crate::sched_policy::Verdict::Admit => {
                         owl_shared::metrics::with_metrics_store(|m| {
@@ -2187,19 +2300,84 @@ impl<D: DeviceClient> RunningEngine<D> {
                         let alloc_slots = self
                             .chain_alloc_slots(head_facts.prompt_tokens, head_facts.max_new)
                             .max(reserved_slots);
-                        let out = self
-                            .store_hook(crate::store_hook::StoreHook::capacity_reserve(
-                                owl_store::Need::kv(0, owl_store::NeedWhy::Admit),
+                        // **Plan/DryRun**：先用 store 账本算一份“现在放行”的计划。
+                        // 只有 plan 明确 Admit 才走 commit；其余姿态保留旧路径，
+                        // 等 EvictThen 的搬迁/排队语义单独切。
+                        let (floor, ctx_tokens) = {
+                            let t = cand
+                                .and_then(|ci| self.turns.queue.get(ci))
+                                .ok_or_else(|| ModelError::EngineInvariant {
+                                    what: "准入: 候选 turn 在 plan 前消失".into(),
+                                })?;
+                            let floor = t
+                                .opts
+                                .dense_floor
+                                .unwrap_or(self.boot.cfg.knobs.dense_floor);
+                            let ctx = t
+                                .prompt_ids
+                                .len()
+                                .saturating_add(t.spec.max_new)
+                                .saturating_add(self.dev.spec_rt.depth)
+                                .saturating_sub(t.cached);
+                            (floor, ctx)
+                        };
+                        match self
+                            .plan_admission_start(
                                 head_facts.turn,
+                                floor,
+                                ctx_tokens,
                                 reserved_slots,
                                 alloc_slots,
-                            ))
-                            .await?;
-                        admission_grant = out.grant;
-                        if admission_grant.is_none() {
-                            return Err(ModelError::EngineInvariant {
-                                what: "准入 Admit 后 Capacity 未返回 Grant".into(),
-                            });
+                            )
+                            .await?
+                        {
+                            PlannedAdmission::Committed(applied) => {
+                                owl_shared::metrics::with_metrics_store(|m| {
+                                    m.counter_add("admit.plan.commit", 1, file!(), line!())
+                                });
+                                planned_start = Some(applied);
+                            }
+                            PlannedAdmission::Queue(reason) => {
+                                start_ok = false;
+                                owl_shared::metrics::with_metrics_store(|m| {
+                                    m.counter_add("admit.plan.queue", 1, file!(), line!())
+                                });
+                                if self.turns.admit_wait.is_none() {
+                                    self.turns.admit_wait =
+                                        Some((head_facts.turn, std::time::Instant::now()));
+                                }
+                                owl_shared::log_info!(
+                                    "admit",
+                                    "准入排队 turn {}（会话 {:#x}）：{reason}",
+                                    head_facts.turn,
+                                    head_facts.session
+                                );
+                            }
+                            PlannedAdmission::Reject(reason) => {
+                                start_ok = false;
+                                owl_shared::metrics::with_metrics_store(|m| {
+                                    m.counter_add("admit.plan.reject", 1, file!(), line!())
+                                });
+                                self.turns.admission.note_rejected(
+                                    head_facts.session,
+                                    now_ms,
+                                    crate::sched_policy::Reason::NoMemory {
+                                        need_pages: reserved_slots,
+                                        free_pages: s.usable_pages(l.reserve_pages),
+                                    },
+                                );
+                                self.turns
+                                    .note_reject(head_facts.session, "no_memory");
+                                let eta = self.turns.eta_ms(l.max_batch, self.turns.queue.len());
+                                // F-18 统一收口：出队 + 临时会话清理 + Failed +
+                                // `store.admit.reject` 指标 + sync 都在这一处。
+                                self.reject_queued_turn(
+                                    head_facts.turn,
+                                    "no_memory",
+                                    reason,
+                                    Some(eta),
+                                )?;
+                            }
                         }
                     }
                     crate::sched_policy::Verdict::Hold => {
@@ -2264,14 +2442,14 @@ impl<D: DeviceClient> RunningEngine<D> {
                 };
                 if let Some(turn) = picked {
                     let facts = Self::facts_of_queued(&turn);
-                    let grant =
-                        admission_grant
-                            .take()
-                            .ok_or_else(|| ModelError::EngineInvariant {
-                                what: "准入放行但无 Grant（store 账未发）".into(),
-                            })?;
                     let turn_id = turn.id;
-                    match self.start_one(turn, grant).await {
+                    let applied = planned_start.take().ok_or_else(|| {
+                        ModelError::EngineInvariant {
+                            what: "准入放行但无 plan 提交结果（store 账未落）".into(),
+                        }
+                    })?;
+                    let start_result = self.start_one_planned(turn, applied).await;
+                    match start_result {
                         Ok(b) => {
                             begin = Some(b);
                             self.turns.admission.note_started(&facts);
@@ -2284,7 +2462,14 @@ impl<D: DeviceClient> RunningEngine<D> {
                             // 不到终态（HTTP 永挂）。
                             // 与 `reject_queued_turn` 同一口径：坏一个 turn，就只给
                             // 它一个 `Failed`，泵继续跑（`Idle`/下一步都会排空队列）。
-                            self.bank.parts_mut().rel.release_turn_grants(turn_id);
+                            // **单一围栏**：Grant + admission + GDN 行一次收口
+                            // （plan/commit 路径可能已登记，不能只退 Grant）。
+                            if let Err(rb) = self.bank.parts_mut().rel.finish_turn(turn_id) {
+                                owl_shared::log_warn!(
+                                    "sched",
+                                    "turn {turn_id} 启动失败收尾失败：{rb}（原错误：{e}）"
+                                );
+                            }
                             owl_shared::log_warn!(
                                 "sched",
                                 "turn {turn_id} 启动失败（只弃本 turn）：{e}"
@@ -2311,9 +2496,15 @@ impl<D: DeviceClient> RunningEngine<D> {
                             });
                         }
                     }
-                } else if let Some(g) = admission_grant.take() {
-                    // 队首在判决后消失（理论竞态）⇒ 票必须归还。
-                    self.bank.parts_mut().rel.release_turn_grants(g.turn);
+                } else if let Some(applied) = planned_start.take() {
+                    // 队首在判决后消失（理论竞态）⇒ 已提交的账必须归还。
+                    if let Err(e) = self.bank.parts_mut().rel.finish_turn(applied.grant.turn) {
+                        owl_shared::log_warn!(
+                            "sched",
+                            "准入竞态收尾失败 turn {}: {e}",
+                            applied.grant.turn
+                        );
+                    }
                 }
             }
         }

@@ -207,11 +207,14 @@ apps/server/src/openai.rs/chat()
       store_hook(Capacity{need})                     // 需求驱动保洁（段边界）
       scheduler.rs/schedule()
           admit_blocked?（admit_wait = 队首）⇒ 不起新 turn
-          Admission::decide()                        // 第二套准入判决
-              Admit  → capacity_reserve → Grant
+          Admission::decide_slots()                  // 只判槽位/同会话/退避
+              Admit  → plan_admission
+                         ├ Admit     → commit_admission(实际值) → start_one_planned
+                         ├ EvictThen → capacity/swap → 重新 plan → commit
+                         └ Queue/Reject → 留队/出队 + Failed
               Hold   → 留队首（本拍只推活跃）
               Reject → pop + Failed(pending_events)   // ⚠ 不 burn ephemeral（F-18）
-          start_one(turn, grant)                     // host 账：admission/borrow_row/reserve_row
+          start_one_planned(turn, applied)            // 只做前缀/块链/GDN 行使用
               plan_image_leave_gap | plan_prefix_reuse
               ensure_for_len（虚拟化档只到首 chunk）
               ActiveTurn.push
@@ -357,7 +360,7 @@ V_avail          = v_card − weights − runtime_floor − gdn_row×gdn_slots �
 | F-14 | ✅ | 移除错位的 `arc_with_non_send_sync`；把 `boot_rank` 的文档注移回函数；`boot_knobs_check` 接受真实属性 |
 | F-23 | ✅ | `AgentSession::guard` 先校验 `cached_len <= tokens.len()`，失守按失配（回退全量）而不是切片 panic |
 | F-25 | ✅ | `pool_cap` 的 `ctx_max` 用真页宽（`pol.page`；legacy = 0），删除 `page_guess=32` |
-| F-20 | 🟡 注释 | 已在 `admission_gate` 与 `Admission::decide` 补"两段分工/顺序固定"注释；**状态机合并仍挂账**（改行为风险高） |
+| F-20 | ✅ 2026-11-18 | 生产路径 = `admission_gate`（地板预检）+ `Admission::decide_slots`（槽位/会话/退避）+ store `plan_admission → commit_admission`（容量/腾位/票）；旧 `Admission::decide`/`capacity` 只作测试与 `/debug` 诊断，`capacity_reserve` 已删 |
 | F-22 | ✅→🗑 2026-11-16 | 一度以 `[runtime] max_sessions` + `enforce_session_cap` 收口；**2026-11-16 按原始算法撤回**：会话总数不设上限（改由池/淘汰机制与"整会话淘汰"约束），会话身份 = **内容身份**（`SessionTable::match_prefix`）；`max_sessions`/`implicit_session` 两键已从配置面删除 |
 | F-24 | ✅ 主要 | 生产路径 5 处 `expect` 改为显式 `Result`/`if let`（3×`submit 已建会话账`、探测 `刚查过`、队列 `刚定位过`）；剩余 `expect` 均为测试 helper、`world==2` 前置门或 64B 固定头（结构上不可失败），已注明 |
 | F-26 | ✅ 显式 | `[vram-gov]` 的 `fixed_after` 行显式标注 `+scratch 未计: attn_v2/xqa/fi 表/bt`；`FixedAfter` 文档写明不含 scratch、由 reserve 覆盖（精确并入另案，避免两处公式） |

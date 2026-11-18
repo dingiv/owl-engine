@@ -291,8 +291,7 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
         s.set_img_spans(spans, pads);
         // **L1 资产:尾锚点 + 消息边界跨轮保留**(2026-11-12)。
         // 中断时只保留已算前缀内的边界;尾快照若已拍到则保持 Dense 档。
-        if act.last_snap.is_some() {
-            let key = act.last_snap.expect("刚判过");
+        if let Some(key) = act.last_snap {
             s.tail_snap = Some(key);
             // 与 complete 同律：最近 K 个尾保持 Dense，溢出者降 Extra。
             demote_tail = s.push_recent_tail(
@@ -444,8 +443,7 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
             // **L1 资产:尾锚点 + 消息边界跨轮保留**(2026-11-12)。
             // 空闲会话的 tail_snap 保持 Dense 档(最后淘汰,不是 pin) ——
             // append 时上一条消息末尾 100% 命中;msg_snaps 供下一轮回撤定位。
-            if act.last_snap.is_some() {
-                let key = act.last_snap.expect("刚判过");
+            if let Some(key) = act.last_snap {
                 s.tail_snap = Some(key);
                 // 最近 K 个 turn 尾保持 Dense；更老的尾降 Extra。
                 demote_tail = s.push_recent_tail(

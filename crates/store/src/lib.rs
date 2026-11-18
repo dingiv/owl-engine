@@ -3,6 +3,17 @@
 //!
 //! 本 crate **只做账、身份与策略**:东西在哪、这一步该看到什么、放不下时丢谁。
 //! 不认模型层、不做前向、不持设备块句柄的所有权(所有权归 engine;见 `arch.md` 律②)。
+//! **不做 I/O**:搬运/落盘以 `plan_*` 描述(`OutPlan`/`InPlan`/`SpillPlan`),
+//! 由 `owl-engine::io` 执行,成功后回来 `commit_*`(2026-11-18 S1)。
+//!
+//! # API 形状（2026-11-18 用户裁决）
+//!
+//! - `plan_*`：纯 host 的**描述**，零状态变更；告诉 engine“要搬什么/腾多少/谁过期”。
+//! - engine 执行真正的 I/O（`face.swap` / 文件读写）。
+//! - `commit_*`：engine 把**实际完成的东西**报回来，store 只按实际结果改账。
+//!
+//! 没有 open/commit/abort 三态，没有事务对象，没有回滚日志。
+//! store 只回答两件事：**现在账上是什么**、**下一步该怎么挪**。
 //!
 //! # 四个词(设计卷 §2.3 定义;本 crate 全程按此用词)
 //!
@@ -44,9 +55,9 @@ pub mod host;
 pub mod id;
 pub mod kv;
 pub mod leg;
-pub mod moves;
 pub mod plan;
 pub mod policy;
+pub mod pool_budget;
 pub mod pressure;
 pub mod rel;
 pub mod reservations;
@@ -78,19 +89,22 @@ pub use leg::{
     BlockClass, BlockLeg, BlockOutPlan, Carrier, ChainCand, ChainHit, InPlan, LegConfig, LegOps,
     LegStats, OutPlan, PieceSpec, PoolLayout, ReadPlan, SkipWhy, HOST_PLACEHOLDER,
 };
-pub use moves::{bytes_of, download_span, offload_to_host, onload_from_host, upload_span};
 pub use pressure::{PressurePolicy, PressureSignals};
 pub use plan::{
-    CardPlan, ComponentId, MemComponent, MemoryPlan, PlanCheck, PlanPolicy, PlanSource, PoolPlan,
-    TierPlan,
+    auto_pool_tokens, CardPlan, ComponentId, MemComponent, MemoryPlan, PlanCheck, PlanPolicy,
+    PlanSource, PoolPlan, TierPlan,
+};
+pub use pool_budget::{
+    pool_cap_tokens, PoolCap, PoolCapInputs, PoolFixedInputs, PoolFixedTerms, PoolTokenTerms,
 };
 pub use policy::{
     AdmissionPolicy, EvictCandidate, EvictPolicy, EvictPolicyKind, Leg, LrfuPolicy, LruPolicy,
     QueuePolicy,
 };
 pub use rel::{
-    AdoptChainsReport, DiskAttach, DiskSessionUsage, EventBook, KvCheckpointPlan, KvConfig,
-    OpenLoan, Protected, RecallHit, RecallMode, Rel, SnapEvictPreview, StoreReport,
+    AdmissionApplied, AdmissionPlan, AdoptChainsReport, DiskAttach, DiskSessionUsage, EventBook,
+    KvCheckpointPlan, KvConfig, OpenLoan, Protected, RecallHit, RecallMode, Rel, SnapEvictPreview,
+    StoreReport,
 };
 pub use reservations::{Grant, GrantReport, ReservationId, ReservationKind, ReservationLedger};
 pub use select::{

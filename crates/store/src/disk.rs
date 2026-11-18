@@ -17,7 +17,8 @@
 //!
 //! **为什么 I/O 不在 store**(§21 裁决):文件读写会阻塞命令线程(§15.4 实测警告),
 //! 必须由 engine 在 `spawn_blocking`(或专用 I/O 线程)里做 ⇒ store 出计划、
-//! engine 执行、回来 `commit_*`。这与 `moves.rs` 的 dtoh/upload 同一条律。
+//! engine 执行、回来 `commit_*`。这与 engine `io::moves` 的 dtoh/upload 同一条律：
+//! store 只描述，engine 执行。
 //!
 //! # 磁盘 = **权威副本**,宿主 = 缓存
 //!

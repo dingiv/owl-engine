@@ -9,6 +9,10 @@
 它回答三个问题:**东西在哪(repository view)**、**这一步该看到什么(selection)**、
 **放不下时丢谁(eviction)** —— 不做前向计算、不认识模型层。
 
+**它是账本 + 策略状态机，不是 I/O 层**：只出 `plan_*` 描述（要搬哪些块、
+腾多少、丢谁），由 engine 执行真正的 DMA/文件读写，成功后 engine 把**实际结果**
+交回 `commit_*` 改账。没有 open/commit/abort 事务，没有回滚日志。
+
 ## 结构(裁决②:两腿独立 + 一层关系)
 
 ```
@@ -16,15 +20,34 @@ Rel(关系层门面)  身份映射 · 召回语义(Exact / ContextOnly)· 换出
 ├─ KvStore       attention 块腿 = 槽池(SlotPool)+ 内容身份前缀树(PrefixTree)
 │                (迁自 BlockManager/PrefixCache 的 host 账;设备叶子仍归 engine)
 └─ StateStore    GDN 快照与行账(snap 身份 = 块边界内容身份)
-公共: tier(三层账/预算) · policy(驱逐与准入策略对象) · host(宿主承载) · moves(搬运自由函数)
+公共: tier(三层账/预算) · policy(驱逐与准入策略对象) · host(宿主承载) · plan(纯描述)
+      · pool_budget(池容量/逐 token/固定项纯算式，2026-11-18)
 ```
+
+### `Rel` 文件切分（2026-11-18）
+
+`Rel` 仍是唯一门面，生产实现按域落在 `src/rel/`：
+
+```text
+rel.rs          Rel 类型 + 轻量访问器（约 430 行）
+rel/boot.rs     open/open_world + MemoryPlan 注入 + 几何
+rel/admin.rs    准入 plan/commit + Reservation/Grant + check/plan_need
+rel/kv.rs       KV 腿访问 / 前缀命中 / 块表增长 / KV 下沉计划
+rel/state.rs    GDN 行 / 快照 / 宿主与设备搬运计划
+rel/disk.rs     KV + 快照盘层 attach/adopt/spill/fill/evict
+rel/report.rs   report / leg_accounting / ledger_cell / leg_stats
+rel/index.rs    Mean-K 索引账
+rel/tests.rs    Rel 测试入口（helpers）+ tests/{admin,kv,state,disk,report}.rs
+```
+
+子模块只 `impl Rel`，不引入第二套门面；字段仍私有，跨腿不变量留在关系层。
 
 **已立**(S3-3,§10-§19):
 ```
-BlockLeg(engine 侧唯一门面)= KvStore(身份+槽账)+ HostTier(宿主物理)+ 搬运口
-                              ↑ 布局由 engine 注册(id 级 + epoch);server 执行搬运(swap 单命令)
+BlockLeg(engine 侧唯一门面)= KvStore(身份+槽账)+ HostTier(宿主物理)+ 计划面
+                              ↑ 布局由 engine 注册(id 级 + epoch);engine 执行搬运(swap 单命令)
 Rel   = 关系层门面(S3b 已接线):双腿关联 / 准入 / 搬运计划;组合件字段私有,
-        engine 只调语义方法(slots_free / state_locate / kv_disk_* / plan_* / release_*)
+        engine 只调语义方法(slots_free / state_locate / kv_disk_* / plan_* / commit_*)
 ```
 
 ## 谁在用(2026-10-17,S3-3 全刀之后;交互契约全文见设计卷 §10、钩子 §14、需求驱动 §17)
@@ -35,7 +58,9 @@ engine 侧原来的 `blocks.rs` / `prefix_cache.rs` **已整文件删除**(§9.5
 已经通的:
 
 - **换出/回灌**(§16/§17.7):链级**整条**下沉(链头段也进宿主 ⇒ 命中面从链头就是宿主格)
-  + `onload_blocks` **一条命令搬 N 块**;搬运走 `DeviceClient::swap`(CUDA 单命令 / CPU 池化解码);
+  + `onload_blocks` **一条命令搬 N 块**;store 只出计划，engine 用
+  `DeviceClient::swap` 执行(CUDA 单命令 / CPU 池化解码)，再把实际结果交回
+  `commit_offload/commit_onload`;
 - **需求驱动保洁**(§17):engine 钩子 H1/H2 用与 `schedule` **同源算式**算 need;
   `ensure_for_len` 的同步驱逐降为兜底(报告面 `ops.ensure_evicted` 监控);
 - **无卡验证**:`tests/store_e2e.rs`(端到端三门口 + 链级粒度,0.00s)
@@ -46,15 +71,39 @@ engine 侧原来的 `blocks.rs` / `prefix_cache.rs` **已整文件删除**(§9.5
 - 盘层**已接线**(S6:`attach_disk` / `adopt_disk_*` / spill / fill),不再是"未接线";
 - 历史挂账清单集中在本包 `docs/devlog/memory/store.md` **§20**。
 
+### 现行 API（2026-11-18）
+
+```text
+store plan_*      纯 host 描述：要搬哪些块 / 腾多少 / 丢谁
+    ↓
+engine I/O        真正的 swap / dtoh / htod / 文件读写
+    ↓
+store commit_*    engine 报“实际完成了什么”，store 只按实际结果改账
+```
+
+例子：
+
+```text
+Rel::plan_admission(...) -> AdmissionPlan     // 不建 Grant、不改 admission
+Rel::plan_need(need)     -> Verdict            // 搬哪些 KV、丢哪些缓存
+    engine 执行 swap/drop
+Rel::commit_offload/onload(实际块)             // 只改账
+Rel::commit_admission(实际 floor/槽数)          // Grant + admission + GDN 行
+```
+
+`plan_*` 任意次调用零副作用；`commit_*` 不吃 plan，只收实际值。
+没有 open/commit/abort 事务；`abort_*` 只是失败后的账回滚函数。
+
 ## 律(违反即 `// CMA:` 标记)
 
-1. **分层单向**:本 crate 只依赖 `owl-iface`(契约面)+ `owl-shared`(工具面)+
+1. **分层单向**:本 crate 只依赖 `owl-iface`(契约面/描述类型)+ `owl-shared`(工具面)+
    **`libc`(仅内存布局提示:宿主块 `madvise(MADV_HUGEPAGE)`,2026-10-19 记注于
    `crates/store/Cargo.toml`)**;
    **禁止**依赖 `owl-cuda` / `owl-engine` / `owl-models` 内部(engine → store 单向)。
-   补注(**测试面例外**):dev-dependency 允许 `owl-cpu` —— 它是契约面
-   (`owl-iface::DeviceClient`)的一个真实现体,用真 face 测搬运闭环胜过手写假 face;
-   `owl-cuda` / `owl-engine` 连测试面也不许拉(那会造成环)。
+   **生产代码零 `DeviceClient`**：store 不持有 face、不调 `swap/dtoh/htod`、不读写文件。
+   补注(**测试面例外**):dev-dependency 允许 `owl-cpu` —— 它只是测试编排用的
+   契约面真实现体，不是 store 运行期依赖；`owl-cuda` / `owl-engine` 连测试面也不许拉
+   (那会造成环)。
 2. **账与叶子分家**:store 持**身份 + 账 + 宿主物理**;**设备叶子句柄的所有权归 engine**
    (store 只经 `KvLeaves` 口引用,不持有 `Bytes` 所有权 —— 避免双主人)。
 3. **搬运只在段边界**:换入/换出只能发生在 piecewise 段接缝 / pump 间隙 / prefill 分块之间
@@ -65,8 +114,10 @@ engine 侧原来的 `blocks.rs` / `prefix_cache.rs` **已整文件删除**(§9.5
    绝不允许改走近似召回。
 6. **判定口禁副作用**:`probe` 一类的查询必须零分配零设备动作
    (对全量 Want 逐个问的声扫同理 —— 见坑册 §40)。
-7. **I/O 走顶层自由函数**:本 crate 的设备/宿主/磁盘 I/O 一律写成自由函数(显式传 `&mut D`),
-   结构体方法保持自肃(只改自身字段);不设全局态、不设线程局部态。
+7. **store 不做 I/O**:本 crate 只出 `plan_*` / 算账 / 改账；真正的设备/宿主/磁盘
+   I/O 是 **engine 的顶层自由函数**（`engine::io`）。store 结构体方法保持自肃，
+   只改自身字段；不设全局态、不设线程局部态。
+   `abort_*` 只是 I/O 失败后的**账回滚函数**，不是事务状态。
 8. **身份律**:store 里"是谁"一律用**内容身份**(`ChainHash`),**物理槽号不入身份** ——
    槽可回收复用,拿槽号当键 = 槽复用后假命中(设计要求见 §9.1)。
    槽是**绑定**(`SlotPool` 发号、前缀树持 `Option<u32>` 绑定),可随手沉/换。
@@ -74,15 +125,18 @@ engine 侧原来的 `blocks.rs` / `prefix_cache.rs` **已整文件删除**(§9.5
    (登记 → `incref`,逐出 → `decref`)—— 调用方不再手工配 `for id in inserted { incref }` 的双写。
 10. **指针 / ID 律**(裁决⑫):裸指针只有 server 持;本 crate 与 models/engine 一样**只持
     id + 元数据** —— 不持裸指针,不持 `Bytes` 所有权(布局由 engine **注册**进来,id 级 + `epoch`)。
-11. **三分工**(裁决⑪):engine = 决策/调用 · **本 crate = 实现**(换什么/搬到哪层/账怎么走/
-    宿主缓冲/策略出序)· server = 执行(地址/DMA/一次 ack)。
+11. **三分工**(2026-11-18 现行):engine = 决策 + I/O 执行(地址/DMA/文件) ·
+    **本 crate = 账本 + 策略 + 计划**(东西在哪/该看到什么/放不下丢谁/搬什么) ·
+    backend = 设备命令面。store 不知道 I/O 何时发生，也不持有执行句柄。
 12. **载体三层**:`Carrier{Device(SlotId) | Host(HostId) | Disk(FileOff)}` —— 身份与载体**正交**,
     换层只换 `Carrier` + 台账挪一行。`Disk` 已接线（S6：`attach_disk` / `adopt_disk_*` /
     spill / fill）；盘上-only 的 `slot=None` 不等于 Host，报告/候选必须走 `Rel::carrier_of`
     或 `BlockLeg` 的宿主内容过滤。
-13. **批面为搬运唯一规范**:单件 = `n = 1` 的糖(实现共享一条路径)。批的 N 有上限并切块。
-14. **段边界独占**：搬运口只接受"段边界"的调用形状;调用点不得持会话借用(先收集工作单,
-    再独占执行)—— 与律⑦(自由函数)配套。捕获窗内 server 对 Swap 类命令**响亮拒**。
+13. **批面为搬运计划唯一规范**:单件 = `n = 1` 的糖;store 出批计划，
+    engine 执行一条批命令(实现共享一条路径)。批的 N 有上限并切块。
+14. **段边界独占**：`plan_*` 只接受"段边界"的调用形状;调用点不得持会话借用
+    (先收集工作单,再独占执行)。真正的 I/O 由 engine 在段边界发起；捕获窗内
+    server 对 Swap 类命令**响亮拒**。
 15. **需求驱动(§12.4/§17;2026-10-16)**：保洁只由**真需求**触发(准入 Δ_j / prefill 增量 /
     decode 上界 / 空转零需求),**禁用常数水位**预搬;需求算式必须与调度决策**单源**
     (engine 的 `step_need` ↔ `reuse_face`/`prefill_step_chunk`);`ensure_for_len` 的同步

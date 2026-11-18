@@ -18,6 +18,13 @@
 > H3/H6 与状态腿；Phase 4 修 `FixedAfter`/N6 触发）；本卷中的 `Node` 描述
 > 保留为历史，新契约见
 > [`store-hook-contract.md`](store-hook-contract.md)。
+>
+> **2026-11-18 现行口径（以此为准）**：store = **账本 + 策略状态机**，零 I/O。
+> `plan_*` 只出描述（搬哪些块/腾多少/丢谁）；engine 执行真正的 swap/文件 I/O；
+> `commit_*` 只按**实际完成结果**改账。`store/src/moves.rs` 已删，搬运原语在
+> `engine::io::moves`。本文中“store 自己发命令”“store `apply(face)`”等旧段落是历史，
+> 已被 §21 与本口径取代；不引入事务对象/回滚日志。现行 API 以
+> [`crates/store/arch.md`](../../../crates/store/arch.md) 为准。
 
 ## 0. 立项口径(边界,先说清楚)
 
@@ -55,7 +62,7 @@
 - **设备侧** `StatePool`(`state.rs`)= 分配 + 叶子句柄(`kv_caches`/`gdn_caches`/`bt_leaf`)
   + 状态治理(`reset_gdn` / `capture_snap` / `restore_snap` / `write_bt`);
 - **host 侧** `BlockManager`(`blocks.rs`)= ref_count(0 空闲/1 独占/≥2 共享)
-  + 空闲 FIFO + `ensure_for_len` **事务性增长** + **压力驱逐**(先逐前缀缓存叶补自由度)
+  + 空闲 FIFO + `ensure_for_len` **原子增长**（不是事务对象）+ **压力驱逐**(先逐前缀缓存叶补自由度)
   + **E2c 块级前缀缓存**(内容链哈希,`prefix_cache.rs` 持索引/LRU);
 - **会话** `SessionTable`(`session.rs`)= `slot_base` + `gdn_slot`;close 释放格号;
 - 全局:**没有任何 host/盘层卸载**(现有 `dtoh/htod` 只出现在取证探针里)。
@@ -332,10 +339,10 @@ dense_floor < N·k        ⇔  容忍 B :差额 (N·k − dense_floor) 落三层
 ```
 
 **分工律**(本卷最重要的一条):
-- **store 持「身份 + 账 + 宿主/盘物理」**——纯策略与簿记,可在 CpuFace 下全量单测;
-- **engine 持「设备叶子句柄」与「时序」**——store 要动设备时,由 engine 把
-  `&mut D`(DeviceClient)借给它,**store 自己发命令**,不新增后端原语;
-- 数据面 I/O 写成 crate 级**自由函数**(host↔device 的块搬运),store 本体方法保持自肃
+- **store 持「身份 + 账 + 宿主/盘物理 + 策略」**——纯策略与簿记,可在 CpuFace 下全量单测;
+- **engine 持「设备叶子句柄」「时序」与 I/O 执行**——store 只出 `plan_*` 描述;
+  engine 拿计划执行 `face.swap`/文件读写，然后把**实际结果**交回 `commit_*`；
+- 数据面 I/O 写成 **engine 的**顶层自由函数（`engine::io`）；store 本体方法保持自肃
   (只改自身字段;不摸别人的变量、不做隐藏在方法里的 I/O)—— 与工作区 AGENTS 纪律同源。
 
 ### 3.2 对外接口(伪代码契约;输入/输出/失败/生命周期)
@@ -429,7 +436,7 @@ L4 启动预算
 - **搬运的设备端序**:宿主 lease 复用靠 server 侧"流完成回调才还池";与
   计算流的序走复合口(写等读/读等写),沿用 `三流事件序` 卷的既有机制,**不新造**。
 - **单向依赖**:`engine → store → (iface, shared)`,禁止反向;
-  store 不认识 `GraphPlan`/`StatePool`,只认识 `DeviceClient` 与块 id。
+  store 不认识 `GraphPlan`/`StatePool`，也不认识 `DeviceClient`；只认描述类型与块 id。
 
 ### 3.5 空间预算(A5.1/A5.2 形态)
 
@@ -922,7 +929,7 @@ server 不再"默默照办",焊死"随手搬")。
 ```
         结构(谁是可分层的块)  ← models
                 │
-   执行(前向/调度) ← engine(决定:这一批要哪些) → store(实现:驻留/搬运/账) → server(执行)
+   执行(前向/调度) ← engine(决定 + I/O 执行) → store(实现:驻留/账/计划) → server(设备命令面)
                 ▲
         热信号(router 每层命中:谁热)
 ```
@@ -983,7 +990,7 @@ fp8 大 MoE 单专家 40MB+),而路由是**每 token 每层**的 ⇒ 40MB/10GB·
 | 面 | 内容 |
 |---|---|
 | `store::leg` | `BlockClass`(类轴)· `Carrier`(三层载体,身份正交)· `PieceSpec`/`PoolLayout`(id 级布局 + `epoch`)· `LegConfig`/`LegOps`/`LegStats` · **`BlockLeg`**(控制面:`match_prefix`→`ChainHit`/`ensure_for_len`/`register_chain`/`release_table`/`incref`/`evict_candidates`/`carrier_of`/`report`)· **数据面自由函数** `offload_block`/`onload_block`(显式收 `&mut D`) |
-| `store::moves` | **`download_span` / `upload_span`**(带偏移;老口 `offload_to_host`/`onload_from_host` 改为其特例 —— 一套实现) |
+| `engine::io::moves` | **`download_span` / `upload_span`**(带偏移;2026-11-18 自 store 迁入;store 只出计划) |
 | `store::kv` | `alloc_slot` / `bound_slot` / **`ensure_offloadable`**(换出前置:存在 + 设备绑定 + 引用 = 1) |
 | `owl-iface` | **`dtoh_at`**(带偏移 D2H;默认 = 响亮"未实现") |
 | `owl-cpu` | `dtoh_at` 实现(store 的搬迁单测跑**真 face**) |
@@ -1254,7 +1261,7 @@ H5 用它;H2 的"按需下沉"同样用链(不足一条链时退化按叶,并打
 | 物 | 声明 | 实现 | 使用 |
 |---|---|---|---|
 | `Connector` trait(+ `SwapDir` / `SwapPiece` / `ConnSlot`) | **owl-iface** | **owl-store**(RAM = `HostTier`;disk = 文件层) | **owl-cuda 的 server**(搬运时逐片读/写) |
-| `DeviceClient::swap(...)`(一条命令的入口) | **owl-iface** | owl-cuda(GpuClient)+ owl-cpu(循环等价) | **owl-store**(`apply` 里调) |
+| `DeviceClient::swap(...)`(一条命令的入口) | **owl-iface** | owl-cuda(GpuClient)+ owl-cpu(循环等价) | **owl-engine**(按 store 的 plan 执行) |
 | 交换的**决策**(谁走谁进) | — | owl-store(`plan`/`Verdict`) | owl-engine(钩子) |
 
 **为什么要这样切**:server 是**唯一持裸指针**的一层(裁决⑫)—— 只有它能把设备字节搬到
@@ -1320,8 +1327,8 @@ store 的 `apply` 里逐刀切到 `swap`;CPU 面给 `swap` 的**循环等价实�
    逐片 `dtoh_at`/`upload_pinned` 循环,语义等价 ⇒ 老 face 不改也能跑);
 2. `owl-cuda`:`Command::Swap { dir, pieces, conn, ack }` + server 侧一处 handler
    (逐片 `memcpy_*` + `conn.put/get`;捕获窗落 reject 臂)+ `GpuClient::swap`;
-3. `owl-store`:`HostTier` 实现 `Connector`(RAM);`apply` 改用 `face.swap` ——
-   **引擎侧零改动**(钩子接口不变);
+3. `owl-engine`:`HostTier` 由 store 提供，engine 按 store 的 `plan_*` 调 `face.swap`；
+   store 不改账以外的事；
 4. 门:store 单测(CpuFace 的循环实现)+ 演示台(`OWL_OFFLOAD_PROBE=1`)。
 
 ---
@@ -1386,7 +1393,8 @@ store 的 `apply` 里逐刀切到 `swap`;CPU 面给 `swap` 的**循环等价实�
 |---|---|
 | iface | `ConnSlot` / `SwapDir` / `SwapPiece{block,dev_off,conn_off,len,slot}` / `Connector{put,get,tier_name,unbox}` + `DeviceClient::swap`(默认实现 = 逐片 `dtoh_at`/`alloc_pinned+upload_pinned` 循环,**语义等价**) |
 | owl-cuda | `Command::Swap` + `handle_swap`(`swap_out`/`swap_in`)+ `GpuClient::swap` + 五处路由(段计时表 / `cmd_stream` / dispatch / closed / **捕获窗 reject**) |
-| owl-store | `SlotTable`(Connector 的 RAM 实现)+ `HostTier::{lend_slots, land, recycle_many}`;`offload_planes`(批量一条命令)/`offload_chain`/`onload_block` 全切 `face.swap` —— **store 内部只此一条搬运面** |
+| owl-store | `SlotTable`(Connector 的 RAM 实现)+ `HostTier::{lend_slots, land, recycle_many}`;`offload_planes`/`offload_chain`/`onload_block` 只出**计划**，不调 `face.swap` |
+| owl-engine | 按 store 的 `plan_*` 调 `face.swap`，执行完把实际结果交回 `commit_*` |
 
 **实现补记(对 §15.2 伪代码的修正,详见坑册 §49)**:
 
@@ -1782,11 +1790,14 @@ engine lib 套件  65s → 4.59s   (含两处 CPU 装载)
 
 ---
 
-## 21. 裁决:store **不做 I/O**(plan/commit/abort),搬运由 engine 编排 · 2026-10-17
+## 21. 裁决:store **不做 I/O**(plan/commit;abort 只是失败账回滚),搬运由 engine 编排 · 2026-10-17
 
 > 收敛 §10.2 与 §14.1 的表述张力:§10.2 写"engine = 决策 + 调用 · store = 实现 · server = 执行",
 > 而 §14.1 的伪代码把 `apply(face, …)` 放在了 store。**本裁决以前者为准** ——
 > **store 是纯逻辑状态机,连 `face` 都不认**。
+>
+> 2026-11-18 补注：`plan_*` 是纯描述；engine 执行 I/O 后，`commit_*` 只按
+> **实际结果**改账。`abort_*` 只是失败后的账回滚函数，**不是事务状态**。
 
 ```rust
 // ── store(纯 host;零 I/O 依赖)────────────────────────────

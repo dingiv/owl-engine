@@ -39,6 +39,7 @@
 // —— 原来平铺时的 `crate::xxx` 与 `owl_engine::xxx` 全部继续有效。
 // 归拢是**物理整理**,不是接口改版。
 mod graph; // 图治理:plan(三态编排)+ fleet(图族账)
+mod io; // I/O 执行面(S1:store 只出计划,真正的 DMA/文件动作在这里)
 mod kernels; // 算子族装配参数下发(设备能力 ≠ 族装配)
 mod mem; // 内存/存储三层:StatePool / Store 钩子 / 磁盘执行面
 mod parallel; // 并行域:TP2 双 rank 装配

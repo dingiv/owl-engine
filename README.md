@@ -115,6 +115,7 @@ a quality-gate ledger), not a config flag.
 |---|---|
 | **Declared VRAM budget (hard contract)** | Budget declared at boot, held for the whole process life. The decomposition is closed — weights / KV pool / graph allowance / activation peak / workspace / comm buffers / runtime floor / margin — and **a missing measured number means refuse-to-start**. Every allocation is ledgered *by name* and periodically reconciled against the driver; overspend is fail-fast with a ledger snapshot. **The process never OOMs itself.** |
 | **Three-tier KV offload** | The KV pool is not a hard ceiling: blocks demote GPU → pinned host RAM → disk and return on demand, tracked by a content-addressed ledger (`crates/store` tiers). Running out of VRAM costs latency, not a failed request. |
+| **Store is a ledger, not an I/O layer** | `owl-store` owns state, identity and eviction/admission policy only. It emits `plan_*` descriptions (“move these blocks / evict this much / drop this set”); the engine performs the actual I/O, then calls `commit_*` with what really happened. No `DeviceClient` or file I/O in store production code; no transaction object. |
 | **KV-cache virtualization (selection layer)** | A turn only materializes its working set on the device (bounded by `workspace_per_req`); everything else stays virtual and is recalled by attention-aware scoring — this is the path to 262k on a single consumer card. |
 | **Quantization as the first lever** | AWQ-INT4 (W4A16 · W4A8) / G128 / NVFP4 / GGUF (Q4_K · IQ4 · IQ3) — every GB saved on weights is a GB handed back to context. |
 | **KV dtype knob** | fp16 (default) / fp8 / int8 — fp8 doubles the pool, at a measured accuracy cost. |
@@ -215,7 +216,7 @@ cargo test -p owl-kernels --lib       # operator face (oracle parity included)
 
 ```
 crates/
-  store      KV/state three-tier virtualization + block ledger (pure state machine)
+  store      KV/state three-tier ledger + policy (pure state machine; plans only, engine executes I/O)
   iface      HAL contract (DeviceClient) + DeviceHandle (alloc ledger + command face)
   kernels    Operator dispatch + device-code assets (AOT cubins; Marlin/FlashInfer/XQA/GDN/GGUF); depends on `iface`, not the other way around
   backends/  cuda (GpuServer actor / GpuClient), cpu (CpuFace reference impl)

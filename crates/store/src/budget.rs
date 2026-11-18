@@ -383,7 +383,9 @@ impl Admission {
 
     /// 保留面合计(**唯一**活跃块字节 —— 共享前缀只计一次)。
     ///
-    /// 未接块身份(`slot_bytes = 0`,旧测试/非块资产)= 退回各 turn floor 之和。
+    /// - 未接块身份(`slot_bytes = 0`,旧测试/非块资产)= 各 turn floor 之和；
+    /// - 已接块身份 = 槽号并集；**尚未分配块表**的 turn（刚 `commit_admission`、
+    ///   第一次段边界 sync 之前）用 `floor_bytes` 计入，不能按空槽集算 0。
     pub fn reserved_bytes(&self) -> usize {
         if self.slot_bytes == 0 {
             return self.active.values().map(|t| t.floor_bytes).sum();
@@ -393,7 +395,16 @@ impl Admission {
             .values()
             .flat_map(|t| t.slots.iter().copied())
             .collect();
-        union.len().saturating_mul(self.slot_bytes)
+        let unassigned: usize = self
+            .active
+            .values()
+            .filter(|t| t.slots.is_empty())
+            .map(|t| t.floor_bytes)
+            .sum();
+        union
+            .len()
+            .saturating_mul(self.slot_bytes)
+            .saturating_add(unassigned)
     }
 
     /// 弹性面合计(可驱逐)。
@@ -507,7 +518,10 @@ pub fn check_admission(
     }
 }
 
-fn verdict_for_full(on_full: crate::policy::QueuePolicy, reason: String) -> AdmissionVerdict {
+pub(crate) fn verdict_for_full(
+    on_full: crate::policy::QueuePolicy,
+    reason: String,
+) -> AdmissionVerdict {
     match on_full {
         crate::policy::QueuePolicy::Reject => AdmissionVerdict::Reject { reason },
         crate::policy::QueuePolicy::Queue { max_wait_ms } => AdmissionVerdict::Queue {
@@ -634,6 +648,17 @@ mod tests {
             check_admission(&b, &a, TurnFloor::Strict, 97, 0, QueuePolicy::Reject),
             AdmissionVerdict::Reject { .. }
         ));
+    }
+
+    /// `commit_admission` 后、第一次 `sync_pool_account` 前：新 turn 还没有
+    /// 槽号并集，但它的 floor 必须立刻计入保留面（否则同拍 plan 重复放人）。
+    #[test]
+    fn unassigned_turn_floor_counts_before_slots() {
+        let mut a = Admission::new();
+        a.admit(1, 0, 0).expect("t1");
+        a.set_active_slots(1, [1u32], 1 << 20).expect("t1 slots");
+        a.admit(2, 2 << 20, 0).expect("t2 floor");
+        assert_eq!(a.reserved_bytes(), 3 << 20, "1MiB 并集 + 2MiB 未分配 floor");
     }
 
     #[test]

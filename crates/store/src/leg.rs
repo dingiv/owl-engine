@@ -12,7 +12,8 @@
 //!
 //! engine 侧只该认一个类型(接口唯一);`KvStore` 收成 store 的内部件 ⇒ 本类型对外
 //! 提供:①控制面(命中/增长/登记/归还;同步、零 I/O)②**布局注册**(id 级,`epoch`)③
-//! 数据面(换出/换回,经 [`crate::moves`] 的自由函数,显式收 `&mut D`)。
+//! 数据面(换出/换回)只出 `OutPlan` / `InPlan` / `ReadPlan`；真正的
+//! `dtoh_at` / `upload_pinned_on` 在 **engine 的 `io::moves`** 执行。
 //!
 //! # 注册制(设计卷 §10.3 推论 A)
 //!
@@ -24,8 +25,10 @@
 //!
 //! - 控制面 / 布局 / 换出换回**已接线**;`host_bytes = 0`(默认)= **关宿主层**,
 //!   此时换出会**响亮拒**(不静默降级)—— 行为与接线前完全一致。
-//! - 片段读走 [`moves::download_span`](=`dtoh_at`;CUDA 面待补,见设计卷 §10.5)。
-//!   批面(`DtohBatch`/`HtodBatch`)是下一步;它**不改本文件的 API**(实现换成批命令即可)。
+//! - 片段读写是 **engine 的 I/O 执行面**（`dtoh_at` / `upload_pinned_on`）；
+//!   本文件只出 `OutPlan` / `InPlan` / `ReadPlan` 与记账，不认 `DeviceClient`。
+//!   批面（`DtohBatch`/`HtodBatch`）是下一步；它**不改本文件的 plan API**
+//!   （engine 换执行实现即可）。
 
 use owl_iface::contract::{Bytes, ConnSlot, Connector, SwapPiece};
 
@@ -33,8 +36,6 @@ use crate::error::{StoreError, StoreResult};
 use crate::host::{HostBlock, HostTier, SlotTable};
 use crate::id::ChainHash;
 use crate::kv::{CacheUpdate, KvDiag, KvStore, PrefixMatch};
-#[cfg(test)]
-use crate::moves::{download_span, upload_span}; // 测试的种图样/读回路径
 use crate::policy::EvictCandidate;
 
 /// **块类**(策略维度;设计卷 §10.6)。
@@ -1595,7 +1596,8 @@ mod tests {
     use crate::id::TOKENS_PER_BLOCK;
     use owl_cpu::CpuFace;
     use owl_iface::contract::Dtype;
-    use owl_iface::contract::{DeviceClient, SwapDir};
+    // 测试编排驱动 CpuFace 需要 trait 方法；生产 store 不依赖 DeviceClient。
+    use owl_iface::contract::{DeviceClient, SwapDir, UpStream};
 
     /// **测试侧编排**(模拟 engine):取计划 → `face.swap` → 回执 → 记账。
     /// 生产里这段编排在 engine(§21);store 侧只出计划与记账 —— 这里替身是为了
@@ -1657,23 +1659,31 @@ mod tests {
         leg_with(2)
     }
 
-    /// 往"槽 slot 的每个片段"写可辨识图样(经带偏移写;与换出读同一路径)。
+    /// 往"槽 slot 的每个片段"写可辨识图样。
+    ///
+    /// 这是**测试编排**（模拟 engine 的 I/O 执行面）；生产 store 不认 `DeviceClient`。
     async fn seed_slot(face: &mut CpuFace, pieces: &[PieceSpec], slot: u32, seed: u8) {
         for p in pieces {
             let pat: Vec<u8> = (0..p.stride_bytes).map(|i| seed.wrapping_add(i as u8)).collect();
-            upload_span(face, &pat, &p.buf, slot as usize * p.stride_bytes)
+            let off = slot as usize * p.stride_bytes;
+            let mut lease = face
+                .alloc_pinned(pat.len(), "store:test-seed")
+                .await
+                .expect("pinned 暂存");
+            lease.slice_bytes_mut()[..pat.len()].copy_from_slice(&pat);
+            face.upload_pinned_on(UpStream::Compute, lease, &p.buf, off, pat.len())
                 .await
                 .expect("seed 写");
         }
         face.sync().await.expect("sync");
     }
 
-    /// 读"槽 slot 的每个片段"(换出读路径)。
+    /// 读"槽 slot 的每个片段"（测试编排；见 [`seed_slot`]）。
     async fn read_slot(face: &mut CpuFace, pieces: &[PieceSpec], slot: u32) -> Vec<u8> {
         let mut out = Vec::new();
         for p in pieces {
             let mut dst = vec![0u8; p.stride_bytes];
-            download_span(face, &p.buf, slot as usize * p.stride_bytes, &mut dst)
+            face.dtoh_at(&p.buf, slot as usize * p.stride_bytes, &mut dst)
                 .await
                 .expect("读");
             out.extend_from_slice(&dst);

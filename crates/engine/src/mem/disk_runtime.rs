@@ -10,6 +10,7 @@
 
 use std::path::PathBuf;
 
+use owl_iface::contract::ModelError;
 use owl_store::{ChainHash, HostBlock, Rel, SnapKey, SpillPlanOf, StoreError, Tier};
 
 use crate::mem::disk_io;
@@ -203,9 +204,11 @@ impl DiskRuntime {
                     break;
                 }
                 Err(StoreError::Exhausted(_)) if attempt < 2 => {
-                    let block = rel
-                        .snap_disk_block_bytes()
-                        .expect("调用方判过 snap_disk_enabled");
+                    let block = rel.snap_disk_block_bytes().ok_or_else(|| {
+                        ModelError::EngineInvariant {
+                            what: "快照溢写: snap_disk_enabled 但块字节缺失".into(),
+                        }
+                    })?;
                     let over = rel
                         .snap_disk_used_bytes()
                         .saturating_sub(rel.snap_disk_budget_bytes());
@@ -217,7 +220,9 @@ impl DiskRuntime {
                         let keep = rel.snap_disk_live_paths();
                         let root = rel
                             .snap_disk_root()
-                            .expect("调用方判过 snap_disk_enabled")
+                            .ok_or_else(|| ModelError::EngineInvariant {
+                                what: "快照溢写: snap_disk_enabled 但根目录缺失".into(),
+                            })?
                             .to_path_buf();
                         let sw = disk_io::sweep_unaccounted(&root, &keep);
                         if sw.removed > 0 {
@@ -451,9 +456,11 @@ impl DiskRuntime {
                 Ok(p) => return Ok(Some(p)),
                 Err(StoreError::Exhausted(_)) if attempt < 2 => {
                     // 腾够**能写进这一块**的量：超配额部分 + 本次一块。
-                    let block = rel
-                        .kv_disk_block_bytes()
-                        .expect("调用方判过 disk_enabled");
+                    let block = rel.kv_disk_block_bytes().ok_or_else(|| {
+                        ModelError::EngineInvariant {
+                            what: "KV 溢写: disk_enabled 但块字节缺失".into(),
+                        }
+                    })?;
                     let over = rel
                         .disk_used_bytes()
                         .saturating_sub(rel.kv_disk_budget_bytes());
@@ -465,7 +472,9 @@ impl DiskRuntime {
                         let keep = rel.disk_live_paths();
                         let root = rel
                             .kv_disk_root()
-                            .expect("调用方判过 disk_enabled")
+                            .ok_or_else(|| ModelError::EngineInvariant {
+                                what: "KV 溢写: disk_enabled 但根目录缺失".into(),
+                            })?
                             .to_path_buf();
                         let sw = disk_io::sweep_unaccounted(&root, &keep);
                         if sw.removed > 0 {

@@ -154,7 +154,7 @@ pub fn distribution(logits: &mut [f32], cfg: &SamplerCfg, history: &[u32]) -> Ve
             min_pos = cand
                 .iter()
                 .enumerate()
-                .min_by(|a, b| a.1 .0.partial_cmp(&b.1 .0).unwrap())
+                .min_by(|a, b| a.1 .0.total_cmp(&b.1 .0))
                 .unwrap()
                 .0;
         }
@@ -165,11 +165,7 @@ pub fn distribution(logits: &mut [f32], cfg: &SamplerCfg, history: &[u32]) -> Ve
     // 拓扑选择只保证"集合"一致,而**槽位顺序**是扫描历史的产物(被替换的
     // 低值填充位会改变顺序)⇒ 求和顺序随实现漂移。规范化后,全表路径与
     // "两半 top-K 并集"路径的集合相同 ⇒ 采样**逐位相同**。
-    cand.sort_by(|a, b| {
-        b.0.partial_cmp(&a.0)
-            .unwrap_or(std::cmp::Ordering::Equal)
-            .then(a.1.cmp(&b.1))
-    });
+    cand.sort_by(|a, b| b.0.total_cmp(&a.0).then(a.1.cmp(&b.1)));
     // ── softmax(temperature;减 max 稳定化)──
     let mx = cand.iter().map(|(v, _)| *v).fold(f32::NEG_INFINITY, f32::max);
     let mut sum = 0f32;

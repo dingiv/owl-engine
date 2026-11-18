@@ -989,12 +989,19 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
         // **B-3e-2**:视图在场时**不写**(本步页表走 `sel_pt` 输入槽;而链上可能有
         // 洞 = 占位符,写进设备块表就是把 u32::MAX 当页号 —— 守卫会响亮拒且白跑)。
         // 设备半(每 rank 各自写)在 `decode_dev` 里;这里只算出表内容。
-        let grow_bt = (grew && !self.sel.has_view()).then(|| {
-            self.bank.parts().sessions.get(sid)
-                .expect("账在")
-                .block_table
-                .clone()
-        });
+        let grow_bt = if grew && !self.sel.has_view() {
+            let s = self
+                .bank
+                .parts()
+                .sessions
+                .get(sid)
+                .ok_or_else(|| ModelError::EngineInvariant {
+                    what: format!("decode: 会话 {sid:#x} 不在账"),
+                })?;
+            Some(s.block_table.clone())
+        } else {
+            None
+        };
         // XQA 裸 decode 臂(2026-10-13 ②):`xqa_seq` = kv_len 的 **u32 位型**
         // (核按 `const uint32_t*` 读;`(pos+1) as f32` 会拿到浮点位型);
         // `xqa_sem` 每轮清零(KV-split 归约计数 —— 参考实现 `sem.zero_()`)。

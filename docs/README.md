@@ -108,7 +108,7 @@ Body documents are written in **Chinese**; this index and all meta documents
 
 ## G. Memory, KV and long context
 
-- ⬜ [`devlog/memory/store.md`](devlog/memory/store.md) — store = GPU pool → host → disk three-tier virtualization
+- ⬜ [`devlog/memory/store.md`](devlog/memory/store.md) — store = GPU pool → host → disk three-tier **ledger/state machine**; `plan_*` describes, engine executes I/O, `commit_*` records actual results. Current contract: `crates/store/arch.md`.
 - ⬜ [`devlog/memory/kvmem-selection.md`](devlog/memory/kvmem-selection.md) — KVMem selection layer (B axis)
 - ⬜ [`devlog/memory/longctx-attribution.md`](devlog/memory/longctx-attribution.md) — Long-context performance attribution, round one
 - ⬜ [`devlog/memory/prefix-deletion.md`](devlog/memory/prefix-deletion.md) — Prefix-transparent deletion

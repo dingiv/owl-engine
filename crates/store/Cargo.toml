@@ -5,7 +5,8 @@ edition.workspace = true
 license.workspace = true
 description = "State store: KV/state virtualization across GPU / host / disk tiers"
 # 依赖纪律见 arch.md 律①:只允许 owl-iface(契约面)+ owl-shared(工具面)。
-# S1(账与策略)零依赖;S1b(搬运)加 owl-iface 的 DeviceClient。
+# S1(账与策略)零依赖;S1b(搬运)只用 owl-iface 的 SwapPiece/SlotTable 等
+# **描述类型**。真正的 DeviceClient 执行已迁至 owl-engine::io（2026-11-18 S1）。
 
 [dependencies]
 owl-iface = { path = "../backends/iface" }

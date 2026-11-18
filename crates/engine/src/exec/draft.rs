@@ -36,7 +36,11 @@ fn mtp_table_for_session(
     cover: usize,
 ) -> Result<Vec<u32>> {
     let parts = bank.parts_mut();
-    let s = parts.sessions.get_mut(sid).expect("账在");
+    let s = parts.sessions.get_mut(sid).ok_or_else(|| {
+        ModelError::EngineInvariant {
+            what: format!("MTP 链页表: 会话 {sid:#x} 不在账"),
+        }
+    })?;
     if let Some(ring) = ring {
         let pages = cover.div_ceil(page.max(1));
         let table = ring.table(pages);
@@ -1847,7 +1851,14 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
     ) -> Result<(Vec<u32>, owl_iface::contract::Bytes, Option<Vec<f32>>)> {
         let bt_chain = {
             let act = self.turns.active()?;
-            let s = self.bank.parts().sessions.get(act.session_id).expect("账在");
+            let s = self
+                .bank
+                .parts()
+                .sessions
+                .get(act.session_id)
+                .ok_or_else(|| ModelError::EngineInvariant {
+                    what: format!("verify_forward: 会话 {:#x} 不在账", act.session_id),
+                })?;
             s.block_table.clone()
         };
         // P1.1 词表切:切档 ⇒ 两 rank 都读半表行(rank0 host 拼接);

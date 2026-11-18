@@ -434,6 +434,69 @@ impl MemoryPlan {
     }
 }
 
+/// **自动池容量（并发感知；唯一产地）**。
+///
+/// 语义（`sessions = max_batch`）：
+/// - `sessions == 1`：池 = 单会话 ctx（逐字节旧行为；不扣瞬态）；
+/// - `sessions > 1`：池 = `min(cap − transient, seq × sessions)`；瞬态余量给
+///   prefill activation / 图 warmup / 内核惰性保留；
+/// - `seq > cap`：仅超卖档允许，池 = `cap − transient`（其余链块下沉）。
+///
+/// 返回 `(pool_tokens, overcommit_path)`。`Err` = 非超卖档连单请求都装不下
+/// （boot 应当响亮拒，不许静默缩 ctx）。
+pub fn auto_pool_tokens(
+    seq_tokens: usize,
+    sessions: usize,
+    cap_tokens: usize,
+    per_tok_bytes: usize,
+    transient_mb: u64,
+    overcommit: bool,
+) -> std::result::Result<(usize, bool), String> {
+    let sessions = sessions.max(1);
+    let per_tok = per_tok_bytes.max(1);
+    let transient_tok = (((transient_mb as usize) << 20) / per_tok).max(1);
+    if seq_tokens > cap_tokens {
+        if !overcommit {
+            return Err(format!(
+                "[store] 自动池装不下本档:max_seq={}(+页对齐) > 预算可服务上限 ctx_max={}。\
+                 本档 per_tok={}B。修法:降 [runtime].max_seq、降 per_tok\
+                 (池 fp8 / 减草稿池)、或开 [kvmem] 超卖(select_decode+select_partial+pool_overcommit)。",
+                seq_tokens, cap_tokens, per_tok_bytes
+            ));
+        }
+        return Ok((cap_tokens.saturating_sub(transient_tok).max(1), true));
+    }
+    if sessions == 1 {
+        // **单会话同样要留瞬态**（2026-11-16）：以前直接返回 seq，池把
+        // cap 里属于 prefill 工作区的那一段也吃了 ⇒ 运行期 free 卡在
+        // reserve 上、工作区被拒发。现在与多会话同式：usable = cap − transient。
+        let usable = cap_tokens.saturating_sub(transient_tok);
+        if seq_tokens > usable {
+            if !overcommit {
+                return Err(format!(
+                    "[store] 自动池装不下单请求:max_seq={} > cap−瞬态={} (cap={} / 瞬态 {} MiB = {} tok)。\
+                     修法:降 max_seq、降 prefill_chunk、或开 [kvmem] 超卖。",
+                    seq_tokens, usable, cap_tokens, transient_mb, transient_tok
+                ));
+            }
+            return Ok((usable.max(1), true));
+        }
+        return Ok((seq_tokens, false));
+    }
+    let usable = cap_tokens.saturating_sub(transient_tok);
+    let target = seq_tokens.saturating_mul(sessions);
+    let pool = target.min(usable).max(1);
+    if pool < seq_tokens && !overcommit {
+        return Err(format!(
+            "[store] 并发自动池装不下单请求:max_seq={} > cap−瞬态={} \
+             (cap={} / 瞬态 {} MiB = {} tok)。修法:降 max_seq、\
+             降 `prefill_chunk`、或开 [kvmem] 超卖。",
+            seq_tokens, usable, cap_tokens, transient_mb, transient_tok
+        ));
+    }
+    Ok((pool, false))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

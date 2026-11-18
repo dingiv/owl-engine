@@ -8,7 +8,8 @@
 //! - **零 I/O、零设备、零引擎类型**（只 `use std`）—— 单测不需要卡；
 //! - **事实全部由外部注入**：每次调用把 `StoreFacts`（store 的池/层账）与
 //!   `&[TurnFacts]`（引擎的活跃/队首事实）传进来；本模块**不查**任何全局/单例；
-//! - **状态机只记自己的账**（预留页、退避时刻、时间片游标），不碰会话/KV/GDN。
+//! - **状态机只记自己的账**（会话守卫、退避时刻、时间片游标），不碰会话/KV/GDN。
+//!   内存是否够由 store 的 `plan_admission` 判；本模块不再算第二套容量。
 //!
 //! # 两个状态机
 //!
@@ -26,13 +27,12 @@
 //! # 不变式
 //!
 //! ## 准入（Admission）
-//! - **A1 单一放行口**：引擎只在本模块返回 `Admit` 时才借 GDN 行 / 长块链；
+//! - **A1 单一放行口**：引擎先问本模块 `decide_slots`（槽位/同会话/退避），
+//!   再问 store `plan_admission`（完整预算/腾位）；两边都 `Admit` 才启动。
 //!   其它路径不得自行判定"容量够"。
-//! - **A2 预留口径**（页账由 store `ReservationLedger` 持有；本模块只读）：
-//!   - 不超卖（`oversub = false`）：`pages = ceil((prompt + max_new) / page)`
-//!     —— prefill 要读前缀链、decode 每步读整条链，**整条链必须驻留**；
-//!   - 超卖（`oversub = true`）：`pages = workspace_pages + chunk_pages`
-//!     —— 只有工作集进准入面；分配面仍由 Grant 覆盖整条块表。
+//! - **A2 内存口径归 store**：租约/地板/腾位计划由 `plan_admission` /
+//!   `ReservationLedger` 持有；本模块只读 `StoreFacts.in_flight_turns`，
+//!   不再算第二套 `need_pages`。
 //! - **A3 在跑者不受新人影响**：预留账满 ⇒ 新人 `Hold`/`Reject`，**绝不**驱逐/收缩
 //!   已在跑的 turn（"实质性进展"底线）。
 //! - **A4 拒绝可行动**：必带 `Reason`（内存/槽位/会话/排队超时）+ `retry_after_ms`。
@@ -47,14 +47,15 @@
 //!   相位混合 ⇒ 单动作（批门要求同相位，不许硬拼）；
 //! - **P4 公平**：prefill 挑**欠账最多**（`fed` 最小）；gen 挑 round-robin。
 //!
-//! # 与引擎的接线（后续，不在本文件）
+//! # 与引擎的接线（2026-11-18 现行）
 //!
 //! ```text
-//! submit/schedule:
-//!   let verdict = admission.decide(&store_facts, &running, &head, now_ms);
-//!   match verdict { Admit => 借 GDN 行 + ensure_for_len + 入 active,
-//!                   Hold  => 留队首不动（下一拍再判）,
-//!                   Reject{reason, retry_after_ms} => 出队 + 事件（服务面翻 429） }
+//! schedule:
+//!   decide_slots(store_facts, head, now)        // 先判槽位/会话/退避
+//!   store.plan_admission(floor, ctx, ...)       // 再纯 dry-run，判完整预算/腾位
+//!     ├ Admit    -> store.commit_admission(实际值) -> start
+//!     ├ EvictThen-> engine 执行 plan_need/swap -> 重新 plan
+//!     └ Queue/Reject -> 留队/出队 + 事件
 //! 每拍执行:
 //!   match phase.next(&actives, batch_ok) { Some(Plan{..}) => 发对应 StepAction, None => Idle }
 //! ```
@@ -367,9 +368,8 @@ impl Admission {
     /// **本轮生成预算**（token；2026-11-16 用户裁决）。
     ///
     /// 不再"按剩余空间反推封顶"：预算在 submit 时定死 = `min(max_new_cap,
-    /// max_seq − prompt)`，由 [`TurnFacts::max_new`] 带进准入。
-    /// 池装不下整份预算 ⇒ 拒/排队（见 [`Self::decide`]）；**不切在跑者的份额**。
-    /// **容量快照**（纯函数；门/诊断/单测直接用）。
+    /// max_seq − prompt)`，由 [`TurnFacts::max_new`] 带进 store `plan_admission`。
+    /// **本函数只作诊断/历史对照**；生产放行由 store plan 决定，不切在跑者份额。
     ///
     /// `running` = 活跃 turn（它们已占预留）；`incoming` = 待判 turn。
     pub fn capacity(
@@ -409,12 +409,41 @@ impl Admission {
         ))
     }
 
-    /// **放行判定**（唯一放行口）。`now_ms` = 单调时钟毫秒（由引擎注入）。
-    /// **准入第二段：槽位/同会话/退避判决**。
-    ///
-    /// 与 `RunningEngine::admission_gate`（第一段：`rel.check` 地板/腾位）的
-    /// 分工见那里（F-20）：本函数只在第一段 Admit 之后运行；第一段
-    /// Reject/Queue 的 turn 到不了这里。两套状态机合并是挂账。
+    /// **生产放行判定**：只做槽位/同会话/退避；内存是否够由 store 的
+    /// `plan_admission` 决定（scheduler 先调本函数，再 plan/commit）。
+    pub fn decide_slots(
+        &mut self,
+        l: &Limits,
+        s: &StoreFacts,
+        head: &TurnFacts,
+        now_ms: u64,
+    ) -> Verdict {
+        // ① 同会话守卫（引擎不变量：同会话两 turn 会共享 KV/GDN = 互踩）
+        if let Some(t) = self.sess_turn.get(&head.session) {
+            if *t != head.turn {
+                return Verdict::Reject {
+                    reason: Reason::SessionBusy,
+                    retry_after_ms: 1000,
+                };
+            }
+        }
+        // ② 槽位（并发上限 = min(max_batch, gdn_slots)）
+        let n_slots = l.max_batch.min(l.gdn_slots).max(1);
+        if s.in_flight_turns >= n_slots {
+            return Verdict::Hold;
+        }
+        // ③ 退避（同会话刚被拒过 ⇒ 本拍不重判）
+        if let Some(ts) = self.backoff.get(&head.session) {
+            if now_ms.saturating_sub(*ts) < 200 {
+                return Verdict::Hold;
+            }
+        }
+        Verdict::Admit
+    }
+
+    /// **测试/诊断专用**：旧的“槽位 + 容量”判决，保留为历史对照。
+    /// 生产路径走 [`Self::decide_slots`] + store `plan_admission`。
+    #[cfg(test)]
     pub fn decide(
         &mut self,
         l: &Limits,
@@ -866,6 +895,47 @@ mod tests {
         // 在跑者终了 ⇒ 名额与预留一起回来（剩第二人的 64 页）
         a.note_finished(1);
         assert_eq!(a.in_flight(), 1);
+    }
+
+    /// **生产放行口**：`decide_slots` 只做会话/槽位/退避；内存由 store plan 管。
+    #[test]
+    fn decide_slots_checks_session_slots_and_backoff() {
+        let l = limits_non_oversub(); // max_batch = gdn_slots = 2
+        let mut a = Admission::new();
+        let t1 = turn(1, 10, 1024, 64);
+        assert_eq!(a.decide_slots(&l, &store(100, 0), &t1, 0), Verdict::Admit);
+        a.note_started(&t1);
+
+        // 同会话第二个 turn：会话守卫先于槽位
+        let dup = turn(2, 10, 1024, 64);
+        assert!(matches!(
+            a.decide_slots(&l, &store(100, 0), &dup, 0),
+            Verdict::Reject {
+                reason: Reason::SessionBusy,
+                ..
+            }
+        ));
+
+        // 槽满：Hold，不是拒绝
+        let busy = StoreFacts {
+            in_flight_turns: 2,
+            ..store(100, 0)
+        };
+        assert_eq!(
+            a.decide_slots(&l, &busy, &turn(3, 11, 1024, 64), 0),
+            Verdict::Hold
+        );
+
+        // 退避窗口：200ms 内 Hold，过期后 Admit
+        a.note_rejected(11, 1_000, Reason::NoSlot);
+        assert_eq!(
+            a.decide_slots(&l, &store(100, 0), &turn(4, 11, 1024, 64), 1_199),
+            Verdict::Hold
+        );
+        assert_eq!(
+            a.decide_slots(&l, &store(100, 0), &turn(4, 11, 1024, 64), 1_200),
+            Verdict::Admit
+        );
     }
 
     /// **用户裁决门（2026-11-16；2026-11-17 A 修订口径）**：预算 =
