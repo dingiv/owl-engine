@@ -17,7 +17,7 @@ crates/<crate>/src/<模块路径>.rs  +  用例名 <fn>
 ```toml
 # 只改几何:其余全继承(生产档或环境档)
 [runtime]
-max_seq = 2048
+max_context_length = 2048
 
 # 也可自带基准(显式路径)
 # extends = "profiles/qwen38_27b-3090-w4a16-dflash.toml"

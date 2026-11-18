@@ -1,7 +1,7 @@
 # KV 格式对照:INT8 vs FP8(+shadow)—— 32k/64k/100k(两轮)
 
 > 2026-11-04 · 单 3090 Ti(`0000:41:00.0`)· Qwen3.8-27B AWQ **W4A8** ·
-> `prefill_chunk=2048` · `prefix_cache=false` · spec off · max_seq 131072。
+> `prefill_chunk=2048` · `prefix_cache=false` · spec off · max_context_length 131072。
 > 目的:给「30 系默认 INT8 主池」一个同卡同模型的对照读数,并量化
 > `kernel.prefill_shadow`(FP8→F16 prefill staging)在长上下文的价值。
 >

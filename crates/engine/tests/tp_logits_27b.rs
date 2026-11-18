@@ -45,7 +45,7 @@ fn knobs() -> EngineKnobs {
 }
 
 fn cfg_of(ordinal: usize, chunk: usize) -> EngineConfig {
-    EngineConfig { device_ordinal: ordinal, max_seq_tokens: 1024, prefill_chunk: chunk, knobs: knobs() }
+    EngineConfig { device_ordinal: ordinal, max_context_length_tokens: 1024, prefill_chunk: chunk, knobs: knobs() }
 }
 
 /// 跑一个 turn(只取首步 logits;`max_new = 1`)

@@ -8,7 +8,7 @@
 
 ## 一、现场
 
-单 3090 Ti / 27B AWQ-INT4 + DFlash2 d7 + FI + CUDA graph,`max_seq=49152`:
+单 3090 Ti / 27B AWQ-INT4 + DFlash2 d7 + FI + CUDA graph,`max_context_length=49152`:
 
 ```text
 [DEBUG] [spec-round] pos=60 接受完成 m=7 bonus=17 emitted=8
@@ -81,7 +81,7 @@ fn live_depth_for_budget(depth: usize, remaining: usize) -> usize {
 ```bash
 cd packages/owl && cargo build --release -p server
 ./target/release/server -p profiles/qwen38_27b-3090.toml \
-  --set runtime.max_seq=49152 --set parallel.device='["GPU-…"]' \
+  --set runtime.max_context_length=49152 --set parallel.device='["GPU-…"]' \
   --log-level debug &
 curl -s http://127.0.0.1:8134/v1/chat/completions -H 'Content-Type: application/json' \
   -d '{"model":"qwen3.8-27b","messages":[{"role":"user","content":"What is 2+2?"}],
@@ -191,7 +191,7 @@ debug 档停在(删去无关行):
 ### 真机验证
 
 固定二进制 = 本修复后的 `server`，`qwen38_27b-3090.toml`（spec d7，
-`max_seq=49152`）与 `qwen38_27b-3080_tp2.toml` 各起一次：
+`max_context_length=49152`）与 `qwen38_27b-3080_tp2.toml` 各起一次：
 
 | 用例 | 修复前 | 修复后 |
 |---|---|---|

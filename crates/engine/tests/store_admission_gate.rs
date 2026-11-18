@@ -49,7 +49,7 @@ fn num_prompt(base: u32, n: u32) -> String {
         .join(" ")
 }
 
-/// 池 = 8 槽(下限 = 单会话容量 max_seq/32);prompt 全部 ≤ 32 tok(单 chunk)
+/// 池 = 8 槽(下限 = 单会话容量 max_context_length/32);prompt 全部 ≤ 32 tok(单 chunk)
 const MAX_SEQ: usize = 256;
 const POOL_TOKENS: usize = 256;
 /// 数字 prompt 的实测锚(n=4 ⇒ 27 tok;模板开销 ≈ 12 ⇒ 每词 ≈ 4 tok)
@@ -67,12 +67,12 @@ async fn boot_rows(
 ) -> owl_engine::RunningEngine<owl_engine::DeviceHandle<CpuFace>> {
     let cfg = EngineConfig {
         device_ordinal: 0,
-        max_seq_tokens: MAX_SEQ,
+        max_context_length_tokens: MAX_SEQ,
         prefill_chunk: 32,
         knobs: EngineKnobs {
             sampler_enabled: false,
             pool_tokens: Some(POOL_TOKENS),
-            host_cache_mb: 16, // 整条链(8 块 ≈ 6.3MB)要放得下宿主层
+            ram_pool_size: 16, // 整条链(8 块 ≈ 6.3MB)要放得下宿主层
             // 会话不再占行(S2b)⇒ 这一项现在只是"行池大小"(并发 turn 天花板)
             gdn_slots: rows,
             admission_on_full: on_full,
@@ -127,12 +127,12 @@ async fn boot_virt(
 ) -> owl_engine::RunningEngine<owl_engine::DeviceHandle<CpuFace>> {
     let cfg = EngineConfig {
         device_ordinal: 0,
-        max_seq_tokens: MAX_SEQ,
+        max_context_length_tokens: MAX_SEQ,
         prefill_chunk: 32,
         knobs: EngineKnobs {
             sampler_enabled: false,
             pool_tokens: Some(POOL_TOKENS),
-            host_cache_mb: 16,
+            ram_pool_size: 16,
             gdn_slots: 1,
             dense_floor: owl_store::TurnFloor::Pages(0),
             kvmem_virtualization: true,
@@ -374,7 +374,7 @@ async fn non_strict_dense_floor_is_refused_loudly() {
     // ① boot 面的 knobs
     let cfg = EngineConfig {
         device_ordinal: 0,
-        max_seq_tokens: 256,
+        max_context_length_tokens: 256,
         prefill_chunk: 32,
         knobs: EngineKnobs {
             sampler_enabled: false,
@@ -476,7 +476,7 @@ async fn non_strict_dense_floor_is_allowed_when_virtualization_is_on() {
     }
     let cfg = EngineConfig {
         device_ordinal: 0,
-        max_seq_tokens: 256,
+        max_context_length_tokens: 256,
         prefill_chunk: 32,
         knobs: EngineKnobs {
             sampler_enabled: false,
@@ -541,7 +541,7 @@ async fn non_strict_dense_floor_is_allowed_when_virtualization_is_on() {
 /// **A7-bis 门②**:per-turn 地板的**上限 = 本档工作集**（视图只能保这么多常驻）
 /// ⇒ 超了必须**响亮拒**(不静默夹）。
 ///
-/// ⚠️ 为什么单开一档:上一条测试的档 `max_seq(256 tok = 8 页) ≤ 工作集(320 tok = 10 页)`
+/// ⚠️ 为什么单开一档:上一条测试的档 `max_context_length(256 tok = 8 页) ≤ 工作集(320 tok = 10 页)`
 /// ⇒ `floor_pages = min(请求页, ctx 页) ≤ 8 < 10` —— **上限结构性触发不到**。
 /// 本档把工作集压到 **96 tok = 3 页**(> 保底 2 页),ctx 上限 8 页 ⇒ 可触发。
 #[tokio::test(flavor = "current_thread")]

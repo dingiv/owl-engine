@@ -253,7 +253,7 @@ profiles/qwen38_27b-3090-w4a16-dflash-kvmem.toml
 
 ```toml
 [runtime]
-max_seq = 262144
+max_context_length = 262144
 
 [spec]
 depth = 7
@@ -262,7 +262,7 @@ draft_path = "../models/syvai/Qwen3.8-27B-DFlash2-W4A16"
 [pool]
 prefix_cache = true
 kv_fp8 = true
-host_cache_mb = 10240
+ram_pool_size = 10240
 snap_max = 1
 vram_activation_reserve = 512
 

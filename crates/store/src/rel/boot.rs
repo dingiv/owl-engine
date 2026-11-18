@@ -18,7 +18,7 @@ impl Rel {
     }
 
     /// **TP 档装配**(`world = 2`):KV 腿与状态腿的宿主槽都按 `world` 个平面开
-    /// (`host_cache_mb` 语义不变 = **两 rank 合计**;单链字节 = `world ×` 单页)。
+    /// (`ram_pool_size` 语义不变 = **两 rank 合计**;单链字节 = `world ×` 单页)。
     ///
     /// 搬运面契约:engine 对每个 rank 各发一条 `swap`(片偏移用
     /// [`crate::pieces_on_plane`]),槽台在两条命令之间**原箱传递** ⇒ 一次

@@ -237,7 +237,7 @@
 | **F-7** | `block_valid_mask` 只在 `if (split_kv)` 块内分配(`scheduler.cuh:891`);核侧守卫 = `if (block_valid_mask && !block_valid_mask[bx]) return;`(`prefill.cuh:3019`) | split 关 ⇒ **上游不生成 mask**;P-5 须由适配器在 `int_ws` 自建(语义上游已有,只是不给分配) |
 | **F-8** | 尾部 CTA 若真跑:`request_idx/qo_tile_idx` 读 staging **残留**;batch=1 下 `request_idx` 恒 0 ⇒ 不越界;越界的写入被 `if (o_idx < qo_upper_bound)` 守卫(`prefill.cuh:2175/2227`)⇒ **不写错行,但白跑一遍 KV 循环** | 残留"无害"是**巧合不是不变量**(残留内容取决于上一次 plan 写了什么)⇒ 显式 mask(P-5),顺带省下白跑的 tile |
 | **F-9** | `params.total_num_rows` 只在 split 合并路径被读(`prefill.cuh:4558/4750`) | **P-4 删除**(生产档 split 关;`params.total_num_rows = nullptr` 维持合法) |
-| **F-10** | graph 档 `cta_tile_q` 由最坏情形 `max_seq_len = total_rows - batch + 1` 定(`scheduler.cuh:602-608`);**batch=1 时与 eager 同式**(本仓 FI 调用恒 `batch=1`) | 开 `enable_cuda_graph` **不改瓦型** ⇒ 无性能副作用;可统一用 graph 档 plan 服务 eager 与图(eager 只需同时带 mask) |
+| **F-10** | graph 档 `cta_tile_q` 由最坏情形 `max_context_length_len = total_rows - batch + 1` 定(`scheduler.cuh:602-608`);**batch=1 时与 eager 同式**(本仓 FI 调用恒 `batch=1`) | 开 `enable_cuda_graph` **不改瓦型** ⇒ 无性能副作用;可统一用 graph 档 plan 服务 eager 与图(eager 只需同时带 mask) |
 
 **推论 A:padding 是主路(不是可选)**
 

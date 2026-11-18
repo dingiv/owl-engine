@@ -143,7 +143,7 @@ async fn cpu_construct_and_load(cfg: &OwlConfig) {
     let mut engine = Engine::on(
         EngineConfig {
             device_ordinal: 0, // CPU face 不看卡位(卡位改由 [parallel] device 表达)
-            max_seq_tokens: cfg.runtime.max_seq,
+            max_context_length_tokens: cfg.runtime.max_context_length,
             prefill_chunk: cfg.runtime.prefill_chunk,
             knobs: EngineKnobs::from_config(cfg).expect("knobs 组装"),
         },
@@ -172,12 +172,12 @@ async fn mock_snap_engine(
         ..Default::default()
     };
     knobs.pool_tokens = Some(256);
-    knobs.host_cache_mb = 8;
+    knobs.ram_pool_size = 8;
     knobs.snap_host_mb = 64;
     knobs.snap_max = snap_max;
     let cfg = EngineConfig {
         device_ordinal: 0,
-        max_seq_tokens: 256,
+        max_context_length_tokens: 256,
         // 单块 64 tok：让 40 tok 的 prompt 走**单 chunk**（CPU mock 不支持多 chunk），
         // 且跨过 32-tok 页边界 ⇒ 末边界快照存在 ⇒ 第二轮真的能命中前缀链。
         prefill_chunk: 64,
@@ -216,12 +216,12 @@ async fn multi_active_decode_uses_selected_turn_gdn_row() {
         ..Default::default()
     };
     knobs.pool_tokens = Some(256);
-    knobs.host_cache_mb = 8;
+    knobs.ram_pool_size = 8;
     knobs.snap_host_mb = 64;
     knobs.snap_max = 1;
     let cfg = EngineConfig {
         device_ordinal: 0,
-        max_seq_tokens: 256,
+        max_context_length_tokens: 256,
         prefill_chunk: 32,
         knobs,
     };
@@ -327,7 +327,7 @@ async fn keyless_repeat_hits_cached_prefix() {
     let mut running = mock_engine_with(knobs).await;
     let page = running.dev.pool.geom.page.max(1);
 
-    // 跨一页的历史（mock 档 max_seq=256，别撑爆）
+    // 跨一页的历史（mock 档 max_context_length=256，别撑爆）
     let mut p1 = String::new();
     while running.boot.tok.encode(&p1).len() <= page {
         p1.push_str("word ");
@@ -431,7 +431,7 @@ async fn pressure_evicts_cold_sessions_whole() {
         ..Default::default()
     };
     knobs.pool_tokens = Some(256);
-    knobs.host_cache_mb = 8;
+    knobs.ram_pool_size = 8;
     knobs.snap_host_mb = 64;
     knobs.snap_max = 1;
     let mut running = mock_engine_with(knobs).await;
@@ -471,8 +471,8 @@ async fn pressure_evicts_cold_sessions_whole() {
 
 /// **准入预留 = 上下文 + 本请求的 max_tokens**（2026-11-17 裁决 A）。
 ///
-/// - 预留 = 请求值（先被 `max_new_cap` 与 `max_seq − prompt` 夹过）；
-/// - 近窗 prompt（`prompt + cap > max_seq`）仍能按请求值预留（旧 cap 口径会拒）；
+/// - 预留 = 请求值（先被 `max_new_cap` 与 `max_context_length − prompt` 夹过）；
+/// - 近窗 prompt（`prompt + cap > max_context_length`）仍能按请求值预留（旧 cap 口径会拒）；
 /// - 在跑者不被新人挤占（另见 `budget_is_ctx_plus_max_output_and_not_squeezable`）。
 #[cfg(test)]
 #[tokio::test]
@@ -486,7 +486,7 @@ async fn submit_reserves_request_max_new() {
         ..Default::default()
     };
     knobs.pool_tokens = Some(256);
-    knobs.host_cache_mb = 8;
+    knobs.ram_pool_size = 8;
     knobs.snap_host_mb = 64;
     knobs.snap_max = 1;
     let mut running = mock_engine_with(knobs).await;
@@ -572,7 +572,7 @@ async fn queued_cancel_keeps_persistent_session() {
 fn boot_kvmem_check_rejects_partial_without_decode() {
     let cfg = EngineConfig {
         device_ordinal: 0,
-        max_seq_tokens: 256,
+        max_context_length_tokens: 256,
         prefill_chunk: 32,
         knobs: EngineKnobs {
             select_partial: true,
@@ -626,12 +626,12 @@ async fn failed_start_returns_gdn_row() {
         ..Default::default()
     };
     knobs.pool_tokens = Some(256);
-    knobs.host_cache_mb = 8;
+    knobs.ram_pool_size = 8;
     knobs.snap_host_mb = 64;
     knobs.snap_max = 1;
     let cfg = EngineConfig {
         device_ordinal: 0,
-        max_seq_tokens: 256,
+        max_context_length_tokens: 256,
         prefill_chunk: 32,
         knobs,
     };
@@ -725,7 +725,7 @@ async fn failed_start_does_not_kill_active_turn() {
         ..Default::default()
     };
     knobs.pool_tokens = Some(512);
-    knobs.host_cache_mb = 8;
+    knobs.ram_pool_size = 8;
     knobs.snap_host_mb = 64;
     knobs.snap_max = 2;
     let mut running = mock_engine_with(knobs).await;
@@ -782,12 +782,12 @@ async fn position_consolidation_resets_high_water() {
         sampler_enabled: false,
         max_batch: 1,
         gdn_slots: 1,
-        // mock 的 max_seq_tokens = 256 ⇒ pos_cap = 256 + 64 = 320
+        // mock 的 max_context_length_tokens = 256 ⇒ pos_cap = 256 + 64 = 320
         gap_reserve: 64,
         ..Default::default()
     };
     knobs.pool_tokens = Some(256);
-    knobs.host_cache_mb = 8;
+    knobs.ram_pool_size = 8;
     knobs.snap_host_mb = 64;
     knobs.snap_max = 2;
     let mut running = mock_engine_with(knobs).await;
@@ -852,7 +852,7 @@ async fn mock_engine_with(
 ) -> RunningEngine<owl_iface::handle::DeviceHandle<owl_cpu::CpuFace>> {
     let cfg = EngineConfig {
         device_ordinal: 0,
-        max_seq_tokens: 256,
+        max_context_length_tokens: 256,
         prefill_chunk: 32,
         knobs,
     };
@@ -1004,15 +1004,15 @@ async fn disk_spill_and_fill_roundtrip() {
         ..Default::default()
     };
     knobs.pool_tokens = Some(256);
-    knobs.host_cache_mb = 0;
+    knobs.ram_pool_size = 0;
     knobs.snap_host_mb = 24; // 只装得下一张快照(0.8B 一条 ≈19MiB)
     knobs.snap_max = 2;
-    knobs.disk_cache_mb = 8;
+    knobs.disk_pool_size = 8;
     knobs.snap_disk_mb = 24;
     knobs.disk_dir = dir.display().to_string();
     let cfg = EngineConfig {
         device_ordinal: 0,
-        max_seq_tokens: 256,
+        max_context_length_tokens: 256,
         prefill_chunk: 32,
         knobs,
     };
@@ -1144,15 +1144,15 @@ async fn state_slot_spills_host_snapshot_to_disk_before_drop() {
         ..Default::default()
     };
     knobs.pool_tokens = Some(256);
-    knobs.host_cache_mb = 0;
+    knobs.ram_pool_size = 0;
     knobs.snap_host_mb = 24; // 只装一条快照
     knobs.snap_max = 2;
-    knobs.disk_cache_mb = 8;
+    knobs.disk_pool_size = 8;
     knobs.snap_disk_mb = 24; // 盘再装一条
     knobs.disk_dir = dir.display().to_string();
     let cfg = EngineConfig {
         device_ordinal: 0,
-        max_seq_tokens: 256,
+        max_context_length_tokens: 256,
         prefill_chunk: 32,
         knobs,
     };
@@ -1371,9 +1371,9 @@ async fn disk_checkpoint_survives_restart_without_host_pressure() {
                 ..Default::default()
             };
             knobs.pool_tokens = Some(64); // 2 页：prompt 4 块 ⇒ 必须下沉到宿主
-            knobs.host_cache_mb = 8; // 宿主够装整链 ⇒ **永不产生磁盘压力**
+            knobs.ram_pool_size = 8; // 宿主够装整链 ⇒ **永不产生磁盘压力**
             knobs.snap_max = 0;
-            knobs.disk_cache_mb = 8;
+            knobs.disk_pool_size = 8;
             knobs.snap_disk_mb = 0;
             knobs.disk_dir = dir.display().to_string();
             // 本门的主角：主动 checkpoint（对照组 = 0 = 测试关闭；生产自动）
@@ -1383,7 +1383,7 @@ async fn disk_checkpoint_survives_restart_without_host_pressure() {
             };
             EngineConfig {
                 device_ordinal: 0,
-                max_seq_tokens: 256,
+                max_context_length_tokens: 256,
                 prefill_chunk: 32,
                 knobs,
             }
@@ -1482,14 +1482,14 @@ async fn disk_chain_index_enables_cross_restart_reuse() {
             ..Default::default()
         };
         knobs.pool_tokens = Some(96); // 3 页(短池:容易满)
-        knobs.host_cache_mb = 1; // 宿主只装得下 ~2 块(0.8B 块 ≈384KiB)
+        knobs.ram_pool_size = 1; // 宿主只装得下 ~2 块(0.8B 块 ≈384KiB)
         knobs.snap_max = 0;
-        knobs.disk_cache_mb = 8;
+        knobs.disk_pool_size = 8;
         knobs.snap_disk_mb = 0;
         knobs.disk_dir = dir.display().to_string();
         EngineConfig {
             device_ordinal: 0,
-            max_seq_tokens: 256,
+            max_context_length_tokens: 256,
             prefill_chunk: 32,
             knobs,
         }
@@ -1609,15 +1609,15 @@ async fn disk_adopt_on_boot_restores_ledger() {
             ..Default::default()
         };
         knobs.pool_tokens = Some(256);
-        knobs.host_cache_mb = 0;
+        knobs.ram_pool_size = 0;
         knobs.snap_host_mb = 24;
         knobs.snap_max = 2;
-        knobs.disk_cache_mb = 8;
+        knobs.disk_pool_size = 8;
         knobs.snap_disk_mb = 24;
         knobs.disk_dir = dir.display().to_string();
         EngineConfig {
             device_ordinal: 0,
-            max_seq_tokens: 256,
+            max_context_length_tokens: 256,
             prefill_chunk: 32,
             knobs,
         }
@@ -1748,7 +1748,7 @@ async fn cpu_incremental_decode_multibyte(cfg: &OwlConfig) {
     let mut engine = Engine::on(
         EngineConfig {
             device_ordinal: 0, // CPU face 不看卡位(卡位改由 [parallel] device 表达)
-            max_seq_tokens: cfg.runtime.max_seq,
+            max_context_length_tokens: cfg.runtime.max_context_length,
             prefill_chunk: cfg.runtime.prefill_chunk,
             knobs: EngineKnobs::from_config(cfg).expect("knobs 组装"),
         },
@@ -1795,7 +1795,7 @@ async fn case_config_injection(cfg: &OwlConfig) {
 /// GuardHit 增量复用。执行器不跑 —— 推进用手工模拟(fed/out 直写)。
 /// S0 调度决策面单测(GPU 门控 boot,但**调度步零设备执行**):
 /// Idle / Begin(Fresh)+ 首块切块 / 决策幂等 / decode 派生量 / GuardHit 增量复用。
-/// ⚠️ **不进 0.8B 共享装载组**(2026-10-13):本测依赖 `max_seq=64/chunk=4`
+/// ⚠️ **不进 0.8B 共享装载组**(2026-10-13):本测依赖 `max_context_length=64/chunk=4`
 /// 的切块语义,而共享档是 `4096/32` → 实测红。切块敏感的用例一律自带装载。
 pub async fn gpu_schedule_decision_surface() {
     let Some(ordinal) = gpu_ordinal() else {
@@ -1805,7 +1805,7 @@ pub async fn gpu_schedule_decision_surface() {
     let dir = asset_dir();
     let mut engine = Engine::new(EngineConfig {
         device_ordinal: ordinal,
-        max_seq_tokens: 64,
+        max_context_length_tokens: 64,
         prefill_chunk: 4,
         knobs: EngineKnobs::default(),
     })
@@ -2114,12 +2114,12 @@ fn state_leg_probe_config(ordinal: usize) -> EngineConfig {
         ..Default::default()
     };
     knobs.pool_tokens = Some(256);
-    knobs.host_cache_mb = 8;
+    knobs.ram_pool_size = 8;
     knobs.snap_host_mb = 64;
     knobs.snap_max = 1;
     EngineConfig {
         device_ordinal: ordinal,
-        max_seq_tokens: 256,
+        max_context_length_tokens: 256,
         prefill_chunk: 32,
         knobs,
     }
@@ -2286,7 +2286,7 @@ async fn coverage_run_and_report<D: DeviceClient>(
     // 默认 3072 对 chunk ∈ {256,512,1024} 都是合法边界(见下断言)。
     //
     // 为什么不去补 prompt 对齐 chunk(试过,已废):补齐会**撞 ctx 上限**
-    // (4006 → 5120 > max_seq 4096 ⇒ 拒),而且按 token 缺口补词永不落点
+    // (4006 → 5120 > max_context_length 4096 ⇒ 拒),而且按 token 缺口补词永不落点
     // (一个词+句号 ≈ 1.17 token)。
     let at: usize = owl_shared::env_reader::parse::<usize>("OWL_COV_AT").unwrap_or(3072);
     eprintln!(
@@ -2478,7 +2478,7 @@ async fn select_decode_scenario() {
         cfg.knobs.select_partial = mode == "partial";
         if mode == "partial" {
             // 部分驻留要真下沉 ⇒ 宿主层必须开(两条腿成对:见 §8.17(2) 律)
-            cfg.knobs.host_cache_mb = 32;
+            cfg.knobs.ram_pool_size = 32;
             cfg.knobs.snap_host_mb = 32;
         }
         if mode == "plain" {
@@ -2486,7 +2486,7 @@ async fn select_decode_scenario() {
             cfg.knobs.index_probe = false;
         }
         cfg.knobs.pool_tokens = Some(2048);
-        cfg.max_seq_tokens = 2048;
+        cfg.max_context_length_tokens = 2048;
         cfg.prefill_chunk = 512;
         // 本场景是**单会话对照**(三臂各自一个新引擎)⇒ 并发上限取 1:
         // 取 flavor 的 2 会让池下限 2×(38+16)=108 页 > 池 64 页 ⇒ 被 boot 拒
@@ -2880,7 +2880,7 @@ fn probe_engine_config(ordinal: usize, default_flavor: &str) -> EngineConfig {
     );
     EngineConfig {
         device_ordinal: ordinal,
-        max_seq_tokens: cfg.runtime.max_seq,
+        max_context_length_tokens: cfg.runtime.max_context_length,
         prefill_chunk: cfg.runtime.prefill_chunk,
         knobs,
     }
@@ -3033,7 +3033,7 @@ fn stage_in_config(ordinal: usize) -> EngineConfig {
         ..Default::default()
     };
     knobs.pool_tokens = Some(512);
-    knobs.host_cache_mb = 32;
+    knobs.ram_pool_size = 32;
     // 状态腿宿主层也开:命中面的**边界快照**沉下去才不被压力挤掉
     // (`reuse_face` 要求边界有快照 ⇒ 没它复用面会被裁到 0,回灌永不发生)
     knobs.snap_host_mb = 32;
@@ -3041,7 +3041,7 @@ fn stage_in_config(ordinal: usize) -> EngineConfig {
     knobs.gdn_slots = 8;
     EngineConfig {
         device_ordinal: ordinal,
-        max_seq_tokens: 512,
+        max_context_length_tokens: 512,
         prefill_chunk: 64,
         knobs,
     }
@@ -3068,7 +3068,7 @@ async fn select_27b_scenario() {
     let items: usize = owl_shared::env_reader::parse::<usize>("OWL_27B_ITEMS").unwrap_or(2_600);
     let cfg = probe_engine_config(ordinal, "awq27b-kvmem");
     let mut knobs = cfg.knobs;
-    let cfg_ctx = cfg.max_seq_tokens;
+    let cfg_ctx = cfg.max_context_length_tokens;
     // ⚠️ 只是**手写值**;真池容量由引擎治理器算(见 `[vram-gov]` 行)—— 别拿它当分配量
     let cfg_pool = knobs.pool_tokens.unwrap_or(2 * cfg_ctx);
     // **分段臂**:`bare`(KVMem 全关)/`index`/`view`/`partial`(全开)。
@@ -3098,7 +3098,7 @@ async fn select_27b_scenario() {
     // snap_host 1024 MiB 又按回 512 MiB,状态腿随即撞分片上限)。
     let mut engine = Engine::new(EngineConfig {
         device_ordinal: ordinal,
-        max_seq_tokens: cfg_ctx,
+        max_context_length_tokens: cfg_ctx,
         prefill_chunk: cfg.prefill_chunk,
         knobs,
     })
@@ -3287,7 +3287,7 @@ fn index_probe_config(ordinal: usize) -> EngineConfig {
     knobs.snap_host_mb = 64;
     EngineConfig {
         device_ordinal: ordinal,
-        max_seq_tokens: 256,
+        max_context_length_tokens: 256,
         prefill_chunk: 32,
         knobs,
     }
@@ -3300,11 +3300,11 @@ fn offload_probe_config(ordinal: usize) -> EngineConfig {
         ..Default::default()
     };
     knobs.pool_tokens = Some(256); // 单会话容量下限 = 256/32 = 8 页 ⇒ nb = **8 槽**
-    knobs.host_cache_mb = 8; // 宿主面开(8MiB ⇒ 可容 ~21 块)
+    knobs.ram_pool_size = 8; // 宿主面开(8MiB ⇒ 可容 ~21 块)
     knobs.snap_max = 16; // 快照别被 LRU 冲掉(前缀复用要求边界快照在场)
     EngineConfig {
         device_ordinal: ordinal,
-        max_seq_tokens: 256, // 8 页(池下限 = 单会话容量;要造压力就得同时压它)
+        max_context_length_tokens: 256, // 8 页(池下限 = 单会话容量;要造压力就得同时压它)
         prefill_chunk: 32,
         knobs,
     }
@@ -3519,7 +3519,7 @@ pub async fn gpu_08b_budget_probe() {
 
     let mut engine = Engine::new(EngineConfig {
         device_ordinal: ordinal,
-        max_seq_tokens: 4096,
+        max_context_length_tokens: 4096,
         prefill_chunk: 32,
         knobs: EngineKnobs::default(),
     })
@@ -3673,7 +3673,7 @@ runtime_floor_bytes={runtime_floor} draft_pool_bytes={draft_pool} gdn_row_bytes=
         knobs.cuda.vram_activation_reserve = 1 << 20;
         let mut e2 = Engine::new(EngineConfig {
             device_ordinal: ordinal,
-            max_seq_tokens: 4096,
+            max_context_length_tokens: 4096,
             prefill_chunk: 32,
             knobs,
         })
@@ -3729,7 +3729,7 @@ pub async fn gpu_08b_fuse_text_parity() {
         knobs.env.gdn.fused_decode = true;
         let mut engine = Engine::new(EngineConfig {
             device_ordinal: ordinal,
-            max_seq_tokens: 128,
+            max_context_length_tokens: 128,
             prefill_chunk: 16,
             knobs,
         })
@@ -3763,7 +3763,7 @@ pub async fn gpu_two_turns_lifecycle(shared: Option<&mut RunningEngine<crate::Gp
         None => {
             let mut engine = Engine::new(EngineConfig {
                 device_ordinal: ordinal,
-                max_seq_tokens: 64,
+                max_context_length_tokens: 64,
                 prefill_chunk: 16,
                 knobs: EngineKnobs::default(),
             })
@@ -3829,7 +3829,7 @@ pub async fn gpu_session_continuity(shared: Option<&mut RunningEngine<crate::Gpu
         None => {
             let mut engine = Engine::new(EngineConfig {
                 device_ordinal: ordinal,
-                max_seq_tokens: 256,
+                max_context_length_tokens: 256,
                 prefill_chunk: 32,
                 knobs: EngineKnobs::default(),
             })
@@ -3891,7 +3891,7 @@ pub async fn gpu_longctx_4k_prefix_qa(shared: Option<&mut RunningEngine<crate::G
         None => {
             let mut engine = Engine::new(EngineConfig {
                 device_ordinal: ordinal,
-                max_seq_tokens: seq,
+                max_context_length_tokens: seq,
                 prefill_chunk: 32,
                 knobs: EngineKnobs::default(),
             })
@@ -4034,7 +4034,7 @@ pub async fn gpu_longctx_fi_direct_gate() {
         knobs.env.attn.fi = fi; // ← 唯一变量:读核(FI 直读 vs 自研 chunked/split)
         let mut engine = Engine::new(EngineConfig {
             device_ordinal: ordinal,
-            max_seq_tokens: seq,
+            max_context_length_tokens: seq,
             prefill_chunk: 32,
             knobs,
         })
@@ -4126,7 +4126,7 @@ pub async fn gpu_w4a16_marlin_e2e() {
     }
     let mut engine = Engine::new(EngineConfig {
         device_ordinal: ordinal,
-        max_seq_tokens: 256,
+        max_context_length_tokens: 256,
         prefill_chunk: 32,
         knobs: EngineKnobs::default(),
     })
@@ -4183,7 +4183,7 @@ pub async fn gpu_awq27b_marlin_e2e(shared: Option<&mut RunningEngine<crate::GpuF
         None => {
             let mut engine = Engine::new(EngineConfig {
                 device_ordinal: ordinal,
-                max_seq_tokens: 256,
+                max_context_length_tokens: 256,
                 prefill_chunk: 32,
                 knobs: EngineKnobs::default(),
             })
@@ -4267,7 +4267,7 @@ pub async fn gpu_multi_session_isolation(shared: Option<&mut RunningEngine<crate
         None => {
             let mut engine = Engine::new(EngineConfig {
                 device_ordinal: ordinal,
-                max_seq_tokens: 256,
+                max_context_length_tokens: 256,
                 prefill_chunk: 32,
                 knobs: EngineKnobs::default(),
             })
@@ -4374,7 +4374,7 @@ pub async fn gpu_prefix_cache_hit(shared: Option<&mut RunningEngine<crate::GpuFa
         None => {
             let mut engine = Engine::new(EngineConfig {
                 device_ordinal: ordinal,
-                max_seq_tokens: 512,
+                max_context_length_tokens: 512,
                 prefill_chunk: 32,
                 knobs: EngineKnobs::default(),
             })
@@ -4531,7 +4531,7 @@ pub async fn gpu_27b_chat_inference(shared: Option<&mut RunningEngine<crate::Gpu
         None => {
             let mut engine = Engine::new(EngineConfig {
                 device_ordinal: ordinal,
-                max_seq_tokens: 1024,
+                max_context_length_tokens: 1024,
                 prefill_chunk: 128,
                 knobs: EngineKnobs::default(),
             })
@@ -4646,7 +4646,7 @@ pub async fn gpu_batch_decode_matches_serial() {
     let dir = asset_dir();
     let mut engine = Engine::new(EngineConfig {
         device_ordinal: ordinal,
-        max_seq_tokens: 256,
+        max_context_length_tokens: 256,
         prefill_chunk: 32,
         knobs: EngineKnobs {
             max_batch: 2,
@@ -4777,7 +4777,7 @@ pub async fn gpu_batch_decode_bench_27b() {
     let max_new = 64usize;
     let mut engine = Engine::new(EngineConfig {
         device_ordinal: ordinal,
-        max_seq_tokens: 2048,
+        max_context_length_tokens: 2048,
         prefill_chunk: 256,
         knobs: EngineKnobs {
             max_batch: 2,
@@ -4885,13 +4885,13 @@ pub async fn gpu_batch_decode_bench_27b() {
 /// schedule_decision_surface / two_turns_lifecycle / session_continuity /
 /// multi_session_isolation / prefix_cache_hit / longctx_4k_prefix_qa)。
 /// 装载本身即一步测试(构造+装载+装配+捕获态断言+计时)。
-pub async fn boot_08b(max_seq: usize) -> RunningEngine<crate::GpuFace> {
+pub async fn boot_08b(max_context_length: usize) -> RunningEngine<crate::GpuFace> {
     let ordinal = gpu_ordinal().expect("OWL_TEST_DEVICE");
     let dir = asset_dir();
     let t0 = std::time::Instant::now();
     let mut engine = Engine::new(EngineConfig {
         device_ordinal: ordinal,
-        max_seq_tokens: max_seq,
+        max_context_length_tokens: max_context_length,
         prefill_chunk: 32,
         knobs: EngineKnobs::default(),
     })
@@ -4907,7 +4907,7 @@ pub async fn boot_08b(max_seq: usize) -> RunningEngine<crate::GpuFace> {
         running.capture_outcome()
     );
     eprintln!(
-        "[e2e] 0.8B 默认档装载完成 {:?}(max_seq={max_seq})",
+        "[e2e] 0.8B 默认档装载完成 {:?}(max_context_length={max_context_length})",
         t0.elapsed()
     );
     running
@@ -4924,7 +4924,7 @@ pub async fn boot_27b_default() -> RunningEngine<crate::GpuFace> {
     let t0 = std::time::Instant::now();
     let mut engine = Engine::new(EngineConfig {
         device_ordinal: ordinal,
-        max_seq_tokens: 1024,
+        max_context_length_tokens: 1024,
         prefill_chunk: 128,
         knobs: EngineKnobs::default(),
     })
@@ -4970,7 +4970,7 @@ pub async fn gpu_27b_raw_completion_diag() {
     let ordinal = gpu_ordinal().expect("OWL_TEST_DEVICE");
     let mut engine = Engine::new(EngineConfig {
         device_ordinal: ordinal,
-        max_seq_tokens: 512,
+        max_context_length_tokens: 512,
         prefill_chunk: 128,
         knobs: EngineKnobs::default(),
     })
@@ -5020,7 +5020,7 @@ pub async fn gpu_spec_identity_gate() {
             sampler_enabled: false,
             ..Default::default()
         }; // greedy(恒等门口径)
-           // 显式池余量(缺省 = 2×max_seq = 8 页,spec 链一挤就"块池耗尽";
+           // 显式池余量(缺省 = 2×max_context_length = 8 页,spec 链一挤就"块池耗尽";
            // 2026-10-13 套件内实测:前置用例扰动即红、单跑绿。恒等门测的是
            // 文本等价,不是容量边界 —— 边界另有专测)
         knobs.pool_tokens = Some(1024);
@@ -5034,12 +5034,12 @@ pub async fn gpu_spec_identity_gate() {
         // `flashinfer_fi_plan_sync` 刷精确表"全链。(env 名保留历史拼写:`OWL_GATE_PIECEWISE`)
         if owl_shared::env_reader::flag("OWL_GATE_PIECEWISE") {
             knobs.fi_cuda_graph = true;
-            knobs.fi_plan_bake = Some(128); // ≥ max_seq(本门 max_seq_tokens=128)
+            knobs.fi_plan_bake = Some(128); // ≥ max_context_length(本门 max_context_length_tokens=128)
             knobs.env.attn.verify_arm = owl_shared::config::VerifyArm::Fi;
         }
         let mut engine = Engine::new(EngineConfig {
             device_ordinal: ordinal,
-            max_seq_tokens: 128,
+            max_context_length_tokens: 128,
             prefill_chunk: 16,
             knobs,
         })
@@ -5135,7 +5135,7 @@ pub async fn gpu_spec_identity_gate_27b() {
     async fn boot_gate_engine(
         ordinal: usize,
         dir: &str,
-        max_seq_tokens: usize,
+        max_context_length_tokens: usize,
         gate_depth: usize,
     ) -> RunningEngine<crate::GpuFace> {
         let mut knobs = EngineKnobs {
@@ -5163,14 +5163,14 @@ pub async fn gpu_spec_identity_gate_27b() {
         // `flashinfer_fi_plan_sync` 刷精确表"全链。(env 名保留历史拼写:`OWL_GATE_PIECEWISE`)
         if owl_shared::env_reader::flag("OWL_GATE_PIECEWISE") {
             knobs.fi_cuda_graph = true;
-            knobs.fi_plan_bake = Some(max_seq_tokens); // ≥ max_seq(本门 max_seq_tokens)
+            knobs.fi_plan_bake = Some(max_context_length_tokens); // ≥ max_context_length(本门 max_context_length_tokens)
             knobs.env.attn.verify_arm = owl_shared::config::VerifyArm::Fi;
         }
         let mut engine = Engine::new(EngineConfig {
             device_ordinal: ordinal,
-            // `_MIN_GEN_TOKENS = 1024` ⇒ room = max_seq − prompt 必须 ≥ 1024
+            // `_MIN_GEN_TOKENS = 1024` ⇒ room = max_context_length − prompt 必须 ≥ 1024
             // (老门 256 恒拒发 = 环境性红;2026-10-16 抬到 2048 —— 恒等门不比容量)
-            max_seq_tokens,
+            max_context_length_tokens,
             prefill_chunk: 64,
             knobs,
         })
@@ -5242,7 +5242,7 @@ pub async fn gpu_spec_identity_gate_27b() {
 /// E5-DF3 恒等门(27B AWQ target + DFlash2 草稿):greedy spec 文本
 /// ≡ 无 spec 逐位。门控 OWL_TEST_DEVICE + ckpt:27b-awq +
 /// ckpt:dflash2。**20G 卡贴顶**(target ~13.7G + draft 3.85G +
-/// 池)—— OOM 时降 max_seq_tokens/挪 24G 卡。
+/// 池)—— OOM 时降 max_context_length_tokens/挪 24G 卡。
 pub async fn gpu_dflash2_identity_gate_27b() {
     let Some(ordinal) = gpu_ordinal() else {
         owl_shared::testkit::report::skip("OWL_TEST_DEVICE 未设");
@@ -5315,7 +5315,7 @@ pub async fn gpu_dflash2_identity_gate_27b() {
         };
         let mut engine = Engine::new(EngineConfig {
             device_ordinal: ordinal,
-            max_seq_tokens: owl_shared::env_reader::parse_or(
+            max_context_length_tokens: owl_shared::env_reader::parse_or(
                 "OWL_GATE_MAXSEQ",
                 320.max(max_new + 64),
             ),
@@ -5519,7 +5519,7 @@ pub async fn gpu_gdn_slot_cross_probe() {
     knobs.prefix_cache = false;
     let mut engine = Engine::new(EngineConfig {
         device_ordinal: ordinal,
-        max_seq_tokens: 512,
+        max_context_length_tokens: 512,
         prefill_chunk: 32,
         knobs,
     })
@@ -5598,7 +5598,7 @@ pub async fn gpu_decode_marginal_bench() {
         knobs.prefix_cache = false;
         let mut engine = Engine::new(EngineConfig {
             device_ordinal: ordinal,
-            max_seq_tokens: 256,
+            max_context_length_tokens: 256,
             prefill_chunk: 32,
             knobs,
         })
@@ -5739,7 +5739,7 @@ pub async fn gpu_head_int8_gate() {
         knobs.prefix_cache = false;
         let mut engine = Engine::new(EngineConfig {
             device_ordinal: ordinal,
-            max_seq_tokens: 256,
+            max_context_length_tokens: 256,
             prefill_chunk: 32,
             knobs,
         })
@@ -5788,7 +5788,7 @@ pub async fn gpu_head_int8_gate() {
         knobs.prefix_cache = false;
         let mut engine = Engine::new(EngineConfig {
             device_ordinal: ordinal,
-            max_seq_tokens: 256,
+            max_context_length_tokens: 256,
             prefill_chunk: 32,
             knobs,
         })
@@ -6301,12 +6301,12 @@ async fn abort_publishes_written_prompt_prefix() {
         ..Default::default()
     };
     knobs.pool_tokens = Some(2048); // 64 页(页 32)⇒ 前缀面够放
-    knobs.host_cache_mb = 8;
+    knobs.ram_pool_size = 8;
     knobs.snap_host_mb = 64;
     knobs.snap_max = 64;
     let cfg = EngineConfig {
         device_ordinal: 0,
-        max_seq_tokens: 2048,
+        max_context_length_tokens: 2048,
         prefill_chunk: 32,
         knobs,
     };
@@ -6406,14 +6406,14 @@ async fn same_session_queues_instead_of_rejecting() {
         max_batch: 2, // 批位容得下两个 —— 串行只能由会话判据挡住
         gdn_slots: 2,
         pool_tokens: Some(512),
-        host_cache_mb: 8,
+        ram_pool_size: 8,
         snap_host_mb: 64,
         snap_max: 1,
         ..Default::default()
     };
     let cfg = EngineConfig {
         device_ordinal: 0,
-        max_seq_tokens: 512,
+        max_context_length_tokens: 512,
         prefill_chunk: 32,
         knobs,
     };
@@ -6516,7 +6516,7 @@ pub async fn gpu_vlm_image_baseline() {
     }
     let mut engine = Engine::new(EngineConfig {
         device_ordinal: ordinal,
-        max_seq_tokens: 512,
+        max_context_length_tokens: 512,
         prefill_chunk: 32,
         knobs: EngineKnobs {
             vision: true,
@@ -6686,7 +6686,7 @@ pub async fn gpu_vlm_first_turn_probe(first_image: bool) {
     }
     let mut engine = Engine::new(EngineConfig {
         device_ordinal: ordinal,
-        max_seq_tokens: 512,
+        max_context_length_tokens: 512,
         prefill_chunk: 32,
         knobs: EngineKnobs {
             vision: true,
@@ -6796,7 +6796,7 @@ pub async fn gpu_vlm_first_turn_probe_27b(first_image: bool) {
     let t0 = std::time::Instant::now();
     let mut engine = Engine::new(EngineConfig {
         device_ordinal: ordinal,
-        max_seq_tokens: 1024,
+        max_context_length_tokens: 1024,
         prefill_chunk: 128,
         knobs: EngineKnobs {
             vision: true,
@@ -6917,7 +6917,7 @@ pub async fn gpu_image_evict_gate() {
     }
     let mut engine = Engine::new(EngineConfig {
         device_ordinal: ordinal,
-        max_seq_tokens: 768,
+        max_context_length_tokens: 768,
         prefill_chunk: 64,
         knobs: EngineKnobs {
             vision: true,
@@ -7483,7 +7483,7 @@ pub async fn gpu_image_evict_gate() {
 /// 唯一快照是链尾（`snap_pages=[last]`），而尾部页正是被删图的页 ⇒ `layout`
 /// 安全拒绝尾快照，幸存页上没有任何边界快照 ⇒ 退回 fresh。
 ///
-/// 本门把 `prefill_chunk` 升到 `max_seq`（只留链尾快照）钉住这个形状；
+/// 本门把 `prefill_chunk` 升到 `max_context_length`（只留链尾快照）钉住这个形状；
 /// 修法见 `img_evict::evict_snap_points` + 预填充硬切点（可删图段前的锚点）。
 ///
 /// # 判据（硬）
@@ -7504,7 +7504,7 @@ pub async fn gpu_image_evict_anchor_gate() {
     }
     let mut engine = Engine::new(EngineConfig {
         device_ordinal: ordinal,
-        max_seq_tokens: 1024,
+        max_context_length_tokens: 1024,
         // 生产形状：整条短 prompt 一个 chunk ⇒ 只有链尾快照
         prefill_chunk: 1024,
         knobs: EngineKnobs {
@@ -8027,7 +8027,7 @@ pub async fn gpu_image_evict_multi_gate() {
     }
     let mut engine = Engine::new(EngineConfig {
         device_ordinal: ordinal,
-        max_seq_tokens: 1024,
+        max_context_length_tokens: 1024,
         prefill_chunk: 64,
         knobs: EngineKnobs {
             vision: true,
@@ -8596,7 +8596,7 @@ pub async fn gpu_image_evict_spec_identity_gate() {
         }
         let mut engine = Engine::new(EngineConfig {
             device_ordinal: ordinal,
-            max_seq_tokens: 768,
+            max_context_length_tokens: 768,
             prefill_chunk: 64,
             knobs,
         })
@@ -9071,7 +9071,7 @@ pub async fn gpu_mtp_kv_parity() {
     knobs.cuda.capture_slab_mb = Some(160);
     let mut engine = Engine::new(EngineConfig {
         device_ordinal: ordinal,
-        max_seq_tokens: 2048,
+        max_context_length_tokens: 2048,
         prefill_chunk: 64,
         knobs,
     })

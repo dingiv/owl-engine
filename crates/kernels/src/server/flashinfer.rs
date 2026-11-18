@@ -235,7 +235,7 @@ struct Fa2Key {
     n_seq: usize,
     heads: usize,
     head_dim: usize,
-    max_seqlen: usize,
+    max_context_lengthlen: usize,
     cu_id: u64,
 }
 
@@ -1136,7 +1136,7 @@ impl FiRuntime {
                 got: format!("page={page} hkv={hkv} hd={hd}"),
             })?;
         // **固定 cap**:cap_tokens=0 时退回按当前 ctx 增长(探针/未配置);
-        // 生产 boot 期下发 max_seq ⇒ 首层就按最大 ctx 预留,池后期变满也不再扩容。
+        // 生产 boot 期下发 max_context_length ⇒ 首层就按最大 ctx 预留,池后期变满也不再扩容。
         let cap_tokens = prefill_shadow_cap();
         let cap_pages = if cap_tokens == 0 { 0 } else { cap_tokens.div_ceil(page.max(1)) };
         if cap_pages != 0 && pages > cap_pages {
@@ -1376,8 +1376,8 @@ impl FiRuntime {
                 detail: "FA2 cu 未缓存而处于捕获窗(需 download/upload)⇒ 拒捕回 eager".into(),
             });
         }
-        let max_seqlen = match cached {
-            Some(k) => k.max_seqlen,
+        let max_context_lengthlen = match cached {
+            Some(k) => k.max_context_lengthlen,
             None => {
                 let need = (call.n_seq + 1) * 4;
                 if need > cu_scratch.bytes {
@@ -1418,7 +1418,7 @@ impl FiRuntime {
                         got: format!("{cu_host:?}"),
                     });
                 }
-                let max_seqlen = cu_host
+                let max_context_lengthlen = cu_host
                     .windows(2)
                     .map(|w| (w[1] - w[0]) as usize)
                     .max()
@@ -1444,10 +1444,10 @@ impl FiRuntime {
                     n_seq: call.n_seq,
                     heads: call.heads,
                     head_dim: call.head_dim,
-                    max_seqlen,
+                    max_context_lengthlen,
                     cu_id: call.cu.id,
                 });
-                max_seqlen
+                max_context_lengthlen
             }
         };
         let need = call.heads.saturating_mul(call.rows).saturating_mul(4);
@@ -1475,7 +1475,7 @@ impl FiRuntime {
                 cu_scratch.ptr as *mut i32,
                 call.n_seq as i32,
                 call.rows as i32,
-                max_seqlen as i32,
+                max_context_lengthlen as i32,
                 call.heads as i32,
                 call.head_dim as i32,
                 call.scale,

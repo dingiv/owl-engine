@@ -1,7 +1,7 @@
 # ── 单 3090 Ti / Qwen3.8-27B AWQ-INT4 + 视觉 ───────────────────────────────
 #
 # 短上下文 / 低时延档：单卡 24G，W4A8 + INT8 KV + DFlash2 d7。
-# 全特性稳定点 max_seq=57344；prefill_chunk=2048（单卡实测最优点）。
+# 全特性稳定点 max_context_length=57344；prefill_chunk=2048（单卡实测最优点）。
 extends = [
   "full.toml",
   "parts/model/27b-awq.toml",
@@ -26,7 +26,8 @@ prefill_shadow = false
 
 [runtime]
 admission_on_full = "reject"
-max_seq = 57344
+max_context_length = 57344
+max_concurrency = 1
 prefill_chunk = 2048
 
 [sampling]
@@ -42,7 +43,7 @@ rep_penalty = 1.00
 # 显式钉死显存预算：全部给 KV 池
 vram_budget = 1.0
 vram_activation_reserve = 970
-host_cache_mb = 10240
+ram_pool_size = 10240
 snap_host_mb = 3072
 
 [store.gdn]

@@ -51,7 +51,7 @@
 
 | # | 状态 | 落点 | 几何/粒度 | dtype | 容量与上限 | 可共享 |
 |---|---|---|---|---|---|---|
-| ① | **attention KV** | `engine/src/state.rs::StatePool.kvs` | paged classic `kc [nb,Hkv,hd/x,page,x]`、`vc [nb,Hkv,hd,page]`;策略表 `models::module::kv_paged_policy(dtype)` 分发(legacy token-major 为回退) | 随 `spec.dtype` 或 fp8(U32 承载 1B/elem,元素数 ÷4) | `nb=ceil(pool_tokens/page)`;2026-10-22 起 `pool_tokens` 配置项删除 ⇒ `nb = 剩余显存自动 cap`(页对齐;`max_seq` 只是单请求上限) | ✅ 块级 ref-count(≥2 = 前缀共享) |
+| ① | **attention KV** | `engine/src/state.rs::StatePool.kvs` | paged classic `kc [nb,Hkv,hd/x,page,x]`、`vc [nb,Hkv,hd,page]`;策略表 `models::module::kv_paged_policy(dtype)` 分发(legacy token-major 为回退) | 随 `spec.dtype` 或 fp8(U32 承载 1B/elem,元素数 ÷4) | `nb=ceil(pool_tokens/page)`;2026-10-22 起 `pool_tokens` 配置项删除 ⇒ `nb = 剩余显存自动 cap`(页对齐;`max_context_length` 只是单请求上限) | ✅ 块级 ref-count(≥2 = 前缀共享) |
 | ② | **GDN/线性注意力状态** | `StatePool.gdns`(每 GDN 层 4 块:`conv_q/conv_k/conv_v/rec`) | 行宽 = `elems/gdn_slots`;**一格一会话** | **恒 f32** | 格数 = `knobs.gdn_slots`(缺省 8)⇒ **并发上限被格数钉死**(`session.rs` 耗尽报错);27B `rec` ≈ 1MiB/格/层 × 18 层 | ❌ 独占;可**快照** |
 | ③ | **草稿 KV** | `StatePool.mtp_kvs` / `StatePool.dflash_kvs` | MTP:1 层独立页池;DFlash2:5 层 × (8 头 × hd128) | MTP = 主池 dtype;DFlash2 = BF16 或 fp8(`OWL_DFLASH_KV_FP8`) | MTP 按池容量全额预留;**DFlash2 2026-10-22 起按检查点 `sliding_window` 环形**(2048 → 固定 ~40MiB;写槽 = 逻辑位 % 窗口;自块/被拒行走环外 scratch) | ❌(MTP **不接前缀缓存** —— 依赖 hidden,不可 token 哈希) |
 | ④ | **视觉塔** | `models/src/layers/vision.rs` + `models/src/vlm.rs` | 塔权重 `model.visual.*` + **每图一次前向**;输出 `[n_img,D]` 经 `image_scatter` 注入文本序列 | — | 图像 token 的 KV **落进主池**(⇒ 天然可前缀复用);塔自身无驻留 KV | ✅(经文本池) |
@@ -994,7 +994,7 @@ fp8 大 MoE 单专家 40MB+),而路由是**每 token 每层**的 ⇒ 40MB/10GB·
 | `store::kv` | `alloc_slot` / `bound_slot` / **`ensure_offloadable`**(换出前置:存在 + 设备绑定 + 引用 = 1) |
 | `owl-iface` | **`dtoh_at`**(带偏移 D2H;默认 = 响亮"未实现") |
 | `owl-cpu` | `dtoh_at` 实现(store 的搬迁单测跑**真 face**) |
-| `engine` | `SessionBank { leg_target, leg_mtp: BlockLeg }`;`BankPlan` 加 `mtp_block_bytes`/`host_bytes`;boot 注册布局(`StatePool::pool_layout`/`mtp_pool_layout`,id 级,`epoch = 0`);`EngineKnobs.host_cache_mb`(`OWL_HOST_CACHE_MB`,默认 **0 = 关层**);删掉 session 侧的两条自由函数包装 |
+| `engine` | `SessionBank { leg_target, leg_mtp: BlockLeg }`;`BankPlan` 加 `mtp_block_bytes`/`host_bytes`;boot 注册布局(`StatePool::pool_layout`/`mtp_pool_layout`,id 级,`epoch = 0`);`EngineKnobs.ram_pool_size`(`OWL_HOST_CACHE_MB`,默认 **0 = 关层**);删掉 session 侧的两条自由函数包装 |
 
 ### 11.2 门(全绿)
 
@@ -1056,7 +1056,7 @@ P1(E2c 快照迁 `copy_batch`,纯收益)→ 批读直写宿主缓冲(省一次�
 | 层 | 容量 | 现状旋钮 |
 |---|---|---|
 | 设备 | `S_dev = nb` 槽(槽 = 32 token 页) | `pool_tokens` / `vram_budget`(治理夹) |
-| 宿主 | `S_host = host_bytes / slot_bytes` | `host_cache_mb`(**0 = 关层**) |
+| 宿主 | `S_host = host_bytes / slot_bytes` | `ram_pool_size`(**0 = 关层**) |
 | 盘 | `S_disk`(S6;位留着) | — |
 
 ### 12.3 约束层级(A 轴 ⇒ 只有一条硬约束)
@@ -1981,7 +1981,7 @@ elastic_bytes  = 0(留 B 轴:`dense_floor` 之上的灵活面)
 | `gdn_row_bytes` | `StatePool::gdn_row_bytes()` |
 | `draft_pool_bytes` | `StatePool::draft_pool_bytes()` |
 | `kv_bytes_per_token` | `block_bytes / page` |
-| `host_bytes` / `disk_bytes` | `knobs.host_cache_mb << 20` / 0 |
+| `host_bytes` / `disk_bytes` | `knobs.ram_pool_size << 20` / 0 |
 | `AdmissionPolicy` | `max_active_turns = knobs.gdn_slots`(正名待 S2b)、`on_full = knobs.admission_on_full` |
 
 **无设备账档**(CPU mock:全 `vram` 账为 0)⇒ 固定池档放宽规则接管:池墙照判,卡级三项记 0
@@ -1996,7 +1996,7 @@ elastic_bytes  = 0(留 B 轴:`dense_floor` 之上的灵活面)
 | `Queue { reason }` | 留队首(不弹),记等待起点;等待 > `max_wait_ms` ⇒ 按 `Reject`(文案带原因与等待时长) |
 | `Reject { reason }` | 弹掉该 turn + `TurnEvent::Failed { turn, err }`(队列继续;文案含**具体数字**) |
 
-**文案纪律**:准入拒**不带** "超预算" 字样 —— 那是"prompt+max_tokens > max_seq"的专用标记
+**文案纪律**:准入拒**不带** "超预算" 字样 —— 那是"prompt+max_tokens > max_context_length"的专用标记
 (server 据此归一化成 `context_length_exceeded` 触发客户端自动 compact)。池墙拒是
 **另一类**(客户端该做的动作是降并发/重试,不是压缩上下文),故用 `准入拒绝:` 前缀,
 server 侧照原样 400 回吐。
@@ -2068,7 +2068,7 @@ B 轴落地后放开(那时 `Bytes` 才有物质基础:窗口压缩 + 按需物�
 | CPU mock 冒烟 | **3/3**(无卡档照旧可 boot —— 固定池档放宽规则接管) |
 | **新准入门**(`crates/engine/tests/store_admission_gate.rs`,无卡可跑) | **4/4**:①**先腾后进**(池 8 槽被可动缓存占满 ⇒ `EvictThen` ⇒ 段边界**下沉 7 块** ⇒ 准入成功;兜底驱逐 0)②**池墙拒**(8 个键控会话占满 8 槽、可动面 0 ⇒ `Failed` 带数字且**不含 "超预算"**)③**排队姿态**(`Queue{1ms}`:首轮 pump 回 Idle + turn 留队 + 零兜底驱逐;超时后 `Failed`「排队 5ms 仍无法腾位」)④**地板语义**(非 `Strict` 在 knobs(boot)与 `TurnOpts`(submit)两处**响亮拒**) |
 | **GPU 三门口**(§22 场景重跑;3080 ordinal 0) | 轮 3 判 `EvictThen` ⇒ **换出 6 块**/自由槽 2/8/宿主 6 块 · 轮 4 **回灌 2 块 1 命令** · 兜底驱逐 **0** |
-| 0.8B 场景回归(GPU) | `prefix_cache_hit` / `two_turns_lifecycle` / `session_continuity` / `multi_session_isolation` / `schedule_decision_surface`(max_seq=64 小档)/ `gdn_slot_cross_probe` / **`spec_identity_gate`(逐 token 恒等)** 全 OK |
+| 0.8B 场景回归(GPU) | `prefix_cache_hit` / `two_turns_lifecycle` / `session_continuity` / `multi_session_isolation` / `schedule_decision_surface`(max_context_length=64 小档)/ `gdn_slot_cross_probe` / **`spec_identity_gate`(逐 token 恒等)** 全 OK |
 | clippy | 改动面**零告警**(既有告警在 sampler/graph_plan/e4_api 等未触面) |
 
 ### 24.4 操作期发现(两条给后人)
@@ -2195,7 +2195,7 @@ turn 止:register_chain(历史进前缀缓存)→ **释放设备表**(表清空)
 
 ### 26.3 实现期发现(四条)
 
-1. **宿主预算是两条腿的分片,不是一根旋钮**。S3b 里 `host_cache_mb` 全给了 KV 块腿
+1. **宿主预算是两条腿的分片,不是一根旋钮**。S3b 里 `ram_pool_size` 全给了 KV 块腿
    ⇒ `Rel::open` 算出的状态腿分片 = 0 ⇒ 快照下沉**无位**(静默走"丢"分支)。
    ⇒ 新增 `EngineKnobs.snap_host_mb`(`OWL_SNAP_HOST_MB`),**总账 = KV 分片 + 状态腿分片**
    (`Rel::open` 交叉校验分片不超总账)。教训:两个热区完全不同的腿共用一个预算数,
@@ -2499,7 +2499,7 @@ StatePool::snap_pick_slot(key, order)   // engine 只做映射
 ### 30.8 真机验证(27B AWQ INT4 / 3090 Ti 对 / 3080 无关)· 2026-10-19
 
 **档**:`/tmp/owl-sched-27b.toml`(临时)—— `pool_tokens=16896` / `snap_max=4` /
-`host_cache_mb=2048` / `snap_host_mb=1024` / `gdn_slots=8` / `reserve=512MiB` /
+`ram_pool_size=2048` / `snap_host_mb=1024` / `gdn_slots=8` / `reserve=512MiB` /
 `prefill_chunk=512` / `prefill_bucket=off`。22 个随机 prompt 请求(96 tok 输出)+ 1 个 600 词长 prompt。
 
 **通过项(判据归一在真机成立)**:
@@ -2561,9 +2561,9 @@ StatePool::snap_pick_slot(key, order)   // engine 只做映射
 
 ```toml
 [pool]
-host_cache_mb = 2048   # 宿主 KV 分片(MiB;0 = 关层)
+ram_pool_size = 2048   # 宿主 KV 分片(MiB;0 = 关层)
 snap_host_mb  = 1024   # 宿主状态腿分片
-disk_cache_mb = 4096   # 磁盘 KV 分片(S6;0 = 关层)
+disk_pool_size = 4096   # 磁盘 KV 分片(S6;0 = 关层)
 snap_disk_mb  = 2048   # 磁盘状态腿分片
 disk_dir      = "/var/lib/owl/kv"   # 内容目录(空 = 关层;两腿子目录 kv/ 与 snap/)
 ```
@@ -2704,7 +2704,7 @@ KV 树(见下)⇒ **本版的快照回填"账上可见、实际选不中"**(内�
 3. 同拍可以"设备→宿主→磁盘"两跳(`apply_verdict` 按 Host 票在前、Disk 票在后执行),
    所以轮 1.5 **不再排除轮一刚沉的链**(早期版本用 `picked` 排除 ⇒ 磁盘票恒零)。
 
-**配置律(新)**:`host_cache_mb / disk_cache_mb` 必须分别**容纳最长链**
+**配置律(新)**:`ram_pool_size / disk_pool_size` 必须分别**容纳最长链**
 (`ceil(ctx/32) × 块字节`),否则整链下沉/整链搬盘永不发生(0.8B 真机两次踩中:
 宿主 1 MiB / 盘 1 MiB 都装不下 5–6 块链)。配得太小 = 退回逐叶 Drop(内容丢)。
 
@@ -2753,7 +2753,7 @@ engine **59**(+ `disk_chain_index_enables_cross_restart_reuse`:turn 写索引 �
 ```toml
 [store]
 disk_dir            = "/var/lib/owl/kv"   # 盘层目录(空 = 关层)
-disk_cache_mb       = 2048                 # KV 盘分片(S6;0 = 关层)
+disk_pool_size       = 2048                 # KV 盘分片(S6;0 = 关层)
 snap_disk_mb        = 1024                 # 状态腿盘分片(锚点快照要它)
 # 主动 checkpoint 自动运行；单次 64 MiB / 最小间隔 5s 是引擎内部策略。
 # 它只限制后台复制量，**不是**准入/压力卸载的门槛。
@@ -3309,7 +3309,7 @@ OWL_CPU_MOCK=1 cargo test -p owl-engine \
 **残余**：
 
 - 顺序轮换仍可能逐请求累计搬多；本设计接受，若真机出现 churn 再加全局窗口；
-- `server --test config_check` 的 3 项既有 `runtime.max_seq` 期望值失败与本节无关。
+- `server --test config_check` 的 3 项既有 `runtime.max_context_length` 期望值失败与本节无关。
 
 ---
 

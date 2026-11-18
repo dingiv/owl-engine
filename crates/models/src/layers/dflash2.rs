@@ -176,7 +176,7 @@ impl GroupedConv {
 //
 // 草稿 config:`layer_types = sliding_attention×5`、`sliding_window = 2048`、
 // `use_sliding_window = true`。NC 核的前缀读已经是滑窗 2048(自块恒全可见);
-// 但池按 `max_seq` 全长分配 = 10240B/token(TP2 每 rank),184k 白吃 1.8GiB。
+// 但池按 `max_context_length` 全长分配 = 10240B/token(TP2 每 rank),184k 白吃 1.8GiB。
 // ring 只保留 **窗口 + 自块** 的槽,写者/读者都按 `p % ring_cap` 映射。
 //
 // `ring_cap` = 向上取整到页的 `2048 + 8`;页宽 32 时 = 2080(65 页)。

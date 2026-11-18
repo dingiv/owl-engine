@@ -37,7 +37,7 @@ run(job)
       pipeline = "sequential",
       sequential_offload_device = "cuda",
       batch_size = 8,
-      max_seq_length = 2048,
+      max_context_length_length = 2048,
     )
       trace/split decoder layers
       per-layer AWQ scale search

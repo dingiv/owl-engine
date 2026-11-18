@@ -16,7 +16,7 @@ use crate::family::xqa;
 /// 双臂共用的 20 槽参数表(两份实例化签名逐字同型,故共用一张表)。
 ///
 /// `[q, k_cache, v_cache, page_table, seq_lens, mask, semaphores, scratch,
-///   wr, out, q_seq_len, hkv, hd, page, max_seq_len, q_scale_bits, sm_count,
+///   wr, out, q_seq_len, hkv, hd, page, max_context_length_len, q_scale_bits, sm_count,
 ///   stride_page, stride_token, stride_head]`
 const XQA_PARAMS: &[Param] = &[
     Param::t_in("q", Dtype::F16, 2),
@@ -45,7 +45,7 @@ const XQA_PARAMS: &[Param] = &[
     Param::sz("hkv").range(RangeRule { min: Some(1.0), max: None, set: None }),
     Param::sz("hd").range(RangeRule { min: None, max: None, set: Some(&[128, 256]) }),
     Param::sz("page").range(RangeRule { min: None, max: None, set: Some(&[16, 32, 64, 128]) }),
-    Param::sz("max_seq_len").range(RangeRule { min: Some(1.0), max: None, set: None }),
+    Param::sz("max_context_length_len").range(RangeRule { min: Some(1.0), max: None, set: None }),
     // f32 位型走私(显式 token):= attn_scale·sqrt(hd)
     Param::s("q_scale_bits", crate::spec::ScalarTy::F32Bits),
     Param::sz("sm_count").range(RangeRule { min: Some(1.0), max: None, set: None }),
@@ -66,7 +66,7 @@ const XQA_SHAPE: ShapeFamily = ShapeFamily {
 };
 
 /// 跨参耦合检查(表表达不了):`mask` 元素数 ≥ `ceil(q_seq_len/32)`,
-/// 且 `q_seq_len ≤ max_seq_len`。
+/// 且 `q_seq_len ≤ max_context_length_len`。
 fn check_xqa(ctx: &CheckCtx<'_>) -> Result<(), OpError> {
     crate::spec::check_from_params("xqa", XQA_PARAMS, ctx)?;
     let sc = |i: usize| -> Option<u64> {
@@ -75,12 +75,12 @@ fn check_xqa(ctx: &CheckCtx<'_>) -> Result<(), OpError> {
             _ => None,
         }
     };
-    let (q_seq_len, max_seq) = (sc(10).unwrap_or(0), sc(14).unwrap_or(0));
-    if q_seq_len > max_seq {
+    let (q_seq_len, max_context_length) = (sc(10).unwrap_or(0), sc(14).unwrap_or(0));
+    if q_seq_len > max_context_length {
         return Err(OpError::Contract {
             op: ctx.op.to_string(),
             field: "q_seq_len",
-            expect: format!("≤ max_seq_len({max_seq})"),
+            expect: format!("≤ max_context_length_len({max_context_length})"),
             got: format!("{q_seq_len}"),
         });
     }

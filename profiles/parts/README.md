@@ -5,4 +5,4 @@
 #   → parts/model/<model>.toml
 #   → parts/feature/<feature>.toml ...
 #   → parts/pool/<pool>.toml
-# 最后 leaf 只写站点键（server.bind / runtime.max_seq / 路径）。
+# 最后 leaf 只写站点键（server.bind / runtime.max_context_length / 路径）。

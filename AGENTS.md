@@ -99,7 +99,7 @@ cargo build --release -p server --features perf  # 基准(计时器保留)
 # 预检 / 生效配置 / 单键解释(不加载权重,~10–20ms)
 ./target/release/server -p profiles/qwen38_27b-3090.toml --check
 ./target/release/server -p profiles/qwen38_27b-3090.toml --print-config
-./target/release/server -p profiles/qwen38_27b-3090.toml --explain runtime.max_seq
+./target/release/server -p profiles/qwen38_27b-3090.toml --explain runtime.max_context_length
 
 # 起服务 + 诊断(端口纪律 2026-11-03:**双 3080 = 8135 / 双 3090 = 8136 / 单卡 3090 = 8137 / 4080 = 8138**;
 # 单卡"换配置"不换端口 —— 端口 = 硬件形状,配置 = 档文件 / `--set`;
@@ -108,7 +108,7 @@ cargo build --release -p server --features perf  # 基准(计时器保留)
 cargo serve -p profiles/qwen38_27b-3090.toml          # 单 3090 满血(= cargo run --release -p server --)
 ./target/release/server -p profiles/qwen38_27b-3080_tp2.toml --log-level info
 # 实验变体一律 `--set`,不新建入口档(入口档面由测试钉死,见 profiles/README.md):
-#   --set runtime.max_seq=81920                     # 冲上下文,接受压力腾槽
+#   --set runtime.max_context_length=81920                     # 冲上下文,接受压力腾槽
 #   --set spec.depth=0 --set spec.lookup=false      # 关投机对照臂
 curl 192.168.1.6:8137/debug/log          # 在线调级 / 换 tag 过滤
 curl 192.168.1.6:8137/debug/metrics/<族> # 引擎内真值(优先用这个)

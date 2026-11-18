@@ -253,7 +253,7 @@ GDN_TRITON_PY=/path/to/owl/crates/kernels/.venv/bin/python \
 ./target/release/server \
   -p profiles/qwen38_27b-3090-w4a16-mtp.toml \
   --set server.bind=127.0.0.1:8141 \
-  --set runtime.max_seq=73728 --set pool.pool_tokens=73728 \
+  --set runtime.max_context_length=73728 --set pool.pool_tokens=73728 \
   --set spec.mtp_window=6144 --set spec.mtp_sink=64
 
 # 64k MATH（2 轮；W=4032 已有基线）

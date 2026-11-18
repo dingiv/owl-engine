@@ -614,7 +614,7 @@ int8_backend = "pth"                # pth | fi_storage | fi_full
 2. **pth 是反量化到 fp16，不是 int8 张量核**：它的性能天花板接近 f16 KV；
    真正的 2× 只在 FI-A2。
 3. **pth 的 scale 内存开销**：D256 +1.56%，池少约 1.5%；262k 档要重算
-   max_seq。
+   max_context_length。
 4. **pth 的 C ABI/planner 版本锁定**：vendor 固定 commit；升级要重跑
    planner oracle 和 GPU parity。
 5. **FI int8 模板侵入性**：0.7.2 的 typed kernel 需要新 TU；不能污染
@@ -1197,7 +1197,7 @@ selfcheck_oracles:   K0 int8 毒值律 ✓
 
 - `profiles/measurement/qwen38_27b-3090_tp2-int8.toml`(8142)
 - `profiles/measurement/qwen38_27b-3090_tp2-fp8.toml`(8143,同形对照)
-- 两者同 `model.quant=w4a8`、`max_seq=262144`、`chunk=2048`、spec off。
+- 两者同 `model.quant=w4a8`、`max_context_length=262144`、`chunk=2048`、spec off。
 - 卡位 UUID:rank0 `GPU-e565…`(41:00.0)/ rank1 `GPU-89df…`(42:00.0)。
 
 ### 短/中/长 prefill + decode(单轮,output 128,ignore_eos)
@@ -1384,7 +1384,7 @@ w4a8 的速度但先修 32k 质量。当前代码保留 `ex2f_fast`(commit
 
 ### 0.17.7 100k 同卡 A/B:INT8 KV vs FP8 KV 的 attention 占比
 
-同一单 3090 Ti、同 27B w4a16、同 `max_seq=131072`、同 `prefill_chunk=2048`、
+同一单 3090 Ti、同 27B w4a16、同 `max_context_length=131072`、同 `prefill_chunk=2048`、
 spec off、同 100k prompt、同 output=8；两边都开引擎 CUPTI
 (`--perf-level gpu`，epoch 视图)。
 
@@ -1904,7 +1904,7 @@ kernel host parity T=1/32:  cos=0.999999956  max|d|=1.69e-4  PASS
 同时 V f16 shadow 把 per_tok 从 35,072B 抬到 67,840B:
 
 ```text
-max_seq 131072 放不下;只能 --set runtime.max_seq≈70k
+max_context_length 131072 放不下;只能 --set runtime.max_context_length≈70k
 ```
 
 判决:
@@ -2236,16 +2236,16 @@ boot/config 门拒绝；同时保持与 no-spec decode 同源，避免 verify �
 | 短问答 | `17*23` → 391 |
 | needle 8k | RETRIEVED，3.76s |
 | needle 32k | RETRIEVED，16.32s |
-| needle 64k | RETRIEVED，37.31s（max_seq=81920） |
-| needle 100k | RETRIEVED，68.67s（max_seq=101376；`vram_activation_reserve=256` + `prefill_chunk=1024`） |
+| needle 64k | RETRIEVED，37.31s（max_context_length=81920） |
+| needle 100k | RETRIEVED，68.67s（max_context_length=101376；`vram_activation_reserve=256` + `prefill_chunk=1024`） |
 | GSM8K n=200 | **194/200 = 97.0%**（4 题 finish=length，7.6min） |
 
 显存/上限：
 
-- 24G 单卡 + DFlash2 d7 + f32 verify scratch 时，`max_seq=98304` 下
+- 24G 单卡 + DFlash2 d7 + f32 verify scratch 时，`max_context_length=98304` 下
   64k prompt 会撞 `vram-hard-budget`（chunk 2048 需 136MiB，
   驱动 free−reserve 仅 ~10MiB）；降到 81920 后 64k 通过。
-- 100k 需要约 101376 max_seq；把 `pool.vram_activation_reserve` 从 512 降到 256
+- 100k 需要约 101376 max_context_length；把 `pool.vram_activation_reserve` 从 512 降到 256
   且 chunk 1024 后才够 transient。**这是单卡 24G 的容量边界，不是核错误**；
   3080 TP2 / 3090 TP2 应重新做 20G/rank 预算（P3）。
 - verify scratch 改 f32 使 `vattn2` 从 18MiB → ~50MiB（T=8），

@@ -186,7 +186,7 @@ profiles/qwen38_27b-3090-gguf-kvmem-80k.toml
   FP8 KV，view 81920，reserve 1500 ⇒ pool 85568（host 下沉）
 
 profiles/qwen38_27b-3090-gguf-kvmem-262k.toml
-  max_seq=262144，view 81920，host 11264，recall_every=4
+  max_context_length=262144，view 81920，host 11264，recall_every=4
 
 profiles/qwen38_27b-3090-w4a16-dflash-kvmem.toml
   AWQ 27B + DFlash2 d7 + KVMem（8K view）

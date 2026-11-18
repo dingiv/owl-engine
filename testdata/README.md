@@ -28,13 +28,13 @@ extends(可选,基准档路径)  →  OWL_TEST_CONF(整轮环境档)  →  用�
 extends = "profiles/qwen38_27b-3090-w4a16-dflash.toml"
 
 [runtime]
-max_seq = 4096
+max_context_length = 4096
 ```
 
 ```toml
 # testdata/cases/models/layers/gdn/gpu_l2norm_matches_host.toml(单用例差异)
 [runtime]
-max_seq = 2048
+max_context_length = 2048
 ```
 
 ```bash

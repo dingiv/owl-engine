@@ -37,7 +37,7 @@ fn cfg_of(ordinal: usize) -> EngineConfig {
     knobs.prefix_cache = false;
     EngineConfig {
         device_ordinal: ordinal,
-        max_seq_tokens: 2048,
+        max_context_length_tokens: 2048,
         prefill_chunk: 128,
         knobs,
     }

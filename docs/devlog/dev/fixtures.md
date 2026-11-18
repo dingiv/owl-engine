@@ -8,7 +8,7 @@ owl 的测试分三层,**别混用**:单元(纯函数/CPU)→ 设备门(`*_gpu_*
 |---|---|---|
 | `OWL_TEST_DEVICE=<BDF>` | GPU 门的**唯一开关**:值 = **PCI BDF**(如 `41:00.0`;CUDA 序号**已禁用** —— 序会漂)。解析走 `owl_cuda::resolve_ordinal_by_bdf`(设备表 + `DeviceSpec` 归一) | **未设 = 逐字 skip**(不是失败);纯数字 = **响亮 panic** |
 | `OWL_E2E_ONLY=<子串>` | 只跑名字含该子串的场景 | 未设 = 全跑 |
-| `OWL_E2E_SEQ=<n>` | 0.8B 场景的 `max_seq`(预算类门的旋钮) | 4096 |
+| `OWL_E2E_SEQ=<n>` | 0.8B 场景的 `max_context_length`(预算类门的旋钮) | 4096 |
 | `testdata/resources.toml` | **资源清单**(取代 `OWL_AWQ27B_DIR` / `OWL_DFLASH2_DIR` / `OWL_VLM_CKPT` 等 17 键) | 缺 = 相关用例 skip(点名 key);**旧 env 设了 = 响亮 panic** |
 | `OWL_TEST_CONF` | 测试环境档(整轮口径;可含 `flavor`) | 未设 = 各用例走 `OwlConfig::default()` + overlay |
 

@@ -93,7 +93,7 @@ resolve 分发表加行 → ③ 该 arch 的 kernel 实例化/预编资产 → �
 **演进规则**:新 KV dtype = ① `KvEnv` 构造行 → ② `kv_paged_policy` 键表行
 (或 provider 直接携带)→ ③ K0 核 dtype/布局变体 → ④ 注意力核读臂 → ⑤ 影子池
 几何(若 FI)→ ⑥ 速度/精度二维数据表(REQ-CTX-03 验收口径)。
-**容量红利**:fp8 = 池×2(max_seq/并发格翻倍),对长 ctx 是白赚项。
+**容量红利**:fp8 = 池×2(max_context_length/并发格翻倍),对长 ctx 是白赚项。
 
 ### 3.4 注意力分派(attn)
 

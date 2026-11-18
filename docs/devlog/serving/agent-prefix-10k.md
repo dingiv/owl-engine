@@ -27,7 +27,7 @@ T1 的 assistant 输出故意超过 32 token：生成段会跨页，触发 Trans
 
 ## 2. 实测矩阵
 
-引擎：GGUF Qwen3.8-27B Q4_K_M，单 3090 Ti，`max_seq=32768`，f16 KV，
+引擎：GGUF Qwen3.8-27B Q4_K_M，单 3090 Ti，`max_context_length=32768`，f16 KV，
 `prefix_cache=true`，`query_replay=true`（KVMem 行；新 GGUF agent 档为
 `query_replay=false`），`implicit_session=true`。
 不同行只改 `snap_max` / `snap_host_mb`。
@@ -197,7 +197,7 @@ python3 apps/server/tests/agent_prefix_10k_probe.py \
 
 # 反例：KVMem 档 snap_max=0
 ./target/release/server -p profiles/qwen38_27b-3090-gguf-kvmem.toml \
-  --set runtime.max_seq=32768 --set runtime.implicit_session=true
+  --set runtime.max_context_length=32768 --set runtime.implicit_session=true
 # boot 出现 WARN；探针 RESULT: FAIL（T2/T4/T5/T6 全 0）
 ```
 

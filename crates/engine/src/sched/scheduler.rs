@@ -687,7 +687,7 @@ impl<D: DeviceClient> RunningEngine<D> {
         //
         // 只看位置高水位：`pos_hi + max_new >= pos_cap` ⇒ 本 turn 不再走
         // leave-gap（这次不秒回），而是**重置位置账 + 冷灌**。`pos_cap =
-        // max_seq + gap 预留`；正常（非 gap）会话 pos_hi = n_tokens ≤ max_seq，
+        // max_context_length + gap 预留`；正常（非 gap）会话 pos_hi = n_tokens ≤ max_context_length，
         // 永远不会触发。
         let consolidate = {
             let pos_hi = turn
@@ -700,7 +700,7 @@ impl<D: DeviceClient> RunningEngine<D> {
             let pos_cap = self
                 .boot
                 .cfg
-                .max_seq_tokens
+                .max_context_length_tokens
                 .saturating_add(self.boot.cfg.knobs.gap_reserve);
             turn.positions_gap && crate::running::needs_consolidation(pos_hi, turn.spec.max_new, pos_cap)
         };
@@ -724,7 +724,7 @@ impl<D: DeviceClient> RunningEngine<D> {
                 turn.session_id,
                 turn.positions.iter().flat_map(|p| p.iter()).copied().max().unwrap_or(-1),
                 turn.prompt_ids.len(),
-                self.boot.cfg.max_seq_tokens.saturating_add(self.boot.cfg.knobs.gap_reserve)
+                self.boot.cfg.max_context_length_tokens.saturating_add(self.boot.cfg.knobs.gap_reserve)
             );
             owl_shared::metrics::with_metrics_store(|m| {
                 m.counter_add("img_evict.consolidate", 1, file!(), line!());
@@ -733,7 +733,7 @@ impl<D: DeviceClient> RunningEngine<D> {
 
         // **硬护栏**：本 turn 用到的位置必须落在 rope 表内（核里对 pos 无边界
         // 检查 —— `rope_f32.cu` 直接 `cos_t[p*half]`）。表长 = max(模型原生,
-        // max_seq + gap 预留)；压实后 pos_hi 是紧凑坐标，正常远低于表长。
+        // max_context_length + gap 预留)；压实后 pos_hi 是紧凑坐标，正常远低于表长。
         {
             let table = self.dev.boot.rope.max_pos();
             let pos_hi = turn

@@ -25,7 +25,7 @@
    decode `138.1 → 82.1`（**−40.5%**；m=1 权重带宽墙 + 激活量化 + AL 下降）。
    184k 同量级 `+47.4% / −47.4%`。⇒ 单独成档 `…-tp2-w4a8`，按负载选。
 6. **草稿池 ring（2026-10-22）**：草稿 config `sliding_window=2048`，NC 核本就只读
-   最近 2048 行；但池按 `max_seq` 全长分配（10240B/token，184k = 1800MiB）。
+   最近 2048 行；但池按 `max_context_length` 全长分配（10240B/token，184k = 1800MiB）。
    改 ring（2080 slots = 20MiB）后 `per_tok 26624→16384`、`[ctx-max] 322k→442k`；
    **262k 档 std 与 184k 持平**（138.1/1616.8），4096 点 `90.4`（ring 前 91.4）。
 7. **W4A8 decode 下降不是固定内核税**：nsys 单轮 `+1.0ms`（quant 0.91 + marlin/attn），
@@ -167,7 +167,7 @@ fi_cuda_graph = true
 ```
 
 保留：`head_quant = "rtn-int4-g32"`、`tp_vocab_split` 不写、`tp_ar_fused` 不写。
-**262k**：`max_seq = pool_tokens = 262144`(圆顶 = 模型原生上限；ring 后实测可服务)。
+**262k**：`max_context_length = pool_tokens = 262144`(圆顶 = 模型原生上限；ring 后实测可服务)。
 头注写入了本轮 A/B、ring 与“不要再叠 int8 头/词表切”的警告。
 
 ### 4.2 `profiles/qwen38_27b-3080_tp2-w4a8.toml`（新增）
@@ -287,7 +287,7 @@ use_sliding_window = true
 ```
 
 NC 核早就按 **2048 滑窗**读前缀（`OWL_NC_SLIDING_WINDOW`，自块恒全可见），
-但草稿池仍按 `max_seq` **全长线性分配**（10240B/token/rank）：
+但草稿池仍按 `max_context_length` **全长线性分配**（10240B/token/rank）：
 184k = **1800 MiB**，262k = **2.56 GiB**，而核永远只读最后 2048 行。
 ⇒ 这是上下文上不去、显存对不上账的最大单项。
 

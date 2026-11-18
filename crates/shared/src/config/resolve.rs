@@ -5,7 +5,7 @@
 //! 1. `[site]` 映射(路径/卡/端口);
 //! 2. `[intent]` → 派生低层键(模型/目标/上下文/并发/投机/KV/KVMem/图/复用);
 //! 3. 显式低层键覆盖派生值(高级覆盖;provenance 记文件);
-//! 4. `context = "max"` 用内存模型求解(显式 `max_seq` 优先;池由引擎按剩余显存自动定);
+//! 4. `context = "max"` 用内存模型求解(显式 `max_context_length` 优先;池由引擎按剩余显存自动定);
 //! 5. 反序列化 + `OwlConfig::validate`(同一套语义门)。
 //!
 //! **来源追踪**:每个叶子键记一条 [`Origin`](缺省/文件/站点/CLI/派生规则);
@@ -171,17 +171,19 @@ pub fn apply(value: &mut Value, origins: &mut Origins) -> Result<Option<ResolveM
         }
     }
 
-    // 并发单键三处同源
-    let c = intent.concurrency;
-    let mut max_batch = c.min(8);
+    // 并发单键：max_concurrency 唯一真源；gdn_slots / max_batch 派生。
+    let mut c = intent.concurrency;
     if intent.kvmem == KvmemIntent::Overcommit {
         // 超卖档批路与选择层视图不共戴（池小于上下文，页表按行铺）。
-        max_batch = 1;
+        if c > 1 {
+            warnings.push("kvmem=overcommit 与合批不共戴 ⇒ max_concurrency 压到 1".into());
+        }
+        c = 1;
     }
     let _ = tp;
     if c > 8 {
         warnings.push(format!(
-            "concurrency={c} > 8:max_batch 限制为 8(Concat 8 槽),其余请求在引擎队列里等"
+            "concurrency={c} > 8:max_batch 派生上限为 8(Concat 8 槽),其余活跃 turn 串行 decode"
         ));
     }
     if c > 1 {
@@ -190,10 +192,9 @@ pub fn apply(value: &mut Value, origins: &mut Origins) -> Result<Option<ResolveM
              非超卖档池按上下文×{c} 计"
         ));
     }
-    // 并发唯一真源 = `store.gdn.gdn_slots`（2026-11-16：`[runtime] max_concurrency` 已删；
-    // 服务面 permit 数与引擎活跃槽位上限都从它来）
-    b.set("store.gdn.gdn_slots", (c as i64).into(), "intent.concurrency → GDN 状态格 = 并发唯一真源");
-    b.set("runtime.max_batch", (max_batch as i64).into(), "intent.concurrency → 合批上限(≤8)");
+    // 并发唯一真源 = `runtime.max_concurrency`；gdn_slots / max_batch 在
+    // OwlConfig::bind_derived 里派生。
+    b.set("runtime.max_concurrency", (c as i64).into(), "intent.concurrency → 并发唯一真源");
 
     match intent.spec {
         SpecIntent::Off => {
@@ -239,8 +240,8 @@ pub fn apply(value: &mut Value, origins: &mut Origins) -> Result<Option<ResolveM
                 );
             }
             b.set("kvmem.pool_overcommit", false.into(), "intent.kvmem = off");
-            b.set("store.host_cache_mb", 0i64.into(), "kvmem=off:无宿主 KV 腿");
-            b.set("store.disk_cache_mb", 0i64.into(), "kvmem=off:无磁盘 KV 腿");
+            b.set("store.ram_pool_size", 0i64.into(), "kvmem=off:无宿主 KV 腿");
+            b.set("store.disk_pool_size", 0i64.into(), "kvmem=off:无磁盘 KV 腿");
             b.set("store.snap_disk_mb", 0i64.into(), "kvmem=off:无磁盘状态腿");
         }
         KvmemIntent::Overcommit => {
@@ -253,7 +254,7 @@ pub fn apply(value: &mut Value, origins: &mut Origins) -> Result<Option<ResolveM
             }
             b.set("kvmem.pool_overcommit", true.into(), "intent.kvmem = overcommit");
             b.set("kvmem.workspace_per_req", 1024i64.into(), "kvmem=overcommit:每 turn 工作集");
-            b.set("store.host_cache_mb", 4096i64.into(), "kvmem=overcommit:宿主 KV 腿");
+            b.set("store.ram_pool_size", 4096i64.into(), "kvmem=overcommit:宿主 KV 腿");
             b.set("store.snap_host_mb", 2048i64.into(), "kvmem=overcommit:宿主状态腿");
         }
     }
@@ -303,7 +304,7 @@ pub fn apply(value: &mut Value, origins: &mut Origins) -> Result<Option<ResolveM
                         b.set("kernel.verify_arm", "v2".into(), "graphs=auto:无投机 ⇒ verify 臂不影响,留 v2");
                     }
                     b.set("kernel.fi_cuda_graph", true.into(), "graphs=auto:图档瓦(plan 形状恒定)");
-                    b.set("kernel.fi_plan", "baked".into(), "graphs=auto:烘 plan 进图(上界 = max_seq) + 表由窗外 flashinfer_fi_plan_sync 刷");
+                    b.set("kernel.fi_plan", "baked".into(), "graphs=auto:烘 plan 进图(上界 = max_context_length) + 表由窗外 flashinfer_fi_plan_sync 刷");
                     true
                 }
             }
@@ -322,7 +323,7 @@ pub fn apply(value: &mut Value, origins: &mut Origins) -> Result<Option<ResolveM
             b.set("store.prefix_cache", false.into(), "reuse=off:单会话最大上下文档");
             b.set("store.gdn.snap_max", 0i64.into(), "reuse=off:无消费方");
             b.set("store.snap_host_mb", 0i64.into(), "reuse=off");
-            b.set("store.host_cache_mb", 0i64.into(), "reuse=off");
+            b.set("store.ram_pool_size", 0i64.into(), "reuse=off");
         }
         ReuseIntent::Session => {
             b.set("store.prefix_cache", true.into(), "reuse=session");
@@ -333,7 +334,7 @@ pub fn apply(value: &mut Value, origins: &mut Origins) -> Result<Option<ResolveM
             b.set("store.prefix_cache", true.into(), "reuse=global");
             b.set("store.gdn.snap_max", 4i64.into(), "reuse=global:4 条快照(跨会话)");
                         b.set("store.snap_host_mb", 3072i64.into(), "reuse=global:状态腿下沉");
-            b.set("store.host_cache_mb", 4096i64.into(), "reuse=global:KV 宿主腿");
+            b.set("store.ram_pool_size", 4096i64.into(), "reuse=global:KV 宿主腿");
         }
     }
     // 超卖档强制前缀缓存(否则 select_* 永远不出洞 ⇒ 池装不下就 Exhausted)
@@ -356,7 +357,7 @@ pub fn apply(value: &mut Value, origins: &mut Origins) -> Result<Option<ResolveM
     // `overcommit` 以最终值为准(显式 [kvmem] 覆盖可改变它)
     overcommit = get_bool(&out, "kvmem.pool_overcommit").unwrap_or(overcommit);
 
-    // ── ⑥ context 求解(显式 max_seq 优先;池不含在配置里) ──
+    // ── ⑥ context 求解(显式 max_context_length 优先;池不含在配置里) ──
 
     // 尾块合并 = 引擎定值 0（2026-11-16：`runtime.prefill_tail_merge` 已删）
     let (act, act_note) = memory::activation_for(
@@ -374,7 +375,7 @@ pub fn apply(value: &mut Value, origins: &mut Origins) -> Result<Option<ResolveM
             "fp8" | "int8" => 1,
             _ => 2,
         },
-        gdn_slots: get_usize(&out, "store.gdn.gdn_slots").unwrap_or(8),
+        gdn_slots: get_usize(&out, "runtime.max_concurrency").unwrap_or(1),
         snap_max: get_usize(&out, "store.gdn.snap_max").unwrap_or(4),
         sessions: c,
         tp_world: if tp { 2 } else { 1 },
@@ -383,16 +384,16 @@ pub fn apply(value: &mut Value, origins: &mut Origins) -> Result<Option<ResolveM
         activation_note: act_note,
         stability_margin_bytes: STABILITY_MARGIN_BYTES,
     };
-    let explicit_ctx = origins.contains_key("runtime.max_seq");
+    let explicit_ctx = origins.contains_key("runtime.max_context_length");
     let want_max = matches!(intent.context, ContextSpec::Max) && !explicit_ctx;
     // TP 的 weights/KV/GDN 按卡摊(27B TP2 权重是实测;视觉塔每 rank 全量)
     let (ctx, _solve_pool) = if want_max {
         let (ctx, pool, _cap) = memory::solve_max(&inp, model.geom.max_pos, overcommit)?;
         (ctx, pool)
     } else {
-        // 显式 max_seq(文件/--set)优先于 intent.context
+        // 显式 max_context_length(文件/--set)优先于 intent.context
         let n = if explicit_ctx {
-            get_usize(&out, "runtime.max_seq").unwrap_or(0)
+            get_usize(&out, "runtime.max_context_length").unwrap_or(0)
         } else {
             match intent.context {
                 ContextSpec::Tokens(n) => n,
@@ -441,9 +442,9 @@ pub fn apply(value: &mut Value, origins: &mut Origins) -> Result<Option<ResolveM
         ctx,
         memory::CONTEXT_ROUND_TOKENS,
     );
-    if !origins.contains_key("runtime.max_seq") {
-        set_path(&mut out, "runtime.max_seq", Value::Integer(ctx as i64));
-        origins.insert("runtime.max_seq".into(), Origin::Derived(ctx_rule));
+    if !origins.contains_key("runtime.max_context_length") {
+        set_path(&mut out, "runtime.max_context_length", Value::Integer(ctx as i64));
+        origins.insert("runtime.max_context_length".into(), Origin::Derived(ctx_rule));
     }
     if tp {
         warnings.push(
@@ -679,7 +680,7 @@ mode = "greedy"
     /// **P0 验收**:意图派生结果 = 该意图**应当**产出的逐键值(绝对锚)。
     ///
     /// 2026-10-24 改锚:本门原先拿仓库档 `profiles/qwen38_27b-3090.toml` 当对照物,
-    /// 而档面收敛后现役档 = `spec on / reuse on / max_seq 79872`,与本夹具
+    /// 而档面收敛后现役档 = `spec on / reuse on / max_context_length 79872`,与本夹具
     /// (`spec=off / reuse=off / context=max`)有意不同 ⇒ 对照锚会随档位漂移而假失败。
     /// 派生器的正确性只能钉在它自己的输出上,不能挂在会动的靶子上。
     #[test]
@@ -692,14 +693,14 @@ mode = "greedy"
         assert_eq!(c.model.quant, crate::config::QuantScheme::W4a16);
 
         // 上下文/并发/预填充
-        assert_eq!(c.runtime.max_seq, 143_360, "context=max ⇒ 合并预留后的模型上限");
+        assert_eq!(c.runtime.max_context_length, 143_360, "context=max ⇒ 合并预留后的模型上限");
         assert_eq!(c.store.gdn.gdn_slots, 1, "并发唯一真源 = gdn_slots");
         assert_eq!(c.runtime.max_batch, 1);
         assert_eq!(c.runtime.prefill_chunk, 512);
 
         // 复用关(reuse=off ⇒ 快照/宿主/前缀缓存全零)
         assert_eq!(c.store.gdn.snap_max, 0, "reuse=off ⇒ 快照池关");
-        assert_eq!(c.store.host_cache_mb, 0, "reuse=off ⇒ KV 宿主层关");
+        assert_eq!(c.store.ram_pool_size, 0, "reuse=off ⇒ KV 宿主层关");
         assert_eq!(c.store.snap_host_mb, 0, "reuse=off ⇒ 快照宿主层关");
         assert!(!c.store.prefix_cache, "reuse=off ⇒ 前缀缓存关");
         assert_eq!(c.store.gdn.gdn_slots, 1);
@@ -779,9 +780,8 @@ context = 32768
 concurrency = 2
 "#,
         );
-        assert_eq!(get_usize(&v, "runtime.max_seq"), Some(32_768));
-        assert_eq!(get_usize(&v, "store.gdn.gdn_slots"), Some(2));
-        assert_eq!(get_usize(&v, "runtime.max_batch"), Some(2));
+        assert_eq!(get_usize(&v, "runtime.max_context_length"), Some(32_768));
+        assert_eq!(get_usize(&v, "runtime.max_concurrency"), Some(2));
     }
 
     /// CLI `--set` 层(loader 已合并,origin=Cli)覆盖派生值
@@ -808,7 +808,7 @@ context = "max"
         // 激活面随之变化(1024 档),context=max 解更小。
         // 2026-11-16:尾块合并退休(=0)⇒ 激活面只按 chunk 算(旧口径 chunk+512),
         // 解出的 ctx 比旧口径更大(106,496 → 126,976)。
-        assert_eq!(get_usize(&v, "runtime.max_seq"), Some(126_976));
+        assert_eq!(get_usize(&v, "runtime.max_context_length"), Some(126_976));
     }
 
     /// 意图与显式 [model] 冲突 = 拒(模型只能有一个真源)
@@ -851,7 +851,7 @@ graphs = "auto"
     /// 旧档(无 intent)零变化:apply 返回 None 且不增删键
     #[test]
     fn legacy_config_is_untouched() {
-        let src = "[runtime]\nmax_seq = 4096\n[store.gdn]\ngdn_slots = 2\n";
+        let src = "[runtime]\nmax_context_length = 4096\n[store.gdn]\ngdn_slots = 2\n";
         let mut v: Value = toml::from_str(src).expect("toml");
         let before = v.clone();
         let mut origins = Origins::new();
@@ -873,7 +873,7 @@ context = "max"
 kvmem = "overcommit"
 "#,
         );
-        let ctx = get_usize(&v, "runtime.max_seq").expect("ctx");
+        let ctx = get_usize(&v, "runtime.max_context_length").expect("ctx");
         assert_eq!(ctx, 262_144, "超卖档逻辑上下文可到模型上限");
         assert_eq!(get_bool(&v, "store.prefix_cache"), Some(true));
         assert_eq!(get_bool(&v, "kvmem.select_decode"), Some(true));

@@ -17,7 +17,7 @@
 |---|---|---|---|
 | S1 | `#[tokio::test]` + 手建 runtime 等价物 | **106 处**(models 90 / engine 6 / shared 6 / server 4) | 每个 async 测试都要宏 |
 | S2 | **GPU 门控四行**:`let Some(ordinal) = … else { eprintln!("skip: OWL_TEST_DEVICE 未设"); return }` | **59 处** `OWL_TEST_DEVICE 未设` | 同一段逐字重复,分散在各测试头部 |
-| S3 | `EngineConfig { device_ordinal, max_seq, prefill_chunk, knobs }` **字面量构造** | **24 处** | 每个测试 hardcode 一套配置,换档 = 改代码 |
+| S3 | `EngineConfig { device_ordinal, max_context_length, prefill_chunk, knobs }` **字面量构造** | **24 处** | 每个测试 hardcode 一套配置,换档 = 改代码 |
 | S4 | 测试参数无通路 | — | 配置类参数只能 env 直读(违反显式依赖律的测试域豁免)或写死 |
 
 **根因**:libtest 的 `#[test]` 无参 ⇒ 测试所需的一切(设备门控、引擎配置)
@@ -35,7 +35,7 @@ use owl_shared::config::OwlConfig;
 /// 无门控用例:配置变量由宏注入
 #[owl_test]
 async fn cpu_case(cfg: &OwlConfig) {
-    assert!(cfg.runtime.max_seq >= 64);   // ← 配置文件真的到了
+    assert!(cfg.runtime.max_context_length >= 64);   // ← 配置文件真的到了
 }
 
 /// GPU 门控用例:OWL_TEST_DEVICE 未设 ⇒ 自动 skip(样板 S2 消失)
@@ -135,7 +135,7 @@ fn 名() {
 ## 四、验收
 
 1. `cargo test -p owl-macros -p owl-shared -p owl-engine --lib` 全绿;
-2. **参数化实证**:设 `OWL_TEST_CONF` 指向一份改了 `runtime.max_seq` 的 TOML
+2. **参数化实证**:设 `OWL_TEST_CONF` 指向一份改了 `runtime.max_context_length` 的 TOML
    (或丢一个用例 overlay),断言测试收到该值;env 清除/无 overlay 则收 default
    —— 双臂/三层单测,用 `EnvGuard` 防踩踏(`testkit::case` 自带 4 项);
 3. 示范测试在 GPU 环境下行为不变(GPU 门控测试:env 未设 = skip 打印逐字同);

@@ -170,7 +170,7 @@ pub struct FlashinferCfg {
     pub cuda_graph: bool,
     /// prefill-only fp8→f16 影子(`[kernel] prefill_shadow`;仅 fp8 主池)。
     pub prefill_shadow: bool,
-    /// 影子容量上界(token;`runtime.max_seq`):首层按它一次预留。
+    /// 影子容量上界(token;`runtime.max_context_length`):首层按它一次预留。
     pub prefill_shadow_cap: usize,
     /// **40 系原生 FP8 MMA 臂**(由引擎从运行期 `Arch::Sm89` 投影;非编译 feature)
     pub fp8_native: bool,
@@ -215,7 +215,7 @@ pub fn configure(cfg: FlashinferCfg) -> Result<(), crate::contract::OpError> {
         return Err(crate::contract::OpError::Contract {
             op: PREFILL_FI.into(),
             field: "prefill_shadow_cap",
-            expect: "影子开启 ⇒ cap > 0(容量上界,取 runtime.max_seq)".into(),
+            expect: "影子开启 ⇒ cap > 0(容量上界,取 runtime.max_context_length)".into(),
             got: "cap = 0(首层将按 0 预留,影子静默不生效)".into(),
         });
     }
@@ -465,7 +465,7 @@ extern "C" {
         cu_dev: *mut i32,
         batch: i32,
         total_q: i32,
-        max_seqlen: i32,
+        max_context_lengthlen: i32,
         heads: i32,
         head_dim: i32,
         scale: f32,

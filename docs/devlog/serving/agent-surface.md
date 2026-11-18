@@ -380,7 +380,7 @@ data: [DONE]
 ```json
 {"count":6,"max_model_len":4096,"tokens":[…],"mode":"raw","model":"…"}
 ```
-- `max_model_len` = 本档 `max_seq_tokens`(引擎侧唯一产地,经 actor 应答捎回)。
+- `max_model_len` = 本档 `max_context_length_tokens`(引擎侧唯一产地,经 actor 应答捎回)。
 - **单一真源**:tokenizer 常驻引擎(`RunningEngine`),HTTP 层**不二次装载**
   ⇒ 包装律/特殊 token 律只有一份。代价 = 本请求排在**当前 turn 之后**
   (actor 单线程“收件与泵不相交”),工量毫秒级 CPU;生成期间调用会等本轮结束
@@ -414,7 +414,7 @@ data: [DONE]
 | 场景 | 响应 |
 |---|---|
 | 请求体非法/缺 messages/未支持字段 | `400` + `{"error":{"message":…,"type":"invalid_request_error"}}`(生命周期正确,pi 会用于 compaction/重试判断) |
-| 上下文超限(超 `max_seq`) | ✅ **已落地(2026-10-15)**，两段：① **预算收缩**(`engine::running::budget_clamp`):`prompt + max_tokens > max_seq` 时**不直接拒**，先把生成长度收缩到剩余额度(下限 1024 tok)，`finish_reason=length` 由客户端自行续写/压缩；② **真溢出**(连 1024 都放不下) ⇒ `400` + 报文带上 pi 词表的规范短语 `prompt exceeds max length` + `code="context_length_exceeded"`(`openai::error_json_for_reject`；引擎原中文诊断**逐字保留**) ⇒ pi 的 `isContextOverflow()` 认出并走 compaction/上下文修复。词表来源 = pi-ai bundle `OVERFLOW_PATTERNS`(实测 2026-10-15)，锁在 `server` 单测 `budget_reject_is_normalized_for_pi_compaction` |
+| 上下文超限(超 `max_context_length`) | ✅ **已落地(2026-10-15)**，两段：① **预算收缩**(`engine::running::budget_clamp`):`prompt + max_tokens > max_context_length` 时**不直接拒**，先把生成长度收缩到剩余额度(下限 1024 tok)，`finish_reason=length` 由客户端自行续写/压缩；② **真溢出**(连 1024 都放不下) ⇒ `400` + 报文带上 pi 词表的规范短语 `prompt exceeds max length` + `code="context_length_exceeded"`(`openai::error_json_for_reject`；引擎原中文诊断**逐字保留**) ⇒ pi 的 `isContextOverflow()` 认出并走 compaction/上下文修复。词表来源 = pi-ai bundle `OVERFLOW_PATTERNS`(实测 2026-10-15)，锁在 `server` 单测 `budget_reject_is_normalized_for_pi_compaction` |
 | 引擎未就绪/断流 | `503`(现状) |
 | 生成中错误(已开始 SSE) | `error` 帧 + `[DONE]`(现状 `TurnEvent::Failed` 分支) |
 
@@ -1148,7 +1148,7 @@ decoding。该子项目的原型设计、阶段与工时见
   旧 `nb/2` 的算式从 engine(`session.rs`)移入 store;engine 只传**政策输入**
   (2026-10-22 起 `prefix_cache_share` 已退役:缓存可占整池,新请求逐出到 host/disk)。
 - flavor 三层账(`spec-dflash`/`awq27b`):`prefix_cache=true` ·
-  `host_cache_mb=4096`(KV 腿宿主:缓存**下沉**而非丢弃) ·
+  `ram_pool_size=4096`(KV 腿宿主:缓存**下沉**而非丢弃) ·
   `snap_max=4` · `snap_host_mb=3072`(状态腿宿主:旧快照下沉 ⇒ `reuse_face`
   能回查到更早的边界)。
 - **末段页对齐**(`Scheduler::prefill_step_chunk` 加 `page` 参数 + 新旋钮
@@ -1483,7 +1483,7 @@ undo/rollback ・`reasoning_tokens`。**施工序**(风险从低到高):
 - `crates/models/src/tokenizer.rs`:**`try_encode`(Result 版)**;旧 `encode`
   改为薄封装(保留吞错回退 + 日志)—— 新调用方走显式路。
 - `crates/engine/src/running.rs`:**`RunningEngine::tokenize(text, chat_wrap)`**
-  (+ 新类型 `TokenizeReply { tokens, max_seq_tokens }`,已从 crate 根导出);
+  (+ 新类型 `TokenizeReply { tokens, max_context_length_tokens }`,已从 crate 根导出);
   `chat_wrap` 分支复用 `Tokenizer::chat_wrap`(与裸文本提交**同一律**,不重写)。
 - `apps/server/src/actor.rs`:`EngineReq::Tokenize { text, chat_wrap, reply(oneshot) }`
   —— **不落 turn、不碰池/图**;首收与积压两处共同收拢到新 `handle_req`
@@ -1587,7 +1587,7 @@ chunk 帧两项)。
 
 **处置**:
 - 新测装 `testdata/args/pi-27b-64k.toml`(gitignored;基座 = `spec-dflash`,
-  只改 `max_seq=65536` + `pool_tokens=66048`,`prompt_dump=false`)——
+  只改 `max_context_length=65536` + `pool_tokens=66048`,`prompt_dump=false`)——
   启动命令与口径注在文件头;
 - pi 侧 `~/.pi/agent/models.json`:**contextWindow 65536 / maxTokens 8192**(备份
   `models.json.bak-agent-1019-pi-align`);

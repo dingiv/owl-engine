@@ -166,7 +166,7 @@ _eval_node(t)
 ## 八、首次实测(2026-10-14;P1-P4 交付当日)
 
 **协议**:生产 27B AWQ(cyankiwi)/ 单 3090 Ti(`bench-27b-std.toml`:f16 池 9472 tok /
-max_seq 9216 / gdn_chunked + FI + prefill_split)/ device=1 / release + `--features perf` /
+max_context_length 9216 / gdn_chunked + FI + prefill_split)/ device=1 / release + `--features perf` /
 prompt 24 tok + 128 输出(ignore_eos)/ greedy-decode 档(sampling,非 spec)。
 原始数据:`/tmp/owl-perf/{epoch.json, run1.csv, boot1.log}`。
 

@@ -576,11 +576,11 @@ mod tests {
     #[test]
     fn intent_unknown_key_rejected_with_key_list() {
         let e = toml::from_str::<Intent>(
-            "model = \"qwen3.8-27b-awq\"\ncontext = 1024\nmax_seq = 4096\n",
+            "model = \"qwen3.8-27b-awq\"\ncontext = 1024\nmax_context_length = 4096\n",
         )
         .expect_err("账外键必须拒");
         let msg = e.to_string();
-        assert!(msg.contains("max_seq"), "拒语应点名键: {msg}");
+        assert!(msg.contains("max_context_length"), "拒语应点名键: {msg}");
         // Intent::KEYS 是 CLI 报错面;保证非空且包含核心键
         assert!(Intent::KEYS.contains(&"context") && Intent::KEYS.contains(&"model"));
     }

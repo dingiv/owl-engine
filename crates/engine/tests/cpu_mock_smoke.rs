@@ -29,7 +29,7 @@ async fn cpu_mock_engine_boots_loads_and_runs_a_turn() {
     }
     let cfg = EngineConfig {
         device_ordinal: 0,
-        max_seq_tokens: 256,
+        max_context_length_tokens: 256,
         prefill_chunk: 32,
         knobs: EngineKnobs { sampler_enabled: false, ..Default::default() },
     };
@@ -53,7 +53,7 @@ async fn cpu_mock_vram_wall_rejects_boot_loudly() {
     }
     let cfg = EngineConfig {
         device_ordinal: 0,
-        max_seq_tokens: 256,
+        max_context_length_tokens: 256,
         prefill_chunk: 32,
         knobs: EngineKnobs { sampler_enabled: false, ..Default::default() },
     };
@@ -81,7 +81,7 @@ async fn cpu_mock_load_cost_breakdown() {
     }
     let cfg = EngineConfig {
         device_ordinal: 0,
-        max_seq_tokens: 256,
+        max_context_length_tokens: 256,
         prefill_chunk: 32,
         knobs: EngineKnobs { sampler_enabled: false, ..Default::default() },
     };

@@ -58,8 +58,8 @@ TTFT（ms，与上表同序）：
 | 现象 | 现场 | 说明 |
 |---|---|---|
 | **开不起来**（`target=0.95` + `reserve=2048`） | `budget=0.89G ⇒ cap=14555 tok < 36864`，boot 直接拒 | f16 `per_tok=65536B`（16 个全注意力层 × K+V × 2B）⇒ 2.3 GB 池才算 35k 上下文 |
-| **能开、请求时炸**（`max_seq=40960`，池 2.56G） | `PoolExhausted: vram-hard-budget 需 25 165 824B 余 13 172 736B`（`reserve=1024`）⇒ `丢本 turn`，API 回**空补全** | 每 chunk 的 `gdn_conv_fwd` / `narrow_strided` / `embed` 各要 ~20~24 MiB 瞬态；池把余量吃干后**硬预算门**拒发 |
-| **可用档** | `max_seq=34816`（1088 槽 × 2 MiB = 2.18 GB，`vram_budget=0.99`、`reserve=1024`）⇒ 8k/32k 均跑通 | 65k 需 ≥ 65 568 tok ⇒ 池 ≥ 4.1 GB ⇒ 24G 单卡（权重 17.2G + 固定 1.07G）**装不下** |
+| **能开、请求时炸**（`max_context_length=40960`，池 2.56G） | `PoolExhausted: vram-hard-budget 需 25 165 824B 余 13 172 736B`（`reserve=1024`）⇒ `丢本 turn`，API 回**空补全** | 每 chunk 的 `gdn_conv_fwd` / `narrow_strided` / `embed` 各要 ~20~24 MiB 瞬态；池把余量吃干后**硬预算门**拒发 |
+| **可用档** | `max_context_length=34816`（1088 槽 × 2 MiB = 2.18 GB，`vram_budget=0.99`、`reserve=1024`）⇒ 8k/32k 均跑通 | 65k 需 ≥ 65 568 tok ⇒ 池 ≥ 4.1 GB ⇒ 24G 单卡（权重 17.2G + 固定 1.07G）**装不下** |
 
 ⚠️ **测量陷阱（务必记）**：f16 池 OOM 时，`llm_speedtest` 会**降级**成
 「本地估算 + 0 输出 token」，打印出 `prefill=324204 t/s / TTFT=27ms` 这种
@@ -72,7 +72,7 @@ TTFT（ms，与上表同序）：
 # int8（fp8s 换 -p ...-fp8.toml + kernel.prefill_shadow=true；f16 再 + pool.kv_dtype=f16）
 ./target/release/server -p profiles/measurement/qwen38_27b-3090-int8.toml \
   --set 'parallel.device=["0000:41:00.0"]' --set 'model.quant="w4a8"' \
-  --set 'pool.prefix_cache=false' --set 'runtime.max_seq=73728' \
+  --set 'pool.prefix_cache=false' --set 'runtime.max_context_length=73728' \
   --set 'spec.depth=7' --set 'spec.lookup=true' \
   --set 'spec.draft_path="'"$PWD"'/models/syvai/Qwen3.8-27B-DFlash2-W4A16"' \
   --set 'server.bind="127.0.0.1:8151"' --log-level info &
@@ -114,7 +114,7 @@ cap    = budget / per_tok
 > `transient→512`」这两条由池组件带下去的变化；`snap_max`/`pool_cap_mb` 的收紧
 > **只作用于两个测量档**，不动生产的前缀缓存/搬运面。
 
-## 6.2 实测效果（f16，`max_seq=40960`，同 profile 同参数）
+## 6.2 实测效果（f16，`max_context_length=40960`，同 profile 同参数）
 
 | | `[vram-gov]` | 请求结果 |
 |---|---|---|
@@ -125,14 +125,14 @@ f16 可用上下文（单 24G，权重 17.2G，spec d7）：
 
 | 档 | 上限 | 证据 |
 |---|---:|---|
-| 旧配置 | ~34.8k | `max_seq=36864` 时 `cap=14555`（`target=0.95` 更糟）；`40960` 请求期 OOM |
+| 旧配置 | ~34.8k | `max_context_length=36864` 时 `cap=14555`（`target=0.95` 更糟）；`40960` 请求期 OOM |
 | **新配置（`snap_max=1`）** | **40 960 跑通** | cap 62 887 |
 | **新配置 + `snap_max=0`** | **49 152 跑通** | prefill **1952.4 t/s** / TTFT 25.18 s / decode 55.9 t/s（`fixed_after` 0.92G→0.78G） |
 | 65k | 仍差 ~0.2 GB | `fixed_after` 里 `图slab = 320 MiB` 是**保守上界**（同档实测 0.0 MiB）⇒ 要吃它得改 `crates/store/src/plan.rs`（代码层） |
 
 int8 回归（同批配置收紧后，单次）：32k **2059.8** t/s（旧 2074.7，−0.7%）、
-65k **1775.2**（旧 1789.4，−0.8%）——在单次噪声内；`cap=117 511 tok` ≫ `max_seq`，
-说明 int8/fp8 的限制本来就在 `max_seq`，收紧只把余量还给运行时闸。
+65k **1775.2**（旧 1789.4，−0.8%）——在单次噪声内；`cap=117 511 tok` ≫ `max_context_length`，
+说明 int8/fp8 的限制本来就在 `max_context_length`，收紧只把余量还给运行时闸。
 
 ## 6.3 压力行为（收紧后仍然优雅）
 

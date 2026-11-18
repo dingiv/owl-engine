@@ -36,13 +36,13 @@ template_vars = ""
 admission_on_full = "reject"
 # 未带 max_tokens 时的生成长度 / 单请求上限
 default_max_new = 4096
-max_new_cap = 32768
+max_new_cap = 32768   # FIXME: 这个参数是做什么的? 是否和 max_context_length 重复?
 # 上下文上限（token）
-max_seq = 32768
+max_context_length = 32768
 # prefill 块长；越大吞吐越高，但激活工作区也越大
 prefill_chunk = 512
-# 跨会话 decode 合批上限（1 = 串行）
-max_batch = 1
+# 最大同时活跃请求数（gdn_slots / max_batch 由它派生）
+max_concurrency = 1
 
 # ---------------------------------------------------------------------------
 # [parallel] —— 并行与卡位
@@ -91,16 +91,16 @@ attention_factor = 1.0
 # [store] —— KV / GDN / 宿主 / 磁盘
 # ---------------------------------------------------------------------------
 [store]
-# 前缀缓存（跨 turn / 跨会话复用）
-prefix_cache = true
-# 宿主/快照/磁盘腿（MiB；0 = 关层）
-host_cache_mb = 0
-disk_cache_mb = 0
-# 磁盘目录：给了磁盘配额就必须给，且必须独占
-disk_dir = ""
 # 显存治理：驱动 total 的占比；以及池外固定预留 MiB
 vram_budget = 0.99
 vram_activation_reserve = 714
+# 宿主/快照/磁盘腿（MiB；0 = 关层）
+ram_pool_size = 0
+disk_pool_size = 0
+# 磁盘目录：给了磁盘配额就必须给，且必须独占
+disk_dir = ""
+# 前缀缓存（跨 turn / 跨会话复用）
+prefix_cache = true
 
 [store.kv]
 # 主 KV 池 dtype：f16 | fp8 | int8
@@ -110,7 +110,6 @@ draft_kv_dtype = "bf16"
 
 [store.gdn]
 # 同时推进的 turn 上限；也是服务面 permit 数的唯一真源
-gdn_slots = 1
 # GDN 快照设备槽数（0 = 关闭快照池）
 snap_max = 0
 # 消息开启标记覆盖（空 = 模型 ChatFormat.im_open）

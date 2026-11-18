@@ -94,7 +94,7 @@ impl XqaRuntime {
 /// 发射几何档(显式枚举 —— 布尔盲性:三档各自是一个**契约**,不是开关)
 #[derive(Clone, Copy)]
 enum XqaGeom {
-    /// 自动(历史行为):`nb_sub_seq = min(sm/(batch·hkv), ceil(max_seq/ctaTile))`
+    /// 自动(历史行为):`nb_sub_seq = min(sm/(batch·hkv), ceil(max_context_length/ctaTile))`
     Auto,
     /// 自动 + **split 度上限**(verify 臂;上限值住
     /// [`crate::family::xqa::VERIFY_SPLIT_CAP`],那里有几何扫描表)
@@ -155,14 +155,14 @@ fn emit_geom(
             c.sm_count as u32,
             /*batch=*/ 1,
             c.hkv as u32,
-            c.max_seq_len as u32,
+            c.max_context_length_len as u32,
             c.q_seq_len as u32,
         ),
         XqaGeom::Capped(cap) => consts.launch_geometry_capped(
             c.sm_count as u32,
             /*batch=*/ 1,
             c.hkv as u32,
-            c.max_seq_len as u32,
+            c.max_context_length_len as u32,
             c.q_seq_len as u32,
             cap,
         ),
@@ -182,7 +182,7 @@ fn emit_geom(
             v_cache: vc,
             page_list: pt,
             seq_len_list: sl,
-            max_nb_pages_per_seq: consts.max_nb_pages_per_seq(c.max_seq_len as u32),
+            max_nb_pages_per_seq: consts.max_nb_pages_per_seq(c.max_context_length_len as u32),
             _pad: 0,
         },
         batch_size: 1,

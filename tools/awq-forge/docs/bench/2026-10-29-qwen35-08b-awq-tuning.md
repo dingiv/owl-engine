@@ -63,7 +63,7 @@
 | `AWQModifier.offload_device` | AWQ 激活缓存 offload | None |
 | `oneshot.batch_size` | 校准 batch | 8（0.8B）/4（4B） |
 | `num_calibration_samples` | 校准条数 | 128 |
-| `max_seq_length` | 校准长度 | 2048 |
+| `max_context_length_length` | 校准长度 | 2048 |
 
 `apply_clip` 与 `max_chunk_memory` 在 llm-compressor 0.15 的 AWQModifier
 没有公开字段；llm-compressor 的 AWQ 固定执行 clip。

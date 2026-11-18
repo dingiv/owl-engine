@@ -159,7 +159,7 @@ $EDITOR my.toml          # [model] path = "/path/to/Qwen3.8-27B-AWQ-INT4"
 ./target/release/server -p my.toml --check
 ./target/release/server -p my.toml --print-config            # TOML
 ./target/release/server -p my.toml --print-config --format json
-./target/release/server -p my.toml --explain runtime.max_seq  # per-key provenance
+./target/release/server -p my.toml --explain runtime.max_context_length  # per-key provenance
 
 # 4) Serve
 ./target/release/server -p my.toml --log-level info

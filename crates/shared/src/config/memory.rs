@@ -257,7 +257,7 @@ pub fn estimate(
     let pool_bytes = pool_tokens as u64 * per_tok;
     let mut notes: Vec<String> = Vec::new();
 
-    // ① 上下文超出治理器池上限(硬):非超卖档池会被夹 ⇒ 请求到不了 max_seq
+    // ① 上下文超出治理器池上限(硬):非超卖档池会被夹 ⇒ 请求到不了 max_context_length
     if non_overcommit && context_tokens > cap {
         return Err(format!(
             "上下文 {} tok 超过治理器池上限 {} tok(预算 {:.2}G / 每 token {}B)\n\
@@ -376,7 +376,7 @@ mod tests {
         assert_eq!(e.pool_bytes, 163_840 * 32768);
     }
 
-    /// 上下文超过治理器上限 = 硬拒(非超卖档池会被夹 ⇒ 请求到不了 max_seq)
+    /// 上下文超过治理器上限 = 硬拒(非超卖档池会被夹 ⇒ 请求到不了 max_context_length)
     #[test]
     fn context_over_governor_cap_is_rejected() {
         let inp = inputs(true, 512, 512, 0);

@@ -453,7 +453,7 @@ image_evict.consolidate_reason
 max_pos + expected_new_tokens + max_new > max_position_budget
 ```
 
-（`max_position_budget` 建议先取 `runtime.max_seq` 或模型 max position；
+（`max_position_budget` 建议先取 `runtime.max_context_length` 或模型 max position；
 不要和 token 池容量混为一谈。）
 
 ### 9.2 动作
@@ -627,7 +627,7 @@ P2 再尝试 idle 预热。
 4. **prefix cache**：position-aware key 的实现成本；P0 可以先禁用
    positioned 会话的跨会话命中，同会话 block_table 继续复用。
 5. **spec**：DFlash2/MTP 的 verify 位置、槽表、图输入；必须单独门。
-6. **max_position**：`runtime.max_seq` 是 token 容量，不等于 position 上限；
+6. **max_position**：`runtime.max_context_length` 是 token 容量，不等于 position 上限；
    需要单独的 consolidation 阈值。
 7. **共享块**：删除只摘自己的 block；旧链死枝回收仍走 store 的叶/LRU 规则。
 8. **pads**：P0 保留 pad 律；未来可评估去掉 pad 以减少 token 开销。

@@ -3,7 +3,7 @@
 //! 线格式(handler 权威;8 Block + 10 sz,见 family::xqa::VERIFY_XQA_SLOTS):
 //! `[T q, T k_cache, T v_cache, T page_table(i32), T seq_lens(u32),
 //!   T mask(u32), T semaphores(u32), T scratch, T wr, O out, sz q_seq_len, sz hkv, sz hd,
-//!   sz page, sz max_seq_len, sz q_scale_bits, sz sm_count, sz stride_page,
+//!   sz page, sz max_context_length_len, sz q_scale_bits, sz sm_count, sz stride_page,
 //!   sz stride_token, sz stride_head]`
 //!
 //! ⚠️ semaphores 必须**每次发射前为零**(KV-split 归约计数;参考实现
@@ -25,7 +25,7 @@ pub use super::BlockRef;
 /// `client::tests::parse_slots_are_exactly_declared` 逐字锁死)。
 pub const PARSE_SLOTS: &[&str] = &[
     "q", "k_cache", "v_cache", "page_table", "seq_lens", "mask", "semaphores", "scratch",
-    "wr", "out", "q_seq_len", "hkv", "hd", "page", "max_seq_len", "q_scale_bits", "sm_count",
+    "wr", "out", "q_seq_len", "hkv", "hd", "page", "max_context_length_len", "q_scale_bits", "sm_count",
     "stride_page", "stride_token", "stride_head",
 ];
 
@@ -46,7 +46,7 @@ pub struct XqaVerifyCall {
     pub hkv: usize,
     pub hd: usize,
     pub page: usize,
-    pub max_seq_len: usize,
+    pub max_context_length_len: usize,
     pub q_scale: f32,
     pub sm_count: usize,
     pub stride_page: usize,
@@ -75,7 +75,7 @@ pub fn parse_verify(msg: &LaunchMsg) -> Result<XqaVerifyCall, OpError> {
         hkv: s.u64("hkv")? as usize,
         hd: s.u64("hd")? as usize,
         page: s.u64("page")? as usize,
-        max_seq_len: s.u64("max_seq_len")? as usize,
+        max_context_length_len: s.u64("max_context_length_len")? as usize,
         q_scale: f32::from_bits(s.u64("q_scale_bits")? as u32),
         sm_count: s.u64("sm_count")? as usize,
         stride_page: s.u64("stride_page")? as usize,

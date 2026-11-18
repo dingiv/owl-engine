@@ -7,7 +7,7 @@
 
 ## 一、目标(不变)
 
-解锁 OWL_MAX_KV=256 硬顶:max_seq_tokens 抬到 4k/8k 级;>256 段从
+解锁 OWL_MAX_KV=256 硬顶:max_context_length_tokens 抬到 4k/8k 级;>256 段从
 "滑窗截断近似"回归真全局注意力语义。
 
 ## 二、路线(用户裁决定盘)
@@ -59,7 +59,7 @@
   1. **v1 动态 smem 越界**(decode 图回放 ILLEGAL_ADDRESS;包装层漏算
      上下文项,2048B 隐形 512 顶)→ 按 .cu 头注契约公式修复,详见
      attention-port.md 结案条目;
-  2. **GDN 状态块解耦**:原按 max_seq_tokens 整表分配(s=4096 → rec
+  2. **GDN 状态块解耦**:原按 max_context_length_tokens 整表分配(s=4096 → rec
      72GB),改 GDN_SLOTS=4 常量(格语义 = 每会话一格,核内恒 slot 0,
      逐核验证);M2 多会话时提升为 EngineConfig 字段;
   3. **server 中间块零回收**:eval 产生的中间块全量常驻,4k 双 turn

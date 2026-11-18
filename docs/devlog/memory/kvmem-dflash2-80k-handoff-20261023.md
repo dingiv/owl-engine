@@ -81,7 +81,7 @@ pos[r] = logical pos
 
 ### 3.4 前一轮遗留（同一工作树，未提交）
 
-- `crates/engine/src/mem/state.rs`：超卖档允许 auto pool `max_seq > cap`。
+- `crates/engine/src/mem/state.rs`：超卖档允许 auto pool `max_context_length > cap`。
 - `crates/store/src/rel.rs`：`host_used` 含腿自报 `Host KvBlock`。
 - `docs/devlog/perf/vram-map.md`：上述记录。
 

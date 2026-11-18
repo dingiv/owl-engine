@@ -4,7 +4,7 @@
 > 卡：单张 3090 Ti 41:00.0（24G）；f16 KV；无投机。
 > 档：
 > - `profiles/qwen38_27b-3090-gguf.toml`（baseline，32k，无 KVMem）
-> - `profiles/qwen38_27b-3090-gguf-kvmem.toml`（KVMem，max_seq 131k，
+> - `profiles/qwen38_27b-3090-gguf-kvmem.toml`（KVMem，max_context_length 131k，
 >   自动池 48k，workspace 8192，`gqa_aggregation=max`）
 
 ## 1. baseline
@@ -47,7 +47,7 @@ KVMem 56k 正常、60k 退化。当前判断是 **GGUF + 稀疏视图在 ~60k �
 
 ```bash
 ./target/release/server -p profiles/qwen38_27b-3090-gguf.toml \
-  --set runtime.max_seq=61000 --set pool.kv_fp8=true --log-level info
+  --set runtime.max_context_length=61000 --set pool.kv_fp8=true --log-level info
 
 ./target/release/server -p profiles/qwen38_27b-3090-gguf-kvmem.toml \
   --set probes.dflash_probe=true --set probes.view_hash_block=207 --log-level info

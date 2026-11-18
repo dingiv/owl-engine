@@ -29,7 +29,7 @@ type Result<T> = std::result::Result<T, ModelError>;
 
 pub(crate) type BlockN = (Bytes, usize); // (块句柄, 元素数;重置分块写用)
 
-/// GDN 行容量(**与会话数绑定,与 max_seq_tokens 解耦**)。
+/// GDN 行容量(**与会话数绑定,与 max_context_length_tokens 解耦**)。
 /// 格语义 = 每会话一格(SessionTable 分配/释放);按位分配是历史包袱:
 /// s=4096 时 rec(1 MiB/格/层 × 18 层)将达 72 GB,而真实需求 = 格数。
 /// 8 = 覆盖需求并发上限(§二 并发 ≤8);会话 close 即释放格号。
@@ -163,7 +163,7 @@ pub(crate) fn prefill_transient_mb(chunk_tokens: usize) -> u64 {
 /// 投机形态 = SpecMode 枚举,互斥语义由派生保证,调用点零自洽负担)
 #[derive(Clone, Debug)]
 pub(crate) struct PoolPlan {
-    /// 单会话容量(= max_seq_tokens)
+    /// 单会话容量(= max_context_length_tokens)
     pub seq_tokens: usize,
     /// 池容量(token;**`pool_auto = true` 时本值被忽略**,按 `seq_tokens` 自动)
     pub pool_tokens: usize,
@@ -2151,8 +2151,8 @@ impl<'a> AllocCtx<'a> {
         let pool_cap = pool_cap(plan, &per_tok, &fixed_after)?;
         // ── 池容量:**手写值** 或 **自动 = 本档 ctx**(2026-10-21)──
         //
-        // 自动档把"池多大"从配置里拿掉:池只为 `max_seq` 分配(页对齐),
-        // 显存治理器的 `cap` 只做两件事 —— ① 兜底:`max_seq` 超预算即拒启;
+        // 自动档把"池多大"从配置里拿掉:池只为 `max_context_length` 分配(页对齐),
+        // 显存治理器的 `cap` 只做两件事 —— ① 兜底:`max_context_length` 超预算即拒启;
         // ② 报告:`ctx_max = cap − 1 页`(Strict 准入 = 整 ctx 常驻)。
         // **对齐余量 = 真页宽**（F-25）：paged 档取布局策略的 page；legacy
         // 档无页概念 ⇒ 0（别拿 32 冒充，也别拿 seq_tokens 当页宽——后者会把
@@ -2177,7 +2177,7 @@ impl<'a> AllocCtx<'a> {
                         // "池 < 上下文" —— 多出的链块靠选择层下沉 host/disk。
                         owl_shared::log_info!(
                             "pool",
-                            "**超卖档**:max_seq={} > ctx_max={} ⇒ 设备池 = cap − 瞬态余量({} MiB) = {} tok(超卖 {:.2}×);\
+                            "**超卖档**:max_context_length={} > ctx_max={} ⇒ 设备池 = cap − 瞬态余量({} MiB) = {} tok(超卖 {:.2}×);\
                              其余链块靠选择层下沉 host/disk",
                             plan.seq_tokens,
                             m,
@@ -2191,7 +2191,7 @@ impl<'a> AllocCtx<'a> {
                             .max(1);
                         owl_shared::log_info!(
                             "pool",
-                            "**并发自动池**:max_seq={} × {} = {} tok，\
+                            "**并发自动池**:max_context_length={} × {} = {} tok，\
                              cap={} − 瞬态 {} MiB({} tok) ⇒ 池 {} tok(占预算 {:.0}%)",
                             plan.seq_tokens,
                             plan.pool_sessions,
@@ -2227,7 +2227,7 @@ impl<'a> AllocCtx<'a> {
                 let pct = 100.0 * plan.seq_tokens as f64 / m.max(1) as f64;
                 eprintln!(
                     "[ctx-max] per_tok={}B(主池 {} + 草稿 {} + MTP 链 {}) ⇒ 预算 cap={} tok \
-                     ⇒ **本档最大 ctx ≈ {} tok**;当前 max_seq={}(占 {:.0}%)⇒ 池 {} tok / {} MiB{}",
+                     ⇒ **本档最大 ctx ≈ {} tok**;当前 max_context_length={}(占 {:.0}%)⇒ 池 {} tok / {} MiB{}",
                     per_tok.total(),
                     per_tok.main_kv,
                     per_tok.draft_pool,
@@ -2242,13 +2242,13 @@ impl<'a> AllocCtx<'a> {
                 );
                 if plan.seq_tokens + page_align > m {
                     eprintln!(
-                        "[ctx-max] ⚠️ max_seq 已到算式上限(剩 {} tok;再大要降 per_tok 或加卡)",
+                        "[ctx-max] ⚠️ max_context_length 已到算式上限(剩 {} tok;再大要降 per_tok 或加卡)",
                         m.saturating_sub(plan.seq_tokens)
                     );
                 }
             }
             _ => eprintln!(
-                "[ctx-max] 显存治理禁用(vram_budget=0 或 total 未知)⇒ 池按 max_seq={} tok 分配(自动档无上限校验)",
+                "[ctx-max] 显存治理禁用(vram_budget=0 或 total 未知)⇒ 池按 max_context_length={} tok 分配(自动档无上限校验)",
                 plan.seq_tokens
             ),
         }
@@ -2289,7 +2289,7 @@ impl<'a> AllocCtx<'a> {
                 return Err(ModelError::Msg(format!(
                     "非超卖档池预算不足:seq_tokens={seq_tokens}(effective={effective} tok) > \
                      治理器 cap={cap} tok;本档装不下整条上下文。\
-                     修法:降 [runtime].max_seq / 减少 fixed/激活,或显式开 [kvmem] 超卖。"
+                     修法:降 [runtime].max_context_length / 减少 fixed/激活,或显式开 [kvmem] 超卖。"
                 )));
             }
         }
@@ -2674,7 +2674,7 @@ impl KvBank {
                 semaphores: block_leaf(&sem.0, vec![1, sem_n]),
                 scratch: block_leaf_dt(&scr.0, vec![(scr_mb << 20) / 2], Dtype::F16),
                 q_seq_len: seqs,
-                max_seq_len: nb_i * page,
+                max_context_length_len: nb_i * page,
                 sm_count: xqa_sm_count,
             })
         } else {
@@ -2786,7 +2786,7 @@ impl DraftBank {
         // dtype = BF16(E5-DF3 同日十四;草稿路径 BF16 全程,独立于目标池
         // dims.dtype —— 同 2B/elem,几何 page/x 不变)
         // **DFlash2 ring**(2026-10-22):草稿 NC 核只读最近 2048 行(自块恒全可见),
-        // 池按 max_seq 全长分配 = 10240B/token(184k 白吃 1.8GiB)。ring 只留
+        // 池按 max_context_length 全长分配 = 10240B/token(184k 白吃 1.8GiB)。ring 只留
         // 窗口+自块(页对齐;32 页宽 ⇒ 2080 slots = 65 页)。
         let ring_slots = if dflash && paged {
             owl_models::layers::dflash2::draft_ring_slots(page)
@@ -3088,7 +3088,7 @@ mod vram_budget_tests {
     }
 
     /// **自动池并发感知**（2026-11-15）：单会话 = 旧行为；并发 = 用满
-    /// `cap − transient`，不再被单请求 `max_seq` 钉死。
+    /// `cap − transient`，不再被单请求 `max_context_length` 钉死。
     #[test]
     fn auto_pool_uses_budget_and_scales_with_batch() {
         // 27B/3080 档实测账：cap ≈ 380,746（不含 scratch），per_tok 17,536。

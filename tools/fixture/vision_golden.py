@@ -106,7 +106,7 @@ def main() -> None:
         cos, sin = model.rotary_pos_emb(h, pos_ids)
         out["g.cos"], out["g.sin"] = cos, sin
         for i, blk in enumerate(model.blocks):
-            h = blk(h, cu_seqlens=cu_seqlens, max_seqlen=int(cu.max()),
+            h = blk(h, cu_seqlens=cu_seqlens, max_context_lengthlen=int(cu.max()),
                     position_embeddings=(cos, sin))
             out[f"g.blk_{i:02d}"] = h
         out["g.pre_merger"] = h.clone()  # 与 blk_{depth-1} 同值;clone 免 safetensors 共享内存告警
@@ -126,7 +126,7 @@ def main() -> None:
         out["h.h0"] = hh.float()
         cos_h, sin_h = model_h.rotary_pos_emb(hh, pos_ids)
         for i, blk in enumerate(model_h.blocks):
-            hh = blk(hh, cu_seqlens=cu_seqlens, max_seqlen=int(cu.max()),
+            hh = blk(hh, cu_seqlens=cu_seqlens, max_context_lengthlen=int(cu.max()),
                      position_embeddings=(cos_h, sin_h))
             out[f"h.blk_{i:02d}"] = hh.float()
         out["h.merged"] = model_h.merger(hh).float()

@@ -54,7 +54,7 @@ echo "[workload] 日志: $LOG" >&2
         --set "store.prefix_cache=true" \
         --set "store.gdn.snap_max=2" \
         --set "store.snap_host_mb=1024" \
-        --set "runtime.max_seq=${MAX_SEQ}" \
+        --set "runtime.max_context_length=${MAX_SEQ}" \
         --log-level info >"${LOG}" 2>&1
 ) &
 SERVER_PID=$!

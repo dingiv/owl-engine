@@ -458,8 +458,8 @@ pub fn auto_pool_tokens(
     if seq_tokens > cap_tokens {
         if !overcommit {
             return Err(format!(
-                "[store] 自动池装不下本档:max_seq={}(+页对齐) > 预算可服务上限 ctx_max={}。\
-                 本档 per_tok={}B。修法:降 [runtime].max_seq、降 per_tok\
+                "[store] 自动池装不下本档:max_context_length={}(+页对齐) > 预算可服务上限 ctx_max={}。\
+                 本档 per_tok={}B。修法:降 [runtime].max_context_length、降 per_tok\
                  (池 fp8 / 减草稿池)、或开 [kvmem] 超卖(select_decode+select_partial+pool_overcommit)。",
                 seq_tokens, cap_tokens, per_tok_bytes
             ));
@@ -474,8 +474,8 @@ pub fn auto_pool_tokens(
         if seq_tokens > usable {
             if !overcommit {
                 return Err(format!(
-                    "[store] 自动池装不下单请求:max_seq={} > cap−瞬态={} (cap={} / 瞬态 {} MiB = {} tok)。\
-                     修法:降 max_seq、降 prefill_chunk、或开 [kvmem] 超卖。",
+                    "[store] 自动池装不下单请求:max_context_length={} > cap−瞬态={} (cap={} / 瞬态 {} MiB = {} tok)。\
+                     修法:降 max_context_length、降 prefill_chunk、或开 [kvmem] 超卖。",
                     seq_tokens, usable, cap_tokens, transient_mb, transient_tok
                 ));
             }
@@ -488,8 +488,8 @@ pub fn auto_pool_tokens(
     let pool = target.min(usable).max(1);
     if pool < seq_tokens && !overcommit {
         return Err(format!(
-            "[store] 并发自动池装不下单请求:max_seq={} > cap−瞬态={} \
-             (cap={} / 瞬态 {} MiB = {} tok)。修法:降 max_seq、\
+            "[store] 并发自动池装不下单请求:max_context_length={} > cap−瞬态={} \
+             (cap={} / 瞬态 {} MiB = {} tok)。修法:降 max_context_length、\
              降 `prefill_chunk`、或开 [kvmem] 超卖。",
             seq_tokens, usable, cap_tokens, transient_mb, transient_tok
         ));

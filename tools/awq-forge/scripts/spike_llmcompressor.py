@@ -101,7 +101,7 @@ def main() -> int:
         tokenizer=tokenizer,
         dataset=dataset,
         recipe=recipe,
-        max_seq_length=args.seq_len,
+        max_context_length_length=args.seq_len,
         num_calibration_samples=args.samples,
         pipeline=args.pipeline,
         sequential_offload_device=args.seq_offload,

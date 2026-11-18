@@ -53,7 +53,7 @@ vs 引擎 157.5)销案。
 
 > 协议:llm_speedtest std 五点三轮(512/1024/2048/4096/8192 × 3,out 256,单并发,
 > 随机词池);owl spec-dflash 生产档(27B AWQ + int4 头 + DFlash2 d7 + fp8 池 +
-> gdn_chunked),**池放宽 4352→10240、max_seq 2560→9216**(为覆盖 4096/8192 两点,
+> gdn_chunked),**池放宽 4352→10240、max_context_length 2560→9216**(为覆盖 4096/8192 两点,
 > 本轮首次全档 15/15;上轮 M4 验收仅 9/15)。3090 Ti 单卡(CUDA ordinal 1)。
 > 裸档 A/B = 同配置仅 spec.depth=0。数据 `data/qwen38-3090单卡/owl-{specdflash,bare}-std-2026.{csv,json}`。
 
@@ -334,7 +334,7 @@ MMVQ **5.1 µs**(m=1,96 CTA)。判据 = 「`m ≤ TILE_MT` 且整张量 ≤ 4 Mi
 
 #### K.3 P3 定谳:注意力臂换 **FI 双面**(长 ctx 的 26% 变 3%)
 
-`[dispatch] verify_arm = decode_arm = "fi"` + `fi_plan_bake = 0`(取 max_seq)+
+`[dispatch] verify_arm = decode_arm = "fi"` + `fi_plan_bake = 0`(取 max_context_length)+
 `fi_plan_restore = false` + `fi_cuda_graph = true`(三项互相约束,缺一拒启)。
 
 | 点 | v2 verify | **FI verify** | 备注 |
@@ -628,7 +628,7 @@ K.10 把三条律写下来后,按律把配置面收口,**期间发现合并(`5f7
 >   `gguf_tile / gguf_cublas / gguf_mmq2 / gguf_mmq / gguf_smem`(**全 true 缺省**)
 >   与 `gguf_cublas_tile: Option<usize>` —— 与本节"env ⇒ 配置"同终局,只是键名不同;
 > - `[pool].pool_tokens` 因档位走 `extends` 继承,自动档用**显式 `0`** 表达;
-> - `fi_plan_bake` 在 main 上是 `bool`(上界恒 = max_seq)。
+> - `fi_plan_bake` 在 main 上是 `bool`(上界恒 = max_context_length)。
 
 > 用户裁定(2026-10-21)的**常设目标函数**:
 > **① 上下文长 > ② decode 速度 > ③ prefill 速度,但三者必须均衡。**
@@ -637,7 +637,7 @@ K.10 把三条律写下来后,按律把配置面收口,**期间发现合并(`5f7
 
 ### M.1 四点曲线(f16 池,单次启动,std 256tok,三轮)
 
-档 = `profiles/gguf27b-mtp.toml` + `--set runtime.max_seq/pool.pool_tokens`:
+档 = `profiles/gguf27b-mtp.toml` + `--set runtime.max_context_length/pool.pool_tokens`:
 
 | ctx | pref 池 | 池大小 | prefill t/s | decode t/s(三轮中位) | TTFT |
 |---:|---|---:|---:|---:|---:|
@@ -657,7 +657,7 @@ K.10 把三条律写下来后,按律把配置面收口,**期间发现合并(`5f7
    96k 是 3/3 稳的上限。
 
 原始:512 `87.9/96.7/84.0` · 8k `78.2/82.4/72.2` · 32k `74.7/67.9/62.2`(定档档
-`max_seq=pool=34816`,prefill 1275–1387)· 64k `48.8/57.5/58.2` ·
+`max_context_length=pool=34816`,prefill 1275–1387)· 64k `48.8/57.5/58.2` ·
 128k(fp8)`37.1/38.4/42.9`。
 
 ### M.2 读法(为什么 32k 是拐点)
@@ -672,11 +672,11 @@ K.10 把三条律写下来后,按律把配置面收口,**期间发现合并(`5f7
    §23.6 的定档实录同向(f16 核读 2× 字节仍更快:fp8 要逐元素反量化,compute-bound)。
    ⇒ **fp8 只在"f16 装不下"时才是正解**(本机 f16 能到 64k/4 GiB,够用)。
 4. **两个边界别看错**(实测踩了两次):
-   - **`max_seq` = 「prompt + 生成」合计**。`max_seq = pool = 32768` 时,一个
+   - **`max_context_length` = 「prompt + 生成」合计**。`max_context_length = pool = 32768` 时,一个
      32768 的 prompt 会被夹紧到 **0 生成**(`finish_reason=length`,CLI 报 FAILED);
-   - **池 ≥ `max_seq`**,且 `Strict` 准入是整 ctx 常驻 ⇒ `131072` 的 prompt 配
+   - **池 ≥ `max_context_length`**,且 `Strict` 准入是整 ctx 常驻 ⇒ `131072` 的 prompt 配
      `pool=131328` 差 172 tok 被 `no_memory` 拒。
-   ⇒ 本档取 **`max_seq = pool = 34816`**:32k prompt + 256 生成 + 余量全装得下。
+   ⇒ 本档取 **`max_context_length = pool = 34816`**:32k prompt + 256 生成 + 余量全装得下。
 5. **硬预算的实际上限 = 96k**(`vram_budget=1.0` / `vram_activation_reserve=128`):
    权重 live 12.96 GiB + 固定 1.17 GiB + 池 6.0 GiB ≈ 20.1 GiB,其余全是
    **per-turn scratch**(实测 34–74 MiB,随 prompt 长度变)与 boot 期 258 MiB。
@@ -702,12 +702,12 @@ K.10 把三条律写下来后,按律把配置面收口,**期间发现合并(`5f7
 
 | 档 | 配置 | 用途 |
 |---|---|---|
-| **`gguf27b-mtp`(默认)** | `max_seq = pool = 98304`,f16,`vram_budget=1.0`/`reserve=128` | **ctx 顶满**(硬预算上限):96k / 51.8 t/s / 100–120 s TTFT / 6.0 GiB 池 |
-| 64k(临时) | `--set runtime.max_seq=66048 --set pool.pool_tokens=66048` | 更"均衡"的档:57.5 t/s / 59 s TTFT |
-| 32k(临时) | `--set runtime.max_seq=34816 --set pool.pool_tokens=34816` | 交互优先:67.9 t/s / 24 s TTFT |
-| 128k(极端) | `--set pool.kv_fp8=true --set runtime.max_seq=140000 --set pool.pool_tokens=140000` | 批处理/离线;38.4 t/s / 3 min TTFT(**f16 装不下**) |
+| **`gguf27b-mtp`(默认)** | `max_context_length = pool = 98304`,f16,`vram_budget=1.0`/`reserve=128` | **ctx 顶满**(硬预算上限):96k / 51.8 t/s / 100–120 s TTFT / 6.0 GiB 池 |
+| 64k(临时) | `--set runtime.max_context_length=66048 --set pool.pool_tokens=66048` | 更"均衡"的档:57.5 t/s / 59 s TTFT |
+| 32k(临时) | `--set runtime.max_context_length=34816 --set pool.pool_tokens=34816` | 交互优先:67.9 t/s / 24 s TTFT |
+| 128k(极端) | `--set pool.kv_fp8=true --set runtime.max_context_length=140000 --set pool.pool_tokens=140000` | 批处理/离线;38.4 t/s / 3 min TTFT(**f16 装不下**) |
 
-> TP2(双 3090)随手可翻倍:`max_seq` 到 131072 用 **f16**(8 GiB 池,fp8 不收),
+> TP2(双 3090)随手可翻倍:`max_context_length` 到 131072 用 **f16**(8 GiB 池,fp8 不收),
 > 且 prefill 约 ×2 ⇒ 128k 的 TTFT 会从 3 min 掉到 ~1.5 min。
 
 ### M.4 fp8 KV + **原生块草稿**(MTP 头量化)+ 192k —— 定档(2026-10-21 晚)
@@ -770,14 +770,14 @@ hidden ⇒ 槽位可复用),改动面 = `state.rs` 一处 + 一轮 smoke。
 |---|---|---|
 | 192k | 稳(964 MiB 池外占用) | 稳 |
 | 216k | ✗ 每 turn 差 34 MiB | ✅ **198.9k prompt 实测 451 s / prefill 441 t/s** |
-| 224k | ✗ | ✗ 仍差 10 MiB(`fi_plan_bake` 的上界恒 = `max_seq`,挂账) |
+| 224k | ✗ | ✗ 仍差 10 MiB(`fi_plan_bake` 的上界恒 = `max_context_length`,挂账) |
 
-⇒ 定档 **216k**(`max_seq = pool_tokens = 221184`)。
+⇒ 定档 **216k**(`max_context_length = pool_tokens = 221184`)。
 
-**更正(2026-10-21 实测)**:原先挂的"FI plan 表按桶 max_seq 烘可省几百 MiB"是**错的** ——
+**更正(2026-10-21 实测)**:原先挂的"FI plan 表按桶 max_context_length 烘可省几百 MiB"是**错的** ——
 FI 的 workspace 是**定尺**的(`FI_FLOAT_WS_BYTES` 64 MiB + `FI_INT_WS_BYTES` 32 MiB +
 host staging 32 MiB,构造期预钉),plan 表只是其中一个按键缓存的分片,**不随 ctx 增**;
-而且 `validate` 明确禁止 `fi_plan_bake < max_seq`(表的工作项数 < 运行期 chunk 数 ⇒
+而且 `validate` 明确禁止 `fi_plan_bake < max_context_length`(表的工作项数 < 运行期 chunk 数 ⇒
 partial 行 stride 错)。224k 只差 10 MiB 的真凶 = **每 turn 的 prefill 瞬态**
 (`owl_silu_and_mul_f16` 36~50 MiB / `owl_add_f16` 10 MiB / `owl_fused_add_rmsnorm` 10 MiB /
 `owl_gguf_dequant_rows_q3k` 14 MiB,随 `prefill_chunk=1024` 走),不是 plan 表。
@@ -788,20 +788,20 @@ partial 行 stride 错)。224k 只差 10 MiB 的真凶 = **每 turn 的 prefill 
 
 | 件 | 改动 |
 |---|---|
-| `[pool].pool_tokens` | **不写 = 自动**:池 = 本档 `max_seq`(页对齐);手写值仍可钉(多会话/省显存),但**不再用来"开大 ctx"** |
-| boot 报告 | 新增两行 `[ctx-max]`:① `per_tok` 分解 + 预算 `cap` + **算式上限 ctx**(`cap − 1 页`)+ 当前 `max_seq` 占比;② 池落账(页数 × 页宽、工作集常驻口径) |
-| 拒启 | 自动档下 `max_seq > 算式上限` ⇒ 响亮拒并给出可服务上限(不再靠"池静默夹紧") |
+| `[pool].pool_tokens` | **不写 = 自动**:池 = 本档 `max_context_length`(页对齐);手写值仍可钉(多会话/省显存),但**不再用来"开大 ctx"** |
+| boot 报告 | 新增两行 `[ctx-max]`:① `per_tok` 分解 + 预算 `cap` + **算式上限 ctx**(`cap − 1 页`)+ 当前 `max_context_length` 占比;② 池落账(页数 × 页宽、工作集常驻口径) |
+| 拒启 | 自动档下 `max_context_length > 算式上限` ⇒ 响亮拒并给出可服务上限(不再靠"池静默夹紧") |
 | **治理器 bug** | `pool_cap` 的启用条件写成 `target > 0 && target < 1.0` ⇒ **`vram_budget = 1.0` 时治理静默失效**(boot 里根本没有 cap 行,池怎么设都不校验,直到驱动 OOM —— 上一轮 224k 的"boot OK / turn 全挂"就是这么来的)。改为 `target > 0` |
 
 **算式上限 vs 真机上限**(本档 `per_tok = 34816 B`:主池 32768 + MTP 链 2048):
 
 ```
 [ctx-max] per_tok=34816B(主池 32768 + 草稿 0 + MTP 链 2048) ⇒ 预算 cap=280278 tok
-          ⇒ 本档最大 ctx ≈ 280246 tok;当前 max_seq=221184(占 79%)⇒ 池 221184 tok / 7344 MiB(自动)
+          ⇒ 本档最大 ctx ≈ 280246 tok;当前 max_context_length=221184(占 79%)⇒ 池 221184 tok / 7344 MiB(自动)
 [ctx-max] 池落账 6912 MiB(221184 tok × 32 页宽;工作集 2240 tok 常驻,Strict 准入)
 ```
 
-实测边界(同档,只改 `max_seq`):**216k ✓**(198.9k prompt,prefill 441 t/s / 451 s)、
+实测边界(同档,只改 `max_context_length`):**216k ✓**(198.9k prompt,prefill 441 t/s / 451 s)、
 220k ✗(差 17 MiB)、224k ✗。差额 = 未入账固定开销 ~1.6 GiB + 每 turn 瞬态。
 ⇒ **算式值只是上界,档位按实测取 216k**;`[ctx-max]` 两行正是为了让这件事一眼可见。
 

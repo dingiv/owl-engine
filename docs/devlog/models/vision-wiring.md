@@ -358,7 +358,7 @@ HF/AWQ 档的塔在检查点目录(`model.visual.*`);GGUF 主文件**只带文�
 
 - `driver::attn_full` 现在把 **f16 + hd64/72 的单图/多图统一交给 vLLM FA2
   varlen**:hd64 → `run_mha_fwd_hdim64`,hd72 → `run_mha_fwd_hdim96`;
-  `batch = n_seq`,`cu_seqlens` 逐图,`max_seqlen` 取真实最大段长。
+  `batch = n_seq`,`cu_seqlens` 逐图,`max_context_lengthlen` 取真实最大段长。
 - FA2 的 cu 按 **block id + 形状** 缓存,每请求只上传一次;未缓存时禁止在
   capture 内 download/upload。
 - **FI ragged 代码暂时保留但不再被 driver 选中**;只有 f32 / `rows < 64`

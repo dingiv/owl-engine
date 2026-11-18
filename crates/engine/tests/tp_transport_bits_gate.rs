@@ -55,7 +55,7 @@ fn knobs() -> EngineKnobs {
 }
 
 fn cfg_of(ordinal: usize) -> EngineConfig {
-    EngineConfig { device_ordinal: ordinal, max_seq_tokens: 256, prefill_chunk: 64, knobs: knobs() }
+    EngineConfig { device_ordinal: ordinal, max_context_length_tokens: 256, prefill_chunk: 64, knobs: knobs() }
 }
 
 /// 卡名(型号一致才可比;同 ordinal 会命中同一行 ⇒ 幂等)

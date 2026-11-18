@@ -1063,7 +1063,7 @@ boot 面全绿:分档 Window / staging 握手 / 自证 `produced=0 consumed=0 er
 ### 22.6 TP2 吞吐实测(2026-10-17;**权重错误档**,仅供吞吐参考)
 
 护栏临时旁路(`TEMP-BENCH`)后跑 std 五点三轮(`--ignore-eos`;3080 对 =
-CUDA ordinal 2/3;档 = `tp27b`,max_seq/pool 8704、chunk 1024、greedy;
+CUDA ordinal 2/3;档 = `tp27b`,max_context_length/pool 8704、chunk 1024、greedy;
 与 TP1 基准档**逐项同参**,唯一差别 = rank 数)。数据
 `/tmp/owl-bench/tp2-3080-std.{csv,json}`(TP1 = `tp1-3080-std.csv`)。
 
@@ -4813,7 +4813,7 @@ reduce 侧同样 3 次 `LDG.E.128` / 2 次 `STG.E.128`(SASS 复验)。**同数�
 
 ### 62. ★★★★★ **TP2 × 投机解码首跑跑通 + M4 达成**(2026-10-19)
 
-#### 62.1 战绩(std 五点三轮;双 3080;depth=4;`max_seq = 8704`)
+#### 62.1 战绩(std 五点三轮;双 3080;depth=4;`max_context_length = 8704`)
 
 | 臂 | prefill 中位 | decode 中位 | TTFT | 说明 |
 |---|---:|---:|---:|---|
@@ -4856,7 +4856,7 @@ reduce 侧同样 3 次 `LDG.E.128` / 2 次 `STG.E.128`(SASS 复验)。**同数�
 19.63G ⇒ `live` **不可能是单卡**。根因:`owl_shared::vram::LIVE` 是**进程级全局
 计数器**,TP2 下**两卡的分配都加进同一个数**,而 `total`/`per_tok` 是**单卡**口径
 ⇒ 拿两卡之和比单卡总量 ⇒ 预算负数 ⇒ **池被压到一半**(136 槽 = 4352 tok,而
-`max_seq` = 8704)。
+`max_context_length` = 8704)。
 
 **修复**:`PoolPlan += tp_ranks`(boot_rank 从 `TpCtx.plan.world()` 填),
 治理器用 `live / tp_ranks`(两 rank 对称 ⇒ 摊分是正确口径)。
@@ -5830,7 +5830,7 @@ TTFT/prefill 不变**符合结构**:prefill 也在**末行窄切后**调头(`for
 两条与本刀无关的观察(记在这,免得下轮白查):
 1. **3080 对 × `tp27b` 档,≥4096 prompt 撞池上限**:`池 used=18671MiB / reserved=18720MiB`、
    驱动 free 1011MiB ⇒ `vram-hard-budget` 硬拒(该 turn 被优雅丢弃,不崩)。
-   档的 `max_seq = 8704` 是按 24G 卡算的;20G 对得上更小的池或更低的 `vram_budget`。
+   档的 `max_context_length = 8704` 是按 24G 卡算的;20G 对得上更小的池或更低的 `vram_budget`。
 2. **停服后进程不退**:SIGTERM 走完优雅关停(打印 + 释放卡锁 + `exit 0`)后
    RSS 4.1GB 仍存活,需 `kill -9`(卡上内存随之释放)。别用 `pkill -f`(自杀陷阱)。
 
@@ -5943,7 +5943,7 @@ TTFT/prefill 不变**符合结构**:prefill 也在**末行窄切后**调头(`for
    (现在 marlin 占 66%,是唯一还剩两位数占比的内核项);
 3. 合批(别的会话)⇒ 聚合吞吐;
 4. 3080 对 ≥~2.7k ctx 撞池上限(池 18.7 GB / 驱动余 1 GB)⇒ 需按 20 GB 卡重定
-   `max_seq`/`pool_tokens`,否则 std 五点只能跑到 2048(本轮 4096 点复现了硬拒 +
+   `max_context_length`/`pool_tokens`,否则 std 五点只能跑到 2048(本轮 4096 点复现了硬拒 +
    `N4 未归还 18 块` ⇒ **后续请求连续失败**,这是失败路径的账泄漏,另案)。
 
 ## 77. 新档 `tp27b-3080-262k`(2026-10-20)—— 2×20G 上的 **27B W4A16 · TP2 · 声明 262k**
@@ -5954,7 +5954,7 @@ TTFT/prefill 不变**符合结构**:prefill 也在**末行窄切后**调头(`for
 
 | 面 | 值 | 理由 |
 |---|---|---|
-| `max_seq` | **262144** | 模型训练上限(不启 YaRN) |
+| `max_context_length` | **262144** | 模型训练上限(不启 YaRN) |
 | `kv_fp8` | **true** | 每 rank/token 32 KiB(fp16)→ **16 KiB**;262k = 4 GiB vs 8 GiB;**长 ctx 解码时 KV 读量 ≈ 权重的 2 倍** ⇒ 省的是带宽 |
 | 池 | 设备 3 GiB + **宿主 8 GiB** + `[kvmem]` 虚拟化 | 唯一能在 20G 上把 262k 声明下来的配方(与单卡 `awq27b-262k` 同形) |
 | `prefill_chunk` | **512** | 单 turn 瞬态账:1024 → 6 GiB(rank0)/ 512 → 3.5 / 256 → 1.8(prefill 各 −2%/−9%) |
@@ -5989,7 +5989,7 @@ TTFT/prefill 不变**符合结构**:prefill 也在**末行窄切后**调头(`for
 
 ### 78.1 P1 🔴 **prefill 瞬态块不归还**(N4 未归还清单;长 ctx 的唯一硬堵点)
 
-**证据**(`tp27b` + `max_seq=16384`/`chunk=512`/常驻;每 turn 一次 `/debug/vram` + N4 行):
+**证据**(`tp27b` + `max_context_length=16384`/`chunk=512`/常驻;每 turn 一次 `/debug/vram` + N4 行):
 
 | prompt | 泄漏块 | 泄漏字节 | 备注 |
 |---:|---:|---:|---|
@@ -6085,7 +6085,7 @@ A/B 同口径可比;但**不许**把 std 的绝对数直接与 nsys 设备账相
 | `DeviceHandle::free_settled` | `handle.rs` | 覆盖:只 `inner.free` + `untrack` |
 | `RunningEngine::n4_force_release` | `running.rs`(`Node::TurnEnd`) | 报告(WARN 名字/字节)→ drain → free_settled → INFO "结清并归还驱动" + metrics `store.turn_end.stale_{blocks,bytes}` |
 
-**实测(3080 对,`tp27b` + `max_seq=16384`/chunk 512;4k prompt)**:
+**实测(3080 对,`tp27b` + `max_context_length=16384`/chunk 512;4k prompt)**:
 
 | | 修前 | 修后 |
 |---|---|---|

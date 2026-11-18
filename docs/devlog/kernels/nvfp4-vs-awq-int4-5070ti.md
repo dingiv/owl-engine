@@ -7,7 +7,7 @@ decode 从 8.47 → **6.89 ms**（对 CUTLASS 臂 1.23×，对 AWQ 只差 1.17×
 ## 1. 口径
 
 - 机器：RTX 5070 Ti 16G（driver 595.91.07），单会话，`kv_dtype=fp8`，`spec.depth=0`，
-  `prefill_chunk=2048`，`max_seq=32768`；两臂除 `[model]` 三键外**逐字同档**
+  `prefill_chunk=2048`，`max_context_length=32768`；两臂除 `[model]` 三键外**逐字同档**
   （`.local-state/4b-nvfp4-full.toml` / `.local-state/4b-awq-full.toml`）。
 - 模型：`Qwen3.8-4B-Distill`（32 层 hybrid：8 full-attn + 24 GDN），流式 738 张量。
 - NVFP4 臂：`format=safetensors` + `quant=nvfp4`，**装载期 RTN**（权重 e2m1 + 每 16 元素 e4m3）。

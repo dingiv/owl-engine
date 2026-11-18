@@ -5,7 +5,7 @@
 # 拉起(端口 8135,设备 CUDA ordinal 1 = 3090 Ti)。
 #
 # 口径来由(§三十三):8448/8704 + prefill_split = 数学 gate 判据干净的配置
-# (nb/max_seq 边界已定谳;池 8704 = 272 页 × 32 tok)。
+# (nb/max_context_length 边界已定谳;池 8704 = 272 页 × 32 tok)。
 #
 # ⚠️ 路径为本机资产(workspace models/ 下),换机需改。
 
@@ -22,7 +22,7 @@ name = "qwen3.8-27b"
 # 2026-10-16 回归复跑:旧写法 `device = 1`(整数)在新 schema(DeviceSpec 表)
 # 下反序列化即拒启(P0-2 同族);测试资产改显式 ordinal,指向空闲卡(本 boot CUDA0=41:00)
 # (原 [runtime] device_ordinal 已迁 [parallel] device)
-max_seq = 8448
+max_context_length = 8448
 
 [store]
 [store.gdn]

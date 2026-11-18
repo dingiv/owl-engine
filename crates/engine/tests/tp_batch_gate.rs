@@ -24,7 +24,7 @@ fn dev(name: &str) -> Option<usize> {
 fn cfg_of(ordinal: usize) -> EngineConfig {
     EngineConfig {
         device_ordinal: ordinal,
-        max_seq_tokens: MAX_SEQ,
+        max_context_length_tokens: MAX_SEQ,
         prefill_chunk: 64,
         knobs: EngineKnobs {
             sampler_enabled: false,

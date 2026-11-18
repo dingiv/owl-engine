@@ -685,7 +685,7 @@ pub struct XqaVerifyCtx {
     pub semaphores: TensorOps,
     pub scratch: TensorOps,
     pub q_seq_len: usize,
-    pub max_seq_len: usize,
+    pub max_context_length_len: usize,
     pub sm_count: usize,
 }
 

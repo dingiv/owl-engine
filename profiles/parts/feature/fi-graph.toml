@@ -1,4 +1,4 @@
-# 内核组件：FI 单图快档（plan 按 max_seq 烘死）。
+# 内核组件：FI 单图快档（plan 按 max_context_length 烘死）。
 [kernel]
 decode_arm = "fi"
 verify_arm = "fi"

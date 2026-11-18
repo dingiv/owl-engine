@@ -129,12 +129,12 @@ mod tests {
         let path = std::env::temp_dir().join(format!("owl_test_conf_{}.toml", std::process::id()));
         std::fs::write(
             &path,
-            format!("extends = \"{}\"\n[runtime]\nmax_seq = 2048\n", base.display()),
+            format!("extends = \"{}\"\n[runtime]\nmax_context_length = 2048\n", base.display()),
         )
         .expect("写");
         let _c = crate::env_reader::EnvGuard::set(TEST_CONF_ENV, path.to_str().unwrap());
         let cfg2 = case_config("env_conf_arm", "crates/shared/src/testkit/case.rs");
-        assert_eq!(cfg2.runtime.max_seq, 2048, "覆盖项到手");
+        assert_eq!(cfg2.runtime.max_context_length, 2048, "覆盖项到手");
         assert_eq!(cfg2.sampling.mode, crate::config::SamplerMode::Greedy, "基准在手");
         let direct = OwlConfig::load_chain(None, &[path.as_path()]).expect("直调复算");
         assert_eq!(cfg2, direct, "与 load_chain 直调逐字段同");
@@ -164,9 +164,9 @@ mod tests {
         let file = "crates/shared/src/testkit/case.rs";
         let p = case_overlay_path(file, "overlay_probe").expect("路径");
         crate::file_loader::create_dir_all(p.parent().unwrap()).expect("mkdir");
-        crate::file_loader::write(&p, "[runtime]\nmax_seq = 4321\n").expect("写 overlay");
+        crate::file_loader::write(&p, "[runtime]\nmax_context_length = 4321\n").expect("写 overlay");
         let cfg = case_config("overlay_probe", file);
-        assert_eq!(cfg.runtime.max_seq, 4321, "overlay 文件被吃到");
+        assert_eq!(cfg.runtime.max_context_length, 4321, "overlay 文件被吃到");
         std::fs::remove_file(&p).ok();
     }
 }

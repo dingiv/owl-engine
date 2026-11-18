@@ -173,7 +173,7 @@ V = (q * s_row_V + zp_V) * s_col_V
   `kv_page_for(quant)`：KVarN→128，其余→32。
 - `StatePool::PoolGeom.page` 跟档；store/前缀缓存/快照的 `block_tokens`
   自动变成 128（`SessionBank` 从 `pool.geom.page` 取）。
-- `runtime.max_seq` 必须 128 对齐（现有 79872/262144 都满足）。
+- `runtime.max_context_length` 必须 128 对齐（现有 79872/262144 都满足）。
 - `V2_PARTITION_TOKENS=512` 仍可用（4 页/分区）；`snap_decode_stride` 等
   按 128 页解释。
 - `image_evict` 直接拒（K 已量化，无法重转）。

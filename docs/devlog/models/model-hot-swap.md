@@ -99,7 +99,7 @@ apps/server/src/main.rs::main()
   - boot 时 `adopt_disk` / `adopt_disk_chains` 可从目录回填账。
 - 但磁盘层当前只持久化**被卸载的** KV/快照；不会自动把“所有活跃链”落盘。
 - `disk_dir` 当前是单目录；多模型必须改成按模型隔离的目录。
-- `prefix_cache`、`disk_cache_mb`、`snap_disk_mb` 都是 profile 级配置；262k-vlm 档当前
+- `prefix_cache`、`disk_pool_size`、`snap_disk_mb` 都是 profile 级配置；262k-vlm 档当前
   `prefix_cache = false`、磁盘层关闭。
 
 ### 2.4 不可直接恢复的进程内状态
@@ -302,7 +302,7 @@ verify = "manifest"    # manifest | hash
       "status": "active",
       "generation": 7,
       "profile": "profiles/tp27b-3080-262k-vlm.toml",
-      "capabilities": {"vision": true, "spec_depth": 7, "max_seq": 262144}
+      "capabilities": {"vision": true, "spec_depth": 7, "max_context_length": 262144}
     },
     {
       "id": "holo",
@@ -507,7 +507,7 @@ Serving(old, gen)
 - `tp_vocab_split`；
 - `dtype` / 激活 dtype；
 - `device_repack` 路径；
-- `model.rope`（如果按 max_seq 改变 rope 表，虽然 v1 不缓存 rope，但避免误命中）；
+- `model.rope`（如果按 max_context_length 改变 rope 表，虽然 v1 不缓存 rope，但避免误命中）；
 - `vision`；
 - `spec` / 草稿目录指纹（如果草稿权重也进同一快照）。
 

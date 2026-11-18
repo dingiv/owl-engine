@@ -19,7 +19,8 @@ device = ["3090"]
 [runtime]
 admission_on_full = "reject"
 # 含 0.9GB 视觉塔后的稳定点（cap 约 218k 的 79%）
-max_seq = 172032
+max_context_length = 172032
+max_concurrency = 1
 prefill_chunk = 2048
 
 [spec]
@@ -32,7 +33,7 @@ lookup = true
 # 显式钉死显存预算：全部给 KV 池
 vram_budget = 1.0
 vram_activation_reserve = 714
-host_cache_mb = 10240
+ram_pool_size = 10240
 # 单槽快照；宿主面默认关闭，避免「下沉后再 land」撞块层不变量
 
 [store.gdn]

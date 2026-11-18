@@ -124,7 +124,7 @@
 ### 1.5 草稿池 ring（已落地）
 
 - `engine/src/mem/state.rs`：DFlash2 草稿池按 `window+block` 的 ring 分配，
-  不再按 `max_seq` 线性。
+  不再按 `max_context_length` 线性。
 - `naive_attn_nc.cu`：新增 `ring_cap`，逻辑位 `% ring_slots`；
   `ring_cap < 2048 + T` 直接 `__trap()`。
 - 主档 `lookup=true` 不变；262k 实测与 184k 持平。
@@ -144,7 +144,7 @@
 - `rtn-int8-row`（W8A16）：**0.9896，过现行 0.95 门**；默认。
 - `rtn-int8-row-a8`（W8A8）：**0.6962，未过**；诊断档。
 - f16 vs i8 只有 1 个后段分歧；a8 早期就分叉 ⇒ W8A8 激活量化是主因。
-- 现行门是 6×96、spec m=7/8、`max_seq=1024`；**32K fixed-tail 的
+- 现行门是 6×96、spec m=7/8、`max_context_length=1024`；**32K fixed-tail 的
   W8A16 TC / W8A8 尚未跑**。
 - 不要用“语义看起来对”替代 strict 门；如果要把 a8 转默认，先重新定
   top-1/语义门判据并举证。

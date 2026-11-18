@@ -61,7 +61,7 @@ fn knobs() -> EngineKnobs {
 fn cfg_of(ordinal: usize, chunk: usize) -> EngineConfig {
     EngineConfig {
         device_ordinal: ordinal,
-        max_seq_tokens: 1024,
+        max_context_length_tokens: 1024,
         prefill_chunk: chunk,
         knobs: knobs(),
     }

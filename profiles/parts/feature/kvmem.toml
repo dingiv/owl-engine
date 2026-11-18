@@ -1,8 +1,8 @@
 # 特性组件：KVMem 选择层 + 部分驻留 + host 下沉。
-# 具体 workspace / max_seq / 池大小由 leaf 用 --set 或少量键定。
+# 具体 workspace / max_context_length / 池大小由 leaf 用 --set 或少量键定。
 [store]
 prefix_cache = true
-host_cache_mb = 10240
+ram_pool_size = 10240
 snap_host_mb = 1024
 vram_activation_reserve = 1482
 

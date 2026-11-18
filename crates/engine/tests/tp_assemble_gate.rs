@@ -52,7 +52,7 @@ fn le_f32(v: &[f32]) -> Vec<u8> {
 fn cfg_of(ordinal: usize) -> EngineConfig {
     EngineConfig {
         device_ordinal: ordinal,
-        max_seq_tokens: 4096,
+        max_context_length_tokens: 4096,
         prefill_chunk: 128,
         knobs: EngineKnobs::default(),
     }

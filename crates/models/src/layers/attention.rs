@@ -860,7 +860,7 @@ impl Attention {
             .arg_usize(self.hkv)
             .arg_usize(hd)
             .arg_usize(pol.page)
-            .arg_usize(x.max_seq_len)
+            .arg_usize(x.max_context_length_len)
             .arg_usize(q_scale_bits as usize)
             .arg_usize(x.sm_count)
             .arg_usize(pol.page * self.hkv * hd) // 元素序 strides
@@ -927,7 +927,7 @@ impl Attention {
             .arg_usize(self.hkv)
             .arg_usize(hd)
             .arg_usize(pol.page)
-            .arg_usize(x.max_seq_len)
+            .arg_usize(x.max_context_length_len)
             .arg_usize(q_scale_bits as usize)
             .arg_usize(x.sm_count)
             .arg_usize(pol.page * self.hkv * hd) // 元素序 strides
@@ -3767,7 +3767,7 @@ mod owl_port_tests {
                 vec![32 * 1024 * 1024],
             ),
             q_seq_len: t_len,
-            max_seq_len: nb * page,
+            max_context_length_len: nb * page,
             sm_count: 84,
         };
 

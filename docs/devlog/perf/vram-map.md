@@ -4,7 +4,7 @@
 > 实例:**RTX 3090 Ti 单卡**(BDF 41:00.0,24G)+
 > **Qwen3.8-27B-AWQ-INT4** + **DFlash2 W4A16**;
 > 档:`profiles/qwen38_27b-3090-w4a16-dflash-longctx.toml`(自动池 cap 117,357;
-> `max_seq=67,584`);构建 `server --features perf,cupti`。
+> `max_context_length=67,584`);构建 `server --features perf,cupti`。
 > 本文是**下一轮显存优化的底图**:先给实测分布,再列"哪些不在账上、为什么"、
 > 算子家族分配器审计、A/B 旋钮与待办。
 
@@ -22,7 +22,7 @@
 | 常驻权重 | **17,940** | store `Weight` 16,652 + `Unclassified` 1,288 |
 | ├ 目标 27B AWQ | ~16,700 | embed 2,425 + 64 层 W4A16 marlin B ~13.2G + lm_head int4 606 + scales/zeros/norms |
 | └ DFlash2 草稿 | ~1,240 | fc + 5 层 + 码本 242 + norms(文件 1.28G) |
-| 主 KV 池 | **3,667** | 自动 cap 117,344 tok × 32 KiB;`max_seq` 只占 67,584 tok |
+| 主 KV 池 | **3,667** | 自动 cap 117,344 tok × 32 KiB;`max_context_length` 只占 67,584 tok |
 | GDN live 格(`gdn.conv_*`/`recurrence`) | **148** | 48 个 GDN 层 × 1 格(`gdn_slots=1`) |
 | GDN 前缀快照(`gdn.slot.*`,`snap_max=1`) | **148** | 块边界状态副本,前缀复用/跨 turn 恢复 |
 | GDN 投机快照(`gdn.ring.*`,`spec_snap`) | **148** | 每轮 verify 前拷贝,accept<8 时回滚 |
@@ -98,19 +98,19 @@ fold 族原先按 `m=0..depth-1` 捕 7 张图(每张约 66M 驱动 exec)。fold 
   (AL 只证明 draft/verify 一致性,不是输出质量)。故默认 **f16**;
   `i8` 只在"显存优先、可接受再评测"的档位显式开:
   `server -p <档> --set model.embed_quant=i8`。
-- **96k 实测**(`max_seq=98,304` + i8,同一图形/单 fold 图):97,084 prompt
+- **96k 实测**(`max_context_length=98,304` + i8,同一图形/单 fold 图):97,084 prompt
   通过,AL 2.706,128 token,free 2,068.6 MiB(池 3,699M / cap 118,381)。
   ⇒ 单卡 96k 在 i8 档已落地;f16 档仍受 cap 抖动限制(好的 boot 114k 够,
   抖到 79k 不够)。
 - 下一步质量门:小语料 PPL / 任务集,或 group-wise int8(每 128 列
   一个 scale,误差更小,scale 仅 ~20M)。
 
-### 1.4 池按 `max_seq × 并发` 封顶 + fresh free(2026-10-22 晚)
+### 1.4 池按 `max_context_length × 并发` 封顶 + fresh free(2026-10-22 晚)
 
 两刀一起落:
 
 1. **池按缓存开关分档**:
-   - `prefix_cache=false`:池 = `min(cap, (ceil(max_seq/page)+1 页) × concurrency)`;
+   - `prefix_cache=false`:池 = `min(cap, (ceil(max_context_length/page)+1 页) × concurrency)`;
    - `prefix_cache=true`:池 = `cap`(整池都可被前缀缓存持有,新请求逐出)。
    67k 无缓存档池从 3,635 → **2,113 MiB**;96k 无缓存档 3,699 → **3,073 MiB**;
    dflash 16k 缓存档仍为 **2,069 MiB**(66,208 tok),缓存可占整池。
@@ -216,8 +216,8 @@ fold 族原先按 `m=0..depth-1` 捕 7 张图(每张约 66M 驱动 exec)。fold 
 | cuBLAS 4MB 预绑(已落码) | 23 229 | 23 615 | 117 357 | 209.0 | free +0.31G;AL 不变 |
 
 > **自动池会把省下的显存全部吃掉**:降 Temp/cuBLAS 只会让 cap 变大,`smi`
-> 峰值基本不变。要峰值真降,只能加 `vram_activation_reserve` 或降 `max_seq`
-> (池仍按 cap 预分配;`max_seq` 只影响准入)。`reserve=768` 峰值 −160M,
+> 峰值基本不变。要峰值真降,只能加 `vram_activation_reserve` 或降 `max_context_length`
+> (池仍按 cap 预分配;`max_context_length` 只影响准入)。`reserve=768` 峰值 −160M,
 > 96k 仍可(cap 108k > 98k);`reserve=1024` cap 64k,67k 档会拒启。
 
 ---
@@ -262,7 +262,7 @@ fold 族原先按 `m=0..depth-1` 捕 7 张图(每张约 66M 驱动 exec)。fold 
 3. **P6 家族分配门**:把 `Exec::load_cubin`/`CudaBlas`/`CudaGraph` 的
    分配统一登记(或至少在 boot 日志报字节);加一个 source lint:
    家族 `server/*.rs` 禁止 `stream.alloc`/`CudaSlice`(当前审计为 0 命中)。
-4. **P7 账本收敛**:✅ 池按 `max_seq×并发` 封顶 + 池前 settle/fresh free
+4. **P7 账本收敛**:✅ 池按 `max_context_length×并发` 封顶 + 池前 settle/fresh free
    (2026-10-22 晚,§1.4);余项 = `spec_snap` 进 `fixed_after`、图预算按实测校准、
    `harvest` 直分配改走 `DeviceRes::alloc`。
 5. **P8 大杠杆**:embed 量化(2,425M;int8 首选,省 ~1.2G)、int4 主 KV
@@ -274,7 +274,7 @@ fold 族原先按 `m=0..depth-1` 捕 7 张图(每张约 66M 驱动 exec)。fold 
 
 ## 8. 下一会话 handoff(2026-10-22)
 
-- **当前策略**:`prefix_cache=false` → 池 = `min(cap, max_seq×并发+1页)`;
+- **当前策略**:`prefix_cache=false` → 池 = `min(cap, max_context_length×并发+1页)`;
   `prefix_cache=true` → 池 = `cap`(整池给缓存,新请求逐出 host/disk)。
   池前 `sync/drain/trim` + fresh `cuMemGetInfo` 已消掉 cap 抖动。
 - **下一步**:3090 单卡测 **kvmem 选择层**(`[kvmem]` overcommit/workspace/

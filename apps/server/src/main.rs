@@ -320,7 +320,7 @@ async fn async_main(workers: usize) -> std::process::ExitCode {
         },
         engine: owl_engine::EngineConfig {
             device_ordinal: 0,
-            max_seq_tokens: config.max_seq,
+            max_context_length_tokens: config.max_context_length,
             prefill_chunk: config.prefill_chunk,
             knobs: config.knobs.clone(),
         },

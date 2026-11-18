@@ -500,7 +500,7 @@ device_repack`。
    原处留 `join2` 包装 —— 单卡档逐字旧行为;
 6. ✅ **`dflash_graph_round` 镜像**(图态 propose:捕获图里烘焙着草稿 AR)——
    `join2` 两 rank 各自回放;`write_bt` 也改双 rank(页表是每 rank 独立的设备块);
-7. ✅✅ **端到端跑通 + M4 达成**(2026-10-19;`max_seq = 8704`,depth=4):
+7. ✅✅ **端到端跑通 + M4 达成**(2026-10-19;`max_context_length = 8704`,depth=4):
 
 | 臂(std 五点三轮,双 3080) | prefill 中位 | decode 中位 | TTFT |
 |---|---:|---:|---:|

@@ -38,7 +38,7 @@ async fn boot(dir: &str, ddir: &str) -> RunningEngine<owl_engine::GpuFace> {
     knobs.pool_tokens = Some(2048);
     let mut engine = Engine::new(EngineConfig {
         device_ordinal: gpu_ordinal().expect("OWL_TEST_DEVICE"),
-        max_seq_tokens: MAX_SEQ,
+        max_context_length_tokens: MAX_SEQ,
         prefill_chunk: 32,
         knobs,
     })

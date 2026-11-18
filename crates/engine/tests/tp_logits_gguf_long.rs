@@ -25,18 +25,18 @@ use owl_engine::{Engine, EngineConfig, EngineKnobs, RunningEngine, TpEngine, Tur
 use owl_iface::contract::ModelError;
 use owl_shared::testkit::{resource, resource_ok};
 
-fn cfg_of(ordinal: usize, max_seq: usize, chunk: usize) -> EngineConfig {
+fn cfg_of(ordinal: usize, max_context_length: usize, chunk: usize) -> EngineConfig {
     let mut knobs = EngineKnobs { sampler_enabled: false, raw_completion: true, ..Default::default() };
     if let Ok(mb) = std::env::var("OWL_GGUF_TP_RESERVE_MB").map(|s| s.parse::<u64>()) {
         knobs.vram_activation_reserve = mb.expect("OWL_GGUF_TP_RESERVE_MB 非数字");
     }
-    knobs.pool_tokens = Some(max_seq);
+    knobs.pool_tokens = Some(max_context_length);
     knobs.gdn_slots = 1;
-    knobs.host_cache_mb = 32;
+    knobs.ram_pool_size = 32;
     knobs.snap_host_mb = 0;
     knobs.snap_max = 0;
     knobs.prefix_cache = false;
-    EngineConfig { device_ordinal: ordinal, max_seq_tokens: max_seq, prefill_chunk: chunk, knobs }
+    EngineConfig { device_ordinal: ordinal, max_context_length_tokens: max_context_length, prefill_chunk: chunk, knobs }
 }
 
 fn dev(name: &str) -> Option<usize> {
@@ -210,29 +210,29 @@ fn tp_logits_gguf_long() {
     let words: usize = std::env::var("OWL_GGUF_TP_WORDS").ok().and_then(|s| s.parse().ok()).unwrap_or(900);
     let chunk: usize = std::env::var("OWL_GGUF_TP_CHUNK").ok().and_then(|s| s.parse().ok()).unwrap_or(512);
     // 20G 卡跑单卡参考时 4096 池会超预算；诊断档允许压到刚够 1.3k prompt。
-    let max_seq: usize = std::env::var("OWL_GGUF_TP_MAX_SEQ").ok().and_then(|s| s.parse().ok()).unwrap_or(4096);
+    let max_context_length: usize = std::env::var("OWL_GGUF_TP_MAX_SEQ").ok().and_then(|s| s.parse().ok()).unwrap_or(4096);
     std::thread::Builder::new()
         .stack_size(64 << 20)
         .spawn(move || {
             tokio::runtime::Builder::new_current_thread()
                 .build()
                 .expect("rt")
-                .block_on(body(oa, ob, words, chunk, max_seq, &res))
+                .block_on(body(oa, ob, words, chunk, max_context_length, &res))
         })
         .expect("起测试线程")
         .join()
         .expect("门失败");
 }
 
-async fn body(oa: usize, ob: usize, words: usize, chunk: usize, max_seq: usize, res: &str) {
+async fn body(oa: usize, ob: usize, words: usize, chunk: usize, max_context_length: usize, res: &str) {
     let path = std::path::PathBuf::from(resource(res).expect("列了就有"));
     let prompt = long_prompt(words);
-    eprintln!("[gguf-tp-long] {res} · chunk={chunk} · 词 {words} · max_seq={max_seq} · 设备 A={oa} B={ob}");
+    eprintln!("[gguf-tp-long] {res} · chunk={chunk} · 词 {words} · max_context_length={max_context_length} · 设备 A={oa} B={ob}");
 
     let skip_ref = std::env::var_os("OWL_GGUF_TP_SKIP_REF").is_some();
     // ── ① 单卡参考(最后一词 logits)──
     let (ref_logits, ref_gen) = if skip_ref { (Vec::new(), Vec::new()) } else {
-        let mut e = Engine::new(cfg_of(oa, max_seq, chunk)).expect("engine(单卡参考)");
+        let mut e = Engine::new(cfg_of(oa, max_context_length, chunk)).expect("engine(单卡参考)");
         let loaded = e.loader().load_gguf(&path).await.expect("单卡装载");
         let mut r = e.run(loaded).await.expect("单卡装配");
         let (l, g, _) = first_step_logits(&mut r, &prompt, 16, false)
@@ -243,9 +243,9 @@ async fn body(oa: usize, ob: usize, words: usize, chunk: usize, max_seq: usize, 
     };
 
     // ── ② TP2(同 prompt)──
-    let mut e0 = Engine::new(cfg_of(oa, max_seq, chunk)).expect("engine(r0)");
+    let mut e0 = Engine::new(cfg_of(oa, max_context_length, chunk)).expect("engine(r0)");
     let m0 = e0.loader().slice(0, 2).load_gguf(&path).await.expect("rank0 分片装载");
-    let mut e1 = Engine::new_with_ledger(cfg_of(ob, max_seq, chunk), e0.ledger_cell(), 1).expect("engine(r1)");
+    let mut e1 = Engine::new_with_ledger(cfg_of(ob, max_context_length, chunk), e0.ledger_cell(), 1).expect("engine(r1)");
     let m1 = e1.loader().slice(1, 2).load_gguf(&path).await.expect("rank1 分片装载");
     let tp = TpEngine::assemble(vec![e0, e1], vec![m0, m1]).await.expect("TP2 装配");
     let mut r = tp.run().expect("TP2 进执行态");

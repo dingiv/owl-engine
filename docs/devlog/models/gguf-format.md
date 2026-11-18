@@ -233,7 +233,7 @@ impl PlanSource<'a> {
 kind = "gguf"                 # 新增档;或 dir 探测自动认 GGUF
 dir  = "/path/to/models/mradermacher/Holo-3.1-9B-GGUF/Holo-3.1-9B.Q5_K_M.gguf"
 [runtime]
-max_seq = 32768
+max_context_length = 32768
 ```
 
 `model.path` 今天语义 = **目录**;GGUF 是**单文件** ⇒ 需在 `model` 模块加
@@ -666,7 +666,7 @@ Gemma 式)—— 这正是 owl `RmsNorm::new_add_one`(`×(1+w)`)的来处,而 HF
 | `ModelFormat::Gguf` | `model.format = "gguf"`;`model.path` = **`.gguf` 单文件**(不是目录) |
 | `ModelLoader::load_gguf` | ① `GgufSource::open`(容器 + spec 同源)② `GgufPlan` + `PlanSource::keyed(SourceFacts::GGUF)` + `Model::new`(**构造期取走未解析键,非空即拒**)③ `load_from_dir`(压缩块字节原样)④ 词表 `build_vocab`(文件自给;eos 吃文件给的 id)⑤ rope `rope_facts`(KV 三件套)⑥ 装载分相上屏 |
 | `ModelLoader::load_qwen35_hf` | **通用 Qwen3.5 HF 目录装载**(预设入参化;rope 三件套显式给)—— 为交叉源对拍而生,顺带让任意 Qwen3.5 HF 档能上引擎 |
-| `flavors/gguf4b.toml` | M1 靶位档(单卡 3090 Ti;`max_seq 32768` / `gdn_slots 1` / greedy;**刻意不设 `allowed_ops` 白名单** —— 生产硬化另刀) |
+| `flavors/gguf4b.toml` | M1 靶位档(单卡 3090 Ti;`max_context_length 32768` / `gdn_slots 1` / greedy;**刻意不设 `allowed_ops` 白名单** —— 生产硬化另刀) |
 | server 实测 | `target/release/server --flavor gguf4b <用户档>` 起机 → `/v1/chat/completions` 正常(**thinking 走 `reasoning_content`**,与模板一致);图清单里 `owl_gguf_gemm_q4k ×124 / q6k ×76 / q5k ×8 / owl_gguf_quant_act_f16 ×177` —— 真入图 |
 
 ### 13.4 4B 单卡 e2e 实测(`OWL_TEST_DEVICE=0000:42:00.0`,3090 Ti)
@@ -697,7 +697,7 @@ prompt ids = [760, 6511, 314, 9338, 369] ≡ llama.cpp `/tokenize`(逐位)
    prefill tile 臂未移植。M2 若要与 llama.cpp/vLLM 同台比 prefill,这条必须补
    (设计 §八 R2 给出方向:prefill 回落 dequant+cuBLAS 或 port tile GEMM)。
 
-**测速档口径(踩过的坑,写进 flavor 注释了)**:`pool_tokens = max_seq`(全 ctx 常驻)
+**测速档口径(踩过的坑,写进 flavor 注释了)**:`pool_tokens = max_context_length`(全 ctx 常驻)
 + `prefix_cache = false`。首轮测速用 `pool_tokens = 8192` + `prefix_cache = true`,
 8448-token 那一点撞宿主层预算(`宿主层越界:537919488 > 536870912`)⇒ 请求被弃置、
 测速点降级为"本地估算"(prefill 假 10727 t/s / decode 0)—— **看到"prefill 边界降级"
@@ -1737,7 +1737,7 @@ nsys 的 31.8 ms **GPU busy 不可能成立**(否则 41.2 t/s 不成立),2246 �
 ## 二十三、GGUF × KVMem 联调:262k 单卡档(2026-10-20)
 
 **目标**(用户裁决):把 GGUF 单文件档接进 **KVMem 虚拟化**(设备池 < 上下文,
-全量 KV 在宿主),在**单张 3090 Ti(24 GB)** 上给出 `max_seq = 262144` 的可用配置。
+全量 KV 在宿主),在**单张 3090 Ti(24 GB)** 上给出 `max_context_length = 262144` 的可用配置。
 
 **交付**:`flavors/gguf27b-262k.toml`(起机/三层账/纪律全在该文件注释)。
 
@@ -1749,11 +1749,11 @@ nsys 的 31.8 ms **GPU busy 不可能成立**(否则 41.2 t/s 不成立),2246 �
 + 守卫 0.128 ≈ 20.1 GiB ⇒ 余 ~4 GiB(258k 实测峰值 20.4 GB)
 
 KV 全量 = 262144 tok × 32 KiB(fp8) = 8 GiB ⇒ 非驻留块**全部**落宿主
-  ⇒ host_cache_mb = 9216(258k 实测下沉 8045 块 = 7.86 GiB)
+  ⇒ ram_pool_size = 9216(258k 实测下沉 8045 块 = 7.86 GiB)
   ⇒ snap_host_mb = 2048(GDN 快照 159 MB/张,512 个边界只留最近 ~13 张)
 ```
 
-`max_seq = 262144` **是本文件的原生事实**(`qwen35.context_length`),无需 YaRN/扩表。
+`max_context_length = 262144` **是本文件的原生事实**(`qwen35.context_length`),无需 YaRN/扩表。
 
 ### 23.2 实测(单张 3090 Ti 41:00.0;greedy;needle 置于 prompt 50%)
 
@@ -1909,8 +1909,8 @@ cos/sin          = cos/sin(pos·inv_freq) · (0.1·ln(factor)+1)·attention_fact
 
 - 配置面:`[model.rope] yarn_factor / original_max / beta_fast / beta_slow /
   attention_factor`(缺省 1.0/0/32/1/1 = **关**,短文本逐位不变);
-- **表长** = `max(模型 context, original×factor, runtime.max_seq)`;
-- **未开 YaRN 且 `max_seq > context` ⇒ 响亮拒**(纯外推没有官方背书);
+- **表长** = `max(模型 context, original×factor, runtime.max_context_length)`;
+- **未开 YaRN 且 `max_context_length > context` ⇒ 响亮拒**(纯外推没有官方背书);
 - 只对 GGUF 档生效(HF 家族 rope 由装载器硬编码);factor=1 与旧表**逐位相同**
   (`yarn_inv_freq_blends_extrapolation_and_interpolation` 门)。
 
@@ -1932,8 +1932,8 @@ cos/sin          = cos/sin(pos·inv_freq) · (0.1·ln(factor)+1)·attention_fact
 - 零 Xid / 零 N4 未归还 / 零 Exhausted。
 
 **档**:
-- `flavors/gguf27b-1m.toml`(factor 4.0 / max_seq 1048576 / host 66560);
-- 524k 变体:同档 `yarn_factor=2.0` + `max_seq=524288` + `host_cache_mb=33792`
+- `flavors/gguf27b-1m.toml`(factor 4.0 / max_context_length 1048576 / host 66560);
+- 524k 变体:同档 `yarn_factor=2.0` + `max_context_length=524288` + `ram_pool_size=33792`
   (注释里已写;499k 实测 344.8 s);
 - 262k 内**仍用 `gguf27b-262k`(YaRN 关)**:静态 YaRN 对短文本有轻微精度影响
   (官方说明),日常短对话不要吃这个税。
@@ -1976,10 +1976,10 @@ cos/sin          = cos/sin(pos·inv_freq) · (0.1·ln(factor)+1)·attention_fact
 | `exec/phases.rs::execute_begin` 的 `pending_loads` 回灌 `swap(In)` | 同上 | rank1 页不恢复 ⇒ 回灌后 peer 读旧内容 |
 | `exec/coverage.rs` 视图页表 `write_select_view`(**唯一一处**;`prefill_chunk` 的按 rank 写是对的) | `self.dev.pool` | 选择层视图在 peer 上是捕获期旧表 |
 | `exec/spec.rs::snap_offload` / `snap_ensure_resident`(GDN 快照) | 同族 | 快照回灌后 peer 状态不一致(实测有 `快照 … 不在设备槽` 弃 turn) |
-| `store::Rel` | **一本 host 账**:`host_cache_mb` 只按一份算,链条目 = 1 页字节 | peer 的那半 KV 无处落 |
+| `store::Rel` | **一本 host 账**:`ram_pool_size` 只按一份算,链条目 = 1 页字节 | peer 的那半 KV 无处落 |
 
 **修法(建议,未施工)**:给宿主腿加 **planes = world** 维度 ——
-① `HostTier` 每链条目 = `planes × block_bytes`(`host_cache_mb` 语义不变 = 两 rank 合计);
+① `HostTier` 每链条目 = `planes × block_bytes`(`ram_pool_size` 语义不变 = 两 rank 合计);
 ② `plan_offload/onload` 出 **per-plane 的 pieces + 独立槽台**,engine 对两 rank 各发一条
 `swap`,两回执齐了再一次 `commit`(abort 同理);
 ③ GDN 快照照抄同一套(每 rank 一份,键仍 `SnapKey`);

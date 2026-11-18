@@ -102,7 +102,7 @@ fn cfg_of(ordinal: usize) -> EngineConfig {
         .unwrap_or(64);
     let c = EngineConfig {
         device_ordinal: ordinal,
-        max_seq_tokens: 256,
+        max_context_length_tokens: 256,
         prefill_chunk: chunk,
         knobs: knobs(),
     };
@@ -497,7 +497,7 @@ async fn run_turn_plain<D: owl_iface::contract::DeviceClient>(
 fn cfg_eager(ordinal: usize) -> EngineConfig {
     let mut c = cfg_of(ordinal);
     c.knobs.no_graph = true; // eager:逐核可归因
-    c.max_seq_tokens = 1024; // 探针用长 prompt(缺省 256 装不下)
+    c.max_context_length_tokens = 1024; // 探针用长 prompt(缺省 256 装不下)
     c
 }
 

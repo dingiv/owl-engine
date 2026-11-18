@@ -735,7 +735,7 @@ stage-in:**6 块 / 2.2MiB / 0.6ms(每块 384KiB · 3575MiB/s;全部走 prefill �
 `reuse_face` 找不到边界快照 ⇒ 复用面被裁到 0 ⇒ **整条前缀复用失败**(不是"回灌慢",
 而是"根本不回灌",退化成全量重算)。补上 `snap_host_mb` 后立刻正常。
 📌 **律**:KV 块能下沉 ≠ 这条路能用 —— **边界快照的在场性是复用的通行证**;
-配置里 `host_cache_mb` 与 `snap_host_mb` 必须成对开(否则 KV 落地了也没人认)。
+配置里 `ram_pool_size` 与 `snap_host_mb` 必须成对开(否则 KV 落地了也没人认)。
 
 **(3)G1(单卡 262k)的真前置(立案):那是我们自己的策略粗化**
 
@@ -1363,7 +1363,7 @@ partial/chunk256 的相位账:`索引 515ms + 查询面 804ms(其中**设备往�
 | 件 | 之前 | 现在 |
 |---|---|---|
 | `[kvmem]` | 只有 7 项(`select_*`/`index`/`recall_every`/`dense_floor_mib`/`pool_overcommit`) | **11 项**:补 `coverage_probe` / `evict_policy` / `analyze_at_ctx` |
-| `[pool]` | 无宿主两账(靠 `OWL_HOST_CACHE_MB`/`OWL_SNAP_HOST_MB`) | 补 `host_cache_mb` / `snap_host_mb` |
+| `[pool]` | 无宿主两账(靠 `OWL_HOST_CACHE_MB`/`OWL_SNAP_HOST_MB`) | 补 `ram_pool_size` / `snap_host_mb` |
 | `EngineKnobs::from_config` | `env > config > 缺省` | **只读配置,零 env** |
 | 探针档 | 自己拼 knobs(散落 `OWL_SELECT_*`/`OWL_COV_*`) | **走同一条 `OwlConfig::load`**;`OWL_PROBE_FLAVOR` + `OWL_PROBE_OVERLAY` |
 | 已废 env 读取器 | `parse_evict_policy` / `recall_every_from_env` | **删** |
@@ -1395,7 +1395,7 @@ partial/chunk256 的相位账:`索引 515ms + 查询面 804ms(其中**设备往�
 池页数 ≥ max_active_turns × (select_blocks + sink + recent + ceil(chunk/page))
 96 ≥ 1 × (32 + 2 + 4 + 8) = 46 ✓         页 = 1 MiB(fp8)/2 MiB(f16)
 ```
-改数只动三行(`max_seq` / `pool_tokens` / `select_blocks`);不自洽 **boot 直接拒启并报数**。
+改数只动三行(`max_context_length` / `pool_tokens` / `select_blocks`);不自洽 **boot 直接拒启并报数**。
 `dev-08b` 同样(192 ≥ 2×86 ✓)。实测拦下过两次真实不自洽(池 64 页 vs 2 并发 × 46 页;
 池 16 页 vs 8 并发 × 11 页)—— 这正是它该干的事。
 
@@ -1473,7 +1473,7 @@ partial/chunk256 的相位账:`索引 515ms + 查询面 804ms(其中**设备往�
 - **池容量的正确姿势**:`pool_tokens` = 安全阀(显式),上限由治理器算;
   它必须 ≥ 工作集下限算式(`N_active × (blocks+sink+recent+chunk/page)`)。
 - **低显存档在 27B/24G 的可达规模**:扣掉 prefill 中间件的 3.4 GiB 后,
-  长期可用池 ≈ **1 GiB(32K tok)** ⇒ 配 `max_seq = 131072` = **4× 超卖**。
+  长期可用池 ≈ **1 GiB(32K tok)** ⇒ 配 `max_context_length = 131072` = **4× 超卖**。
   要"池吃满 ~100K",必须先解决第 (2) 条的中间件累积。
 - **下一刀 = prefill 中间件回收面**(每 chunk 128 MiB × N chunk):查 eager 路的
   块释放链(`free_blocks` / arena carve)为何不把中间件还给分配器。
@@ -1887,7 +1887,7 @@ nb ≥ max_active_turns × (ceil(workspace_per_req/32) + ceil(chunk/32))
 ```text
 权重/底价 19.2 + fixed_after ~0.85 + 池 3.0 + 激活面(chunk 512,峰 ~0.7) + 守卫 0.13 ≈ 23.9 GiB
 设备池 98304 tok(3 GiB)⇒ 超卖 2.7×;KV 总量 262144 tok × 32 KiB = 8 GiB
-  ⇒ 非驻留块**全部**落在宿主 KV 腿 ⇒ host_cache_mb = 9216(实测:6 GiB 在 196k 处
+  ⇒ 非驻留块**全部**落在宿主 KV 腿 ⇒ ram_pool_size = 9216(实测:6 GiB 在 196k 处
      下沉 6090 块 = 6.09 GiB ⇒ 守卫拒发;262k 需 ~8160 块 = 8.0 GiB)
 平面:prefill_chunk = 512 + recall_every = 1(实测 1.4× 于 chunk 128;`every=4` 快但**输出跑题**)
 ```
@@ -2085,7 +2085,7 @@ git stash pop         ⇒ 视图步 1 · 输出 2 字 · FAILED
 
 门:`store_admission_gate` **6/6**(新增 `per_turn_floor_above_workspace_is_refused_loudly`;
 原"虚拟化开则放行"那条扩成**真提交一个 `Pages(4)` 的 turn 并跑完**)。
-⚠️ 上限门在 CPU mock 最小档**结构性触发不到**(`max_seq 256 tok = 8 页` < 工作集 10 页)⇒ 单开一档
+⚠️ 上限门在 CPU mock 最小档**结构性触发不到**(`max_context_length 256 tok = 8 页` < 工作集 10 页)⇒ 单开一档
 (工作集压到 **3 页**)才钉得住。
 
 #### (2)prefill 为什么慢:三处真凶(逐条实测)

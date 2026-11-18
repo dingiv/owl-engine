@@ -114,17 +114,17 @@ impl TierBudget {
 /// (`BudgetInputs.host_bytes`)必须**同源** —— 两处各算一遍必然漂,而漂了之后
 /// `Rel::open` 的交叉校验会把启动拒掉(好过静默两把尺)。
 ///
-/// 口径:`host_cache_mb` = KV 块腿的宿主分片,`snap_host_mb` = 状态腿(快照)分片;
+/// 口径:`ram_pool_size` = KV 块腿的宿主分片,`snap_host_mb` = 状态腿(快照)分片;
 /// 两者之和 = store 的中层总账。磁盘层二期(恒 0)。
 pub fn tier_budget_of(
-    host_cache_mb: usize,
+    ram_pool_size: usize,
     snap_host_mb: usize,
-    disk_cache_mb: usize,
+    disk_pool_size: usize,
     snap_disk_mb: usize,
 ) -> TierBudget {
     TierBudget {
-        host_bytes: (host_cache_mb + snap_host_mb) << 20,
-        disk_bytes: (disk_cache_mb + snap_disk_mb) << 20,
+        host_bytes: (ram_pool_size + snap_host_mb) << 20,
+        disk_bytes: (disk_pool_size + snap_disk_mb) << 20,
     }
 }
 

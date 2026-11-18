@@ -387,7 +387,7 @@ cargo test -p owl-shared --lib                125 passed
 cargo check -p server                          PASS
 ```
 
-`server --test config_check` 仍有 3 项既有 `runtime.max_seq` 期望值失败
+`server --test config_check` 仍有 3 项既有 `runtime.max_context_length` 期望值失败
 （57344 vs 79872），与本次改动无关。
 
 真机：

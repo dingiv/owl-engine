@@ -47,14 +47,14 @@ Intent（意图） → Resolve（派生） → Verify（预检） → Explain（
 | # | 现象 | 代价 | 根因 |
 |---|---|---|---|
 | 1 | 做"3090 W4A16 最大上下文"档，需要手写 110 行 flavor：池/上下文/快照/前缀缓存/FI 图五件套/桶/尾合并/chunk/白名单 | 1 次会话 | 没有意图层；低层键直接暴露 |
-| 2 | `max_seq` 与 `pool_tokens` 必须相等（不超卖），但治理器另有 `cap`；`[vram-gov]` 不计 chunk 激活面 | **112k/128k/144k/160k 四次试错**，两次运行期 `PoolExhausted` | 内存模型不完整；没有 `context = "max"` |
+| 2 | `max_context_length` 与 `pool_tokens` 必须相等（不超卖），但治理器另有 `cap`；`[vram-gov]` 不计 chunk 激活面 | **112k/128k/144k/160k 四次试错**，两次运行期 `PoolExhausted` | 内存模型不完整；没有 `context = "max"` |
 | 3 | `prefill_tail_merge=1024 + chunk=1024` 造出 2048 无桶块 → eager 1.6G 激活 → 8k 请求后 OOM | 1 次立案 | 派生关系（尾合并上界 ≤ 桶阶梯顶）无人校验 |
 | 4 | 翻 `gdn_chunked` 默认后，`awq27b` 首次 prefill 撞算子准入门 | 1 次修复 | `allowed_ops` 是**第二份真源**，与臂/池档手工同步 |
 | 5 | 同一份白名单在 4 个 flavor 里各抄一遍（spec-dflash / 262k / kvmem / bench） | 持续漂移 | 白名单没有从"臂集合"派生 |
 | 6 | 启动脚本要生成 `/tmp/xxx.toml` 写 `extends = base.toml` 才能叠加 BDF/端口 | 每个脚本一次 | CLI 没有 `--set key=value` |
 | 7 | `base.toml` 是本地未入库文件；新机器 clone 后任何 flavor 都起不来 | 首次部署 | 站点面（路径/卡位/端口）没有模板/CLI |
 | 8 | `gdn_slots` 改名曾让全部 flavor 解析失败（`deny_unknown`） | 历史事故 | 没有 schema 版本/别名/迁移器 |
-| 9 | `fi_plan_bake = 0` 是"取 max_seq"的哨兵；`Option<usize>` + 0 两义 | 阅读成本 | 哨兵值当枚举用 |
+| 9 | `fi_plan_bake = 0` 是"取 max_context_length"的哨兵；`Option<usize>` + 0 两义 | 阅读成本 | 哨兵值当枚举用 |
 | 10 | "虚拟化"要同时开 `select_decode + select_partial + index + pool_overcommit` 四键 | 易错 | 意图（KVMem=overcommit）没有单键 |
 | 11 | 并发一个概念三处名：`server.max_concurrency` / `pool.gdn_slots` / `runtime.max_batch` | 易错 | 没有意图键 `concurrency` |
 | 12 | 启动日志是长墙；`[boot] 现役臂`、`[vram-gov]`、`slab 总账` 分散 | 排障慢 | 没有"一行摘要 + 可机读 effective config" |
@@ -180,14 +180,14 @@ server --profile awq27b-3090-max --site ~/owl-site.toml \
 | `goal=max-speed` | `reuse=global`（若 ctx 允许）；`fi_*` 全开；`prefill_chunk=1024,tail=0` | 速度优先；ctx 按内存模型 |
 | `goal=balanced` | 折中：`reuse=session`；FI 图开；ctx 取 2/3 max | — |
 | `goal=low-memory` | `kvmem=overcommit`；`reuse=global`；池 < ctx | 需 host/disk 腿 |
-| `context=N` | `runtime.max_seq=N`；`pool.pool_tokens=N`（非超卖） | 非超卖档两者相等（当前手写要求） |
+| `context=N` | `runtime.max_context_length=N`；`pool.pool_tokens=N`（非超卖） | 非超卖档两者相等（当前手写要求） |
 | `context="max"` | `N = solve(内存模型)` | 见 §7 |
 | `concurrency=C` | `pool.gdn_slots=C`；`server.max_concurrency=C`；`runtime.max_batch=C` | **单键三处同源**（当前三处手写） |
 | `spec=off` | `[spec] depth=0`；不要求 draft_dir | — |
 | `spec=dflash` | `depth=7`；`model.dflash2_dir=draft_dir`；草稿池账 +20KiB/token | ctx 重新求解 |
 | `kv=fp8` | `pool.kv_fp8=true`；白名单 fp8 族 | 关 = f16 族 |
 | `kvmem=off` | `select_decode/select_partial/index/pool_overcommit=false`；host/disk 腿=0 | 单键替四键 |
-| `kvmem=overcommit` | 四键全开 + `host_cache_mb/snap_host_mb/disk_*` 必要腿 | 需虚拟化两扇门 |
+| `kvmem=overcommit` | 四键全开 + `ram_pool_size/snap_host_mb/disk_*` 必要腿 | 需虚拟化两扇门 |
 | `graphs=auto` | `no_graph=false`；`fi_cuda_graph=true`；`fi_plan_bake=0`；`fi_plan_restore=false`；`decode_fi/verify_fi=true`；`verify_v2=false`（有 spec） | 需 `kv=fp8` + 单卡 + 非 select_decode；否则自动降级并**打印原因** |
 | `graphs=off` | `no_graph=true`；FI 臂 off | 诊断/对照 |
 | `reuse=off` | `prefix_cache=false`；`snap_max=0`；`snap_host_mb=0` | 单会话最大 ctx 的默认 |
@@ -278,7 +278,7 @@ context_max = min(model_max, floor(pool_tokens_max / page) * page)
 
 ### 7.3 校验门（一次报全）
 
-- `pool_tokens ≥ max_seq`（非超卖）/ 虚拟化档例外；
+- `pool_tokens ≥ max_context_length`（非超卖）/ 虚拟化档例外；
 - `gdn_slots = max_batch = max_concurrency`（意图派生后必须相等）；
 - `fi_plan_restore=false ⇒ fi_plan_bake=Some`；`select_decode ⇒ 非 max_batch`；
 - `kvmem=overcommit ⇒ 虚拟化两扇门 + 宿主腿 > 0`；
@@ -465,7 +465,7 @@ server --migrate-config old.toml --to profile > new.toml
    3090 Ti + 27B + FP8 + spec off + `512+512` 的账:
    `total 23.60G×99% − reserve 0.25G − fixed 0.90G − live 16.26G = budget 5.95G;
    − act 0.60G − margin 1.30G = 4.05G ⇒ 131072 tok`。
-   144k 仍可 `--set runtime.max_seq=147456`(显式优先;`--check` 会告警余量不足)。
+   144k 仍可 `--set runtime.max_context_length=147456`(显式优先;`--check` 会告警余量不足)。
 2. **`total` 用治理器口径**(`[vram-gov] total=`),不是 nvidia-smi 标称:
    3090 Ti = 23.60G、3080 20G = 19.63G;`weights_base` 取 boot `live=`
    (27B AWQ-int4 = 16.26G;spec dflash = +1.26G 草稿权重)。
@@ -490,7 +490,7 @@ server --migrate-config old.toml --to profile > new.toml
 ### 14.3 验收(2026-10-20,单 3090 Ti / BDF 42:00.0)
 
 ```text
---check(不装权重)            : 12ms;max_seq=131072 / pool=131072 / budget 5.95G / cap 194938
+--check(不装权重)            : 12ms;max_context_length=131072 / pool=131072 / budget 5.95G / cap 194938
 --print-config --format json : provenance["pool.pool_tokens"]=derived, estimate.pool_tokens=131072
 真机 boot [vram-gov]         : total=23.60G fixed_after=0.90G live=16.26G budget=5.95G
                               per_tok=32768B cap=194835 tok(manual=131072)—— 与估算逐项一致

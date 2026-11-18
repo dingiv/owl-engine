@@ -10,7 +10,7 @@
 //!
 //! 所以本模块与装载**同源**：臂分派、声明解析、几何对账、草稿族判定都调引擎
 //! 自己的接口；server 只拿 `(format, quant, head_quant, embed_quant, path,
-//! max_seq, vision)` 这些**配置字段**进来，把返回的文本按既有前缀打印。
+//! max_context_length, vision)` 这些**配置字段**进来，把返回的文本按既有前缀打印。
 //!
 //! ## 接口纪律
 //!
@@ -88,7 +88,7 @@ pub struct ModelCheckSpec<'a> {
     pub head_quant: HeadQuant,
     pub embed_quant: EmbedQuant,
     /// 运行时上下文（用于几何对账与 YaRN 软提示）
-    pub max_seq: usize,
+    pub max_context_length: usize,
     pub vision: bool,
     /// `[vision] path`（非空；`vision=false` 时给了它是配置自相矛盾）
     pub vision_path: Option<&'a Path>,
@@ -131,7 +131,7 @@ fn model_decl(
         ));
     };
     if let Some(p) = spec.profile {
-        check_geom_against(decl.as_ref(), p, spec.max_seq)?;
+        check_geom_against(decl.as_ref(), p, spec.max_context_length)?;
     }
     let mut note = decl.summary();
     // 自带 MTP/NextN 头是检查点事实(同一份解析);0 = 不带,不打扰输出
@@ -141,11 +141,11 @@ fn model_decl(
     }
     // max_pos 的**软**超标只在摘要里提示(HF 是硬拒,已在 check_geom_against 抛)
     let g = decl.geom();
-    if decl.max_pos_policy() == MaxPosPolicy::WarnYarn && g.max_pos != 0 && spec.max_seq > g.max_pos
+    if decl.max_pos_policy() == MaxPosPolicy::WarnYarn && g.max_pos != 0 && spec.max_context_length > g.max_pos
     {
         note.push_str(&format!(
-            "（runtime.max_seq={} > 模型 ctx；需 YaRN）",
-            spec.max_seq
+            "（runtime.max_context_length={} > 模型 ctx；需 YaRN）",
+            spec.max_context_length
         ));
     }
     if spec.vision {
@@ -317,7 +317,7 @@ mod tests {
             quant: QuantScheme::W4a16,
             head_quant: HeadQuant::Off,
             embed_quant: EmbedQuant::F16,
-            max_seq: 8192,
+            max_context_length: 8192,
             vision: false,
             vision_path: None,
             profile: None,

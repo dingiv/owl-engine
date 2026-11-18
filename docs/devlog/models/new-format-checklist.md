@@ -195,7 +195,7 @@ GGUF 的写侧(`llama.cpp/conversion/qwen.py`)对 qwen35 做了**六类变换**
 [ ]12. engine:load_<fmt>(单文件自给四件套 + 装载分相);quant_plan = Option(若逐张量)
 [ ]13. 服务:ModelKind + 实例名 + 分派 + 模板来源
 [ ]14. 门:e2e 冒烟(**首 token 硬门**)/ 交叉源 / I-4 源码 / 账本零未命名 / 白名单两处锁
-[ ]15. 档:flutter 档 + 池口径(pool = max_seq、对拍档关前缀缓存)+ 资源清单 + `grep -i skip:`
+[ ]15. 档:flutter 档 + 池口径(pool = max_context_length、对拍档关前缀缓存)+ 资源清单 + `grep -i skip:`
 ```
 
 ---

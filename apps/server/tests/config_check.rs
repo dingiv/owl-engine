@@ -1,7 +1,7 @@
 //! 配置面 P0 回归:意图档预检 / 生效配置 / 单键解释(纯 CPU,不加载权重)。
 //!
 //! 判据(设计卷 §11 P0):
-//! - `--check` < 2s(实测 10–20ms),不碰 GPU/权重,输出 max_seq + 内存依据;
+//! - `--check` < 2s(实测 10–20ms),不碰 GPU/权重,输出 max_context_length + 内存依据;
 //! - `--print-config --format json` 带 provenance / estimate,且可被 JSON 解析;
 //! - 旧 flavor 仍可走同一 CLI(无 intent 分支)。
 //!
@@ -27,7 +27,7 @@ fn run(args: &[&str]) -> std::process::Output {
 }
 
 #[test]
-fn profile_check_reports_max_seq_and_memory_basis() {
+fn profile_check_reports_max_context_length_and_memory_basis() {
     let t0 = Instant::now();
     let out = run(&[
         "-p",
@@ -44,7 +44,7 @@ fn profile_check_reports_max_seq_and_memory_basis() {
     assert!(dt < Duration::from_secs(2), "--check 必须 <2s(实测 {dt:?})");
     let s = String::from_utf8_lossy(&out.stdout);
     for needle in [
-        "max_seq=57344",
+        "max_context_length=57344",
         "pool=auto",
         "OK(estimated",
         "model dir:",
@@ -71,7 +71,7 @@ fn print_config_json_carries_provenance_and_estimate() {
     );
     let v: serde_json::Value =
         serde_json::from_slice(&out.stdout).expect("stdout 必须是合法 JSON");
-    assert_eq!(v["config"]["runtime"]["max_seq"], 57344);
+    assert_eq!(v["config"]["runtime"]["max_context_length"], 57344);
     // 2026-10-22:池容量配置项删除;池由 [vram-gov] 按剩余显存自动定。
     assert!(v["config"]["pool"].get("pool_tokens").is_none());
     // 完整档没有 [intent] ⇒ meta.intent 为空是预期(派生面已退役)
@@ -84,11 +84,11 @@ fn explain_prints_origin_and_rule() {
         "-p",
         profile("qwen38_27b-3090").to_str().expect("路径"),
         "--explain",
-        "runtime.max_seq",
+        "runtime.max_context_length",
     ]);
     assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
     let s = String::from_utf8_lossy(&out.stdout);
-    assert!(s.contains("runtime.max_seq = 57344"), "{s}");
+    assert!(s.contains("runtime.max_context_length = 57344"), "{s}");
     // 完整档:来源必须是文件(file:…),不再是 derived
     assert!(s.contains("来源: file:"), "应给文件来源:\n{s}");
 }
@@ -99,13 +99,13 @@ fn set_overrides_derived_value() {
         "-p",
         profile("qwen38_27b-3090").to_str().expect("路径"),
         "--set",
-        "runtime.max_seq=32768",
+        "runtime.max_context_length=32768",
         "--check",
     ]);
     assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
     let s = String::from_utf8_lossy(&out.stdout);
-    assert!(s.contains("max_seq=32768"), "--set 应覆盖文件值:\n{s}");
-    // 池容量无配置项;改 max_seq 只改单请求上限,物理池仍自动。
+    assert!(s.contains("max_context_length=32768"), "--set 应覆盖文件值:\n{s}");
+    // 池容量无配置项;改 max_context_length 只改单请求上限,物理池仍自动。
     assert!(s.contains("pool=auto"), "池应为自动:\n{s}");
 }
 

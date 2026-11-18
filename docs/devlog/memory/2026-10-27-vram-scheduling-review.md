@@ -21,7 +21,7 @@
 ```text
 boot
   Engine::on
-    └─ ledger = tier_budget_of(host_cache_mb, snap_host_mb, disk…)
+    └─ ledger = tier_budget_of(ram_pool_size, snap_host_mb, disk…)
     └─ BootVram{card_free, total, live_at_new}
   Engine::run
     └─ boot_rank
@@ -393,8 +393,8 @@ pub struct MemComponent {
 
 1. 先测 `weights`、`graph_slab`、`warmup`、`gdn_row`、`snap`、`draft`；
 2. 计算 `pool_budget = card_free − reserve − Σfixed`；
-3. `pool_tokens = min(max_seq, pool_budget / per_token)`；
-4. `TierPlan` 由 `host_cache_mb + snap_host_mb`、`disk_cache_mb + snap_disk_mb`
+3. `pool_tokens = min(max_context_length, pool_budget / per_token)`；
+4. `TierPlan` 由 `ram_pool_size + snap_host_mb`、`disk_pool_size + snap_disk_mb`
    显式分片；
 5. 断言：`Σfixed + pool_bytes + reserve ≤ card_free`；
 6. `BudgetInputs` 变成 `MemoryPlan::to_budget_inputs()` 的**投影**，

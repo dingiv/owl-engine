@@ -123,7 +123,7 @@ reuse       = "off"               # off | session | global;不写 = goal 决定
 | `goal=max-speed` | 复用 global、`1024+0`、贴顶 |
 | `goal=balanced` | 复用 session、`512+512`、0.97 |
 | `goal=low-memory` | kvmem overcommit、复用 global、小激活面 |
-| `context=N` | `max_seq=N`(物理池:无缓存→min(cap,N×并发+1页);缓存开→cap) |
+| `context=N` | `max_context_length=N`(物理池:无缓存→min(cap,N×并发+1页);缓存开→cap) |
 | `context="max"` | 内存模型求解(§4) |
 | `concurrency=C` | `gdn_slots=C`、`runtime.max_concurrency=C`、`max_batch=min(C,8)` |
 | `spec=dflash` | `depth=7` + 草稿目录必填 + **草稿环固定 ~40MiB**(窗口 2048,见下) |
@@ -150,7 +150,7 @@ target_total = total × vram_budget
 fixed        = gdn_row × (gdn_slots + snap_max) + 图 slab 640M + warmup 138M
 budget       = target_total − reserve − fixed − live(权重/运行底价)
 usable       = budget − activation − stability_margin
-max_seq      = usable / per_tok(向下取 4k)
+max_context_length      = usable / per_tok(向下取 4k)
 ```
 
 - `activation` 按块档:`≤512 → 0.60G`、`≤1024 → 1.05G`、`>1024 → 1.70G`
@@ -166,7 +166,7 @@ max_seq      = usable / per_tok(向下取 4k)
 - **2026-10-22 起池容量无配置项**:单卡口径 `budget = free(cuMemGetInfo)
   − reserve − fixed_after`;`fixed_after` 含 `post_pool_extra`(图/plan/
   cudaMallocAsync 保留/驱动碎片/首请求 Temp 的实测固定项)与 `guard slack`。
-  `max_seq` 超过治理器 `cap − 1 页` 直接拒启,并报可服务的 `ctx_max`。
+  `max_context_length` 超过治理器 `cap − 1 页` 直接拒启,并报可服务的 `ctx_max`。
 - **DFlash2 草稿环**:`[spec].draft_window`(0 = auto = 检查点
   `dflash_config.sliding_window`)。草稿 KV 不再按池容量全量物化,
   而是 **窗口大小的环形缓冲**(2048 → 固定 ~40MiB;写槽 = 逻辑位 % 窗口;
@@ -174,7 +174,7 @@ max_seq      = usable / per_tok(向下取 4k)
   写 4k/8k 会 boot 拒(等核加运行时 window);环容量本身已按检查点/配置取值,
   不写死。
 
-**显式覆盖优先**:`--set runtime.max_seq=147456` 不再求解;若超过引擎
+**显式覆盖优先**:`--set runtime.max_context_length=147456` 不再求解;若超过引擎
 治理器 `cap − 1 页`,boot 硬拒并报 `ctx_max`;若只是 `--check` 估算余量
 < 1.30G,`--check` **告警但不拒**(长跑泄漏是另一案)。
 
@@ -201,13 +201,13 @@ device    = "42:00.0"                          # → [parallel] device = ["42:00
 server -p profiles/qwen38_27b-3090-w4a16.toml --site testdata/args/base.toml --check
 
 # 生效配置 + 逐键来源 / 内存估算(JSON)
-server -p profiles/… --site … --print-config --format json | jq '.provenance["runtime.max_seq"]'
+server -p profiles/… --site … --print-config --format json | jq '.provenance["runtime.max_context_length"]'
 
 # 单键解释:值 / 来源 / 派生规则
-server -p profiles/… --site … --explain runtime.max_seq
+server -p profiles/… --site … --explain runtime.max_context_length
 
 # 临时覆盖(替代启动脚本的 extends 拼档;可重复)
-server -p profiles/… --site … --set runtime.max_seq=65536 --set 'parallel.device=["41:00.0"]'
+server -p profiles/… --site … --set runtime.max_context_length=65536 --set 'parallel.device=["41:00.0"]'
 
 # 查看源码里的常用档
 ls profiles/
@@ -330,8 +330,8 @@ ls profiles/
   `model.dflash2_dir`→`spec.draft_path`、`runtime.tp_*`/`device*`→`[parallel]`、
   `server.max_concurrency`→`runtime.max_concurrency`;
 - `OWL_MAX_SEQ` / `OWL_PREFILL_CHUNK` **已删除**(2026-10-20):它们会在
-  意图派生后再改一次,造成 `max_seq` 双源。临时调压请
-  `--set runtime.max_seq=…`(池自动跟随剩余显存)。
+  意图派生后再改一次,造成 `max_context_length` 双源。临时调压请
+  `--set runtime.max_context_length=…`(池自动跟随剩余显存)。
 - **`pool.kv_fp8` / `pool.kv_int8` 已退役**(2026-11-04,用户裁决):
   两个布尔表达三种状态("f16" 只能靠"两个都不写"隐含)违「状态不收隐式组合」
   ⇒ 合成单键 **`pool.kv_dtype = "f16" | "fp8" | "int8"`**(serde 枚举,

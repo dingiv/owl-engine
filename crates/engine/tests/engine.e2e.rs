@@ -21,8 +21,8 @@
 //! **下一步(Step B)**:按 boot 期配置把场景归组,组内共用**一次**装载 ——
 //! | 组 | 场景 | 改前装载数 → 目标 |
 //! |---|---|---|
-//! | 0.8B 默认档(默认 knobs,max_seq ≤4096) | schedule_decision_surface / two_turns / session_continuity / multi_session_isolation / prefix_cache_hit / longctx_4k | 6 → 1 |
-//! | 27B 默认档(默认 knobs,max_seq 1024) | 27b_chat_inference / awq27b_marlin_e2e | 2 → 1 |
+//! | 0.8B 默认档(默认 knobs,max_context_length ≤4096) | schedule_decision_surface / two_turns / session_continuity / multi_session_isolation / prefix_cache_hit / longctx_4k | 6 → 1 |
+//! | 27B 默认档(默认 knobs,max_context_length 1024) | 27b_chat_inference / awq27b_marlin_e2e | 2 → 1 |
 //! | 独立(配置不同,不可合并) | w4a16_marlin_e2e(另一装载器)/ spec_identity_gate(Dumb 草稿)/ spec_identity_gate_27b(MTP 草稿)/ dflash2_gate(DFlash2+fp8)/ decode_marginal_bench(greedy+slots1)/ raw_completion_diag(greedy+Dumb) | 各 1 |
 //! 合并做法 = 场景签名改收 `&mut RunningEngine<owl_engine::GpuFace>`(删各自 3 行装配),
 //! 由本入口建一次并传入。**改动面大、需逐场景核对借用**,单独立刀。
@@ -195,7 +195,7 @@ async fn e2e_body() {
     run!(gpu_single_graph_capture_and_replay);
 
     // ── 0.8B 其余档:boot 期配置各不相同,各自装载 ──
-    run!(gpu_schedule_decision_surface); // max_seq=64/chunk=4(切块敏感)
+    run!(gpu_schedule_decision_surface); // max_context_length=64/chunk=4(切块敏感)
     run!(gpu_batch_decode_matches_serial); // B5.1 合批 decode(T=2,0.8B)
     // §18 CPU mock 档:同一套 store 三门口跑在 CpuFace 上(无卡;OWL_CPU_MOCK 门控)
     run!(cpu_mock_offload_probe);

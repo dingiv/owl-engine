@@ -177,7 +177,7 @@ pub trait ModelSource {
     fn rope(
         &self,
         cfg: &owl_shared::config::RopeCfg,
-        max_seq: usize,
+        max_context_length: usize,
         pos_cap: usize,
     ) -> Result<Rope, ModelError>;
     /// 视觉塔来源(`None` = 纯文本)
@@ -452,10 +452,10 @@ impl ModelSource for HfDirSource {
     fn rope(
         &self,
         _cfg: &owl_shared::config::RopeCfg,
-        max_seq: usize,
+        max_context_length: usize,
         pos_cap: usize,
     ) -> Result<Rope, ModelError> {
-        build_hf_rope(self.rope, self.facts.spec.full_heads.2, max_seq, pos_cap)
+        build_hf_rope(self.rope, self.facts.spec.full_heads.2, max_context_length, pos_cap)
     }
 
     fn vision(&self) -> Option<VisionSource<'_>> {
@@ -695,10 +695,10 @@ impl ModelSource for GgufFileSource {
     fn rope(
         &self,
         cfg: &owl_shared::config::RopeCfg,
-        max_seq: usize,
+        max_context_length: usize,
         pos_cap: usize,
     ) -> Result<Rope, ModelError> {
-        build_gguf_rope(&self.facts.rf, cfg, max_seq, pos_cap, self.spec.full_heads.2)
+        build_gguf_rope(&self.facts.rf, cfg, max_context_length, pos_cap, self.spec.full_heads.2)
     }
 
     fn vision(&self) -> Option<VisionSource<'_>> {
@@ -778,23 +778,23 @@ pub fn check_keyed_overrides(head: QuantPlan, embed: Option<QuantPlan>) -> Resul
 /// **HF 档 rope 表构造**(事实硬编码,无 YaRN;表长必须覆盖 turn 预算)。
 ///
 /// HF 家族档的 rope 事实由装载器显式给(family 参数),没有 GGUF 的
-/// `[model.rope]` 覆盖面 ⇒ `max_seq` 超表长时**响亮拒**(绝不静默外推:
+/// `[model.rope]` 覆盖面 ⇒ `max_context_length` 超表长时**响亮拒**(绝不静默外推:
 /// `owl_rope_*` 核按 `pos` 直接索引 cos/sin 表,越界 = 设备 OOB 读)。
 fn build_hf_rope(
     facts: RopeFacts,
     head_dim: usize,
-    max_seq: usize,
+    max_context_length: usize,
     pos_cap: usize,
 ) -> Result<Rope, ModelError> {
-    if max_seq > facts.max_pos {
+    if max_context_length > facts.max_pos {
         return Err(ModelError::Msg(format!(
-            "max_seq={max_seq} > HF rope 表长={}(HF 档 rope 事实硬编码、不支持 YaRN;\
-             请降 [runtime] max_seq 或改用 GGUF 档 + [model.rope] yarn_factor=…)",
+            "max_context_length={max_context_length} > HF rope 表长={}(HF 档 rope 事实硬编码、不支持 YaRN;\
+             请降 [runtime] max_context_length 或改用 GGUF 档 + [model.rope] yarn_factor=…)",
             facts.max_pos
         )));
     }
     // 表长 = max(模型原生, 位置容量)：`pos_cap` 里的多出来的位置是图片 gap
-    // 预留（只允许 leave-gap 会话消费；正常会话 pos_hi ≤ max_seq）。
+    // 预留（只允许 leave-gap 会话消费；正常会话 pos_hi ≤ max_context_length）。
     Rope::new(facts.max_pos.max(pos_cap), head_dim, facts.rotary_dim, facts.theta)
 }
 
@@ -864,21 +864,21 @@ fn log_gguf_report(path: &Path, rep: &super::gguf::GgufSpecReport) {
 
 /// **GGUF rope 表构造**(单一产地;无 YaRN 时与历史逐位相同)。
 ///
-/// 表长 = `max(模型 context, original×factor, max_seq)` ——
-/// YaRN 的官方缓存长 = `original × factor`;我们再多看一眼 `runtime.max_seq`
+/// 表长 = `max(模型 context, original×factor, max_context_length)` ——
+/// YaRN 的官方缓存长 = `original × factor`;我们再多看一眼 `runtime.max_context_length`
 /// (用户要 1M 而 factor 只给 2.0 时**响亮拒**,不静默外推)。
-/// 未开 YaRN 且 `max_seq > 模型 context` ⇒ **响亮拒**(纯外推没有官方背书)。
+/// 未开 YaRN 且 `max_context_length > 模型 context` ⇒ **响亮拒**(纯外推没有官方背书)。
 fn build_gguf_rope(
     rf: &GgufRopeFacts,
     cfg: &owl_shared::config::RopeCfg,
-    max_seq: usize,
+    max_context_length: usize,
     pos_cap: usize,
     head_dim: usize,
 ) -> Result<Rope, ModelError> {
     if !cfg.yarn_on() {
-        return if max_seq > rf.max_pos {
+        return if max_context_length > rf.max_pos {
             Err(ModelError::Msg(format!(
-                "max_seq={max_seq} > 模型 context={}(未开 YaRN):要么把 [runtime] max_seq ≤ {},要么开 [model.rope] yarn_factor=…(官方:2.0→524k / 4.0→1M)",
+                "max_context_length={max_context_length} > 模型 context={}(未开 YaRN):要么把 [runtime] max_context_length ≤ {},要么开 [model.rope] yarn_factor=…(官方:2.0→524k / 4.0→1M)",
                 rf.max_pos, rf.max_pos
             )))
         } else {
@@ -896,7 +896,7 @@ fn build_gguf_rope(
         ));
     }
     let scaled = (original as f64 * cfg.yarn_factor).round() as usize;
-    let table = rf.max_pos.max(scaled).max(max_seq.max(1)).max(pos_cap);
+    let table = rf.max_pos.max(scaled).max(max_context_length.max(1)).max(pos_cap);
     let yarn = crate::layers::rope::YarnCfg {
         factor: cfg.yarn_factor as f32,
         original_max: original,
@@ -984,9 +984,9 @@ mod tests {
         assert!(e.to_string().contains("仅用于 format"), "{e}");
     }
 
-    /// HF 档 rope:表长硬编码;`max_seq` 越表 = 响亮拒(核按 pos 直索引 cos/sin)
+    /// HF 档 rope:表长硬编码;`max_context_length` 越表 = 响亮拒(核按 pos 直索引 cos/sin)
     #[test]
-    fn hf_rope_rejects_max_seq_beyond_table() {
+    fn hf_rope_rejects_max_context_length_beyond_table() {
         let f = RopeFacts {
             max_pos: 1024,
             rotary_dim: 64,

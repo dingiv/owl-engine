@@ -210,7 +210,7 @@ pub(crate) enum StepAction {
   **前置验证**：图档瓦（`fi_cuda_graph=true`）下 plan 形状对“行数×ctx”是否恒定
   （不恒定 ⇒ 同一图不可复用不同 ctx 组合，需退回 v2 seq 臂）。
 - **草稿池 per-session 分区**（`state.rs:1018` 注释的未决项）：`draft_base(session)
-  = session_row · max_seq`，池容量 ×B；encode/propose 的 `slot_at`/`prefix` 全走分区。
+  = session_row · max_context_length`，池容量 ×B；encode/propose 的 `slot_at`/`prefix` 全走分区。
 - **快照 ≥ B**：`snap_max ≥ B`（每会话轮首一张），VRAM +152MiB×B（进预算公式）。
 - 采样接受：逐会话（现有 `ids/logits` 行切片，`spec.rs` accept 逻辑 per turn）。
 
@@ -353,7 +353,7 @@ pub(crate) enum StepAction {
    ✅ 模型语义已证（§7.2c）+ GDN varlen batch 已修。
 2. **逐 turn accept/fold**：verify 输出按会话切 8 行，复用既有 `spec_fold_to`/接受逻辑
    （每 turn 自己的 GDN 槽/快照）。
-3. **草稿池 per-session 分区**（R3，硬前置）：propose/encode 的逻辑槽加 `session_row × max_seq`
+3. **草稿池 per-session 分区**（R3，硬前置）：propose/encode 的逻辑槽加 `session_row × max_context_length`
    基址；池容量 ×B。
 4. **快照 ×B**（R4）：`spec_snap` 单缓冲 → 按 turn 行的 B 份（或快照池按边界键分区）。
 5. **调度门**：全活跃都是 spec 相位 ⇒ `BatchSpecRound`；混合相位（prefill/裸步）回单 turn。

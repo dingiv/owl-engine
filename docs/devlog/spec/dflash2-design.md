@@ -773,7 +773,7 @@ BF16 化后首跑恒等门:恒等绿(42tok 逐位)但 **AL 仍 0.00**。三连�
   boot(16/128 上限),边际 = Δwall/Δtokens —— 固定成本/EOS 点全消。
   实测 21.6-24.8ms/tok ≈ 40-46 tok/s;**确认无历史回退**(4d21122
   24.3 vs HEAD 24.8ms/tok;"当年 45"= 朴素口径 wall÷max_new 虚高)。
-  另:gate 加 OWL_GATE_MAX_NEW 旋钮 + max_seq_tokens 随 max_new 放宽。
+  另:gate 加 OWL_GATE_MAX_NEW 旋钮 + max_context_length_tokens 随 max_new 放宽。
 - **长生成 AL 剖析**(math 258 tok):裸 decode **40.2 tok/s**(边际
   口径互证);spec **117.0 tok/s(2.91×)**,rounds=51,AL=4.10,
   轮均 43.1ms。恒等门 258 tok 全程逐位一致 ✓。短生成的 AL=1.8 是

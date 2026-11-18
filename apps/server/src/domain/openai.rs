@@ -595,7 +595,7 @@ pub fn error_json_for_reject(err: String) -> Value {
     if is_budget_reject(&err) {
         return json!({"error": {
             "message": format!(
-                "{err}({OVERFLOW_PHRASE}: prompt + max_tokens > max_seq;请缩短上下文/压缩历史后重试)"
+                "{err}({OVERFLOW_PHRASE}: prompt + max_tokens > max_context_length;请缩短上下文/压缩历史后重试)"
             ),
             "type": "invalid_request_error",
             "code": "context_length_exceeded",

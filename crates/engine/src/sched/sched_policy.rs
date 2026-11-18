@@ -368,7 +368,7 @@ impl Admission {
     /// **本轮生成预算**（token；2026-11-16 用户裁决）。
     ///
     /// 不再"按剩余空间反推封顶"：预算在 submit 时定死 = `min(max_new_cap,
-    /// max_seq − prompt)`，由 [`TurnFacts::max_new`] 带进 store `plan_admission`。
+    /// max_context_length − prompt)`，由 [`TurnFacts::max_new`] 带进 store `plan_admission`。
     /// **本函数只作诊断/历史对照**；生产放行由 store plan 决定，不切在跑者份额。
     ///
     /// `running` = 活跃 turn（它们已占预留）；`incoming` = 待判 turn。
@@ -996,17 +996,17 @@ mod tests {
     /// **预留预算 = min(本档最大输出, 上下文窗口余量)**（submit 侧算式）。
     #[test]
     fn reserve_is_capped_by_context_window() {
-        let max_seq = 32_768usize;
+        let max_context_length = 32_768usize;
         // 32k 窗口 / 32k 最大输出：ctx 30k ⇒ 预算只剩 2,768（窗口是硬边界）
         assert_eq!(
-            32_768usize.min(max_seq.saturating_sub(30_000)),
+            32_768usize.min(max_context_length.saturating_sub(30_000)),
             2_768
         );
         // 8k 最大输出 / 32k 窗口：小 ctx ⇒ 预算 = 配置的最大输出
         let cap = 8_192usize;
-        assert_eq!(cap.min(max_seq - 1_000), 8_192);
+        assert_eq!(cap.min(max_context_length - 1_000), 8_192);
         // 同一档，ctx 30k ⇒ 预算被窗口压到 2,768
-        assert_eq!(cap.min(max_seq - 30_000), 2_768);
+        assert_eq!(cap.min(max_context_length - 30_000), 2_768);
     }
 
     /// 相位：全 gen 两行 ⇒ BatchDecode；混合 ⇒ 每 `SLICE_EVERY` 拍 decode 后

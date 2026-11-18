@@ -197,7 +197,7 @@ Marlin 没有浪费。动态 d4/d5 **不是当前负载的杠杆**；只可能�
 ```bash
 # 单卡（同模型）
 ./target/release/server -p profiles/qwen38_27b-3090.toml \
-  --set runtime.max_seq=32768 --set runtime.prefill_chunk=1024 \
+  --set runtime.max_context_length=32768 --set runtime.prefill_chunk=1024 \
   --set model.path=../models/bytkim/Qwen3.8-27B-pi-AWQ-INT4 \
   --set model.quant=w4a8
 # TP2

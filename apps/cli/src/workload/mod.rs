@@ -73,7 +73,7 @@ pub fn run(args: Args) -> i32 {
                  ./target/release/server -p profiles/qwen38_27b-3080_tp2.toml \\\n\
                    --set vision.image_evict=true \\\n\
                    --set store.prefix_cache=true --set store.gdn.snap_max=2 \\\n\
-                   --set store.snap_host_mb=1024 --set runtime.max_seq=131072 \\\n\
+                   --set store.snap_host_mb=1024 --set runtime.max_context_length=131072 \\\n\
                    --log-level info\n\
                  或直接:tools/run-agent-workload.sh gui"
             );

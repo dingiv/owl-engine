@@ -27,7 +27,7 @@ async fn ledger_captures_load_pool_and_graph_phases() {
     }
     let cfg = EngineConfig {
         device_ordinal: 0,
-        max_seq_tokens: 256,
+        max_context_length_tokens: 256,
         prefill_chunk: 32,
         knobs: EngineKnobs {
             sampler_enabled: false,
@@ -37,9 +37,9 @@ async fn ledger_captures_load_pool_and_graph_phases() {
     // 账本**由测试预造**并交给引擎(boot 期接管的那一本)—— 与生产 `Engine::on`
     // 内部造的同一形状,只是为了能在外面读账。
     let cell = owl_store::shared_ledger(owl_store::tier_budget_of(
-        cfg.knobs.host_cache_mb,
+        cfg.knobs.ram_pool_size,
         cfg.knobs.snap_host_mb,
-        cfg.knobs.disk_cache_mb,
+        cfg.knobs.disk_pool_size,
         cfg.knobs.snap_disk_mb,
     ));
     let face = CpuFace::mock(MockLimits {

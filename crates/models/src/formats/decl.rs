@@ -50,7 +50,7 @@ pub struct DeclGeom {
     pub max_pos: usize,
 }
 
-/// `max_pos` 被 `runtime.max_seq` 超过时的处置(**按源**:既有语义)。
+/// `max_pos` 被 `runtime.max_context_length` 超过时的处置(**按源**:既有语义)。
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum MaxPosPolicy {
     /// 硬拒(HF:模型装不下)
@@ -144,7 +144,7 @@ pub fn open_decl(path: &Path, src: DeclSource) -> Result<Option<Box<dyn Checkpoi
 pub fn check_geom_against(
     decl: &dyn CheckpointDecl,
     profile: &owl_shared::config::intent::ModelProfile,
-    max_seq: usize,
+    max_context_length: usize,
 ) -> Result<(), String> {
     let g = decl.geom();
     let want = profile.geom;
@@ -166,11 +166,11 @@ pub fn check_geom_against(
     }
     // max_pos:按源策略(HF 硬拒 / GGUF 软警告,由调用方决定是否落进摘要)
     if g.max_pos != 0 {
-        if max_seq > g.max_pos {
+        if max_context_length > g.max_pos {
             match decl.max_pos_policy() {
                 MaxPosPolicy::Hard => {
                     return Err(format!(
-                        "max_seq={max_seq} 超过检查点 max_position_embeddings={}(模型装不下)",
+                        "max_context_length={max_context_length} 超过检查点 max_position_embeddings={}(模型装不下)",
                         g.max_pos
                     ))
                 }

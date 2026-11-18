@@ -350,7 +350,7 @@ fn run_case(t: usize, ctx: usize, host_check: bool, chunked: bool) {
         semaphores: sem_p,
         scratch: sc_p,
     };
-    // KV-split 关闭实验(XQA_PF_NOSPLIT=1):几何上的 max_seq_len 传 ctaTile
+    // KV-split 关闭实验(XQA_PF_NOSPLIT=1):几何上的 max_context_length_len 传 ctaTile
     // ⇒ nbSubSeq=1(sscratch/semaphores 全省);页表 stride 仍按 nb(batch=1 无影响)
     let no_split = owl_shared::env_reader::flag("XQA_PF_NOSPLIT");
     let xqa_call = |out: u64| {

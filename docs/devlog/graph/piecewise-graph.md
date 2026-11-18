@@ -477,7 +477,7 @@ OWL_GATE_PIECEWISE=1 OWL_GATE_XQA=1 OWL_E2E_ONLY=dflash2_identity cargo test ...
   `[dispatch] verify_xqa = true`(深度合并 ⇒ 只覆盖列出的键)⇒ 必须**同时**把 args 档那几行改掉,
   否则 flavor 的换代被 args 覆盖回 XQA(实测第一轮就踩到:日志/文本看不出,要看轮时签名)。
 - 生产档实测(flavor+args 双改,8192):**轮时 52.8 → 46.7ms(−11.5%)、verify read 36.7 → 20.6ms**、
-  prefill 1305(不动)、decode 71.1 t/s。(生产几何 max_seq=16384 ⇒ 32k 点测不了;
+  prefill 1305(不动)、decode 71.1 t/s。(生产几何 max_context_length=16384 ⇒ 32k 点测不了;
   32k 的 −30% 见 §11.6 的长几何档。)
 
 **② 红线门(接线完成,当前因 MTP 路径的环境性问题为红)**
@@ -485,7 +485,7 @@ OWL_GATE_PIECEWISE=1 OWL_GATE_XQA=1 OWL_E2E_ONLY=dflash2_identity cargo test ...
   (piecewise + verify_fi + verify_xqa/v2 关)⇒ 这条门 = "断点臂不破文本"红线
   (baseline `spec_depth=0` vs spec 的贪心 token 流逐位比)。
 - 该门在本 worktree 有两处**既有**环境性红,已修一处:`_MIN_GEN_TOKENS = 1024`
-  要求 `max_seq − prompt ≥ 1024`(门用 256 ⇒ 恒拒发"超预算")⇒ 抬到 2048 后 baseline 轮通过;
+  要求 `max_context_length − prompt ≥ 1024`(门用 256 ⇒ 恒拒发"超预算")⇒ 抬到 2048 后 baseline 轮通过;
   另一处在 **MTP propose 路径**(`exec/draft.rs:852` panic,spec 轮),与断点臂无关
   (piecewise 关闭时同样复现)⇒ **在这条 MTP 路径修好前,实际红线用**
   `tools/pw-ab-greedy.sh` + `testdata/args/perf-ab-fi.toml`(greedy + 哑草稿,文本逐字对比,
@@ -526,7 +526,7 @@ OWL_GATE_PIECEWISE=1 OWL_GATE_XQA=1 OWL_E2E_ONLY=dflash2_identity cargo test ...
 **为什么要换小模型**:0.8B 是 **f16 池**、且 XQA 不可用(hq/hkv≠6)⇒ 参考臂天然是 **v2 decode**,
 正好把"fp8 行写者/读法"这一大类嫌疑**裁掉一层**;且 boot ~10s(27B 是 ~90s)⇒ 追凶迭代快一个量级。
 落点:`testdata/args/dec08-{base,fi}.toml`(kind="0.8b", `dir=/path/to/models/Qwen/Qwen3.5-0.8B`,
-greedy, `depth=0`,`max_seq=2048`(⚠️ `_MIN_GEN_TOKENS=1024` ⇒ max_seq 太小会恒拒发),
+greedy, `depth=0`,`max_context_length=2048`(⚠️ `_MIN_GEN_TOKENS=1024` ⇒ max_context_length 太小会恒拒发),
 `pool_tokens=4096`);run:`FLAVOR=awq27b CVD=<空闲 3080 uuid> bash tools/pw-ab-greedy.sh …`
 (harness 的 flavor/CVD 已参数化;⚠️ GPU1/2 是主会话实例,别动,用 GPU0/3 的 3080)。
 
@@ -711,7 +711,7 @@ plan 计数、字节差分),再怀疑数值 —— 本轮三个仪器(分段计�
 ### 12.1 口径(可复现的 A/B 三重奏)
 
 同一张卡(3090 Ti 24G,cuda:0)、同一份档(`m2b-bucket-27b.toml` 派生:pool 33280 /
-max_seq 32768 / geobuckets / prefix_cache=true / gdn_slots=8)、同一 env
+max_context_length 32768 / geobuckets / prefix_cache=true / gdn_slots=8)、同一 env
 (`OWL_LOAD_STAGING_MB=1024`;缺省 128MB 会让 AWQ repack 键超槽 ⇒ 装配失败),
 **只换二进制**:
 

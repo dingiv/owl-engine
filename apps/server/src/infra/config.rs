@@ -104,7 +104,7 @@ impl CliArgs {
                 }
                 "--explain" => {
                     out.explain.push(
-                        it.next().ok_or("--explain 需要键(点路径,如 runtime.max_seq)")?,
+                        it.next().ok_or("--explain 需要键(点路径,如 runtime.max_context_length)")?,
                     );
                 }
                 "--set" => {
@@ -378,8 +378,8 @@ pub struct ServerConfig {
     /// 设备所有权面（`[parallel]` + 空闲阈值；卡锁端口由 main 回填）。
     /// **选卡在引擎 boot 内**（2026-11-15 业务下沉 P1），server 只搬配置字段。
     pub device_opts: owl_engine::DeviceOpts,
-    /// attention 窗上限(runtime.max_seq)
-    pub max_seq: usize,
+    /// attention 窗上限(runtime.max_context_length)
+    pub max_context_length: usize,
     /// 预填 chunk(runtime.prefill_chunk)
     pub prefill_chunk: usize,
     /// lm_head 头部量化方案(model.head_quant;C1 2026-10-11;枚举严格)
@@ -517,9 +517,9 @@ impl ServerConfig {
                 lock_role: None,
             },
             // 上下文/块长:**单一来源 = 配置**(2026-10-20 删除 OWL_MAX_SEQ /
-            // OWL_PREFILL_CHUNK —— 它们会在意图派生后再改一次 ⇒ max_seq 与
-            // max_seq 失配的双源;要临时调请 `--set`）。
-            max_seq: cfg.runtime.max_seq,
+            // OWL_PREFILL_CHUNK —— 它们会在意图派生后再改一次 ⇒ max_context_length 与
+            // max_context_length 失配的双源;要临时调请 `--set`）。
+            max_context_length: cfg.runtime.max_context_length,
             prefill_chunk: cfg.runtime.prefill_chunk,
             head_quant: cfg.model.head_quant,
             embed_quant: cfg.model.embed_quant,
@@ -575,7 +575,7 @@ pub fn summary_line(r: &ResolvedConfig) -> Option<String> {
         "[owl] profile={} card={} ctx={} pool=auto({}) {} mem={}/{} (余 {}) reuse={} spec={} c={}",
         m.profile.as_deref().unwrap_or("(inline)"),
         m.intent.hardware.as_deref().unwrap_or("auto"),
-        c.runtime.max_seq,
+        c.runtime.max_context_length,
         gib(e.pool_bytes),
         arms,
         gib(e.used_bytes()),
@@ -621,9 +621,9 @@ pub fn check_report(r: &ResolvedConfig) -> Result<CheckReport, String> {
             m.intent.graphs.name(),
         ));
         out.push_str(&format!(
-            "[check] resolved: max_seq={} pool=auto(剩余显存;boot 报 cap) chunk={} tail={} \
+            "[check] resolved: max_context_length={} pool=auto(剩余显存;boot 报 cap) chunk={} tail={} \
              gdn_slots={} max_batch={} max_concurrency={} kv_dtype={}\n",
-            c.runtime.max_seq,
+            c.runtime.max_context_length,
             c.runtime.prefill_chunk,
             owl_engine::PREFILL_TAIL_MERGE,
             c.store.gdn.gdn_slots,
@@ -670,9 +670,9 @@ pub fn check_report(r: &ResolvedConfig) -> Result<CheckReport, String> {
              [check] 要内存账/意图派生,请用 -p <profile_path> 或写 [intent]。\n",
         );
         out.push_str(&format!(
-            "[check] resolved: max_seq={} pool=auto(剩余显存;boot 报 cap) chunk={} tail={} \
+            "[check] resolved: max_context_length={} pool=auto(剩余显存;boot 报 cap) chunk={} tail={} \
              gdn_slots={} max_batch={} max_concurrency={} kv_dtype={}\n",
-            c.runtime.max_seq,
+            c.runtime.max_context_length,
             c.runtime.prefill_chunk,
             owl_engine::PREFILL_TAIL_MERGE,
             c.store.gdn.gdn_slots,
@@ -713,7 +713,7 @@ pub fn check_report(r: &ResolvedConfig) -> Result<CheckReport, String> {
                 quant: c.model.quant,
                 head_quant: c.model.head_quant,
                 embed_quant: c.model.embed_quant,
-                max_seq: c.runtime.max_seq,
+                max_context_length: c.runtime.max_context_length,
                 vision: c.vision.enabled,
                 vision_path,
                 profile,

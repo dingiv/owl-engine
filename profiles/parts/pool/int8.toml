@@ -15,4 +15,3 @@ vram_activation_reserve = 714
 [store.kv]
 kv_dtype = "int8"
 [store.gdn]
-gdn_slots = 1

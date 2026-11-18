@@ -183,7 +183,7 @@ pub async fn gpu_awq27b_marlin_e2e(shared: Option<&mut RunningEngine<GpuClient>>
 
 **共享组的准入判据(实测教训,2026-10-13)**:并入同一组前,必须确认 **boot 期旋钮真的
 兼容** —— 不只是"看起来一样"。反例:`gpu_schedule_decision_surface` 依赖
-`max_seq=64/chunk=4` 的**切块语义**,并入 `4096/32` 的共享档后**实测红**
+`max_context_length=64/chunk=4` 的**切块语义**,并入 `4096/32` 的共享档后**实测红**
 (断言"首块切块")→ 切块/预算敏感的用例一律自带装载。
 
 **只合"贵的"**:贵 = **模型装载**(27B ~24-32s/次)。便宜的不动(0.8B ~2-5s,

@@ -309,13 +309,13 @@ impl<K: DiskKey> DiskTier<K> {
     pub fn plan_spill(&self, key: K) -> StoreResult<SpillPlanOf<K>> {
         if self.is_disabled() {
             return Err(StoreError::Exhausted(
-                "磁盘层已关闭(disk_cache_mb = 0)".into(),
+                "磁盘层已关闭(disk_pool_size = 0)".into(),
             ));
         }
         let bytes = self.block_bytes;
         if !self.resident.contains_key(&key) && self.used + bytes > self.budget_bytes {
             return Err(StoreError::Exhausted(format!(
-                "磁盘层越界:{}+{} > {}(先 plan_evict 腾位,或调大 disk_cache_mb)",
+                "磁盘层越界:{}+{} > {}(先 plan_evict 腾位,或调大 disk_pool_size)",
                 self.used, bytes, self.budget_bytes
             )));
         }

@@ -78,7 +78,7 @@ Bytes.len 元素口径)。三类**账外占用**必须从硬预算里扣:
 - **KV 池封顶 by construction**:池 = 预分配常驻块 `[max_slots, …]`,
   运行期零增长 —— 结构上不可能 OOM;
 - **准入控制(✅ 已实现)**:`submit` 时 `prompt + max_new >
-  max_seq_tokens` 直接拒绝(fail-fast,engine.rs);
+  max_context_length_tokens` 直接拒绝(fail-fast,engine.rs);
 - **池满行为(⏳)**:新请求无空位 → ①排队等待 **三级 KV 调度**
   (GPU → host → disk 卸载腾位,照 sglang HiCache/vLLM 先例,另行立项)
   或 ②直接回「当前繁忙」拒绝 —— 策略旋钮,**永不超池**;

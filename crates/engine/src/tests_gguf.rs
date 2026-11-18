@@ -44,16 +44,16 @@ fn gguf_arms_from_env() -> owl_models::env::GgufEnv {
     }
 }
 
-fn gguf_cfg(ordinal: usize, max_seq: usize, pool_tokens: usize, gdn_slots: usize) -> EngineConfig {
+fn gguf_cfg(ordinal: usize, max_context_length: usize, pool_tokens: usize, gdn_slots: usize) -> EngineConfig {
     let mut knobs = EngineKnobs { sampler_enabled: false, raw_completion: true, ..Default::default() };
     knobs.pool_tokens = Some(pool_tokens);
     knobs.gdn_slots = gdn_slots;
-    knobs.host_cache_mb = 32;
+    knobs.ram_pool_size = 32;
     knobs.snap_host_mb = 0;
     knobs.snap_max = 0;
     // 臂集 = env 入参(测试例外);生产由 `[dispatch] gguf_*` 给
     knobs.env.gguf = gguf_arms_from_env();
-    EngineConfig { device_ordinal: ordinal, max_seq_tokens: max_seq, prefill_chunk: 128, knobs }
+    EngineConfig { device_ordinal: ordinal, max_context_length_tokens: max_context_length, prefill_chunk: 128, knobs }
 }
 
 /// 冒烟场景(参数化;M1 = 4B,M2 = 27B)。

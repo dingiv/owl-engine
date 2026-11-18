@@ -190,7 +190,7 @@ pub trait CheckpointDecl {           // formats/decl.rs(纯 host,无 async/无�
     fn draft(&self) -> DraftDecl;
 }
 pub fn open_decl(path, gguf: bool) -> Result<Option<Box<dyn CheckpointDecl>>, String>;
-pub fn check_geom_against(decl, profile, max_seq) -> Result<(), String>;  // 源无关对账
+pub fn check_geom_against(decl, profile, max_context_length) -> Result<(), String>;  // 源无关对账
 ```
 
 **效果**:`apps/server/src/config.rs` 里两个格式专用校验函数(合计 ~150 行)
@@ -315,7 +315,7 @@ workspace `--all-targets` 0 error;AWQ+DFlash2 / GGUF+mmproj 起机 + 出词;
 1. `--check` 的源族由 `LoadArm::decl_source()` 决定（不再 `path.is_file()` 猜）；
 2. GGUF 的 head/embed 覆盖门在 `--check` 也跑（`LoadIntent::check_arm`，与装载器
    共用 `check_keyed_overrides`）；
-3. `[model.rope]` 非 GGUF 档 = 配置拒启；HF 档 `max_seq > rope 表长` = 装载期
+3. `[model.rope]` 非 GGUF 档 = 配置拒启；HF 档 `max_context_length > rope 表长` = 装载期
    响亮拒（防 `owl_rope_*` 的 pos 直索引 OOB）。
 
 ### 3.6 附属件开箱面（2026-11-05 review）

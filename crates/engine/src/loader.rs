@@ -116,9 +116,9 @@ pub struct ModelLoader<'a, D: DeviceClient> {
     vocab_split: bool,
     /// **rope 外推/缩放**(`[model.rope]`;缺省关。只对 GGUF 档生效)
     rope: owl_shared::config::RopeCfg,
-    /// 单 turn 预算(`runtime.max_seq`;YaRN 表长至少覆盖它)
-    max_seq: usize,
-    /// **rope 表位置容量**(= max_seq + 图片 gap 预留;0 = 同 max_seq)。
+    /// 单 turn 预算(`runtime.max_context_length`;YaRN 表长至少覆盖它)
+    max_context_length: usize,
+    /// **rope 表位置容量**(= max_context_length + 图片 gap 预留;0 = 同 max_context_length)。
     rope_pos_cap: usize,
     /// 视觉塔(`[vision] enabled`;false = 纯文本路径逐字节不变)
     vision: bool,
@@ -140,7 +140,7 @@ impl<D: DeviceClient + 'static> ModelLoader<'_, D> {
             slice: (0, 1),
             vocab_split: false,
             rope: owl_shared::config::RopeCfg::default(),
-            max_seq: 0,
+            max_context_length: 0,
             rope_pos_cap: 0,
             vision: false,
             mmproj: None,
@@ -154,19 +154,19 @@ impl<D: DeviceClient + 'static> ModelLoader<'_, D> {
         self
     }
 
-    /// **rope 外推档**(`[model.rope]` + `runtime.max_seq`;GGUF 装载用)。
+    /// **rope 外推档**(`[model.rope]` + `runtime.max_context_length`;GGUF 装载用)。
     ///
     /// 显式依赖律:调用方(引擎)把配置**传进来**,本模块零 env 读取。
-    pub fn rope(mut self, rope: owl_shared::config::RopeCfg, max_seq: usize) -> Self {
+    pub fn rope(mut self, rope: owl_shared::config::RopeCfg, max_context_length: usize) -> Self {
         self.rope = rope;
-        self.max_seq = max_seq;
+        self.max_context_length = max_context_length;
         self
     }
 
-    /// **rope 表位置容量**（`runtime.max_seq + gap 预留`）。
+    /// **rope 表位置容量**（`runtime.max_context_length + gap 预留`）。
     ///
     /// 表长 = `max(模型原生, 本值)`；多出来的位置只允许被图片 leave-gap 消费
-    /// （正常会话 `pos_hi = n_tokens ≤ max_seq` 进不来）。
+    /// （正常会话 `pos_hi = n_tokens ≤ max_context_length` 进不来）。
     pub fn rope_pos_cap(mut self, pos_cap: usize) -> Self {
         self.rope_pos_cap = pos_cap;
         self
@@ -288,7 +288,7 @@ impl<D: DeviceClient + 'static> ModelLoader<'_, D> {
         let model = Arc::new(built.model);
 
         let tok = src.tokenizer()?;
-        let rope = src.rope(&self.rope, self.max_seq, self.rope_pos_cap.max(self.max_seq))?;
+        let rope = src.rope(&self.rope, self.max_context_length, self.rope_pos_cap.max(self.max_context_length))?;
         src.log_facts(&rope, tok.n_tokens, &self.rope);
         let ctx = self.shard_ctx(spec.dtype);
         owl_models::interpreters::eval_load(&rope, self.face, &rope.tables(), &ctx).await?;

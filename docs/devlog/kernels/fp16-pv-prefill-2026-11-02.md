@@ -125,7 +125,7 @@ host oracle（fp8 KV，`FI_LONG_HOST=1` / `FI_PF_HOST=1`；host 是 fp32 参考�
 
 ```bash
 ./target/release/server -p profiles/qwen38_27b-3090.toml --log-level info \
-  --set runtime.max_seq=70000 --set kernel.prefill_shadow=true \
+  --set runtime.max_context_length=70000 --set kernel.prefill_shadow=true \
   --set model.vision=false --set spec.depth=0 --set spec.lookup=false \
   --set pool.image_evict=false
 ```

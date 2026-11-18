@@ -504,7 +504,7 @@ impl<D: DeviceClient> GraphFleet<D> {
             if total > budget {
                 owl_shared::log_warn!(
                     "boot",
-                    "⚠️ 图 slab 预算对账:实测 {:.1}MiB > 预算假设 {}MiB(+{:.1}MiB,图族/臂换代后预算偏小)⇒ 池上限可能偏大(请求级 OOM 风险):把 GRAPH_SLAB_BUDGET 校准为新实测值(engine/src/state.rs),或下调 max_seq / per_tok",
+                    "⚠️ 图 slab 预算对账:实测 {:.1}MiB > 预算假设 {}MiB(+{:.1}MiB,图族/臂换代后预算偏小)⇒ 池上限可能偏大(请求级 OOM 风险):把 GRAPH_SLAB_BUDGET 校准为新实测值(engine/src/state.rs),或下调 max_context_length / per_tok",
                     mbf(total),
                     mb(budget),
                     mbf(total - budget),
@@ -716,7 +716,7 @@ impl<D: DeviceClient> GraphFleet<D> {
                     semaphores: sem_in,
                     scratch: x.scratch.clone(),
                     q_seq_len: 1,
-                    max_seq_len: x.max_seq_len,
+                    max_context_length_len: x.max_context_length_len,
                     sm_count: x.sm_count,
                 });
             }
@@ -1294,7 +1294,7 @@ impl<D: DeviceClient> GraphFleet<D> {
                         semaphores: sem_in,
                         scratch: x.scratch.clone(),
                         q_seq_len: depth1,
-                        max_seq_len: x.max_seq_len,
+                        max_context_length_len: x.max_context_length_len,
                         sm_count: x.sm_count,
                     });
                 }

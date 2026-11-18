@@ -25,7 +25,7 @@ disclosed with credit (unless you ask to stay anonymous).
 | 1 | **No HTTP authentication** | The server binds `127.0.0.1` by default. Binding `0.0.0.0` means "anyone on the network can use your GPUs and read your diagnostics" — add a reverse proxy and auth if you need that. |
 | 2 | Diagnostics share the **same port** as the API | `/debug/log`, `/debug/metrics`, `/debug/vram` are readable by any client on that port. They contain **no prompt text**, but they do contain runtime ledgers and paths. |
 | 3 | No multi-tenant isolation | One engine per process; all sessions share the process and the same GPU memory. |
-| 4 | No per-request budget | Bounds come from `runtime.max_seq` / `max_concurrency`; there is no per-user quota. |
+| 4 | No per-request budget | Bounds come from `runtime.max_context_length` / `max_concurrency`; there is no per-user quota. |
 | 5 | Configuration is trusted | Paths such as `[model] path` are read as configured. Anyone who can edit the config already has host access. |
 | 6 | Diagnostic dumps may write to disk | `prompt_dump`, `pf_stages`, `--perf-dump` can write prompts or ledgers to the paths you give them. Control directory permissions accordingly. |
 | 7 | Driver/kernel patches are **not** in this repo | GPU P2P patches and custom kernel modules mentioned in the docs are deployment-environment concerns, out of scope here. |

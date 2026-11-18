@@ -156,13 +156,13 @@ fn knobs_for(plan: QuantPlan, dir: &Path) -> EngineKnobs {
 }
 
 fn cfg_of(ordinal: usize, chunk: usize, knobs: EngineKnobs) -> EngineConfig {
-    let max_seq = std::env::var("OWL_TP_HEAD_CTX")
+    let max_context_length = std::env::var("OWL_TP_HEAD_CTX")
         .ok()
         .and_then(|s| s.parse().ok())
         .unwrap_or(1024);
     EngineConfig {
         device_ordinal: ordinal,
-        max_seq_tokens: max_seq,
+        max_context_length_tokens: max_context_length,
         prefill_chunk: chunk,
         knobs,
     }

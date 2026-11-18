@@ -55,7 +55,7 @@ impl CheckpointStats {
 
 /// **主动 checkpoint 的内部节奏**（不是配置键）。
 ///
-/// 磁盘层一旦启用（`disk_cache_mb>0` + `disk_dir`），空闲拍就按本策略
+/// 磁盘层一旦启用（`disk_pool_size>0` + `disk_dir`），空闲拍就按本策略
 /// 自动复制已算好的 KV，供重启召回。`step_bytes` 只限制**单次空闲拍**
 /// 的复制量，避免长链一次写几 GiB 占住主泵；`min_gap` 限制空闲拍的
 /// 磁盘写频率。二者都不参与准入/压力卸载。
@@ -143,7 +143,7 @@ impl StepProbes {
 pub struct TokenizeReply {
     pub tokens: Vec<u32>,
     /// 本档正文长度上限(token;服务面字段名 `max_model_len`)
-    pub max_seq_tokens: usize,
+    pub max_context_length_tokens: usize,
 }
 
 /// 执行态引擎(请求入口)。
@@ -320,14 +320,14 @@ fn chain_alloc_tokens(
 pub const _MIN_GEN_TOKENS: usize = 1024;
 
 /// **预算收缩**(纯函数;2026-10-15;同日修复回归:下限检查误杀小预算档):
-/// `base + max_new ≤ max_seq` 是 KV 槽位硬约束,但**不因此拒绝** ——
+/// `base + max_new ≤ max_context_length` 是 KV 槽位硬约束,但**不因此拒绝** ——
 /// 先按剩余额度收缩生成长度。
 ///
 /// 语义两段(顺序有义,勿倒):
 /// ① **请求本来就装得下 ⇒ 原样放行**(下限 `_MIN_GEN_TOKENS` 只约束
-///    "需要收缩"的场景;曾无条件先查下限 ⇒ max_seq < 1024 的档位
+///    "需要收缩"的场景;曾无条件先查下限 ⇒ max_context_length < 1024 的档位
 ///    任何 submit 必拒 —— 全部 spec e2e 小预算门被误杀的根因);
-/// ② 装不下 ⇒ 收缩:`room = max_seq − base`;`room < _MIN_GEN_TOKENS`
+/// ② 装不下 ⇒ 收缩:`room = max_context_length − base`;`room < _MIN_GEN_TOKENS`
 ///    ⇒ `Err((base, max_new))`(真溢出,客户端压缩上下文),否则
 ///    `Ok(room)`(此时 room < max_new,即收缩后额度)。
 /// 单调毫秒（`SystemTime`；时钟回拨兜底为 0 —— 只用于排队时长/诊断，不参与语义）
@@ -342,12 +342,12 @@ pub(crate) fn now_ms() -> u64 {
 pub fn budget_clamp(
     base: usize,
     max_new: usize,
-    max_seq: usize,
+    max_context_length: usize,
 ) -> std::result::Result<usize, (usize, usize)> {
-    if base.saturating_add(max_new) <= max_seq {
+    if base.saturating_add(max_new) <= max_context_length {
         return Ok(max_new);
     }
-    let room = max_seq.saturating_sub(base);
+    let room = max_context_length.saturating_sub(base);
     if room < _MIN_GEN_TOKENS {
         return Err((base, max_new));
     }
@@ -362,7 +362,7 @@ pub fn budget_clamp(
 ///
 /// 违反 ⇒ **本 turn 必须先压实**（位置账归零重算），否则核会越界读 rope 表
 /// （`rope_f32.cu` 对 pos 无边界检查）。正常（非 gap）会话不可能触发：
-/// token 预算保证 `pos_hi = n_tokens ≤ max_seq < pos_cap`。
+/// token 预算保证 `pos_hi = n_tokens ≤ max_context_length < pos_cap`。
 pub fn needs_consolidation(pos_hi: i32, max_new: usize, pos_cap: usize) -> bool {
     let pos_hi = pos_hi.max(0) as usize;
     pos_hi.saturating_add(max_new) >= pos_cap
@@ -656,12 +656,12 @@ impl<D: DeviceClient> RunningEngine<D> {
         };
         Ok(TokenizeReply {
             tokens,
-            max_seq_tokens: self.boot.cfg.max_seq_tokens,
+            max_context_length_tokens: self.boot.cfg.max_context_length_tokens,
         })
     }
 
     /// 提交 turn(临时会话:每 turn 独立,终了即焚;行为同 M0.5)。
-    /// 预算:prompt + 生成 ≤ max_seq_tokens(= KV 槽位);超出先收缩生成
+    /// 预算:prompt + 生成 ≤ max_context_length_tokens(= KV 槽位);超出先收缩生成
     /// (见 [`budget_clamp`]),只剩 < 1k 才拒。
     /// turn 域 spec 状态(turn 生命周期;仅活跃 turn 可触 —— 轮执行期
     /// active 恒在;turn 外触碰 = 调用序错误)
@@ -1664,15 +1664,15 @@ impl<D: DeviceClient> RunningEngine<D> {
         // 直接 400(实测:工作区里一句"1+1=?"都发不出去)。收缩后仍能跑,
         // `finish_reason=length` 由客户端自行续写/压缩。
         let base = prompt_ids.len().max(cached_hit);
-        let max_new = match budget_clamp(base, max_new, self.boot.cfg.max_seq_tokens) {
+        let max_new = match budget_clamp(base, max_new, self.boot.cfg.max_context_length_tokens) {
             Ok(m) => {
                 if m != max_new {
                     owl_shared::log_warn!(
                         "chat",
-                        "预算收缩: prompt {} + 生成 {} > max_seq {} ⇒ 生成长度收缩到 {} tokens",
+                        "预算收缩: prompt {} + 生成 {} > max_context_length {} ⇒ 生成长度收缩到 {} tokens",
                         prompt_ids.len(),
                         max_new,
-                        self.boot.cfg.max_seq_tokens,
+                        self.boot.cfg.max_context_length_tokens,
                         m
                     );
                 }
@@ -1686,14 +1686,14 @@ impl<D: DeviceClient> RunningEngine<D> {
                     "submit: prompt {} + 生成 {} 超预算 {}",
                     prompt_ids.len(),
                     max_new,
-                    self.boot.cfg.max_seq_tokens
+                    self.boot.cfg.max_context_length_tokens
                 ))));
             }
         };
         // **生成预算 = 上下文 + 本请求的输出上限**（2026-11-17 裁决 A）。
         //
         // 预留口径 = 这轮**实际可能生成的长度**：`max_new`（请求值，先被
-        // `max_new_cap` 与上下文窗口 `max_seq − prompt` 夹过）。
+        // `max_new_cap` 与上下文窗口 `max_context_length − prompt` 夹过）。
         //
         // 为什么不再预留整档 cap（2026-11-16 旧口径）：客户端只要 13k 时，
         // 多留到 32k 的那 19k 永远不可能被本 turn 兑现；而 `prompt + cap`
@@ -1703,13 +1703,13 @@ impl<D: DeviceClient> RunningEngine<D> {
         let window_left = self
             .boot
             .cfg
-            .max_seq_tokens
+            .max_context_length_tokens
             .saturating_sub(prompt_ids.len());
         if window_left == 0 {
             return Err(SubmitError::Engine(ModelError::Msg(format!(
-                "submit: prompt {} 已占满上下文窗口（max_seq {}）—— 连 1 token 的输出预算都没有",
+                "submit: prompt {} 已占满上下文窗口（max_context_length {}）—— 连 1 token 的输出预算都没有",
                 prompt_ids.len(),
-                self.boot.cfg.max_seq_tokens
+                self.boot.cfg.max_context_length_tokens
             ))));
         }
         let max_new = max_new
@@ -3581,7 +3581,7 @@ impl<D: DeviceClient> RunningEngine<D> {
     /// **拒一个待准入 turn**(§23.4):出队 + 临时会话焚毁 + `Failed` 事件入队。
     ///
     /// 不掉 `ensure_for_len` 的 `Exhausted` —— 拒的文案不带 "超预算" 字样:
-    /// 那是"prompt + max_tokens > max_seq"的专用标记(服务面据此归一化成
+    /// 那是"prompt + max_tokens > max_context_length"的专用标记(服务面据此归一化成
     /// `context_length_exceeded` 触发客户端自动 compact);池墙拒是另一类,
     /// 客户端该做的是降并发/重试。
     pub(crate) fn reject_queued_turn(
@@ -4654,7 +4654,7 @@ mod budget_tests {
         assert!(needs_consolidation(99, 1, 100), "末位 100 越界");
         assert!(!needs_consolidation(99, 0, 100), "prompt 末位 99 安全");
         assert!(needs_consolidation(100, 0, 100), "prompt 本身已越界");
-        // 非 gap 会话：pos_hi = n_tokens ≤ max_seq < pos_cap ⇒ 永不触发
+        // 非 gap 会话：pos_hi = n_tokens ≤ max_context_length < pos_cap ⇒ 永不触发
         assert!(!needs_consolidation(262_144, 0, 393_216));
         // 负数/异常账不得 panic，按 0 处理
         assert!(!needs_consolidation(-5, 0, 10));
@@ -4666,7 +4666,7 @@ mod budget_tests {
         assert_eq!(budget_clamp(26446, 8192, 32768), Ok(32768 - 26446));
         // 装得下 ⇒ 原样(不动客户端请求)
         assert_eq!(budget_clamp(12723, 8192, 32768), Ok(8192));
-        // 边界:刚好 = max_seq ⇒ 可用 0 …… 但 0 < 下限 ⇒ 拒
+        // 边界:刚好 = max_context_length ⇒ 可用 0 …… 但 0 < 下限 ⇒ 拒
         assert_eq!(budget_clamp(32768, 8192, 32768), Err((32768, 8192)));
         // 剩余恰好 = 下限 ⇒ 放行(边界语义:≥ 下限即可)
         assert_eq!(
@@ -4678,10 +4678,10 @@ mod budget_tests {
             budget_clamp(32768 - _MIN_GEN_TOKENS + 1, 8192, 32768),
             Err((32768 - _MIN_GEN_TOKENS + 1, 8192))
         );
-        // base 已 ≥ max_seq(saturating)⇒ 拒,不 panic
+        // base 已 ≥ max_context_length(saturating)⇒ 拒,不 panic
         assert!(budget_clamp(99999, 8192, 32768).is_err());
         // 回归门(2026-10-15):**装得下 ⇒ 原样放行**,下限不倒查 ——
-        // 小预算档(max_seq < 1024)曾被无条件下限检查误杀,全部
+        // 小预算档(max_context_length < 1024)曾被无条件下限检查误杀,全部
         // spec e2e 门(spec_identity_gate 128 / awq27b 1024 / …)假红
         assert_eq!(budget_clamp(18, 48, 128), Ok(48));
         assert_eq!(budget_clamp(52, 16, 1024), Ok(16));

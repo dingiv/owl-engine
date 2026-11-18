@@ -26,7 +26,7 @@ async fn main() {
     let t0 = std::time::Instant::now();
     let mut engine = Engine::new(EngineConfig {
         device_ordinal: ordinal,
-        max_seq_tokens: 64,
+        max_context_length_tokens: 64,
         prefill_chunk: 32,
         knobs: owl_engine::EngineKnobs::default(),
     })

@@ -70,7 +70,7 @@ apps/server/src/executor.rs/main
               spec_runtime::load_spec_runtime()        // 草稿器装载
               kernel_env 快照（target + draft）
               kernel::kv_manifest_gate
-          kernel_cfg::apply(knobs, max_seq, arch)      // 全局族配置（F-09）
+          kernel_cfg::apply(knobs, max_context_length, arch)      // 全局族配置（F-09）
           boot_kvmem_check(cfg)                        // 纯配置，但已晚于草稿装载（F-01）
           drain_temp_pool → mem_pool_trim → sync → mem_info
           boot_pool_plan → StatePool::alloc

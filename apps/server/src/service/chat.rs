@@ -1032,7 +1032,7 @@ pub(crate) async fn tokenize<W: tokio::io::AsyncWrite + Unpin>(
                 200,
                 &json!({
                     "count": rep.tokens.len(),
-                    "max_model_len": rep.max_seq_tokens,
+                    "max_model_len": rep.max_context_length_tokens,
                     "tokens": rep.tokens,
                     "mode": mode,
                     "model": req.model,

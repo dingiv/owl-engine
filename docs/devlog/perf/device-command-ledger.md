@@ -369,7 +369,7 @@ N4 TurnEnd     → dev.set_owner(Owner::System);      // 复位;无上下文时�
 | `iface/handle.rs` | `pub type LedgerCell = Arc<Mutex<dyn AllocLedger>>`(trait 加 `Send` 超界);`DeviceHandle.ctx: Arc<Mutex<Ctx>>`(**共享上下文**:face_clone 出来的句柄与本体同源 ⇒ 节点设一次全族生效) |
 | `store/tier.rs` | `LedgerBook { tiers, open, hook_fail }`(三层账 + 出借登记**同屋**:一笔出借同时改两处,分两处必分叉)+ `SharedLedger` + `book_lock()`(**锁中毒不许 panic 级联**:取回内部数据 + 计数可见)+ `LedgerEntry`(`AllocLedger` 的 store 适配器)+ `shared_ledger()`/`ledger_entry()`(boot 唯一入口) |
 | `store/rel.rs` | `Rel.ledger: SharedLedger`;`Rel::open(.., ledger)` **交叉校验**账本预算与 `VramBudget::tier_budget()` 逐字相等(不符 = boot 算式漂了 ⇒ 响亮拒) |
-| `store/lib.rs` + `engine` | `tier_budget_of(host_cache_mb, snap_host_mb)` = **中层预算唯一算式**(boot 造账与 `BudgetInputs.host_bytes` 同源) |
+| `store/lib.rs` + `engine` | `tier_budget_of(ram_pool_size, snap_host_mb)` = **中层预算唯一算式**(boot 造账与 `BudgetInputs.host_bytes` 同源) |
 
 两层锁的分工:**外层** = 事件入口对象(`LedgerCell`),**内层** = 账本本体(store 自查也要它);
 两层都只在同步段短暂持有、绝不跨 await、持内层时不回调外部代码。
@@ -749,7 +749,7 @@ device_ledger 2(断言"turn 后池非空 + hits+misses>0")· 真机三轮同上�
 `ModelError::PoolExhausted{..}` ⇒ 丢本 turn(客户端如实拿 500)+ **`relieve_pressure()`**
 (先池排空、再 N6 节点)+ **`continue` 继续泵**;只有 `ServerClosed` / `EngineInvariant` 仍致命。
 
-**真机实录(27B / 3090 Ti / `vram_budget=0.98` / `reserve=2048MiB` / `host_cache_mb=32` /
+**真机实录(27B / 3090 Ti / `vram_budget=0.98` / `reserve=2048MiB` / `ram_pool_size=32` /
 `snap_host_mb=0`,6×2400-token 长 prompt)**:
 
 ```

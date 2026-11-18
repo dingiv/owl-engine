@@ -25,15 +25,15 @@ log="/tmp/owl-boot-$tag.log"
 case "$kind" in
   awq-spec)
     prof="$OL/profiles/measurement/qwen38_27b-3090-int8.toml"
-    extra=( --set 'runtime.max_seq=40960'
+    extra=( --set 'runtime.max_context_length=40960'
             --set 'spec.depth=7' --set 'spec.lookup=true'
             --set "spec.draft_path=\"$OL/models/syvai/Qwen3.8-27B-DFlash2-W4A16\"" ) ;;
   awq-nospec)
     prof="$OL/profiles/measurement/qwen38_27b-3090-int8.toml"
-    extra=( --set 'runtime.max_seq=40960' --set 'spec.depth=0' --set 'spec.lookup=false' ) ;;
+    extra=( --set 'runtime.max_context_length=40960' --set 'spec.depth=0' --set 'spec.lookup=false' ) ;;
   gguf)
     prof="$OL/profiles/qwen38_27b-gguf_3090.toml"
-    extra=( --set 'runtime.max_seq=16384' --set 'spec.depth=0' --set 'spec.lookup=false' ) ;;
+    extra=( --set 'runtime.max_context_length=16384' --set 'spec.depth=0' --set 'spec.lookup=false' ) ;;
   *) echo "未知档 $kind(awq-spec|awq-nospec|gguf)"; exit 2 ;;
 esac
 

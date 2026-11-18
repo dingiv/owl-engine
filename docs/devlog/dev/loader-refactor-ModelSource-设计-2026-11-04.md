@@ -322,7 +322,7 @@ review `apps/server` 配置/检查面时发现三处"检查与启动不一致 / 
 |---|---|---|
 | 1 | `--check` 按 `path.is_file()` 猜源，boot 按 `load_arm_of(format, quant)` ⇒ `format=awq` + `.gguf` 路径"检查通过、启动失败"（反向同理） | `DeclSource` + `LoadArm::decl_source()`；`open_decl(path, src)`；HF 档遇文件 / GGUF 档遇目录都**响亮拒** |
 | 2 | `--check` 不跑旋钮能力门：GGUF + `head_quant`/`embed_quant` 检查通过、boot 拒 | `LoadIntent::check_arm(arm)` + 共享 `check_keyed_overrides`（与 `GgufFileSource::build_model` **同一份文案**） |
-| 3 | `[model.rope]` 在 HF/AWQ 档静默无效；HF rope 表长 262144，`max_seq` 超表时 `owl_rope_*` 按 `pos` 直索引 cos/sin ⇒ **设备 OOB** | `OwlConfig::validate` 拒非 GGUF 的 `yarn_factor > 1`；`build_hf_rope` 在 `max_seq > 表长` 时装载期响亮拒（先于池分配） |
+| 3 | `[model.rope]` 在 HF/AWQ 档静默无效；HF rope 表长 262144，`max_context_length` 超表时 `owl_rope_*` 按 `pos` 直索引 cos/sin ⇒ **设备 OOB** | `OwlConfig::validate` 拒非 GGUF 的 `yarn_factor > 1`；`build_hf_rope` 在 `max_context_length > 表长` 时装载期响亮拒（先于池分配） |
 
 **验证矩阵**（全部实跑）：
 
@@ -331,8 +331,8 @@ review `apps/server` 配置/检查面时发现三处"检查与启动不一致 / 
 - GGUF 档 + AWQ 目录 → `FAIL: 是目录；GGUF 是单文件格式…`；
 - GGUF + `head_quant=rtn-int8-row` → `FAIL`（与 boot 同文案）；
 - AWQ + `[model.rope] yarn_factor=2` → 配置拒启；
-- `runtime.max_seq=262145`（HF）实机 boot → **装载期**拒启：
-  `max_seq=262145 > HF rope 表长=262144`（exit 1，先于 KV 池）；
+- `runtime.max_context_length=262145`（HF）实机 boot → **装载期**拒启：
+  `max_context_length=262145 > HF rope 表长=262144`（exit 1，先于 KV 池）；
 - 单测：`owl-shared` 129 / `owl-models` 324 / `owl-engine` CPU 221 全绿；
   `cargo check --workspace --all-targets` 0 error。
 

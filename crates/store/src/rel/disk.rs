@@ -347,7 +347,7 @@ impl Rel {
         let total = self.budget.tier_budget().disk_bytes;
         if total == 0 {
             return Err(StoreError::Budget(
-                "磁盘层配置为 0(先给 [store] disk_cache_mb)".into(),
+                "磁盘层配置为 0(先给 [store] disk_pool_size)".into(),
             ));
         }
         let want = kv_bytes

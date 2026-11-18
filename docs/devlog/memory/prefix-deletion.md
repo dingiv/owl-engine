@@ -912,7 +912,7 @@ t1(两图,8 tok)           [99484, 95952, 16, 97628, 101843, 95979, 100016, 3709
 token 级门互证。
 
 **（附）合并 main 后的配置 schema 迁移**：`[kernel] kv_fp8` → `[pool] kv_fp8`；
-`[pool] pool_tokens` 已删除（池大小由 VRAM 预算/`max_seq` 派生）。本卷两个 evict 档已改。
+`[pool] pool_tokens` 已删除（池大小由 VRAM 预算/`max_context_length` 派生）。本卷两个 evict 档已改。
 
 ## 6bis. 两条收尾定谳（2026-10-24）
 

@@ -344,7 +344,7 @@ P1 把设备/装配/泵切干净后，server 只剩 HTTP/SSE、OpenAI/agent 协�
 ```text
 cargo check -p server --tests       零错零 warning
 cargo test -p server --bin server   113 passed（新增:http 定界/状态行 8 项、permit 策略表 1 项）
-cargo test -p server --test config_check  3 红 = 存量（期望 max_seq=79872 / profile 是 57344），无新增
+cargo test -p server --test config_check  3 红 = 存量（期望 max_context_length=79872 / profile 是 57344），无新增
 --check（qwen38_27b-3090.toml）     输出形状不变，exit 0
 单 3090（UUID 钉卡，8399，max_concurrency=1，spec off）:
   chat 非流式 / SSE / tokenize / queue / vram / blocks   全通
@@ -384,7 +384,7 @@ pub enum CheckItem { Pass(String), Fail(String) }      // 报告文本，不带 
 pub struct CheckLines { pub items: Vec<CheckItem> }    // 顺序即报告顺序
 
 pub struct ModelCheckSpec<'a> { path, format, quant, head_quant, embed_quant,
-                                max_seq, vision, vision_path, profile }
+                                max_context_length, vision, vision_path, profile }
 pub fn check_model_dir(spec) -> Result<CheckLines, String>;  // Err 仅配置级（臂分派）
 pub fn check_draft_dir(dir: &Path) -> CheckLines;            // DFlash2 / pack-quantized / GGUF
 pub fn check_mtp_head(dir: &Path) -> CheckLines;             // mtp.* 键 / nextn.eh_proj

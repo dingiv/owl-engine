@@ -39,14 +39,14 @@ pub const PREFILL_XQA: &str = "owl_xqa_prefill";
 /// 槽序契约(LaunchMsg.args;6 Block + 10 sz):
 /// `[T q, T k_cache, T v_cache, T page_table(i32), T seq_lens(u32),
 ///   T mask(u32), T semaphores(u32), T scratch, T wr, O out, sz q_seq_len, sz hkv,
-///   sz hd, sz page, sz max_seq_len,
+///   sz hd, sz page, sz max_context_length_len,
 ///   sz q_scale_bits, sz sm_count, sz stride_page, sz stride_token,
 ///   sz stride_head]`
 /// q_scale 以 `f32::to_bits` 过线(= attn_scale·sqrt(hd);核内再除 sqrt(hd))。
 pub const VERIFY_XQA_SLOTS: &str =
     "[T q, T k_cache, T v_cache, T page_table, T seq_lens, T mask, \
      T semaphores, T scratch, T wr, O out, sz q_seq_len, sz hkv, sz hd, sz page, \
-     sz max_seq_len, sz q_scale_bits, sz sm_count, sz stride_page, \
+     sz max_context_length_len, sz q_scale_bits, sz sm_count, sz stride_page, \
      sz stride_token, sz stride_head]";
 /// **线槽序权威**(plain type-list;`lower_kernel`/`foreign_sig` 消费,
 /// 必须与层侧 `.arg` 链同序:9 入参 T + O 输出 + 10 sz)
@@ -214,7 +214,7 @@ impl XqaConsts {
         sm_count: u32,
         batch: u32,
         nb_k_heads: u32,
-        max_seq_len: u32,
+        max_context_length_len: u32,
         q_seq_len: u32,
         nsub_cap: u32,
     ) -> ((u32, u32, u32), (u32, u32, u32), u32) {
@@ -224,7 +224,7 @@ impl XqaConsts {
             1
         } else {
             let by_sm = (sm_count / (batch.max(1) * nb_k_heads.max(1))).max(1);
-            by_sm.min(div_up(max_seq_len, self.cta_tile_x)).min(nsub_cap.max(1))
+            by_sm.min(div_up(max_context_length_len, self.cta_tile_x)).min(nsub_cap.max(1))
         };
         self.geometry(nb_sub_seq, nb_k_heads, q_seq_len)
     }
@@ -234,7 +234,7 @@ impl XqaConsts {
         sm_count: u32,
         batch: u32,
         nb_k_heads: u32,
-        max_seq_len: u32,
+        max_context_length_len: u32,
         q_seq_len: u32,
     ) -> ((u32, u32, u32), (u32, u32, u32), u32) {
         let div_up = |a: u32, b: u32| a.div_ceil(b.max(1));
@@ -242,7 +242,7 @@ impl XqaConsts {
             1
         } else {
             let by_sm = (sm_count / (batch.max(1) * nb_k_heads.max(1))).max(1);
-            by_sm.min(div_up(max_seq_len, self.cta_tile_x))
+            by_sm.min(div_up(max_context_length_len, self.cta_tile_x))
         };
         self.geometry(nb_sub_seq, nb_k_heads, q_seq_len)
     }
@@ -292,8 +292,8 @@ impl XqaConsts {
         ((nb_sub_seq, nb_k_heads * nb_token_blocks, 1), block, self.smem)
     }
     /// `maxNbPagesPerSeq = maxSeqLen / tokensPerPage`(exactDiv)
-    pub fn max_nb_pages_per_seq(&self, max_seq_len: u32) -> u32 {
-        max_seq_len / self.tokens_per_page.max(1)
+    pub fn max_nb_pages_per_seq(&self, max_context_length_len: u32) -> u32 {
+        max_context_length_len / self.tokens_per_page.max(1)
     }
     /// KV stride:元素序 → head 序(`launchMHAFlashInfer` 同式)
     pub fn stride_in_heads(&self, elems: u64) -> u32 {
@@ -456,7 +456,7 @@ pub fn launch_on_stream(
 ///
 /// 为什么要这个口:`launch_geometry` 把 split 度绑在 `sm_count/(batch·hkv)` 上,
 /// 探针想扫"并行度"这一维只能靠伪造 sm_count —— 那条路会把**上限**也一起改
-/// (`min(by_sm, ceil(max_seq/ctaTile))`),两变量纠缠 ⇒ 结论不可归因。
+/// (`min(by_sm, ceil(max_context_length/ctaTile))`),两变量纠缠 ⇒ 结论不可归因。
 /// 本口把这一维**单独**拿出来(调用方自担语义:serve 面仍走 `launch_geometry`)。
 #[cfg(feature = "device")]
 pub fn launch_on_stream_subseq(
