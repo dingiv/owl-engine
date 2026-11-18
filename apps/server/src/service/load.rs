@@ -108,11 +108,11 @@ pub struct NormSpec {
 }
 
 impl LoadSpec {
-    /// 校验 + 归一（`max_concurrency` / `max_new_cap` 由调用方给 —— 单源在配置）
+    /// 校验 + 归一（`max_concurrency` / `max_generation_length` 由调用方给 —— 单源在配置）
     pub fn normalize(
         self,
         max_concurrency: usize,
-        max_new_cap: usize,
+        max_generation_length: usize,
         nonce: u64,
     ) -> Result<NormSpec, String> {
         let concurrency = self.concurrency.unwrap_or(4);
@@ -126,9 +126,9 @@ impl LoadSpec {
             ));
         }
         let tokens = self.tokens.unwrap_or(32);
-        if tokens == 0 || tokens > max_new_cap {
+        if tokens == 0 || tokens > max_generation_length {
             return Err(format!(
-                "tokens({tokens}) 越界 1..={max_new_cap}([agent] max_new_cap / 池预算)"
+                "tokens({tokens}) 越界 1..={max_generation_length}([runtime] max_generation_length / 池预算)"
             ));
         }
         let prompt_tokens = self.prompt_tokens.unwrap_or(256);
@@ -366,7 +366,7 @@ pub(crate) async fn load<W: AsyncWrite + Unpin>(
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_nanos() as u64)
         .unwrap_or(1);
-    let spec = match raw.normalize(max_concurrency, agent.max_new_cap, nonce) {
+    let spec = match raw.normalize(max_concurrency, agent.max_generation_length, nonce) {
         Ok(s) => s,
         Err(e) => return http::respond_json(w, 400, &json!({"error": e})).await,
     };

@@ -84,9 +84,9 @@ pub(crate) async fn chat(
     if clamped {
         owl_shared::log_warn!(
             "chat",
-            "max_tokens={:?} 超出本档上限 {},已夹紧(改 [agent] max_new_cap 随池定档放开)",
+            "max_tokens={:?} 超出本档上限 {},已夹紧(改 [runtime] max_generation_length 随池定档放开)",
             req.max_tokens,
-            agent.max_new_cap
+            agent.max_generation_length
         );
     }
     // 思考档位(AGT-07):OpenAI `reasoning_effort` **直通模板变量**
@@ -1181,10 +1181,10 @@ mod tests {
         let agent = AgentCfg::default();
         let r: ChatRequest = serde_json::from_value(json!({
             "messages":[{"role":"user","content":"x"}], "max_tokens": 32000})).expect("parse");
-        assert_eq!(r.max_new(&agent), (agent.max_new_cap, true));
+        assert_eq!(r.max_new(&agent), (agent.max_generation_length, true));
         let r: ChatRequest = serde_json::from_value(json!({
             "messages":[{"role":"user","content":"x"}]})).expect("parse");
-        assert_eq!(r.max_new(&agent), (agent.default_max_new, false));
+        assert_eq!(r.max_new(&agent), (agent.max_generation_length, false));
         // `defaults` = `chat_template.toml`（模板变量；空表 = 无文件）
         let none = serde_json::Map::new();
         let r: ChatRequest = serde_json::from_value(json!({
@@ -1266,7 +1266,7 @@ mod tests {
         );
 
         // [agent] 定制上限生效(配置面唯一旋钮)
-        let agent = AgentCfg { max_new_cap: 32768, default_max_new: 2048, ..AgentCfg::default() };
+        let agent = AgentCfg { max_generation_length: 32768, ..AgentCfg::default() };
         let r: ChatRequest = serde_json::from_value(json!({
             "messages":[{"role":"user","content":"x"}], "max_tokens": 40000})).expect("parse");
         assert_eq!(r.max_new(&agent), (32768, true));

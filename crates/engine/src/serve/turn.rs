@@ -327,7 +327,7 @@ pub(crate) struct Turn {
     pub(crate) spec: TurnSpec,
     /// **准入预留的生成预算**（token；2026-11-16 用户裁决）。
     ///
-    /// = `min([runtime] max_new_cap, max_context_length − prompt)`：一轮在 submit 时就按
+    /// = `min([runtime] max_generation_length, max_context_length − prompt)`：一轮在 submit 时就按
     /// 「上下文 + 本档最大输出长度」把整份空间预留住（在跑者不被新人挤占）。
     /// `spec.max_new` 仍是**实际**生成上限（≤ 本值；请求要多少给多少）。
     pub(crate) reserve_new: usize,

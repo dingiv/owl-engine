@@ -34,12 +34,9 @@ template_vars = ""
 [runtime]
 # 满员姿态：reject | queue | queue:<ms>
 admission_on_full = "reject"
-# 客户端未带 max_tokens 时的缺省生成长度
-default_max_new = 4096
-# 单请求生成硬上限（与 max_context_length 不重复：
-# max_context_length 限制 prompt + 生成的总量；本键只限制生成段，
-# 实际生效 = min(请求 max_tokens / default_max_new, 本键, max_context_length − prompt)）
-max_new_cap = 32768
+# 单请求生成上限（未带 max_tokens 时默认用它；给了则 min(客户端, 本值)；
+# 另受 max_context_length − prompt 夹紧）
+max_generation_length = 32768
 # 上下文上限（token，prompt + 生成）
 max_context_length = 32768
 # prefill 块长；越大吞吐越高，但激活工作区也越大

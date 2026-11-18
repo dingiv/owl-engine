@@ -50,7 +50,7 @@
 //! | server | template_vars | String / ""(chat 模板变量文件；模板变量不属于引擎配置) |
 //! | server | template_path | Option / None(模板覆盖) |
 //! | runtime | max_concurrency | usize / 1(同时活跃请求上限；GDN 状态格由它派生) |
-//! | runtime | default_max_new / max_new_cap | 生成缺省与上限(见字段注；会话身份已改为**内容身份**，无 implicit_session 键) |
+//! | runtime | max_generation_length | usize / 32768(单请求生成上限；未带 max_tokens 也用它) |
 //! | runtime | max_context_length | usize / 4096 |
 //! | runtime | prefill_chunk | usize / 512（性能旋钮；尾块合并收成引擎定值 0） |
 //! | runtime | max_batch | ~~派生~~（= min(max_concurrency,8)；不是 TOML 键） |
@@ -125,7 +125,7 @@
 //! | cuda | *(nvrtc_include/native_aot 2026-10-13 退役 —— NVRTC 已删)* | — |
 //! | graph | no_graph | flag / false(总闸:eager 直发,跳过**全部**图捕获) |
 //! | agent | template_path | Option<String> / None(相对路径 = 相对 model.dir;`[agent]` 段已解散，现住 `[server]`) |
-//! | agent | default_max_new / max_new_cap | usize / 4096、8192 |
+
 //! | agent | auto_disable_thinking_with_tools | flag / false(有工具即关思考) |
 //! | agent | default_reasoning_effort | Option<String> / None(OpenAI 同名协议值,
 //! |   |   | 模板值域 none/low/medium/high…;None = 不传让模板取默认) |
@@ -481,9 +481,9 @@ pub struct RuntimeCfg {
     ///
     /// 会话身份 = **内容身份**（无键请求按 prompt 前缀认会话），因此也不再
     /// 需要"隐式会话 0"开关（旧 `implicit_session`）。
-    pub default_max_new: usize,
-    /// `max_tokens` 夹紧上限
-    pub max_new_cap: usize,
+    /// **单请求生成上限**：客户端未给 `max_tokens` 时默认用它；
+    /// 给了则 `min(客户端, 本值)`（上下文窗口另夹）。
+    pub max_generation_length: usize,
     // **`queue_wait_ms` 已删**（2026-11-16 用户裁决）：它与
     // `admission_on_full = "queue:<ms>"` 是同一个"等多久"（两处毫秒必有一处
     // 失效）⇒ 唯一来源 = `admission_on_full`，服务面的 HTTP 排队超时也从它派生。
@@ -519,9 +519,9 @@ pub struct RuntimeCfg {
     // **准入三旋钮已删**（2026-11-16 用户裁决）：
     // `newcomer_min_tokens` / `min_gen_tokens` / `max_queue` 是"给新人留头寸"
     // 的补丁层。原始算法的预算已经**保底**：一轮在 submit 时就按
-    // 「本请求上下文 + 本请求 max_tokens」预留（先被 `max_new_cap` 与窗口夹过），
+    // 「本请求上下文 + 本请求 max_tokens」预留（先被 `max_generation_length` 与窗口夹过），
     // 装不下就拒/排队 ⇒ 在跑的 turn 不会被新人挤占，也不需要公平性旋钮去补贴它。
-    // （2026-11-17 裁决 A：不再预留整档 `max_new_cap` —— 近窗 prompt 会被挤出准入。）
+    // （2026-11-17 裁决 A：不再预留整档 `max_generation_length` —— 近窗 prompt 会被挤出准入。）
     /// **准入满员姿态**（`[runtime] admission_on_full`；2026-11-05 从 env 收编）：
     /// `"reject"`（缺省）/ `"queue"`（最多等 30s）/ `"queue:<ms>"`。
     /// 坏值 = boot 拒启（`validate` 与引擎构造都走同一解析）。
@@ -2050,8 +2050,7 @@ impl RuntimeCfg {
 impl Default for RuntimeCfg {
     fn default() -> Self {
         Self {
-            default_max_new: 4096,
-            max_new_cap: 8192,
+            max_generation_length: 32768,
             max_context_length: 4096,
             prefill_chunk: 512,
             max_batch: 1,
@@ -2493,7 +2492,7 @@ fn reject_retired_keys(v: &toml::Value) -> Result<(), String> {
     // 整段搬走的用"段存在即拒",单键搬走的逐键拒 —— 一律给出可行动的新写法。
     const MOVED_SECTIONS: &[(&str, &str)] = &[
         ("graph", "`[graph] no_graph` 已并入 `[cuda] graph`(语义取正:graph = false 才是 eager 直发)"),
-        ("agent", "`[agent]` 已解散:并发旋钮 → `[runtime]`(max_concurrency / default_max_new / max_new_cap / queue_wait_ms);模板面 → `[server]`(template_path / template_vars)；**模板变量本身**住 `chat_template.toml`(2026-11-16)；会话身份 = 内容身份(无 implicit_session/max_sessions 键) - 2026-11-16 原始算法"),
+        ("agent", "`[agent]` 已解散:并发旋钮 → `[runtime]`(max_concurrency / max_generation_length / queue_wait_ms);模板面 → `[server]`(template_path / template_vars)；**模板变量本身**住 `chat_template.toml`(2026-11-16)；会话身份 = 内容身份(无 implicit_session/max_sessions 键) - 2026-11-16 原始算法"),
         ("dispatch", "`[dispatch]` 已更名为 `[kernel]`(字段名不变)"),
     ];
     for (section, hint) in MOVED_SECTIONS {
@@ -3221,11 +3220,11 @@ impl OwlConfig {
             );
         }
         // **生成预算自洽**（2026-11-17 裁决 A：预留 = 上下文 + 请求 max_tokens）。
-        // `max_new_cap = 0` ⇒ 请求的输出上限定死为 0（生成被关死）——
+        // `max_generation_length = 0` ⇒ 请求的输出上限定死为 0（生成被关死）——
         // 那是配置错误，不是"关掉生成"的开关。
-        if self.runtime.max_new_cap == 0 {
+        if self.runtime.max_generation_length == 0 {
             return Err(
-                "[runtime] max_new_cap = 0 —— 请求的生成上限被夹到 0（模型只吐空回复）；\
+                "[runtime] max_generation_length = 0 —— 请求的生成上限被夹到 0（模型只吐空回复）；\
                  要短生成请把请求的 max_tokens 调小，不要把档上限设为 0"
                     .to_string(),
             );
@@ -3341,8 +3340,7 @@ mod tests {
     fn 会话与模板面缺省与账外键() {
         let c = OwlConfig::default();
         assert!(c.server.template_path.is_none());
-        assert_eq!(c.runtime.default_max_new, 4096);
-        assert_eq!(c.runtime.max_new_cap, 8192);
+        assert_eq!(c.runtime.max_generation_length, 32768);
         assert_eq!(
             c.server.template_vars, "",
             "空 = 自动找快照旁的 chat_template.toml"
@@ -3355,12 +3353,12 @@ mod tests {
             "模板变量必须去 chat_template.toml"
         );
         let c = OwlConfig::from_toml_str(
-            "[runtime]\nmax_new_cap = 32768\n\
+            "[runtime]\nmax_generation_length = 32768\n\
              [server]\ntemplate_vars = \"/tmp/ct.toml\"\n",
         )
         .expect("合法键应通过");
         assert_eq!(c.server.template_vars, "/tmp/ct.toml");
-        assert_eq!(c.runtime.max_new_cap, 32768);
+        assert_eq!(c.runtime.max_generation_length, 32768);
         // **会话面旧键已退役**（2026-11-16 原始算法：会话数不设上限、身份 = 内容身份）
         for k in ["max_sessions", "implicit_session"] {
             let src = format!("[runtime]\n{k} = 1\n");
@@ -3482,13 +3480,13 @@ mod tests {
         );
     }
 
-    /// **`max_new_cap = 0` 拒启**（2026-11-17 A：请求上限被夹到 0 = 空回复）。
+    /// **`max_generation_length = 0` 拒启**（2026-11-17 A：请求上限被夹到 0 = 空回复）。
     #[test]
-    fn validate_rejects_zero_max_new_cap() {
-        let e = OwlConfig::from_toml_str("[runtime]\nmax_new_cap = 0\n")
-            .expect_err("max_new_cap = 0 必须拒启");
-        assert!(e.contains("max_new_cap"), "拒语应点名键: {e}");
-        OwlConfig::from_toml_str("[runtime]\nmax_new_cap = 8192\n").expect("正数合规");
+    fn validate_rejects_zero_max_generation_length() {
+        let e = OwlConfig::from_toml_str("[runtime]\nmax_generation_length = 0\n")
+            .expect_err("max_generation_length = 0 必须拒启");
+        assert!(e.contains("max_generation_length"), "拒语应点名键: {e}");
+        OwlConfig::from_toml_str("[runtime]\nmax_generation_length = 8192\n").expect("正数合规");
     }
 
     /// **`max_concurrency` = 同时推进的唯一用户旋钮**；gdn_slots/max_batch 派生。

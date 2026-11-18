@@ -90,7 +90,7 @@ pub struct Limits {
     // 「上下文 + 本请求输出上限」预留整份预算（`TurnFacts::max_new`），
     // 装不下即拒/排队 ⇒ 在跑者天然不被新人挤占，不需要"给新人留头寸"/
     // "在位者最小生成量"/"队列上限"这三个补丁旋钮。
-    // 2026-11-17 裁决 A："本请求输出上限" = 请求 max_tokens（被 `max_new_cap`
+    // 2026-11-17 裁决 A："本请求输出上限" = 请求 max_tokens（被 `max_generation_length`
     // 与窗口夹过），**不是**整档 cap —— 后者会把近窗 prompt 挤出准入。
 }
 
@@ -270,7 +270,7 @@ impl TurnFacts {
     /// **A2 预留口径**：本 turn 需要多少设备页。
     ///
     /// `max_new` = **本 turn 的输出预算**（submit 时取请求 max_tokens，被
-    /// `max_new_cap` 与上下文窗口夹过；2026-11-17 裁决 A），不再有"按剩余
+    /// `max_generation_length` 与上下文窗口夹过；2026-11-17 裁决 A），不再有"按剩余
     /// 空间反推封顶"这一步 —— 装不下就是装不下（准入拒/排队），绝不把在跑
     /// 者的预算切一块给新人。
     pub fn need_pages(&self, l: &Limits) -> usize {
@@ -367,7 +367,7 @@ impl Admission {
 
     /// **本轮生成预算**（token；2026-11-16 用户裁决）。
     ///
-    /// 不再"按剩余空间反推封顶"：预算在 submit 时定死 = `min(max_new_cap,
+    /// 不再"按剩余空间反推封顶"：预算在 submit 时定死 = `min(max_generation_length,
     /// max_context_length − prompt)`，由 [`TurnFacts::max_new`] 带进 store `plan_admission`。
     /// **本函数只作诊断/历史对照**；生产放行由 store plan 决定，不切在跑者份额。
     ///

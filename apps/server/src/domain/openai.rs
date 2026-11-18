@@ -419,13 +419,13 @@ impl ChatRequest {
         Ok(())
     }
 
-    /// 生成步数(夹紧到 `agent.max_new_cap`;夹紧情况返回 true 供调用方告警)
+    /// 生成步数(夹紧到 `agent.max_generation_length`;夹紧情况返回 true 供调用方告警)
     pub fn max_new(&self, agent: &AgentCfg) -> (usize, bool) {
         let want = self
             .max_tokens
             .filter(|v| *v > 0)
-            .unwrap_or(agent.default_max_new);
-        (want.min(agent.max_new_cap), want > agent.max_new_cap)
+            .unwrap_or(agent.max_generation_length);
+        (want.min(agent.max_generation_length), want > agent.max_generation_length)
     }
 
     /// **模板 kwargs 的唯一组装点**(vLLM `build_chat_params` 同款)。

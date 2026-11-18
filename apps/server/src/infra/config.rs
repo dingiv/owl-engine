@@ -237,10 +237,8 @@ pub(crate) const HELP: &str = "用法: server -p <profile_path> [CONFIG] [选项
 pub struct AgentCfg {
     /// 模板路径覆盖(None = 模型快照 `<model.path>/chat_template.jinja`)
     pub template_path: Option<String>,
-    /// 未带 `max_tokens` 时的生成步数
-    pub default_max_new: usize,
-    /// `max_tokens` 夹紧上限
-    pub max_new_cap: usize,
+    /// 单请求生成上限（未带 `max_tokens` 时默认用它；给了则 min）
+    pub max_generation_length: usize,
     /// **chat 模板变量**（`chat_template.toml`；2026-11-16 用户裁决：模板
     /// 变量不属于引擎配置）。扁平表，一个键 = 一个 jinja 变量；请求
     /// `chat_template_kwargs` 覆盖这里。
@@ -277,8 +275,7 @@ impl AgentCfg {
                 // 不静默给 0（那会把"配置写错"变成"排队超时关"）。
                 Err(e) => return Err(e),
             },
-            default_max_new: cfg.runtime.default_max_new,
-            max_new_cap: cfg.runtime.max_new_cap,
+            max_generation_length: cfg.runtime.max_generation_length,
             vars,
             vars_source: source,
         })

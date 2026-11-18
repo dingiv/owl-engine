@@ -1693,7 +1693,7 @@ impl<D: DeviceClient> RunningEngine<D> {
         // **生成预算 = 上下文 + 本请求的输出上限**（2026-11-17 裁决 A）。
         //
         // 预留口径 = 这轮**实际可能生成的长度**：`max_new`（请求值，先被
-        // `max_new_cap` 与上下文窗口 `max_context_length − prompt` 夹过）。
+        // `max_generation_length` 与上下文窗口 `max_context_length − prompt` 夹过）。
         //
         // 为什么不再预留整档 cap（2026-11-16 旧口径）：客户端只要 13k 时，
         // 多留到 32k 的那 19k 永远不可能被本 turn 兑现；而 `prompt + cap`
@@ -1713,7 +1713,7 @@ impl<D: DeviceClient> RunningEngine<D> {
             ))));
         }
         let max_new = max_new
-            .min(self.boot.cfg.knobs.max_new_cap)
+            .min(self.boot.cfg.knobs.max_generation_length)
             .min(window_left);
         let reserve_new = max_new;
         // **v4 快照布局（Tail + History）**：候选 = 消息边界 + prompt 末页；

@@ -212,7 +212,7 @@ async fn multi_active_decode_uses_selected_turn_gdn_row() {
         gdn_slots: 2,
         // 本用例是 2 页级小 turn：256 tok 窗口配 8192 的输出上限会让单轮
         // 预留吃满整窗（新预算律 = 上下文 + 最大输出长度）⇒ 第二个进不来。
-        max_new_cap: 64,
+        max_generation_length: 64,
         ..Default::default()
     };
     knobs.pool_tokens = Some(256);
@@ -471,7 +471,7 @@ async fn pressure_evicts_cold_sessions_whole() {
 
 /// **准入预留 = 上下文 + 本请求的 max_tokens**（2026-11-17 裁决 A）。
 ///
-/// - 预留 = 请求值（先被 `max_new_cap` 与 `max_context_length − prompt` 夹过）；
+/// - 预留 = 请求值（先被 `max_generation_length` 与 `max_context_length − prompt` 夹过）；
 /// - 近窗 prompt（`prompt + cap > max_context_length`）仍能按请求值预留（旧 cap 口径会拒）；
 /// - 在跑者不被新人挤占（另见 `budget_is_ctx_plus_max_output_and_not_squeezable`）。
 #[cfg(test)]
@@ -482,7 +482,7 @@ async fn submit_reserves_request_max_new() {
         raw_completion: true,
         max_batch: 1,
         gdn_slots: 1,
-        max_new_cap: 64,
+        max_generation_length: 64,
         ..Default::default()
     };
     knobs.pool_tokens = Some(256);
@@ -6297,7 +6297,7 @@ async fn abort_publishes_written_prompt_prefix() {
     let mut knobs = EngineKnobs {
         sampler_enabled: false,
         // 2048 tok 窗口：输出上限取 64，否则"上下文 + 最大输出"的预留会吃满整窗
-        max_new_cap: 64,
+        max_generation_length: 64,
         ..Default::default()
     };
     knobs.pool_tokens = Some(2048); // 64 页(页 32)⇒ 前缀面够放

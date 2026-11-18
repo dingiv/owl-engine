@@ -293,12 +293,12 @@ pub struct EngineKnobs {
     // **`slice_every` / `slice_tokens` 字段已删**（2026-11-16 用户裁决 B）：
     // 相位节奏 = 内核常数 `sched_policy::SLICE_EVERY`（为什么要切片由引擎
     // 自己知道：有人在 decode + 有人欠 prefill）。
-    /// **本档配置的最大输出长度**（`[runtime] max_new_cap`；2026-11-16 用户裁决）。
+    /// **本档配置的最大输出长度**（`[runtime] max_generation_length`；2026-11-16 用户裁决）。
     ///
     /// 准入预算 = 本请求上下文 + **本次请求的 max_tokens**（先被本 cap 与
     /// 上下文窗口夹过）—— 一轮在 submit 时就把它预留住，在跑的 turn 不会被
     /// 新人挤占。2026-11-17 裁决 A：cap 只夹单请求上限，不再整体预留。
-    pub max_new_cap: usize,
+    pub max_generation_length: usize,
     // **腾挪/压力 8 个字段已删**（2026-11-16 用户裁决）：策略在
     // `owl_store::PressurePolicy`（零旋钮），引擎不再需要把它们从配置搬进来。
     /// **末段页对齐已恒开**（2026-11-16 用户裁决：删键，默认开）：块边界
@@ -417,7 +417,7 @@ impl Default for EngineKnobs {
             admission_on_full: owl_store::QueuePolicy::Reject,
             dense_floor: owl_store::TurnFloor::Strict,
             no_graph: false,
-            max_new_cap: 8192,
+            max_generation_length: 32768,
             prefill_shadow: false,
             fi_cuda_graph: false,
             fi_plan_bake: None,
@@ -781,7 +781,7 @@ impl EngineKnobs {
             // 合批上限:配置文件单源(`[runtime] max_batch`;env 不参与 ——
             // 用户裁决 2026-10-19:引擎行为参数只许配置文件显式声明)
             max_batch: cfg.runtime.max_batch,
-            max_new_cap: cfg.runtime.max_new_cap,
+            max_generation_length: cfg.runtime.max_generation_length,
             // 快照池容量 = 配置单源（F-03；不再读 `OWL_SNAP_MAX`）
             snap_max: cfg.store.gdn.snap_max,
             snap_msg_delim: cfg.store.gdn.snap_msg_delim.clone(),
