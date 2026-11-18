@@ -124,14 +124,24 @@ impl CkptConfig {
             target_layer_ids: d
                 .get("target_layer_ids")
                 .and_then(|x| x.as_array())
-                .map(|a| a.iter().filter_map(|x| x.as_u64()).map(|x| x as usize).collect())
+                .map(|a| {
+                    a.iter()
+                        .filter_map(|x| x.as_u64())
+                        .map(|x| x as usize)
+                        .collect()
+                })
                 .unwrap_or_default(),
         });
         CkptConfig {
             architectures: v
                 .get("architectures")
                 .and_then(|x| x.as_array())
-                .map(|a| a.iter().filter_map(|x| x.as_str()).map(|x| x.to_string()).collect())
+                .map(|a| {
+                    a.iter()
+                        .filter_map(|x| x.as_str())
+                        .map(|x| x.to_string())
+                        .collect()
+                })
                 .unwrap_or_default(),
             model_type: s(v, "model_type"),
             hidden_size: u(v, "hidden_size"),
@@ -233,7 +243,10 @@ mod tests {
         assert_eq!(c.quant.as_ref().unwrap().group_size, Some(128));
         assert_eq!(c.quant.as_ref().unwrap().symmetric, Some(true));
         assert_eq!(c.dflash.as_ref().unwrap().block_size, Some(8));
-        assert_eq!(c.dflash.as_ref().unwrap().target_layer_ids, vec![5, 19, 33, 47, 61]);
+        assert_eq!(
+            c.dflash.as_ref().unwrap().target_layer_ids,
+            vec![5, 19, 33, 47, 61]
+        );
         // out = hq·hd(无门控)⇒ 与实测装载日志 out=4096 一致
         assert_eq!(c.num_attention_heads.unwrap() * c.head_dim.unwrap(), 4096);
     }
@@ -283,8 +296,14 @@ mod tests {
     #[test]
     fn reads_real_checkpoints_when_present() {
         for dir in [
-            concat!(env!("CARGO_MANIFEST_DIR"), "/../../models/syvai/Qwen3.8-27B-DFlash2-W4A16"),
-            concat!(env!("CARGO_MANIFEST_DIR"), "/../../models/cyankiwi/Qwen3.8-27B-AWQ-INT4"),
+            concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/../../models/syvai/Qwen3.8-27B-DFlash2-W4A16"
+            ),
+            concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/../../models/cyankiwi/Qwen3.8-27B-AWQ-INT4"
+            ),
         ] {
             let p = Path::new(dir);
             if !p.join("config.json").exists() {

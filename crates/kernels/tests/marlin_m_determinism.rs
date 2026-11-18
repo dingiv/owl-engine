@@ -30,7 +30,11 @@ fn f16_to_f32(h: u16) -> f32 {
         return sgn * m * 2f32.powi(-24);
     }
     if e == 31 {
-        return if m == 0.0 { sgn * f32::INFINITY } else { f32::NAN };
+        return if m == 0.0 {
+            sgn * f32::INFINITY
+        } else {
+            f32::NAN
+        };
     }
     sgn * (1.0 + m / 1024.0) * 2f32.powi(e - 15)
 }
@@ -113,27 +117,29 @@ fn run_shape_cfg(m: usize, n: usize, k: usize, tk: i32, tn: i32) -> Option<Vec<u
                 ok = false;
             }
         } else {
-        owl_kernels::family::marlin::gemm_v2_awq_w4a8_raw(
-            a_p as *const i8,
-            b_p as *const i32,
-            c_p as *mut u16,
-            s_p as *const u16,
-            z_p as *const i32,
-            as_p as *const f32,
-            tmp_p as *const std::ffi::c_void,
-            m as i32,
-            n as i32,
-            k as i32,
-            ws_p as *mut i32,
-            G,
-            ctx.ordinal() as i32,
-            cu_stream,
-            false, // w4a8_m8:生产缺省关
-        )
-        .expect("marlin w4a8 launch");
+            owl_kernels::family::marlin::gemm_v2_awq_w4a8_raw(
+                a_p as *const i8,
+                b_p as *const i32,
+                c_p as *mut u16,
+                s_p as *const u16,
+                z_p as *const i32,
+                as_p as *const f32,
+                tmp_p as *const std::ffi::c_void,
+                m as i32,
+                n as i32,
+                k as i32,
+                ws_p as *mut i32,
+                G,
+                ctx.ordinal() as i32,
+                cu_stream,
+                false, // w4a8_m8:生产缺省关
+            )
+            .expect("marlin w4a8 launch");
         }
     }
-    if !ok { return None; }
+    if !ok {
+        return None;
+    }
     stream.synchronize().unwrap();
     let mut out = vec![0u16; m * n];
     stream.memcpy_dtoh(&c, &mut out).unwrap();
@@ -185,12 +191,23 @@ fn w4a8_gemm_m_dependence() {
     //      与 M 都该**位同**;这同时否掉"选核档位造成 M 依赖"的假设。----
     println!("=== 线程档对照 n=5120 k=5120(基准 = auto @ M=2048) ===");
     let base = run_shape(2048, 5120, 5120);
-    for &(m, tk, tn) in &[(16usize, 64, 256), (16, 128, 128), (16, 128, 64),
-                          (1024, 128, 128), (1024, 128, 64), (2048, 64, 128)] {
-        let Some(got) = run_shape_cfg(m, 5120, 5120, tk, tn) else { continue };
+    for &(m, tk, tn) in &[
+        (16usize, 64, 256),
+        (16, 128, 128),
+        (16, 128, 64),
+        (1024, 128, 128),
+        (1024, 128, 64),
+        (2048, 64, 128),
+    ] {
+        let Some(got) = run_shape_cfg(m, 5120, 5120, tk, tn) else {
+            continue;
+        };
         let rows = m.min(2048);
         let (bad, mx) = diff(&got, &base, rows, 5120);
-        println!("  M={m:<5} tk={tk:<4} tn={tn:<4} 差异 {bad:>9} / {:>9}  max|Δ|={mx:.6}  {}",
-                 rows * 5120, if bad == 0 { "位同" } else { "**不同**" });
+        println!(
+            "  M={m:<5} tk={tk:<4} tn={tn:<4} 差异 {bad:>9} / {:>9}  max|Δ|={mx:.6}  {}",
+            rows * 5120,
+            if bad == 0 { "位同" } else { "**不同**" }
+        );
     }
 }

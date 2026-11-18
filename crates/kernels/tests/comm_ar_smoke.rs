@@ -31,7 +31,8 @@ fn load_fn(ctx: &Arc<CudaContext>, src_id: &str, symbol: &str) -> CudaFunction {
     let m = ctx
         .load_module(cudarc::nvrtc::Ptx::from_binary(a.bytes.to_vec()))
         .unwrap_or_else(|e| panic!("load_module {src_id}: {e:?}"));
-    m.load_function(symbol).unwrap_or_else(|e| panic!("符号 {symbol}: {e:?}"))
+    m.load_function(symbol)
+        .unwrap_or_else(|e| panic!("符号 {symbol}: {e:?}"))
 }
 
 /// staging header(64 B;布局与 `cu/comm/ar_stage.cu` 头注一致)
@@ -108,8 +109,20 @@ fn comm_ar_smoke() {
         let (p_own, _) = staging.device_ptr(&stream);
         let (p_peer, _) = staging.device_ptr(&stream); // 自环:own == peer
         unsafe {
-            launch6(&stream, &f_stage, p_local, p_own, p_peer, bytes, SLOT_BYTES, slab_off, "ar_stage");
-            launch6(&stream, &f_reduce, p_local, p_own, p_peer, bytes, SLOT_BYTES, slab_off, "ar_reduce");
+            launch6(
+                &stream, &f_stage, p_local, p_own, p_peer, bytes, SLOT_BYTES, slab_off, "ar_stage",
+            );
+            launch6(
+                &stream,
+                &f_reduce,
+                p_local,
+                p_own,
+                p_peer,
+                bytes,
+                SLOT_BYTES,
+                slab_off,
+                "ar_reduce",
+            );
         }
         stream.synchronize().expect("sync");
         let h = stream.clone_dtoh(&staging).expect("dtoh staging");
@@ -137,7 +150,17 @@ fn comm_ar_smoke() {
     let t0 = std::time::Instant::now();
     unsafe {
         // reduce(out=payload, own=dead(cons=0), peer=dead(prod=0))⇒ 等 prod>0 超时
-        launch6(&stream, &f_reduce, p_dp, p_dead, p_dead, bytes, SLOT_BYTES, slab_off, "ar_reduce(timeout)");
+        launch6(
+            &stream,
+            &f_reduce,
+            p_dp,
+            p_dead,
+            p_dead,
+            bytes,
+            SLOT_BYTES,
+            slab_off,
+            "ar_reduce(timeout)",
+        );
     }
     stream.synchronize().expect("sync");
     let waited = t0.elapsed();

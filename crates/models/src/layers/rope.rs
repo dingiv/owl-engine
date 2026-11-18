@@ -12,9 +12,9 @@
 //! 取数(不经外部数据源);forward 常驻块引用。
 //! kernel 源 = 注册表 `owl_rope_half_partial_f32`(owl-kernels cu/owl)。
 
-use crate::ops::SemanticKernel;
 use crate::contract::ModelError;
 use crate::module::{Loadable, LoaderCtx, LoaderOps, Weight};
+use crate::ops::SemanticKernel;
 use crate::TensorOps;
 
 #[derive(Clone)]
@@ -83,8 +83,16 @@ fn yarn_correction_dim(num_rot: f32, dim: usize, base: f32, max_pos: usize) -> f
 }
 
 /// vLLM `yarn_find_correction_range`(truncate = true)。
-fn yarn_correction_range(beta_fast: f32, beta_slow: f32, dim: usize, base: f32, max_pos: usize) -> (f32, f32) {
-    let low = yarn_correction_dim(beta_fast, dim, base, max_pos).floor().max(0.0);
+fn yarn_correction_range(
+    beta_fast: f32,
+    beta_slow: f32,
+    dim: usize,
+    base: f32,
+    max_pos: usize,
+) -> (f32, f32) {
+    let low = yarn_correction_dim(beta_fast, dim, base, max_pos)
+        .floor()
+        .max(0.0);
     let high = yarn_correction_dim(beta_slow, dim, base, max_pos)
         .ceil()
         .min(dim as f32 - 1.0);
@@ -214,15 +222,16 @@ impl Rope {
         // dtype 跟随 x 声明(F5;表 Weight 经 LoaderCtx 同 dtype)
         let dt = q.dtype;
         // f32 语义锚链同通道(名字/网格 = driver 按 dt 单源)
-        TensorOps::call(SemanticKernel::Rope).aux(&[tokens])
-        .arg(q)
-        .arg(&self.cos.decl())
-        .arg(&self.sin.decl())
-        .arg(pos)
-        .arg_usize(q_heads)
-        .arg_usize(self.head_dim)
-        .arg_usize(self.rotary_dim / 2)
-        .with_shape(dt, vec![tokens, q_heads * self.head_dim])
+        TensorOps::call(SemanticKernel::Rope)
+            .aux(&[tokens])
+            .arg(q)
+            .arg(&self.cos.decl())
+            .arg(&self.sin.decl())
+            .arg(pos)
+            .arg_usize(q_heads)
+            .arg_usize(self.head_dim)
+            .arg_usize(self.rotary_dim / 2)
+            .with_shape(dt, vec![tokens, q_heads * self.head_dim])
     }
 
     /// k 旋转:[T, Hkv*HD] → [T, Hkv*HD]
@@ -234,15 +243,16 @@ impl Rope {
         kv_heads: usize,
     ) -> TensorOps {
         let dt = k.dtype;
-        TensorOps::call(SemanticKernel::Rope).aux(&[tokens])
-        .arg(k)
-        .arg(&self.cos.decl())
-        .arg(&self.sin.decl())
-        .arg(pos)
-        .arg_usize(kv_heads)
-        .arg_usize(self.head_dim)
-        .arg_usize(self.rotary_dim / 2)
-        .with_shape(dt, vec![tokens, kv_heads * self.head_dim])
+        TensorOps::call(SemanticKernel::Rope)
+            .aux(&[tokens])
+            .arg(k)
+            .arg(&self.cos.decl())
+            .arg(&self.sin.decl())
+            .arg(pos)
+            .arg_usize(kv_heads)
+            .arg_usize(self.head_dim)
+            .arg_usize(self.rotary_dim / 2)
+            .with_shape(dt, vec![tokens, kv_heads * self.head_dim])
     }
 }
 
@@ -250,16 +260,14 @@ impl Loadable for Rope {
     fn layout(&self, ctx: &LoaderCtx) -> LoaderOps {
         self.cos.layout(ctx).chain(self.sin.layout(ctx))
     }
-
 }
-
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::tensor::Dtype;
     use crate::testkit::f32b;
-    
+
     /// **YaRN 频率混合门**(vLLM 同式;2026-10-20 长上下文冲击):
     /// factor=1 ⇒ 与旧表逐位相同;factor=2 ⇒ 高频端(i=0, ramp=0)原频、
     /// 低频端(i=half-1, ramp=1)减半,mscale = 0.1·ln2+1。
@@ -286,13 +294,22 @@ mod tests {
         // 高频端(ramp=0 ⇒ mask=1 ⇒ 外推):原频
         assert!((f[0] - base[0]).abs() <= base[0] * 1e-6, "i=0 应外推");
         // 低频端(ramp=1 ⇒ 插值):减半
-        assert!((f[half - 1] - base[half - 1] / 2.0).abs() <= base[half - 1] * 1e-6,
-            "i={} 应插值(÷factor)", half - 1);
+        assert!(
+            (f[half - 1] - base[half - 1] / 2.0).abs() <= base[half - 1] * 1e-6,
+            "i={} 应插值(÷factor)",
+            half - 1
+        );
         // 表长/前向不变性:factor=1 的 Some 与 None 逐位相同
         let a = Rope::new(64, 256, rotary_dim, theta).unwrap();
         let b = Rope::new_with(
-            64, 256, rotary_dim, theta,
-            Some(YarnCfg { factor: 1.0, ..yarn }),
+            64,
+            256,
+            rotary_dim,
+            theta,
+            Some(YarnCfg {
+                factor: 1.0,
+                ..yarn
+            }),
         )
         .unwrap();
         assert_eq!(a.cos_data, b.cos_data, "factor=1 的 cos 表必须逐位相同");
@@ -319,8 +336,14 @@ mod tests {
         assert!(!out.is_poisoned(), "rope 声明不应有毒");
         assert_eq!(out.shape(), &[1, heads * head_dim]);
 
-        assert!(Rope::new(64, head_dim, 7, 10_000.0).is_err(), "非偶 rotary_dim 应拒");
-        assert!(Rope::new(64, head_dim, head_dim * 2, 10_000.0).is_err(), "超 head_dim 应拒");
+        assert!(
+            Rope::new(64, head_dim, 7, 10_000.0).is_err(),
+            "非偶 rotary_dim 应拒"
+        );
+        assert!(
+            Rope::new(64, head_dim, head_dim * 2, 10_000.0).is_err(),
+            "超 head_dim 应拒"
+        );
     }
 
     /// Rope = 位置上下文机制(双输入 + pos),不进 Module(C4 后仍成立;
@@ -328,8 +351,12 @@ mod tests {
     #[test]
     fn stays_outside_module_interface() {
         fn assert_impl<M: crate::module::Module>(_: &M) {}
-        assert_impl(&crate::layers::mlp::Mlp::new(2, 4, crate::module::QuantPlan::F16)); // Mlp 在 Module 内
-        // Rope 无 forward(&TensorOps, &ForwardCtx) 签名 —— 编译期即证不在 trait 内
+        assert_impl(&crate::layers::mlp::Mlp::new(
+            2,
+            4,
+            crate::module::QuantPlan::F16,
+        )); // Mlp 在 Module 内
+            // Rope 无 forward(&TensorOps, &ForwardCtx) 签名 —— 编译期即证不在 trait 内
         let rp = Rope::new(64, 8, 4, 10_000.0).expect("new");
         let pos = TensorOps::from_host(Dtype::F32, vec![1], &f32b(&[5.0]));
         let _ = rp.forward_q(
@@ -345,7 +372,10 @@ mod tests {
     /// 同 owl_narrow_strided 先例);双门控 OWL_HF_PARITY=1 + OWL_TEST_DEVICE)
     #[tokio::test]
     async fn parity_matches_hf() {
-        use crate::testkit::{assert_close, harvest, hf_python, parity_enabled, skip_note, st_read, st_write, tmp_path};
+        use crate::testkit::{
+            assert_close, harvest, hf_python, parity_enabled, skip_note, st_read, st_write,
+            tmp_path,
+        };
         if !parity_enabled() {
             skip_note();
             return;
@@ -369,7 +399,10 @@ mod tests {
         let contract = format!(
             r#"{{"heads": {heads}, "head_dim": {head_dim}, "rotary_dim": {rotary_dim}, "theta": {theta}}}"#
         );
-        let manifest = hf_python("rope.py", &[inp.to_str().unwrap(), outp.to_str().unwrap(), &contract]);
+        let manifest = hf_python(
+            "rope.py",
+            &[inp.to_str().unwrap(), outp.to_str().unwrap(), &contract],
+        );
         eprintln!("[hf manifest] rope: {manifest}");
         let want = st_read(&outp, "y");
 
@@ -398,7 +431,7 @@ mod f16_tests {
     use crate::contract::DeviceClient as _;
     use crate::tensor::Dtype;
     use crate::testkit::{gpu_client, gpu_enabled};
-    
+
     fn half_le(f: f32) -> [u8; 2] {
         half::f16::from_f32(f).to_le_bytes()
     }
@@ -413,31 +446,75 @@ mod f16_tests {
         let (max_pos, hd, half, heads, tokens) = (64usize, 8usize, 4usize, 2usize, 3usize);
         // 表(host f32 生成 → f16 上载;与 Rope::new 同式)
         let cos: Vec<f32> = (0..max_pos)
-            .flat_map(|p| (0..half).map(move |i| (p as f32 * (10000f32).powf(-(2.0 * i as f32) / hd as f32)).cos()))
+            .flat_map(|p| {
+                (0..half)
+                    .map(move |i| (p as f32 * (10000f32).powf(-(2.0 * i as f32) / hd as f32)).cos())
+            })
             .collect();
         let sin: Vec<f32> = (0..max_pos)
-            .flat_map(|p| (0..half).map(move |i| (p as f32 * (10000f32).powf(-(2.0 * i as f32) / hd as f32)).sin()))
+            .flat_map(|p| {
+                (0..half)
+                    .map(move |i| (p as f32 * (10000f32).powf(-(2.0 * i as f32) / hd as f32)).sin())
+            })
             .collect();
-        let x: Vec<f32> = (0..tokens * heads * hd).map(|i| ((i as f32 * 0.29) - 2.0).sin()).collect();
+        let x: Vec<f32> = (0..tokens * heads * hd)
+            .map(|i| ((i as f32 * 0.29) - 2.0).sin())
+            .collect();
         let pos = [1.0f32, 4.0f32, 9.0f32];
 
         let mut gpu = gpu_client().await;
         let sh = crate::contract::Shape::from;
-        let dx = owl_iface::htod!(gpu, Dtype::F16, &sh(vec![tokens, heads, hd]), &x.iter().flat_map(|f| half_le(*f)).collect::<Vec<u8>>()).await.expect("x");
-        let dc = owl_iface::htod!(gpu, Dtype::F16, &sh(vec![max_pos, half]), &cos.iter().flat_map(|f| half_le(*f)).collect::<Vec<u8>>()).await.expect("cos");
-        let ds = owl_iface::htod!(gpu, Dtype::F16, &sh(vec![max_pos, half]), &sin.iter().flat_map(|f| half_le(*f)).collect::<Vec<u8>>()).await.expect("sin");
-        let dp = owl_iface::htod!(gpu, Dtype::F32, &sh(vec![1, tokens]), &crate::testkit::f32b(&pos)).await.expect("pos");
+        let dx = owl_iface::htod!(
+            gpu,
+            Dtype::F16,
+            &sh(vec![tokens, heads, hd]),
+            &x.iter().flat_map(|f| half_le(*f)).collect::<Vec<u8>>()
+        )
+        .await
+        .expect("x");
+        let dc = owl_iface::htod!(
+            gpu,
+            Dtype::F16,
+            &sh(vec![max_pos, half]),
+            &cos.iter().flat_map(|f| half_le(*f)).collect::<Vec<u8>>()
+        )
+        .await
+        .expect("cos");
+        let ds = owl_iface::htod!(
+            gpu,
+            Dtype::F16,
+            &sh(vec![max_pos, half]),
+            &sin.iter().flat_map(|f| half_le(*f)).collect::<Vec<u8>>()
+        )
+        .await
+        .expect("sin");
+        let dp = owl_iface::htod!(
+            gpu,
+            Dtype::F32,
+            &sh(vec![1, tokens]),
+            &crate::testkit::f32b(&pos)
+        )
+        .await
+        .expect("pos");
         let (x_d, c_d, s_d, p_d) = (
-            TensorOps::of_block(dx.id, Dtype::F16, vec![tokens, heads * hd]),  // 契约 x r2(行视图)
+            TensorOps::of_block(dx.id, Dtype::F16, vec![tokens, heads * hd]), // 契约 x r2(行视图)
             TensorOps::of_block(dc.id, Dtype::F16, vec![max_pos, half]),
             TensorOps::of_block(ds.id, Dtype::F16, vec![max_pos, half]),
-            TensorOps::of_block(dp.id, Dtype::F32, vec![1, tokens]),  // 契约 pos r2(生产槽 [1,T])
+            TensorOps::of_block(dp.id, Dtype::F32, vec![1, tokens]), // 契约 pos r2(生产槽 [1,T])
         );
-        let decl = TensorOps::call(SemanticKernel::Rope).aux(&[tokens])
-        .arg(&x_d).arg(&c_d).arg(&s_d).arg(&p_d)
-        .arg_usize(heads).arg_usize(hd).arg_usize(half)
-        .with_shape(Dtype::F16, vec![tokens, heads * hd]);  // 契约 out r2
-        let out = crate::interpreters::eval_ops(decl.step(), &mut gpu).await.expect("eval");
+        let decl = TensorOps::call(SemanticKernel::Rope)
+            .aux(&[tokens])
+            .arg(&x_d)
+            .arg(&c_d)
+            .arg(&s_d)
+            .arg(&p_d)
+            .arg_usize(heads)
+            .arg_usize(hd)
+            .arg_usize(half)
+            .with_shape(Dtype::F16, vec![tokens, heads * hd]); // 契约 out r2
+        let out = crate::interpreters::eval_ops(decl.step(), &mut gpu)
+            .await
+            .expect("eval");
         let mut buf = vec![0u8; tokens * heads * hd * 2];
         gpu.dtoh(&out, &mut buf).await.expect("dtoh");
 
@@ -452,13 +529,25 @@ mod f16_tests {
                     let sf = sin[p * half + i];
                     let want0 = a * cf - b * sf;
                     let want1 = b * cf + a * sf;
-                    let g0 = half::f16::from_le_bytes([buf[((t * heads + h) * hd + i) * 2], buf[((t * heads + h) * hd + i) * 2 + 1]]).to_f32();
-                    let g1 = half::f16::from_le_bytes([buf[((t * heads + h) * hd + i + half) * 2], buf[((t * heads + h) * hd + i + half) * 2 + 1]]).to_f32();
+                    let g0 = half::f16::from_le_bytes([
+                        buf[((t * heads + h) * hd + i) * 2],
+                        buf[((t * heads + h) * hd + i) * 2 + 1],
+                    ])
+                    .to_f32();
+                    let g1 = half::f16::from_le_bytes([
+                        buf[((t * heads + h) * hd + i + half) * 2],
+                        buf[((t * heads + h) * hd + i + half) * 2 + 1],
+                    ])
+                    .to_f32();
                     max_diff = max_diff.max((g0 - want0).abs()).max((g1 - want1).abs());
                 }
                 // partial 直通维逐位
                 for d in 2 * half..hd {
-                    let g = half::f16::from_le_bytes([buf[((t * heads + h) * hd + d) * 2], buf[((t * heads + h) * hd + d) * 2 + 1]]).to_f32();
+                    let g = half::f16::from_le_bytes([
+                        buf[((t * heads + h) * hd + d) * 2],
+                        buf[((t * heads + h) * hd + d) * 2 + 1],
+                    ])
+                    .to_f32();
                     assert_eq!(g, x[(t * heads + h) * hd + d], "直通维 [{t},{h},{d}]");
                 }
             }

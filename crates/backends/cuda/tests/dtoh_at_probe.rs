@@ -7,7 +7,9 @@
 //! 跑法:`CUDA_VISIBLE_DEVICES=GPU-<3080> OWL_TEST_DEVICE=0 \
 //!        cargo test -p owl-cuda --test dtoh_at_probe -- --nocapture`
 
-use owl_cuda::{test_device_ordinal, DeviceClient as _, DeviceSelector, Dtype, GpuClient, GpuServer};
+use owl_cuda::{
+    test_device_ordinal, DeviceClient as _, DeviceSelector, Dtype, GpuClient, GpuServer,
+};
 
 const N: usize = 4096; // 设备块字节
 
@@ -29,13 +31,22 @@ async fn dtoh_at_reads_the_requested_span() {
         .expect("spawn server");
     client.sync().await.expect("sync");
 
-    let dev = client.alloc(Dtype::U32, N / 4, "probe").await.expect("alloc");
+    let dev = client
+        .alloc(Dtype::U32, N / 4, "probe")
+        .await
+        .expect("alloc");
     // 内容:分三段(带偏移)写入 —— 顺带覆盖 upload_pinned 的多段路径
     let all = pattern(N);
     for (off, len) in [(0usize, 2048usize), (2048, 1024), (3072, 1024)] {
-        let mut lease = client.alloc_pinned(len, "probe:dtoh_at").await.expect("pinned");
+        let mut lease = client
+            .alloc_pinned(len, "probe:dtoh_at")
+            .await
+            .expect("pinned");
         lease.slice_bytes_mut()[..len].copy_from_slice(&all[off..off + len]);
-        client.upload_pinned(lease, &dev, off, len).await.expect("upload");
+        client
+            .upload_pinned(lease, &dev, off, len)
+            .await
+            .expect("upload");
     }
     client.sync().await.expect("sync");
 
@@ -46,12 +57,18 @@ async fn dtoh_at_reads_the_requested_span() {
 
     // ② 中段(既非前缀也非后缀):跨两个写入段
     let mut mid = vec![0u8; 1024];
-    client.dtoh_at(&dev, 1024, &mut mid).await.expect("dtoh_at 中段");
+    client
+        .dtoh_at(&dev, 1024, &mut mid)
+        .await
+        .expect("dtoh_at 中段");
     assert_eq!(mid, all[1024..2048], "dtoh_at 中段必须逐字节一致");
 
     // ③ 尾段 + 单字节边界
     let mut tail = vec![0u8; 1024];
-    client.dtoh_at(&dev, 3072, &mut tail).await.expect("dtoh_at 尾段");
+    client
+        .dtoh_at(&dev, 3072, &mut tail)
+        .await
+        .expect("dtoh_at 尾段");
     assert_eq!(tail, all[3072..], "dtoh_at 尾段必须逐字节一致");
     let mut one = vec![0u8; 1];
     client.dtoh_at(&dev, 4095, &mut one).await.expect("末字节");
@@ -83,14 +100,27 @@ async fn dtoh_batch_and_htod_batch_round_trip() {
         .expect("spawn server");
     client.sync().await.expect("sync");
 
-    let _dev = client.alloc(Dtype::U32, N / 4, "probe").await.expect("alloc");
+    let _dev = client
+        .alloc(Dtype::U32, N / 4, "probe")
+        .await
+        .expect("alloc");
     let all = pattern(N);
-    let a = client.alloc(Dtype::U32, 2048 / 4, "probe").await.expect("a"); // 两段:0..1024 与 1024..2048
-    let b = client.alloc(Dtype::U32, 4096 / 4, "probe").await.expect("b"); // 留出偏移余量
+    let a = client
+        .alloc(Dtype::U32, 2048 / 4, "probe")
+        .await
+        .expect("a"); // 两段:0..1024 与 1024..2048
+    let b = client
+        .alloc(Dtype::U32, 4096 / 4, "probe")
+        .await
+        .expect("b"); // 留出偏移余量
 
     // 批量写:三段分落两块(带偏移)
     client
-        .htod_batch(&[(&a, 0, &all[0..1024]), (&b, 512, &all[1024..3072]), (&a, 1024, &all[3072..4096])])
+        .htod_batch(&[
+            (&a, 0, &all[0..1024]),
+            (&b, 512, &all[1024..3072]),
+            (&a, 1024, &all[3072..4096]),
+        ])
         .await
         .expect("htod_batch");
     client.sync().await.expect("sync");
@@ -104,7 +134,10 @@ async fn dtoh_batch_and_htod_batch_round_trip() {
 
     // 逐段对照:与单段 `dtoh_at` 同值
     let mut one = vec![0u8; 2048];
-    client.dtoh_at(&b, 512, &mut one).await.expect("dtoh_at 对照");
+    client
+        .dtoh_at(&b, 512, &mut one)
+        .await
+        .expect("dtoh_at 对照");
     assert_eq!(one, got[1024..3072], "批读中段 = 单段读");
 
     // 越界段 = 整条命令响亮拒(a 只有 2048 字节:2048 + 100 越界)

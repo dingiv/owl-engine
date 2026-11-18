@@ -23,7 +23,11 @@ pub struct LaunchShape {
 
 impl Default for LaunchShape {
     fn default() -> Self {
-        Self { grid: (0, 0, 0), block: (256, 1, 1), shared_mem: 0 }
+        Self {
+            grid: (0, 0, 0),
+            block: (256, 1, 1),
+            shared_mem: 0,
+        }
     }
 }
 
@@ -45,12 +49,27 @@ impl Kernel {
     pub fn new(name: &'static str, src: &'static str) -> Self {
         // F 轮:准入声明是槽序/几何的唯一真源 ⇒ 构造期**自动挂载**
         // (名字已在声明面就带上;逃生舱核自然为 None,走 `sig`)。
-        Self { name, src, launch: LaunchShape::default(), sig: "", meta: crate::ops::meta(name) }
+        Self {
+            name,
+            src,
+            launch: LaunchShape::default(),
+            sig: "",
+            meta: crate::ops::meta(name),
+        }
     }
 
     /// 显式发射配置(覆盖自动 1D)
-    pub fn with_launch(mut self, grid: (u32, u32, u32), block: (u32, u32, u32), shared_mem: u32) -> Self {
-        self.launch = LaunchShape { grid, block, shared_mem };
+    pub fn with_launch(
+        mut self,
+        grid: (u32, u32, u32),
+        block: (u32, u32, u32),
+        shared_mem: u32,
+    ) -> Self {
+        self.launch = LaunchShape {
+            grid,
+            block,
+            shared_mem,
+        };
         self
     }
 
@@ -106,7 +125,12 @@ pub fn kernel(name: &'static str) -> Kernel {
 }
 
 /// 构造 Kernel 值(显式发射配置;行核 embed/rope/attn 等非 ceil/256 网格用)
-pub fn kernel_with(name: &'static str, grid: (u32, u32, u32), block: (u32, u32, u32), shared_mem: u32) -> Kernel {
+pub fn kernel_with(
+    name: &'static str,
+    grid: (u32, u32, u32),
+    block: (u32, u32, u32),
+    shared_mem: u32,
+) -> Kernel {
     Kernel::new(name, source(name)).with_launch(grid, block, shared_mem)
 }
 
@@ -118,18 +142,37 @@ pub fn kernel_with(name: &'static str, grid: (u32, u32, u32), block: (u32, u32, 
 /// 元数据(foreign 家族 `SOURCE` 为空 ⇒ 源码为空串,server 走家族 FFI);
 /// **未建表**(仅引入):回落登记表取源。
 pub fn with_pick(p: crate::driver::KernelPick) -> Kernel {
-    let launch = LaunchShape { grid: p.shape.grid, block: p.shape.block, shared_mem: p.shape.smem };
+    let launch = LaunchShape {
+        grid: p.shape.grid,
+        block: p.shape.block,
+        shared_mem: p.shape.smem,
+    };
     match p.meta() {
-        Some(m) => Kernel { name: m.entry, src: m.src, launch, sig: "", meta: Some(m) },
-        None => Kernel { name: p.name, src: source(p.name), launch, sig: "", meta: None },
+        Some(m) => Kernel {
+            name: m.entry,
+            src: m.src,
+            launch,
+            sig: "",
+            meta: Some(m),
+        },
+        None => Kernel {
+            name: p.name,
+            src: source(p.name),
+            launch,
+            sig: "",
+            meta: None,
+        },
     }
 }
 
 /// 发射配置便捷(与 kernel_with 同参,LaunchShape 形态)
 pub fn launch_shape(grid: (u32, u32, u32), block: (u32, u32, u32), shared_mem: u32) -> LaunchShape {
-    LaunchShape { grid, block, shared_mem }
+    LaunchShape {
+        grid,
+        block,
+        shared_mem,
+    }
 }
-
 
 #[cfg(test)]
 mod tests {
@@ -140,8 +183,14 @@ mod tests {
     #[test]
     fn every_native_table_declares_out_dtype() {
         for m in ops::all() {
-            if m.src.is_empty() { continue; }
-            assert!(m.out_dtype().is_some(), "{}: 无输出槽 ⇒ 声明口径 dtype 不可派生", m.entry);
+            if m.src.is_empty() {
+                continue;
+            }
+            assert!(
+                m.out_dtype().is_some(),
+                "{}: 无输出槽 ⇒ 声明口径 dtype 不可派生",
+                m.entry
+            );
         }
     }
 
@@ -155,10 +204,7 @@ mod tests {
                 "vllm_paged_attention_v2_f16_knhd_hd256",
                 "KNHD 侧新增:f16 无 bs32 以外的 classic v2 对偶(fp8 档才有)",
             ),
-            (
-                "vllm_paged_attention_v2_f16_knhd_hd128",
-                "同上",
-            ),
+            ("vllm_paged_attention_v2_f16_knhd_hd128", "同上"),
             (
                 "owl_reshape_and_cache_int8_knhd",
                 "INT8 专项:K int8 + scale 无 classic 对偶(池只有 kNHD)",
@@ -184,7 +230,8 @@ mod tests {
                 );
             };
             assert_eq!(
-                c.args_str(), e.args_str(),
+                c.args_str(),
+                e.args_str(),
                 "{}: 槽序与 classic 伙伴不符 —— 翻转须只换名(实参表同一)",
                 e.entry
             );
@@ -193,7 +240,10 @@ mod tests {
         }
         // 覆盖锁:22 = 2026-10-13 F 轮实况对数(新增 kNHD 核时同步上调)
         // (C 轮拆文件后 attn 域补入 4 个 knhd NC 变体:18 → 22)
-        assert_eq!(paired, 22, "配对 kNHD 变体数异常(实 {paired})—— 漏登记或误删?");
+        assert_eq!(
+            paired, 22,
+            "配对 kNHD 变体数异常(实 {paired})—— 漏登记或误删?"
+        );
         for (n, why) in KNHD_ONLY {
             assert!(
                 ops::all().any(|e| e.entry == *n),
@@ -243,5 +293,4 @@ mod tests {
             assert!(lookup(n).is_some(), "driver 拾取名未登记:{n}");
         }
     }
-
 }

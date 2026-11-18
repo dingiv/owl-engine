@@ -54,11 +54,16 @@ impl Connector for MemConn {
 
 /// f16 编码(真卡 `dtoh` 口径:每元素 2 字节)。
 fn f16_bytes(vals: &[f32]) -> Vec<u8> {
-    vals.iter().flat_map(|v| half::f16::from_f32(*v).to_le_bytes()).collect()
+    vals.iter()
+        .flat_map(|v| half::f16::from_f32(*v).to_le_bytes())
+        .collect()
 }
 
 fn f16_of(bytes: &[u8]) -> Vec<f32> {
-    bytes.chunks_exact(2).map(|c| half::f16::from_le_bytes([c[0], c[1]]).to_f32()).collect()
+    bytes
+        .chunks_exact(2)
+        .map(|c| half::f16::from_le_bytes([c[0], c[1]]).to_f32())
+        .collect()
 }
 
 /// 以**声明 dtype 字节**写入一整个 F16 块(生产调用点同口径)。
@@ -82,9 +87,15 @@ async fn memset_zero_uses_declared_dtype_bytes() {
     let mut f = CpuFace::new();
     let b = f.alloc(Dtype::F16, 8, "t").await.expect("alloc");
     put_f16(&mut f, &b, &[1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0]).await;
-    assert_eq!(get_f16(&mut f, &b).await, vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0], "上传");
+    assert_eq!(
+        get_f16(&mut f, &b).await,
+        vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0],
+        "上传"
+    );
     // 调用点口径(models/interpreters/eval.rs:731)= n_elems × dtype.size_bytes()
-    f.memset_zero(&b, 8 * Dtype::F16.size_bytes()).await.expect("清零");
+    f.memset_zero(&b, 8 * Dtype::F16.size_bytes())
+        .await
+        .expect("清零");
     assert_eq!(get_f16(&mut f, &b).await, vec![0.0; 8], "整块清零");
 }
 
@@ -97,7 +108,9 @@ async fn copy_block_at_is_byte_level_on_f16() {
     put_f16(&mut f, &src, &[1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0]).await;
     let esz = Dtype::F16.size_bytes();
     // src[0..4] → dst[2..6](长度 4 元素 = 8 字节;与 load.rs:922 同口径)
-    f.copy_block_at(&src, 0, &dst, 2 * esz, 4 * esz).await.expect("拷贝");
+    f.copy_block_at(&src, 0, &dst, 2 * esz, 4 * esz)
+        .await
+        .expect("拷贝");
     assert_eq!(
         get_f16(&mut f, &dst).await,
         vec![0.0, 0.0, 1.0, 2.0, 3.0, 4.0, 0.0, 0.0],
@@ -123,10 +136,19 @@ async fn swap_roundtrip_f16_is_byte_exact() {
         slot: ConnSlot(0),
     };
     let conn = Box::new(MemConn::default());
-    let conn = f.swap(SwapDir::Out, std::slice::from_ref(&piece), conn).await.expect("换出");
+    let conn = f
+        .swap(SwapDir::Out, std::slice::from_ref(&piece), conn)
+        .await
+        .expect("换出");
     let b = f.alloc(Dtype::F16, n, "b").await.expect("alloc b");
-    let piece_b = SwapPiece { block: b.id, ..piece };
-    let _ = f.swap(SwapDir::In, std::slice::from_ref(&piece_b), conn).await.expect("换回");
+    let piece_b = SwapPiece {
+        block: b.id,
+        ..piece
+    };
+    let _ = f
+        .swap(SwapDir::In, std::slice::from_ref(&piece_b), conn)
+        .await
+        .expect("换回");
     assert_eq!(get_f16(&mut f, &b).await, vals.to_vec(), "字节级往返等价");
 }
 
@@ -141,7 +163,10 @@ async fn dtoh_encodes_declared_dtype_and_refuses_wrong_len() {
     assert_eq!(f16_of(&good), vec![1.0, 2.0, 3.0, 4.0], "f16 位型收割");
     // 旧口径(4B/元素)现在响亮拒 —— `testkit::harvest_f16` 正好走 n×2
     let mut wrong = vec![0u8; 4 * 4];
-    let err = f.dtoh(&b, &mut wrong).await.expect_err("长度须按声明 dtype");
+    let err = f
+        .dtoh(&b, &mut wrong)
+        .await
+        .expect_err("长度须按声明 dtype");
     assert!(format!("{err}").contains("声明"), "{err}");
     // 非整除的 memset = 响亮拒(修前静默少做)
     assert!(f.memset_zero(&b, 3).await.is_err(), "3B 非 f16 整除");
@@ -155,10 +180,23 @@ async fn block_slice_arg_is_bounds_checked() {
 
     fn msg(src: u64, out: u64, off: usize, elems: usize) -> LaunchMsg {
         LaunchMsg {
-            kernel: KernelSource { name: "owl_silu_f32".into(), source: String::new() },
+            kernel: KernelSource {
+                name: "owl_silu_f32".into(),
+                source: String::new(),
+            },
             args: vec![
-                Arg::BlockSlice { id: src, byte_offset: off as u64, elems: elems as u64, dtype: Dtype::F32, rank: 1 },
-                Arg::Block { id: out, dtype: Dtype::F32, rank: 1 },
+                Arg::BlockSlice {
+                    id: src,
+                    byte_offset: off as u64,
+                    elems: elems as u64,
+                    dtype: Dtype::F32,
+                    rank: 1,
+                },
+                Arg::Block {
+                    id: out,
+                    dtype: Dtype::F32,
+                    rank: 1,
+                },
             ],
             grid: (1, 1, 1),
             block: (1, 1, 1),
@@ -170,18 +208,32 @@ async fn block_slice_arg_is_bounds_checked() {
     let mut f = CpuFace::new();
     let src = f.alloc(Dtype::F32, 8, "src").await.expect("src");
     let out = f.alloc(Dtype::F32, 4, "out").await.expect("out");
-    f.write_block_f32(&src, 0, &[1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0]).await.expect("写");
+    f.write_block_f32(&src, 0, &[1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0])
+        .await
+        .expect("写");
     // 合法:src[4..8] → out(silu 单调,这里只验落位与长度)
-    f.launch(msg(src.id, out.id, 16, 4)).await.expect("合法切片");
+    f.launch(msg(src.id, out.id, 16, 4))
+        .await
+        .expect("合法切片");
     let mut buf = vec![0u8; 16];
     f.dtoh(&out, &mut buf).await.expect("收割");
-    let got: Vec<f32> = buf.chunks_exact(4).map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]])).collect();
+    let got: Vec<f32> = buf
+        .chunks_exact(4)
+        .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+        .collect();
     let silu = |x: f32| x / (1.0 + (-x).exp());
     for (i, v) in [5.0f32, 6.0, 7.0, 8.0].iter().enumerate() {
-        assert!((got[i] - silu(*v)).abs() < 1e-6, "第 {i} 槽 = {} (want silu({v}))", got[i]);
+        assert!(
+            (got[i] - silu(*v)).abs() < 1e-6,
+            "第 {i} 槽 = {} (want silu({v}))",
+            got[i]
+        );
     }
     // 越界:src[6..12] 超出 8 槽 ⇒ 响亮拒(修前静默返回整块并谎报 shape)
-    let err = f.launch(msg(src.id, out.id, 24, 6)).await.expect_err("越界必拒");
+    let err = f
+        .launch(msg(src.id, out.id, 24, 6))
+        .await
+        .expect_err("越界必拒");
     assert!(format!("{err}").contains("越界"), "{err}");
 }
 
@@ -193,18 +245,33 @@ async fn block_slice_arg_is_bounds_checked() {
 async fn uninit_poison_is_optin_and_visible() {
     // 默认档:未初始化 = 清零(现状行为,逐条不变)
     let mut f = CpuFace::new();
-    let b = f.alloc_uninit(Dtype::F32, 4, "t").await.expect("alloc_uninit");
+    let b = f
+        .alloc_uninit(Dtype::F32, 4, "t")
+        .await
+        .expect("alloc_uninit");
     let mut buf = vec![0u8; 16];
     f.dtoh(&b, &mut buf).await.expect("dtoh");
-    let vals: Vec<f32> = buf.chunks_exact(4).map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]])).collect();
+    let vals: Vec<f32> = buf
+        .chunks_exact(4)
+        .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+        .collect();
     assert_eq!(vals, vec![0.0; 4], "默认档 == alloc(清零)");
 
     // opt-in:NaN 位型(与自身不相等)
-    let mut g = CpuFace::mock(MockLimits { poison_uninit: true, ..Default::default() });
-    let c = g.alloc_uninit(Dtype::F32, 4, "t").await.expect("alloc_uninit(mock)");
+    let mut g = CpuFace::mock(MockLimits {
+        poison_uninit: true,
+        ..Default::default()
+    });
+    let c = g
+        .alloc_uninit(Dtype::F32, 4, "t")
+        .await
+        .expect("alloc_uninit(mock)");
     let mut buf2 = vec![0u8; 16];
     g.dtoh(&c, &mut buf2).await.expect("dtoh");
-    let vals2: Vec<f32> = buf2.chunks_exact(4).map(|x| f32::from_le_bytes([x[0], x[1], x[2], x[3]])).collect();
+    let vals2: Vec<f32> = buf2
+        .chunks_exact(4)
+        .map(|x| f32::from_le_bytes([x[0], x[1], x[2], x[3]]))
+        .collect();
     for v in &vals2 {
         assert!(v.is_nan(), "毒值应为 NaN,得 {v}");
     }

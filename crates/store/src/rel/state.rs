@@ -96,11 +96,7 @@ impl Rel {
     }
 
     /// 归还 GDN 行（可同时挂一条快照）。
-    pub fn return_state_row(
-        &mut self,
-        row: usize,
-        snap: Option<SnapKey>,
-    ) -> StoreResult<()> {
+    pub fn return_state_row(&mut self, row: usize, snap: Option<SnapKey>) -> StoreResult<()> {
         self.state.return_row(row, snap)
     }
 
@@ -115,8 +111,59 @@ impl Rel {
     }
 
     /// 把快照内容放回宿主层（下沉失败回滚/回填）。
+    ///
+    /// **共享池**：宿主满时先逐本腿最冷快照，再让 KV 腿宿主副本让位；
+    /// 仍装不下 = 响亮拒（调用方按“快照不可落宿主”处理，不静默丢）。
     pub fn snap_host_put(&mut self, key: SnapKey, buf: HostBlock) -> StoreResult<()> {
+        if self.snap_host_free_slots() == 0 {
+            let need = self.snap_file_bytes().max(1);
+            let _ = self.evict_snap_host_bytes(need, &[key])?;
+            if self.snap_host_free_slots() == 0 {
+                let slots = need.div_ceil(self.leg.host_slot_bytes().max(1));
+                let _ = self.leg.host_relieve(slots, &[])?;
+                self.leg.host_drop_free();
+            }
+        }
         self.snap_host.put(key, buf)
+    }
+
+    /// **按字节逐出状态腿宿主副本**（共享池让位口；纯账，零 I/O）。
+    ///
+    /// 出序与 `plan_snap_offload` 同一份（`Transient → History → Tail` + 策略）。
+    /// 逐出后 `drop_free()` 把空转缓冲真正还给共享总账；返回释放字节。
+    pub(crate) fn evict_snap_host_bytes(
+        &mut self,
+        need_bytes: usize,
+        protect: &[SnapKey],
+    ) -> StoreResult<usize> {
+        let mut freed = 0usize;
+        while freed < need_bytes {
+            let cands: Vec<EvictCandidate> = self
+                .state
+                .evict_candidates(protect)
+                .into_iter()
+                .filter(|c| c.tier == Tier::Host && c.snap.is_some())
+                .collect();
+            if cands.is_empty() {
+                break;
+            }
+            let victim = crate::hooks::order_snap_victims(self.evict.as_ref(), cands, &self.state)
+                .into_iter()
+                .filter_map(|c| c.snap)
+                .next();
+            let Some(v) = victim else { break };
+            let bytes = self
+                .snap_host
+                .get(v)
+                .map(|b| b.len())
+                .or_else(|| self.state.snap_bytes(v))
+                .unwrap_or(0);
+            self.snap_host.evict(v)?;
+            self.state.drop_snap(v)?;
+            freed = freed.saturating_add(bytes);
+        }
+        self.snap_host.drop_free();
+        Ok(freed)
     }
 
     // ───────────────── 状态腿搬运口(§25.2;与 KV 腿同形:store 出计划与账) ─────────────────
@@ -144,6 +191,30 @@ impl Rel {
                 slot: ConnSlot(0),
             })
             .collect())
+    }
+
+    /// **逐出一条状态腿宿主快照**（共享池让位/复用宿主块用；纯账）。
+    ///
+    /// 出序 = `order_snap_victims`（Transient → History → Tail + 策略）；
+    /// 返回被逐键（None = 没有可逐候选）。
+    fn evict_one_snap_host(&mut self, protect: &[SnapKey]) -> StoreResult<Option<SnapKey>> {
+        let cands: Vec<EvictCandidate> = self
+            .state
+            .evict_candidates(protect)
+            .into_iter()
+            .filter(|c| c.tier == Tier::Host && c.snap.is_some())
+            .collect();
+        if cands.is_empty() {
+            return Ok(None);
+        }
+        let victim = crate::hooks::order_snap_victims(self.evict.as_ref(), cands, &self.state)
+            .into_iter()
+            .filter_map(|c| c.snap)
+            .next();
+        let Some(v) = victim else { return Ok(None) };
+        self.snap_host.evict(v)?;
+        self.state.drop_snap(v)?;
+        Ok(Some(v))
     }
 
     /// **快照下沉计划**(设备槽 `slot` 上的快照 → 宿主)。
@@ -191,6 +262,23 @@ impl Rel {
         // 一条 Tail 尾锚点,却留下更冷的 History。代价说明:先逐后搬 ⇒ 若接下来
         // 的 DMA 失败(`abort_snap_offload`),被逐条目已丢(比"丢新条目"代价小
         // —— 它本来就在淘汰序最前)。
+        // **TTFT 保护（2026-11-18 现场）**：宿主块是 pageable 大块，池接近
+        // 容量时新分配/首次触碰会偶发数秒级停顿；`prefill.bnd` 曾实测
+        // `srv.swap.out.put` 5.8s ⇒ 首 token 门超时。若本腿已接近 3/4 容量
+        // 且空转表为空，先逐一条最冷宿主快照，**复用它的宿主块**，避免在
+        // prefill 关键路径上分配新大块。旧快照按 LRU/角色出序，代价可见。
+        let reuse_floor = self.snap_host.budget_bytes().saturating_mul(3) / 4;
+        if self.snap_host.free_bytes() == 0 && self.snap_host.used_bytes() >= reuse_floor {
+            if let Some(v) = self.evict_one_snap_host(&[key])? {
+                owl_shared::metrics::with_metrics_store(|m| {
+                    m.counter_add("store.snap.host_reuse_evict", 1, file!(), line!());
+                });
+                owl_shared::log_debug!(
+                    "store",
+                    "宿主快照近满 ⇒ 逐 {v:?} 复用宿主块(避免 prefill 路径新分配大块)"
+                );
+            }
+        }
         let last = self.snap_host.used_bytes();
         let mut guard = 0usize;
         let buf = loop {
@@ -204,20 +292,30 @@ impl Rel {
                         .filter(|c| c.tier == Tier::Host)
                         .collect();
                     if cands.is_empty() {
-                        // 宿主账与层账不一致(账说满而层无可逐)—— 不许静默
-                        return Err(StoreError::Invariant(format!(
-                            "宿主梯满且无 Host 层候选可逐({why};层账={last}B)"
-                        )));
+                        // **共享池**：快照自己无可逐时，让 KV 腿的宿主副本让位。
+                        // 先逐 KV 最冷（内容丢失；若盘层可用，计划面通常已先搬盘），
+                        // 再把 KV 空转缓冲真正 drop 掉 —— 空转缓冲仍占共享预算，
+                        // 不 drop 就只是把账从驻留挪到 free，腾不出给快照。
+                        let need_slots = self
+                            .snap_file_bytes()
+                            .div_ceil(self.leg.host_slot_bytes().max(1));
+                        let dropped = self.leg.host_relieve(need_slots, &[])?;
+                        self.leg.host_drop_free();
+                        // KV 空转缓冲也可能占着共享预算；drop 后仍有位就继续。
+                        if dropped == 0 && self.snap_host_free_slots() == 0 {
+                            // 宿主账与层账不一致(账说满而层无可逐)—— 不许静默
+                            return Err(StoreError::Invariant(format!(
+                                "宿主梯满且无 Host 层候选可逐({why};层账={last}B)"
+                            )));
+                        }
+                        continue;
                     }
-                    let v = crate::hooks::order_snap_victims(
-                        self.evict.as_ref(),
-                        cands,
-                        &self.state,
-                    )
-                    .into_iter()
-                    .filter_map(|c| c.snap)
-                    .next()
-                    .ok_or_else(|| StoreError::Invariant("驱逐候选缺 snap 键".into()))?;
+                    let v =
+                        crate::hooks::order_snap_victims(self.evict.as_ref(), cands, &self.state)
+                            .into_iter()
+                            .filter_map(|c| c.snap)
+                            .next()
+                            .ok_or_else(|| StoreError::Invariant("驱逐候选缺 snap 键".into()))?;
                     let freed = self.snap_host.evict(v)?;
                     self.state.drop_snap(v)?;
                     let _ = freed;
@@ -464,7 +562,10 @@ impl Rel {
         }
         // 宿主层的块粒度 = 一条快照 × world 平面(建 host 时未知,故此处重建:预算不变)
         let budget = self.snap_host.budget_bytes();
-        self.snap_host = HostTier::new(bytes.saturating_mul(self.world), budget)?;
+        self.snap_host = match self.snap_host.shared_budget().cloned() {
+            Some(shared) => HostTier::new_shared(bytes.saturating_mul(self.world), shared)?,
+            None => HostTier::new(bytes.saturating_mul(self.world), budget)?,
+        };
         let epoch = layout.epoch;
         self.snap_layout = Some(layout);
         self.snap_bytes = bytes;
@@ -594,11 +695,7 @@ impl Rel {
 
     /// 状态腿宿主层**还能装几条快照**。
     pub fn snap_host_free_slots(&self) -> usize {
-        let used = self.snap_host.used_bytes() + self.snap_host.free_bytes();
-        self.snap_host
-            .budget_bytes()
-            .saturating_sub(used)
-            / self.snap_file_bytes().max(1)
+        self.snap_host.free_slots()
     }
 
     /// 状态腿宿主层总槽数(= 预算 / 单条快照字节;0 = 关层)。

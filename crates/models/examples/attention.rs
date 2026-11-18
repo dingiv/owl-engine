@@ -15,10 +15,10 @@
 use owl_models::contract::DeviceClient;
 use owl_models::interpreters::eval_ops;
 use owl_models::layers::attention::Attention;
-use owl_models::module::{ForwardCtx, KvBuffers};
-use owl_models::Module;
 use owl_models::layers::rope::Rope;
+use owl_models::module::{ForwardCtx, KvBuffers};
 use owl_models::tensor::Dtype;
+use owl_models::Module;
 use owl_models::TensorOps;
 
 fn f32b(v: &[f32]) -> Vec<u8> {
@@ -44,7 +44,7 @@ const MAX_SLOTS: usize = 8;
 // ============================================================================
 
 struct HostRef {
-    wq: Vec<f32>,  // [HQ*HD*2, HIDDEN](safetensors [out,in] 行主序)
+    wq: Vec<f32>, // [HQ*HD*2, HIDDEN](safetensors [out,in] 行主序)
     wk: Vec<f32>,
     wv: Vec<f32>,
     wo: Vec<f32>, // [HIDDEN, HQ*HD]
@@ -59,9 +59,7 @@ impl HostRef {
     /// in_dim = 输入宽度 —— q/k/v = HIDDEN,o_proj = HQ*HD,勿硬编码)
     fn lin(&self, x: &[f32], w: &[f32], out_dim: usize, in_dim: usize) -> Vec<f32> {
         (0..out_dim)
-            .map(|o| {
-                (0..in_dim).map(|i| x[i] * w[o * in_dim + i]).sum::<f32>()
-            })
+            .map(|o| (0..in_dim).map(|i| x[i] * w[o * in_dim + i]).sum::<f32>())
             .collect()
     }
 
@@ -141,8 +139,12 @@ impl HostRef {
                 for (si, sc) in scores.iter_mut().enumerate() {
                     let row = (base + si as i32) as usize;
                     let off = row * HKV * HD + kvh * HD;
-                    let acc: f32 =
-                        qs.iter().zip(&self.kc[off..off + HD]).map(|(a, b)| a * b).sum::<f32>() * scale;
+                    let acc: f32 = qs
+                        .iter()
+                        .zip(&self.kc[off..off + HD])
+                        .map(|(a, b)| a * b)
+                        .sum::<f32>()
+                        * scale;
                     *sc = acc;
                     maxs = maxs.max(acc);
                 }
@@ -177,16 +179,24 @@ async fn main() {
     use owl_cuda::{test_device_ordinal, DeviceSelector, GpuClient};
 
     // 权重(确定性公式;源布局 [out,in] 行主序)
-    let wq: Vec<f32> = (0..HQ * HD * 2 * HIDDEN).map(|i| (i as f32 * 0.061) - 0.35).collect();
-    let wk: Vec<f32> = (0..HKV * HD * HIDDEN).map(|i| (i as f32 * 0.043) - 0.22).collect();
-    let wv: Vec<f32> = (0..HKV * HD * HIDDEN).map(|i| (i as f32 * 0.083) - 0.18).collect();
-    let wo: Vec<f32> = (0..HIDDEN * HQ * HD).map(|i| (i as f32 * 0.037) - 0.31).collect();
+    let wq: Vec<f32> = (0..HQ * HD * 2 * HIDDEN)
+        .map(|i| (i as f32 * 0.061) - 0.35)
+        .collect();
+    let wk: Vec<f32> = (0..HKV * HD * HIDDEN)
+        .map(|i| (i as f32 * 0.043) - 0.22)
+        .collect();
+    let wv: Vec<f32> = (0..HKV * HD * HIDDEN)
+        .map(|i| (i as f32 * 0.083) - 0.18)
+        .collect();
+    let wo: Vec<f32> = (0..HIDDEN * HQ * HD)
+        .map(|i| (i as f32 * 0.037) - 0.31)
+        .collect();
     let qnw: Vec<f32> = (0..HD).map(|i| (i as f32 * 0.11) - 0.2).collect();
     let knw: Vec<f32> = (0..HD).map(|i| (i as f32 * 0.07) - 0.1).collect();
 
     // GPU server face
-    let mut client = GpuClient::spawn(DeviceSelector::Ordinal(test_device_ordinal()))
-        .expect("gpu server boot");
+    let mut client =
+        GpuClient::spawn(DeviceSelector::Ordinal(test_device_ordinal())).expect("gpu server boot");
 
     // 层容器 + 装载(六槽)
     let attn = Attention::new(HQ, HKV, HD, HIDDEN, EPS, owl_models::module::QuantPlan::F16);
@@ -209,12 +219,21 @@ async fn main() {
         .expect("rope 表物化");
 
     // KV 常驻块(Zeros = 清零分配;跨步持久)
-    let kc = owl_iface::client_alloc!(client, Dtype::F32, MAX_SLOTS * HKV * HD).await.expect("alloc kc");
-    let vc = owl_iface::client_alloc!(client, Dtype::F32, MAX_SLOTS * HKV * HD).await.expect("alloc vc");
+    let kc = owl_iface::client_alloc!(client, Dtype::F32, MAX_SLOTS * HKV * HD)
+        .await
+        .expect("alloc kc");
+    let vc = owl_iface::client_alloc!(client, Dtype::F32, MAX_SLOTS * HKV * HD)
+        .await
+        .expect("alloc vc");
 
     // host 参考(独立副本;跨步持缓存)
     let mut host = HostRef {
-        wq, wk, wv, wo, qnw, knw,
+        wq,
+        wk,
+        wv,
+        wo,
+        qnw,
+        knw,
         kc: vec![0.0; MAX_SLOTS * HKV * HD],
         vc: vec![0.0; MAX_SLOTS * HKV * HD],
     };
@@ -230,12 +249,7 @@ async fn main() {
             &[0.0, 5.0],                        // slots
             &[1.0, 2.0],                        // kv_lens(含本步)
         ),
-        (
-            &[0.3, 0.8, -0.5],
-            &[12.0],
-            &[1.0],
-            &[2.0],
-        ),
+        (&[0.3, 0.8, -0.5], &[12.0], &[1.0], &[2.0]),
     ];
 
     for (si, (xs, pos, slots, kv_lens)) in steps.iter().enumerate() {

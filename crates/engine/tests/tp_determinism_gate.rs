@@ -113,7 +113,9 @@ async fn run_turn(
     loop {
         match r.pump().await? {
             owl_engine::TurnEvent::Idle => break,
-            owl_engine::TurnEvent::Completed { turn: t, text: out, .. } if t == turn => {
+            owl_engine::TurnEvent::Completed {
+                turn: t, text: out, ..
+            } if t == turn => {
                 text = out;
             }
             owl_engine::TurnEvent::Failed { turn: t, err } => {
@@ -141,7 +143,13 @@ async fn run_turn(
         gen.len(),
         text.chars().take(24).collect::<String>()
     );
-    Ok(Arm { label: String::new(), gen, text, cached_submit, cached_active })
+    Ok(Arm {
+        label: String::new(),
+        gen,
+        text,
+        cached_submit,
+        cached_active,
+    })
 }
 
 /// 两 rank 分片装载 + 装配(一次 = 一个装配档)
@@ -160,9 +168,8 @@ async fn assemble(
         .await
         .expect("rank0 分片装载");
     // rank1 账本/设备序装载前从 rank0 接过(TP 合流纪律;见 `Engine::new_with_ledger`)
-    let mut e1 =
-        Engine::new_with_ledger(cfg_of(ob, chunk, prefix_cache), e0.ledger_cell(), 1)
-            .expect("engine(rank1)");
+    let mut e1 = Engine::new_with_ledger(cfg_of(ob, chunk, prefix_cache), e0.ledger_cell(), 1)
+        .expect("engine(rank1)");
     let l1 = e1
         .loader()
         .slice(1, 2)
@@ -198,7 +205,9 @@ const TAIL: &str = "\n\n请继续。";
 #[test]
 fn tp_determinism_gate() {
     let (Some(oa), Some(ob)) = (dev("OWL_TP_TEST_DEV_A"), dev("OWL_TP_TEST_DEV_B")) else {
-        owl_shared::testkit::report::skip("需 OWL_TP_TEST_DEV_A / OWL_TP_TEST_DEV_B(两张空闲卡的 CUDA ordinal)");
+        owl_shared::testkit::report::skip(
+            "需 OWL_TP_TEST_DEV_A / OWL_TP_TEST_DEV_B(两张空闲卡的 CUDA ordinal)",
+        );
         return;
     };
     assert_ne!(oa, ob, "A/B 必须是两张不同卡");
@@ -236,7 +245,10 @@ async fn body(oa: usize, ob: usize, dir: PathBuf) {
             None => true,
         })
         .collect();
-    assert!(!groups.is_empty(), "OWL_G8A_GROUPS 过滤后没有装配档:去检查标签拼写");
+    assert!(
+        !groups.is_empty(),
+        "OWL_G8A_GROUPS 过滤后没有装配档:去检查标签拼写"
+    );
 
     let mut baseline: Option<(String, Vec<u32>)> = None;
     let mut total = 0usize;
@@ -290,21 +302,39 @@ async fn body(oa: usize, ob: usize, dir: PathBuf) {
         //    冷臂仍跑(作参考值上屏 + 兼任一次全量形状)。
         let hot1 = run_turn(&mut r, 5, PROMPT, GEN).await.expect("hot-a turn1");
         let full = format!("{PROMPT}{}{TAIL}", hot1.text);
-        let hot_a = run_turn(&mut r, 5, &full, GEN).await.expect("hot-a turn2(回填)");
-        let cold = run_turn(&mut r, 4, &full, GEN).await.expect("cold(全量参考)");
+        let hot_a = run_turn(&mut r, 5, &full, GEN)
+            .await
+            .expect("hot-a turn2(回填)");
+        let cold = run_turn(&mut r, 4, &full, GEN)
+            .await
+            .expect("cold(全量参考)");
         let hot1b = run_turn(&mut r, 6, PROMPT, GEN).await.expect("hot-b turn1");
-        assert_same(&format!("{label}/prefix-reuse turn1"), &hot1b.gen, &hot1.gen);
+        assert_same(
+            &format!("{label}/prefix-reuse turn1"),
+            &hot1b.gen,
+            &hot1.gen,
+        );
         let full_b = format!("{PROMPT}{}{TAIL}", hot1b.text);
-        let hot_b = run_turn(&mut r, 6, &full_b, GEN).await.expect("hot-b turn2(回填)");
+        let hot_b = run_turn(&mut r, 6, &full_b, GEN)
+            .await
+            .expect("hot-b turn2(回填)");
         assert!(
             hot_a.cached_submit > 0 && hot_b.cached_submit > 0,
             "G8-a arm⑤ 空转:回填后 guard 未命中(cached_submit = {}/{})⇒ 本 arm 没测到复用路径。prompt = {full:?}",
             hot_a.cached_submit,
             hot_b.cached_submit
         );
-        assert_same(&format!("{label}/prefix-reuse(同形重复)"), &hot_b.gen, &hot_a.gen);
+        assert_same(
+            &format!("{label}/prefix-reuse(同形重复)"),
+            &hot_b.gen,
+            &hot_a.gen,
+        );
         // turn1 与基线同形(同 prompt)⇒ 必须与基线逐位一致(兼查"先跑别的 turn 后再跑同形")
-        assert_same(&format!("{label}/prefix-reuse turn1 vs base"), &hot1.gen, &arms[0].gen);
+        assert_same(
+            &format!("{label}/prefix-reuse turn1 vs base"),
+            &hot1.gen,
+            &arms[0].gen,
+        );
         eprintln!(
             "[g8a] 复用臂 vs 冷臂(**参考值,不判** —— GDN 分段推进≠一次推进):hot={:?} cold={:?}",
             &hot_a.gen[..4.min(hot_a.gen.len())],
@@ -319,7 +349,11 @@ async fn body(oa: usize, ob: usize, dir: PathBuf) {
         for a in &arms {
             for other in &arms {
                 if a.label != other.label {
-                    assert_same(&format!("{} ↔ {}", a.label, other.label), &a.gen, &other.gen);
+                    assert_same(
+                        &format!("{} ↔ {}", a.label, other.label),
+                        &a.gen,
+                        &other.gen,
+                    );
                 }
             }
             if let Some((bl, bg)) = &baseline {
@@ -356,11 +390,7 @@ async fn body(oa: usize, ob: usize, dir: PathBuf) {
     );
 }
 
-fn labeled(
-    group: &str,
-    arm: &str,
-    r: Result<Arm, ModelError>,
-) -> Arm {
+fn labeled(group: &str, arm: &str, r: Result<Arm, ModelError>) -> Arm {
     let mut a = r.unwrap_or_else(|e| panic!("{group}{arm} 失败:{e}"));
     a.label = format!("{group}{arm}");
     a

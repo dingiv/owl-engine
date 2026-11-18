@@ -87,7 +87,7 @@
 //! ```
 //! (`2`/`3` = 3080 对;3090 Ti 对 = `0`/`1`。未设 env ⇒ skip。)
 //!
-//! **阶梯档不用重编译**:`OWL_ARB_SIZES=4096,10240,...`(逗号分隔字节)+ 
+//! **阶梯档不用重编译**:`OWL_ARB_SIZES=4096,10240,...`(逗号分隔字节)+
 //! `OWL_ARB_DTYPE=f16|f32|bf16` + `OWL_ARB_K=200`。
 //! **AR-2 臂**:`OWL_ARB_AR2=1`(≤256KiB;与 `OWL_ARB_GRAPH=1` 同跑,打印
 //! `[arb-ar2]` 的图内 µs/次)。
@@ -166,7 +166,9 @@ fn memset_pattern(dt: Dtype, n_elems: usize) -> Vec<u8> {
     let mut out = Vec::with_capacity(n_elems * width(dt));
     let mut s = 0x243F_6A88u64;
     for i in 0..n_elems {
-        s = s.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+        s = s
+            .wrapping_mul(6364136223846793005)
+            .wrapping_add(1442695040888963407);
         let v = (((s >> 40) as f32 / (1u64 << 24) as f32) * 2.0 - 1.0) * 0.01;
         let _ = i;
         match dt {
@@ -247,8 +249,11 @@ async fn emit_ar_bind(
     push: bool,
 ) -> Result<(), ModelError> {
     // header 两档都不变;只换**数据块**(与生产 `eval.rs` 同一律)
-    let (stage_data, reduce_data) =
-        if push { (peer.clone(), own.clone()) } else { (own.clone(), peer.clone()) };
+    let (stage_data, reduce_data) = if push {
+        (peer.clone(), own.clone())
+    } else {
+        (own.clone(), peer.clone())
+    };
     for (phase, c) in AllReduce::new(plan_ar(bytes, layout)).steps() {
         let msg = match phase {
             ArPhase::Stage => ArStageCall::new(
@@ -353,8 +358,11 @@ async fn emit_one_push(
     reduce: bool,
     push: bool,
 ) -> Result<(), ModelError> {
-    let (s_data, r_data) =
-        if push { (peer.clone(), own.clone()) } else { (own.clone(), peer.clone()) };
+    let (s_data, r_data) = if push {
+        (peer.clone(), own.clone())
+    } else {
+        (own.clone(), peer.clone())
+    };
     let msg = if reduce {
         ArReduceCall::new(
             payload.clone(),
@@ -422,7 +430,9 @@ async fn emit_ce(
             .to_launch(),
         )
         .await?;
-    client.copy_block_at(peer, HDR, inbox, HDR, bytes as usize).await?;
+    client
+        .copy_block_at(peer, HDR, inbox, HDR, bytes as usize)
+        .await?;
     client
         .launch(
             ArReduceCall::new(
@@ -482,13 +492,21 @@ async fn run_case(
     let payload_bytes = memset_pattern(dt, n_elems);
 
     let payload_a = a
-        
-        .htod(dt, &Shape::from(vec![n_elems]), &payload_bytes, "arb:payload-a")
+        .htod(
+            dt,
+            &Shape::from(vec![n_elems]),
+            &payload_bytes,
+            "arb:payload-a",
+        )
         .await
         .expect("A payload htod");
     let payload_b = b
-        
-        .htod(dt, &Shape::from(vec![n_elems]), &payload_bytes, "arb:payload-b")
+        .htod(
+            dt,
+            &Shape::from(vec![n_elems]),
+            &payload_bytes,
+            "arb:payload-b",
+        )
         .await
         .expect("B payload htod");
 
@@ -609,7 +627,8 @@ async fn run_case(
         }
         let enq = t0.elapsed().as_secs_f64();
         let (sa, sb) = tokio::join!(a.sync(), b.sync());
-        sa.expect("A sync"); sb.expect("B sync");
+        sa.expect("A sync");
+        sb.expect("B sync");
         let ps_dev = per_call_us((t0.elapsed().as_secs_f64() - enq).max(0.0), k_s);
         assert_eq!(read_err(a, staging_a).await, 0, "pS A err");
 
@@ -743,8 +762,12 @@ async fn run_case(
     // 外部参照(NCCL 2-rank all-reduce,`tools/nccl-ar-probe.cu`)在同一对卡上
     // 是 **11.1GB/s**,而 `RR` 只有 7.2 ⇒ 链路另有空间。**真正的分母见 C1/C2。**
     // 留它是因为它与 `R` 成对,能读"双向并发 vs 单向"的差(7.2 vs 8.6)。
-    set_hdr(a, staging_a, HUGE, 0).await.expect("A hdr(produced HUGE)");
-    set_hdr(b, staging_b, HUGE, 0).await.expect("B hdr(produced HUGE)");
+    set_hdr(a, staging_a, HUGE, 0)
+        .await
+        .expect("A hdr(produced HUGE)");
+    set_hdr(b, staging_b, HUGE, 0)
+        .await
+        .expect("B hdr(produced HUGE)");
     let k_rr = (k / 2).max(1);
     let t0 = Instant::now();
     {
@@ -844,8 +867,12 @@ async fn run_case(
     #[allow(unused_assignments)]
     let mut a2_dev_us = f64::NAN;
     {
-        set_hdr(a, inbox_a, HUGE, 0).await.expect("A inbox hdr(produced HUGE)");
-        set_hdr(b, staging_b, HUGE, 0).await.expect("B hdr(produced HUGE)");
+        set_hdr(a, inbox_a, HUGE, 0)
+            .await
+            .expect("A inbox hdr(produced HUGE)");
+        set_hdr(b, staging_b, HUGE, 0)
+            .await
+            .expect("B hdr(produced HUGE)");
         // ⚠️ **伪影排除**:reduce 的 slot = `own.consumed % own.n_slots`(读的是 **own** 的
         // n_slots)⇒ 若 own = staging_a(n_slots=2)而 inbox 只有 1 slot,第 2 次就会
         // **越界读** inbox+64+32MiB。故这里把 staging_a 的游标归零、并**按 parity 把
@@ -916,38 +943,39 @@ async fn run_case(
         )
         .await
         .expect("A accum 发射");
-}
-let l_enq = t0.elapsed().as_secs_f64();
-a.sync().await.expect("A sync");
-l_dev_us = per_call_us((t0.elapsed().as_secs_f64() - l_enq).max(0.0), k_l);
+    }
+    let l_enq = t0.elapsed().as_secs_f64();
+    a.sync().await.expect("A sync");
+    l_dev_us = per_call_us((t0.elapsed().as_secs_f64() - l_enq).max(0.0), k_l);
 
     #[allow(unused_assignments)]
     #[allow(unused_assignments)]
     if push_on {
-    set_hdr(a, staging_a, 0, 0).await.expect("A hdr");
-    set_hdr(b, staging_b, 0, HUGE).await.expect("B hdr(credit HUGE)");
-    let k_p = (k / 2).max(1);
-    let t0 = Instant::now();
-    for _ in 0..k_p {
-        a.launch(
-            ArStageCall::new(
-                payload_a.clone(),
-                alias_b_on_a.clone(), // header:v1 位(此臂 = 直接写对端块)
-                alias_b_on_a.clone(),
-                alias_b_on_a.clone(), // data:写对端块(= 旧 push 臂语义)
-                bytes as u64,
-                layout.slot_bytes,
-                0,
+        set_hdr(a, staging_a, 0, 0).await.expect("A hdr");
+        set_hdr(b, staging_b, 0, HUGE)
+            .await
+            .expect("B hdr(credit HUGE)");
+        let k_p = (k / 2).max(1);
+        let t0 = Instant::now();
+        for _ in 0..k_p {
+            a.launch(
+                ArStageCall::new(
+                    payload_a.clone(),
+                    alias_b_on_a.clone(), // header:v1 位(此臂 = 直接写对端块)
+                    alias_b_on_a.clone(),
+                    alias_b_on_a.clone(), // data:写对端块(= 旧 push 臂语义)
+                    bytes as u64,
+                    layout.slot_bytes,
+                    0,
+                )
+                .to_launch(),
             )
-            .to_launch(),
-        )
-        .await
-        .expect("A 推送发射");
-    }
-    let p_enq = t0.elapsed().as_secs_f64();
-    a.sync().await.expect("A sync");
-    let _p_dev_us = per_call_us((t0.elapsed().as_secs_f64() - p_enq).max(0.0), k_p);
-
+            .await
+            .expect("A 推送发射");
+        }
+        let p_enq = t0.elapsed().as_secs_f64();
+        a.sync().await.expect("A sync");
+        let _p_dev_us = per_call_us((t0.elapsed().as_secs_f64() - p_enq).max(0.0), k_p);
     } /* push_on */
 
     // ── ★ A3(CE 三段 = **生产同形**;2026-10-17 接线)──────────────
@@ -960,10 +988,18 @@ l_dev_us = per_call_us((t0.elapsed().as_secs_f64() - l_enq).max(0.0), k_l);
     let mut a3_dev_us = f64::NAN;
     {
         // 声明改**单格**(块尺寸不变 —— 只是不再乒乓)
-        set_hdr_slots(a, staging_a, 0, 0, 1).await.expect("A hdr(slots=1)");
-        set_hdr_slots(b, staging_b, 0, 0, 1).await.expect("B hdr(slots=1)");
-        set_hdr_slots(a, inbox_a, HUGE, 0, 1).await.expect("A inbox hdr(slots=1)");
-        set_hdr_slots(b, inbox_b, HUGE, 0, 1).await.expect("B inbox hdr(slots=1)");
+        set_hdr_slots(a, staging_a, 0, 0, 1)
+            .await
+            .expect("A hdr(slots=1)");
+        set_hdr_slots(b, staging_b, 0, 0, 1)
+            .await
+            .expect("B hdr(slots=1)");
+        set_hdr_slots(a, inbox_a, HUGE, 0, 1)
+            .await
+            .expect("A inbox hdr(slots=1)");
+        set_hdr_slots(b, inbox_b, HUGE, 0, 1)
+            .await
+            .expect("B inbox hdr(slots=1)");
         for _ in 0..2 {
             let (ra, rb) = tokio::join!(
                 emit_ce(
@@ -1037,8 +1073,12 @@ l_dev_us = per_call_us((t0.elapsed().as_secs_f64() - l_enq).max(0.0), k_l);
         // 恢复两格声明(本块接着给下一个 case 用)
         set_hdr(a, staging_a, 0, 0).await.expect("A hdr(恢复)");
         set_hdr(b, staging_b, 0, 0).await.expect("B hdr(恢复)");
-        set_hdr(a, inbox_a, HUGE, 0).await.expect("A inbox hdr(恢复)");
-        set_hdr(b, inbox_b, HUGE, 0).await.expect("B inbox hdr(恢复)");
+        set_hdr(a, inbox_a, HUGE, 0)
+            .await
+            .expect("A inbox hdr(恢复)");
+        set_hdr(b, inbox_b, HUGE, 0)
+            .await
+            .expect("B inbox hdr(恢复)");
     }
 
     eprintln!(
@@ -1056,8 +1096,12 @@ l_dev_us = per_call_us((t0.elapsed().as_secs_f64() - l_enq).max(0.0), k_l);
     // **差值 = 协议钱**(§50.9 估的 50–70µs 是否成立,就看这一行)。
     // ⚠️ 旁路下数据是脏的(不等对端),只用来量**时间**;放在 run_case 末尾以免污染别的臂。
     {
-        set_hdr(a, staging_a, HUGE, HUGE).await.expect("A hdr(HUGE,HUGE)");
-        set_hdr(b, staging_b, HUGE, HUGE).await.expect("B hdr(HUGE,HUGE)");
+        set_hdr(a, staging_a, HUGE, HUGE)
+            .await
+            .expect("A hdr(HUGE,HUGE)");
+        set_hdr(b, staging_b, HUGE, HUGE)
+            .await
+            .expect("B hdr(HUGE,HUGE)");
         let t0 = Instant::now();
         {
             let fa = async {
@@ -1084,13 +1128,15 @@ l_dev_us = per_call_us((t0.elapsed().as_secs_f64() - l_enq).max(0.0), k_l);
             };
             tokio::join!(fa, fb);
             let (sa, sb) = tokio::join!(a.sync(), b.sync());
-            sa.expect("A sync"); sb.expect("B sync");
+            sa.expect("A sync");
+            sb.expect("B sync");
         }
         let byp = per_call_us(t0.elapsed().as_secs_f64(), k);
         eprintln!(
             "[arb-bypass] {bytes:>9} B  AR(全协议)={ar_us:8.2} · AR(旁路协议)={byp:8.2} \
              ⇒ **协议钱 = {:6.2} µs/次**({:.1}%)",
-            ar_us - byp, 100.0 * (ar_us - byp) / ar_us.max(1e-9)
+            ar_us - byp,
+            100.0 * (ar_us - byp) / ar_us.max(1e-9)
         );
     }
 
@@ -1102,7 +1148,9 @@ l_dev_us = per_call_us((t0.elapsed().as_secs_f64() - l_enq).max(0.0), k_l);
     //   **墙钟 / N = 每次 AR 的真设备时延**(含 credit 前置 / rendezvous 尾段那两次跨卡往返)。
     if std::env::var("OWL_ARB_GRAPH").is_ok() {
         let n: usize = std::env::var("OWL_ARB_GRAPH_N")
-            .ok().and_then(|s| s.parse().ok()).unwrap_or(32);
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(32);
         set_hdr(a, staging_a, 0, 0).await.expect("A hdr(图内)");
         set_hdr(b, staging_b, 0, 0).await.expect("B hdr(图内)");
         a.graph_begin().await.expect("graph_begin A");
@@ -1133,39 +1181,52 @@ l_dev_us = per_call_us((t0.elapsed().as_secs_f64() - l_enq).max(0.0), k_l);
         let gb = b.graph_end().await.expect("graph_end B");
         {
             let (ra, rb) = tokio::join!(a.graph_launch(ga), b.graph_launch(gb));
-            ra.expect("warm A"); rb.expect("warm B");
+            ra.expect("warm A");
+            rb.expect("warm B");
             let (sa, sb) = tokio::join!(a.sync(), b.sync());
-            sa.expect("warm sync A"); sb.expect("warm sync B");
+            sa.expect("warm sync A");
+            sb.expect("warm sync B");
         }
         let t0 = Instant::now();
         {
             let (ra, rb) = tokio::join!(a.graph_launch(ga), b.graph_launch(gb));
-            ra.expect("replay A"); rb.expect("replay B");
+            ra.expect("replay A");
+            rb.expect("replay B");
             let (sa, sb) = tokio::join!(a.sync(), b.sync());
-            sa.expect("sync A"); sb.expect("sync B");
+            sa.expect("sync A");
+            sb.expect("sync B");
         }
         let us = t0.elapsed().as_secs_f64() * 1e6 / (n as f64);
         // ★ **同一张图,换个 header 再放一遍** ⇒ 协议钱(header 是运行期读的)
-        set_hdr(a, staging_a, HUGE, HUGE).await.expect("A hdr(HUGE,HUGE)");
-        set_hdr(b, staging_b, HUGE, HUGE).await.expect("B hdr(HUGE,HUGE)");
+        set_hdr(a, staging_a, HUGE, HUGE)
+            .await
+            .expect("A hdr(HUGE,HUGE)");
+        set_hdr(b, staging_b, HUGE, HUGE)
+            .await
+            .expect("B hdr(HUGE,HUGE)");
         {
             let (ra, rb) = tokio::join!(a.graph_launch(ga), b.graph_launch(gb));
-            ra.expect("warm2 A"); rb.expect("warm2 B");
+            ra.expect("warm2 A");
+            rb.expect("warm2 B");
             let (sa, sb) = tokio::join!(a.sync(), b.sync());
-            sa.expect("warm2 sync A"); sb.expect("warm2 sync B");
+            sa.expect("warm2 sync A");
+            sb.expect("warm2 sync B");
         }
         let t1 = Instant::now();
         {
             let (ra, rb) = tokio::join!(a.graph_launch(ga), b.graph_launch(gb));
-            ra.expect("replay2 A"); rb.expect("replay2 B");
+            ra.expect("replay2 A");
+            rb.expect("replay2 B");
             let (sa, sb) = tokio::join!(a.sync(), b.sync());
-            sa.expect("sync2 A"); sb.expect("sync2 B");
+            sa.expect("sync2 A");
+            sb.expect("sync2 B");
         }
         let byp = t1.elapsed().as_secs_f64() * 1e6 / (n as f64);
         eprintln!(
             "[arb-graph] {bytes:>9} B n={n:<4} **图内 AR = {us:8.2} µs/次**(真设备时延) · \
              旁路协议 = {byp:8.2} ⇒ **协议钱 = {:6.2} µs/次**({:.1}%)",
-            us - byp, 100.0 * (us - byp) / us.max(1e-9)
+            us - byp,
+            100.0 * (us - byp) / us.max(1e-9)
         );
         assert_eq!(read_err(a, staging_a).await, 0, "图内 A err 非 0");
         assert_eq!(read_err(b, staging_b).await, 0, "图内 B err 非 0");
@@ -1212,16 +1273,20 @@ l_dev_us = per_call_us((t0.elapsed().as_secs_f64() - l_enq).max(0.0), k_l);
             let gb1 = b.graph_end().await.expect("ge2");
             {
                 let (ra, rb) = tokio::join!(a.graph_launch(ga1), b.graph_launch(gb1));
-                ra.expect("w1 A"); rb.expect("w1 B");
+                ra.expect("w1 A");
+                rb.expect("w1 B");
                 let (sa, sb) = tokio::join!(a.sync(), b.sync());
-                sa.expect("s1 A"); sb.expect("s1 B");
+                sa.expect("s1 A");
+                sb.expect("s1 B");
             }
             let t2 = Instant::now();
             {
                 let (ra, rb) = tokio::join!(a.graph_launch(ga1), b.graph_launch(gb1));
-                ra.expect("r1 A"); rb.expect("r1 B");
+                ra.expect("r1 A");
+                rb.expect("r1 B");
                 let (sa, sb) = tokio::join!(a.sync(), b.sync());
-                sa.expect("s1b A"); sb.expect("s1b B");
+                sa.expect("s1b A");
+                sb.expect("s1b B");
             }
             let one = t2.elapsed().as_secs_f64() * 1e6 / (n1 as f64);
             eprintln!(
@@ -1241,7 +1306,9 @@ l_dev_us = per_call_us((t0.elapsed().as_secs_f64() - l_enq).max(0.0), k_l);
     // 独立开关 OWL_ARB_AR2=1;只测 ≤256KiB(生产 AR-2 门;大包仍 v1/fused)。
     if std::env::var("OWL_ARB_AR2").is_ok() && (bytes as u64) <= 256 * 1024 {
         let n: usize = std::env::var("OWL_ARB_GRAPH_N")
-            .ok().and_then(|s| s.parse().ok()).unwrap_or(32);
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(32);
         // AR-2 游标在 header 48/56;set_hdr 会清零整 64B(含 48..64)。
         set_hdr(a, staging_a, 0, 0).await.expect("A hdr(AR2)");
         set_hdr(b, staging_b, 0, 0).await.expect("B hdr(AR2)");
@@ -1261,16 +1328,20 @@ l_dev_us = per_call_us((t0.elapsed().as_secs_f64() - l_enq).max(0.0), k_l);
         let gb2 = b.graph_end().await.expect("graph_end B2");
         {
             let (ra, rb) = tokio::join!(a.graph_launch(ga2), b.graph_launch(gb2));
-            ra.expect("AR2 warm A"); rb.expect("AR2 warm B");
+            ra.expect("AR2 warm A");
+            rb.expect("AR2 warm B");
             let (sa, sb) = tokio::join!(a.sync(), b.sync());
-            sa.expect("AR2 warm sync A"); sb.expect("AR2 warm sync B");
+            sa.expect("AR2 warm sync A");
+            sb.expect("AR2 warm sync B");
         }
         let t0 = Instant::now();
         {
             let (ra, rb) = tokio::join!(a.graph_launch(ga2), b.graph_launch(gb2));
-            ra.expect("AR2 replay A"); rb.expect("AR2 replay B");
+            ra.expect("AR2 replay A");
+            rb.expect("AR2 replay B");
             let (sa, sb) = tokio::join!(a.sync(), b.sync());
-            sa.expect("AR2 sync A"); sb.expect("AR2 sync B");
+            sa.expect("AR2 sync A");
+            sb.expect("AR2 sync B");
         }
         let us = t0.elapsed().as_secs_f64() * 1e6 / (n as f64);
         eprintln!("[arb-ar2] {bytes:>9} B n={n:<4} **AR-2 图内 = {us:8.2} µs/次**(真设备时延)");
@@ -1285,7 +1356,9 @@ l_dev_us = per_call_us((t0.elapsed().as_secs_f64() - l_enq).max(0.0), k_l);
     // 只在 OWL_ARB_1STAGE=1 且 bytes≤256KiB 时跑。
     if std::env::var("OWL_ARB_1STAGE").is_ok() && (bytes as u64) <= SLOT_1S as u64 {
         let n: usize = std::env::var("OWL_ARB_GRAPH_N")
-            .ok().and_then(|s| s.parse().ok()).unwrap_or(32);
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(32);
         set_hdr(a, staging_a, 0, 0).await.expect("A hdr(1stage)");
         set_hdr(b, staging_b, 0, 0).await.expect("B hdr(1stage)");
         a.graph_begin().await.expect("graph_begin A1s");
@@ -1320,16 +1393,20 @@ l_dev_us = per_call_us((t0.elapsed().as_secs_f64() - l_enq).max(0.0), k_l);
         let gb1s = b.graph_end().await.expect("graph_end B1s");
         {
             let (ra, rb) = tokio::join!(a.graph_launch(ga1s), b.graph_launch(gb1s));
-            ra.expect("1s warm A"); rb.expect("1s warm B");
+            ra.expect("1s warm A");
+            rb.expect("1s warm B");
             let (sa, sb) = tokio::join!(a.sync(), b.sync());
-            sa.expect("1s warm sync A"); sb.expect("1s warm sync B");
+            sa.expect("1s warm sync A");
+            sb.expect("1s warm sync B");
         }
         let t0 = Instant::now();
         {
             let (ra, rb) = tokio::join!(a.graph_launch(ga1s), b.graph_launch(gb1s));
-            ra.expect("1s replay A"); rb.expect("1s replay B");
+            ra.expect("1s replay A");
+            rb.expect("1s replay B");
             let (sa, sb) = tokio::join!(a.sync(), b.sync());
-            sa.expect("1s sync A"); sb.expect("1s sync B");
+            sa.expect("1s sync A");
+            sb.expect("1s sync B");
         }
         let us = t0.elapsed().as_secs_f64() * 1e6 / (n as f64);
         eprintln!(
@@ -1357,7 +1434,9 @@ l_dev_us = per_call_us((t0.elapsed().as_secs_f64() - l_enq).max(0.0), k_l);
 #[ignore = "bench:AR 通道微基准(3080 对/3090 Ti 对;隔离测量)"]
 async fn comm_ar_channel_bench() {
     let (Some(oa), Some(ob)) = (dev("OWL_PEER_TEST_DEV_A"), dev("OWL_PEER_TEST_DEV_B")) else {
-        owl_shared::testkit::report::skip("需 OWL_PEER_TEST_DEV_A / OWL_PEER_TEST_DEV_B(两张可 P2P 的空闲卡)");
+        owl_shared::testkit::report::skip(
+            "需 OWL_PEER_TEST_DEV_A / OWL_PEER_TEST_DEV_B(两张可 P2P 的空闲卡)",
+        );
         return;
     };
     assert_ne!(oa, ob, "A/B 必须是两张不同卡");
@@ -1367,20 +1446,30 @@ async fn comm_ar_channel_bench() {
 
     // ── VMM 对称握手(与生产同参:slot 32MiB × 2)──────────────────
     let staging_bytes = HDR as u64 + SLOT * N_SLOTS as u64;
-    let (staging_a, cred_a) = a.peer_alloc(staging_bytes as usize, "arb:staging-a").await.expect("A PeerAlloc");
-    let (staging_b, cred_b) = b.peer_alloc(staging_bytes as usize, "arb:staging-b").await.expect("B PeerAlloc");
+    let (staging_a, cred_a) = a
+        .peer_alloc(staging_bytes as usize, "arb:staging-a")
+        .await
+        .expect("A PeerAlloc");
+    let (staging_b, cred_b) = b
+        .peer_alloc(staging_bytes as usize, "arb:staging-b")
+        .await
+        .expect("B PeerAlloc");
     // push AR 档 ⇒ 别名必须 RW(否则 stage 写对端槽当场 ILLEGAL_ADDRESS)
     let push_ar_on = std::env::var("OWL_ARB_AR_PUSH").is_ok();
     let alias_b_on_a = if push_ar_on {
-        a.peer_import_rw(cred_b, staging_bytes as usize, &ub, "arb:alias-rw-b@a").await
+        a.peer_import_rw(cred_b, staging_bytes as usize, &ub, "arb:alias-rw-b@a")
+            .await
     } else {
-        a.peer_import(cred_b, staging_bytes as usize, &ub, "arb:alias-b@a").await
+        a.peer_import(cred_b, staging_bytes as usize, &ub, "arb:alias-b@a")
+            .await
     }
     .expect("A 导入 B");
     let alias_a_on_b = if push_ar_on {
-        b.peer_import_rw(cred_a, staging_bytes as usize, &ua, "arb:alias-rw-a@b").await
+        b.peer_import_rw(cred_a, staging_bytes as usize, &ua, "arb:alias-rw-a@b")
+            .await
     } else {
-        b.peer_import(cred_a, staging_bytes as usize, &ua, "arb:alias-a@b").await
+        b.peer_import(cred_a, staging_bytes as usize, &ua, "arb:alias-a@b")
+            .await
     }
     .expect("B 导入 A");
     let layout = StagingLayout::new(SLOT, N_SLOTS);
@@ -1427,7 +1516,11 @@ async fn comm_ar_channel_bench() {
     eprintln!(
         "[arb] devices: A=ord{oa}({ua}) B=ord{ob}({ub}) slot={}MiB×{N_SLOTS} AR 档={}",
         SLOT >> 20,
-        if push_ar_on { "push(写对端)" } else { "v1(读对端)" }
+        if push_ar_on {
+            "push(写对端)"
+        } else {
+            "v1(读对端)"
+        }
     );
     eprintln!(
         "[arb] {:>10} {:>5} {:>6} {:>7} {:>8} {:>8} {:>8} {:>8} {:>8} {:>8} {:>8} {:>8} {:>8} {:>8} {:>8} {:>8} {:>8} {:>8} {:>8} {:>8} {:>8}",
@@ -1438,22 +1531,40 @@ async fn comm_ar_channel_bench() {
 
     // 档表:env `OWL_ARB_SIZES=4096,10240,...`(逗号分隔字节)+ `OWL_ARB_DTYPE=f16|f32`
     // + `OWL_ARB_K=200` 可覆盖 ⇒ **尺寸阶梯不用重编译**(小载荷异常待定谳)。
-    let env_k: u32 = std::env::var("OWL_ARB_K").ok().and_then(|v| v.parse().ok()).unwrap_or(200);
+    let env_k: u32 = std::env::var("OWL_ARB_K")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(200);
     let env_dt = match std::env::var("OWL_ARB_DTYPE").as_deref() {
         Ok("f32") => Dtype::F32,
         Ok("bf16") => Dtype::BF16,
         _ => Dtype::F16,
     };
-    let env_ladder: Option<Vec<(usize, Dtype, u32)>> = std::env::var("OWL_ARB_SIZES").ok().map(|v| {
-        v.split(',')
-            .filter_map(|t| t.trim().parse::<usize>().ok())
-            .map(|b| (b, env_dt, env_k))
-            .collect()
-    });
+    let env_ladder: Option<Vec<(usize, Dtype, u32)>> =
+        std::env::var("OWL_ARB_SIZES").ok().map(|v| {
+            v.split(',')
+                .filter_map(|t| t.trim().parse::<usize>().ok())
+                .map(|b| (b, env_dt, env_k))
+                .collect()
+        });
     if let Some(ladder) = env_ladder {
         for (bytes, dt, k) in ladder {
-            run_case(&mut a, &mut b, &staging_a, &staging_b, &alias_b_on_a, &alias_a_on_b, &inbox_a, &inbox_b, &one_stage, &layout, bytes, dt, k)
-                .await;
+            run_case(
+                &mut a,
+                &mut b,
+                &staging_a,
+                &staging_b,
+                &alias_b_on_a,
+                &alias_a_on_b,
+                &inbox_a,
+                &inbox_b,
+                &one_stage,
+                &layout,
+                bytes,
+                dt,
+                k,
+            )
+            .await;
         }
         eprintln!("[arb] done");
         return;
@@ -1461,19 +1572,19 @@ async fn comm_ar_channel_bench() {
 
     // 27B 真形状(hidden 5120)+ 边界档
     let cases: [(usize, Dtype, u32); 10] = [
-        (4, Dtype::F16, 400),                              // 发射吞吐档(核 ≈ 0)
-        (5120 * 2, Dtype::F16, 400),                       // decode 1 行 = 10KB
-        (128 * 5120 * 2, Dtype::F16, 200),                 // 1.31MB(128 行)
-        (512 * 5120 * 2, Dtype::F16, 100),                 // ★ 5.24MB(生产 chunk 512)
-        (1024 * 5120 * 2, Dtype::F16, 60),                 // 10.49MB(生产 chunk 1024)
-        ((SLOT as usize), Dtype::F16, 40),                 // 32MiB(1 块上界)
-        ((SLOT as usize) + 2, Dtype::F16, 30),             // 32MiB+2(跨块)
-        (80 << 20, Dtype::F16, 20),                        // 80MiB(3 块;INFO)
+        (4, Dtype::F16, 400),                  // 发射吞吐档(核 ≈ 0)
+        (5120 * 2, Dtype::F16, 400),           // decode 1 行 = 10KB
+        (128 * 5120 * 2, Dtype::F16, 200),     // 1.31MB(128 行)
+        (512 * 5120 * 2, Dtype::F16, 100),     // ★ 5.24MB(生产 chunk 512)
+        (1024 * 5120 * 2, Dtype::F16, 60),     // 10.49MB(生产 chunk 1024)
+        ((SLOT as usize), Dtype::F16, 40),     // 32MiB(1 块上界)
+        ((SLOT as usize) + 2, Dtype::F16, 30), // 32MiB+2(跨块)
+        (80 << 20, Dtype::F16, 20),            // 80MiB(3 块;INFO)
         // ★ **重复档**(2026-10-17):小载荷首跑异常 ⇒ 用"同档再跑一次"判别
         //   "一次性代价(冷启动/TLB/时钟)"与"尺寸依赖代价"。
-        (5120 * 2, Dtype::F16, 400),                       // 10KB 复跑
-        (128 * 5120 * 2, Dtype::F16, 200),                 // 1.31MB 复跑
-        ];
+        (5120 * 2, Dtype::F16, 400),       // 10KB 复跑
+        (128 * 5120 * 2, Dtype::F16, 200), // 1.31MB 复跑
+    ];
     // 同字节 f32 对照(元素数减半 ⇒ 区分"迭代延迟暴露"与"带宽受限")
     let f32_cases: [(usize, Dtype, u32); 2] = [
         (512 * 5120 * 2, Dtype::F32, 60),
@@ -1481,7 +1592,22 @@ async fn comm_ar_channel_bench() {
     ];
 
     for (bytes, dt, k) in cases.iter().chain(f32_cases.iter()) {
-        run_case(&mut a, &mut b, &staging_a, &staging_b, &alias_b_on_a, &alias_a_on_b, &inbox_a, &inbox_b, &one_stage, &layout, *bytes, *dt, *k).await;
+        run_case(
+            &mut a,
+            &mut b,
+            &staging_a,
+            &staging_b,
+            &alias_b_on_a,
+            &alias_a_on_b,
+            &inbox_a,
+            &inbox_b,
+            &one_stage,
+            &layout,
+            *bytes,
+            *dt,
+            *k,
+        )
+        .await;
     }
 
     // ── 收尾:两侧 header 复原(不留 HUGE 哨兵给下一轮)──────────

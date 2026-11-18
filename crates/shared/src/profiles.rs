@@ -41,7 +41,9 @@ fn find_dir(name: &str) -> Option<PathBuf> {
 /// `-p profiles/xxx.local.toml` 启动，但不显示为可发现的常驻档。
 fn names_in(dir: &PathBuf) -> Vec<String> {
     let mut v: Vec<String> = Vec::new();
-    let Ok(rd) = std::fs::read_dir(dir) else { return v };
+    let Ok(rd) = std::fs::read_dir(dir) else {
+        return v;
+    };
     for e in rd.flatten() {
         if !e.path().is_file() {
             continue;
@@ -69,9 +71,8 @@ pub fn profile_names() -> Vec<String> {
 
 /// 常用档名 → 文件路径(内部测试/清单;用户 CLI 直接传路径)
 pub fn profile_path(name: &str) -> Result<PathBuf, String> {
-    let dir = profile_dir().ok_or_else(|| {
-        "profiles 目录未找到(需要它;找过二进制同级与源码树)".to_string()
-    })?;
+    let dir = profile_dir()
+        .ok_or_else(|| "profiles 目录未找到(需要它;找过二进制同级与源码树)".to_string())?;
     let p = dir.join(format!("{name}.toml"));
     if !p.is_file() {
         return Err(format!("未知 profile {name:?}(可用:{:?})", profile_names()));
@@ -126,12 +127,21 @@ mod tests {
     #[test]
     fn 全部档均可经完整度门加载() {
         let names = profile_names();
-        assert!(names.iter().any(|n| n == "qwen38_27b-3090"), "应有单 3090 常驻档:{names:?}");
-        assert!(names.iter().any(|n| n == "qwen38_27b-3080_tp2"), "应有双 3080 常驻档:{names:?}");
+        assert!(
+            names.iter().any(|n| n == "qwen38_27b-3090"),
+            "应有单 3090 常驻档:{names:?}"
+        );
+        assert!(
+            names.iter().any(|n| n == "qwen38_27b-3080_tp2"),
+            "应有双 3080 常驻档:{names:?}"
+        );
         for n in &names {
             let p = profile_path(n).expect("profile 路径");
             crate::config::OwlConfig::load_resolved(
-                Some(&p), &[], &[], crate::config::Completeness::Enforce,
+                Some(&p),
+                &[],
+                &[],
+                crate::config::Completeness::Enforce,
             )
             .unwrap_or_else(|e| panic!("profile {n} 必须可加载(全字段显式): {e}"));
         }
@@ -144,7 +154,10 @@ mod tests {
         let dir = profile_dir().expect("profiles 目录");
         for n in profile_names().iter().take(3) {
             let p = profile_path(n).expect("路径");
-            assert_eq!(p.parent().expect("父目录"), dir.canonicalize().unwrap_or(dir.clone()));
+            assert_eq!(
+                p.parent().expect("父目录"),
+                dir.canonicalize().unwrap_or(dir.clone())
+            );
         }
     }
 }

@@ -114,17 +114,12 @@ impl TierBudget {
 /// (`BudgetInputs.host_bytes`)必须**同源** —— 两处各算一遍必然漂,而漂了之后
 /// `Rel::open` 的交叉校验会把启动拒掉(好过静默两把尺)。
 ///
-/// 口径:`ram_pool_size` = KV 块腿的宿主分片,`snap_host_mb` = 状态腿(快照)分片;
-/// 两者之和 = store 的中层总账。磁盘层二期(恒 0)。
-pub fn tier_budget_of(
-    ram_pool_size: usize,
-    snap_host_mb: usize,
-    disk_pool_size: usize,
-    snap_disk_mb: usize,
-) -> TierBudget {
+/// 口径(2026-11-18 用户裁决):`ram_pool_size` / `disk_pool_size` 是**一层一个总池**，
+/// KV 与 GDN 快照共享；不再有 `snap_host_mb` / `snap_disk_mb` 预切分片。
+pub fn tier_budget_of(ram_pool_size: usize, disk_pool_size: usize) -> TierBudget {
     TierBudget {
-        host_bytes: (ram_pool_size + snap_host_mb) << 20,
-        disk_bytes: (disk_pool_size + snap_disk_mb) << 20,
+        host_bytes: ram_pool_size << 20,
+        disk_bytes: disk_pool_size << 20,
     }
 }
 
@@ -183,7 +178,11 @@ pub struct TierLedger {
 impl TierLedger {
     /// 构造(唯一入口:预算随账走 —— 不设全局态)。
     pub fn new(budget: TierBudget) -> Self {
-        Self { budget, cells: BTreeMap::new(), owners: BTreeMap::new() }
+        Self {
+            budget,
+            cells: BTreeMap::new(),
+            owners: BTreeMap::new(),
+        }
     }
 
     /// 预算(供报告/断言)。
@@ -422,7 +421,12 @@ impl TierLedger {
     pub fn report(&self) -> TierReport {
         let mut rows = Vec::new();
         for ((tier, kind), cell) in &self.cells {
-            rows.push(TierRow { tier: *tier, kind: *kind, bytes: cell.bytes, entries: cell.entries });
+            rows.push(TierRow {
+                tier: *tier,
+                kind: *kind,
+                bytes: cell.bytes,
+                entries: cell.entries,
+            });
         }
         TierReport {
             cells: rows,
@@ -480,7 +484,10 @@ mod tests {
     use super::*;
 
     fn ledger(host: usize) -> TierLedger {
-        TierLedger::new(TierBudget { host_bytes: host, disk_bytes: 0 })
+        TierLedger::new(TierBudget {
+            host_bytes: host,
+            disk_bytes: 0,
+        })
     }
 
     #[test]
@@ -500,7 +507,9 @@ mod tests {
     fn host_cap_is_enforced_loudly() {
         let mut l = ledger(1024);
         l.add(Tier::Host, AssetKind::KvBlock, 1024).expect("占满");
-        let err = l.add(Tier::Host, AssetKind::Snap, 1).expect_err("越界必须拒");
+        let err = l
+            .add(Tier::Host, AssetKind::Snap, 1)
+            .expect_err("越界必须拒");
         assert!(matches!(err, StoreError::Exhausted(_)), "得 {err:?}");
     }
 
@@ -508,14 +517,18 @@ mod tests {
     fn gpu_tier_is_not_capped_here() {
         // GPU 总量约束归 budget.rs(卡级预算分解),账本层不设上限
         let mut l = TierLedger::new(TierBudget::default());
-        l.add(Tier::Gpu, AssetKind::KvBlock, usize::MAX / 2).expect("GPU 无账本上限");
+        l.add(Tier::Gpu, AssetKind::KvBlock, usize::MAX / 2)
+            .expect("GPU 无账本上限");
     }
 
     /// **步 2 门 ①**:事件账与 store 账**同一本**(alloc→free 账平 + 登记清空)
     #[test]
     fn ledger_book_alloc_free_balances_same_book() {
         use owl_iface::handle::{AllocEvent, AllocLedger, AssetClass, FreeEvent, Owner as IfOwner};
-        let cell = shared_ledger(TierBudget { host_bytes: 1 << 20, disk_bytes: 0 });
+        let cell = shared_ledger(TierBudget {
+            host_bytes: 1 << 20,
+            disk_bytes: 0,
+        });
         let mut h = LedgerEntry { book: cell.clone() };
         h.on_alloc(&AllocEvent {
             id: 1,
@@ -547,8 +560,14 @@ mod tests {
     #[test]
     fn drain_owner_keeps_loan_when_account_is_missing() {
         use owl_iface::handle::{AllocEvent, AssetClass, Owner as IfOwner};
-        let cell = shared_ledger(TierBudget { host_bytes: 1 << 20, disk_bytes: 0 });
-        let mut b = LedgerBook::new(TierBudget { host_bytes: 1 << 20, disk_bytes: 0 });
+        let cell = shared_ledger(TierBudget {
+            host_bytes: 1 << 20,
+            disk_bytes: 0,
+        });
+        let mut b = LedgerBook::new(TierBudget {
+            host_bytes: 1 << 20,
+            disk_bytes: 0,
+        });
         b.on_alloc(&AllocEvent {
             id: 21,
             bytes: 4096,
@@ -573,7 +592,10 @@ mod tests {
     #[test]
     fn ledger_book_rejects_double_alloc_and_ghost_free() {
         use owl_iface::handle::{AllocEvent, AllocLedger, AssetClass, FreeEvent, Owner as IfOwner};
-        let cell = shared_ledger(TierBudget { host_bytes: 1 << 20, disk_bytes: 0 });
+        let cell = shared_ledger(TierBudget {
+            host_bytes: 1 << 20,
+            disk_bytes: 0,
+        });
         let mut h = LedgerEntry { book: cell.clone() };
         let ev = AllocEvent {
             id: 9,
@@ -588,7 +610,11 @@ mod tests {
         {
             let b = book_lock(&cell);
             assert_eq!(b.hook_fail(), 1, "双持必须计数");
-            assert_eq!(b.tiers().kind_bytes(Tier::Gpu, AssetKind::Elastic), 128, "只入账一次");
+            assert_eq!(
+                b.tiers().kind_bytes(Tier::Gpu, AssetKind::Elastic),
+                128,
+                "只入账一次"
+            );
         }
         h.on_free(&FreeEvent { id: 999, bytes: 0 }); // 幽灵
         let b = book_lock(&cell);
@@ -604,7 +630,10 @@ mod tests {
         use owl_iface::handle::{
             AllocEvent, AllocLedger, AssetClass, MoveDir, MoveEvent, Owner as IfOwner,
         };
-        let cell = shared_ledger(TierBudget { host_bytes: 1 << 20, disk_bytes: 0 });
+        let cell = shared_ledger(TierBudget {
+            host_bytes: 1 << 20,
+            disk_bytes: 0,
+        });
         let mut h = LedgerEntry { book: cell.clone() };
         h.on_alloc(&AllocEvent {
             id: 5,
@@ -614,12 +643,28 @@ mod tests {
             owner: IfOwner::Cache,
             rank: 0,
         });
-        h.on_move(&MoveEvent { id: 5, bytes: 8192, dir: MoveDir::Out });
+        h.on_move(&MoveEvent {
+            id: 5,
+            bytes: 8192,
+            dir: MoveDir::Out,
+        });
         {
             let b = book_lock(&cell);
-            assert_eq!(b.tiers().kind_bytes(Tier::Gpu, AssetKind::Snap), 0, "设备层已清");
-            assert_eq!(b.tiers().kind_bytes(Tier::Host, AssetKind::Snap), 8192, "宿主层在位");
-            assert_eq!(b.tiers().owner_bytes(IfOwner::Cache), 8192, "owner 不变(下沉≠归还)");
+            assert_eq!(
+                b.tiers().kind_bytes(Tier::Gpu, AssetKind::Snap),
+                0,
+                "设备层已清"
+            );
+            assert_eq!(
+                b.tiers().kind_bytes(Tier::Host, AssetKind::Snap),
+                8192,
+                "宿主层在位"
+            );
+            assert_eq!(
+                b.tiers().owner_bytes(IfOwner::Cache),
+                8192,
+                "owner 不变(下沉≠归还)"
+            );
             let rows = b.tiers().detail();
             assert_eq!(rows.len(), 1, "换层不多出一条:{rows:?}");
             assert_eq!(rows[0].entries, 1, "entries 跟着走");
@@ -627,15 +672,27 @@ mod tests {
             assert_eq!(b.hook_fail(), 0);
         }
         // 方向不符(Host 上再 Out)= 响亮拒
-        h.on_move(&MoveEvent { id: 5, bytes: 8192, dir: MoveDir::Out });
+        h.on_move(&MoveEvent {
+            id: 5,
+            bytes: 8192,
+            dir: MoveDir::Out,
+        });
         assert_eq!(book_lock(&cell).hook_fail(), 1, "方向不符必须计数");
         // **片级换层**(片和 ≠ 登记整块)= 口径不支持 ⇒ **跳过 + 单独计数**
         // (不是记账失败:`hook_fail` 必须恒 0 —— 2026-10-19 真机 4352 条噪声的定谳)
-        h.on_move(&MoveEvent { id: 5, bytes: 4096, dir: MoveDir::In });
+        h.on_move(&MoveEvent {
+            id: 5,
+            bytes: 4096,
+            dir: MoveDir::In,
+        });
         let b = book_lock(&cell);
         assert_eq!(b.hook_fail(), 1, "部分换层不得计为记账失败");
         assert_eq!(b.partial_moves(), 1, "片级换层单独计数");
-        assert_eq!(b.tiers().kind_bytes(Tier::Host, AssetKind::Snap), 8192, "账未被部分搬运搅动");
+        assert_eq!(
+            b.tiers().kind_bytes(Tier::Host, AssetKind::Snap),
+            8192,
+            "账未被部分搬运搅动"
+        );
     }
 
     /// **步 3 门 ⑥**:词表映射**全单射**(12 类 iface ↔ 12 类 store;无遗漏)
@@ -660,20 +717,30 @@ mod tests {
         let mut uniq = kinds.clone();
         uniq.sort_by_key(|k| format!("{k:?}"));
         uniq.dedup();
-        assert_eq!(uniq.len(), all.len(), "映射必须单射(两类别落同一 AssetKind = 记账混淆):{kinds:?}");
+        assert_eq!(
+            uniq.len(),
+            all.len(),
+            "映射必须单射(两类别落同一 AssetKind = 记账混淆):{kinds:?}"
+        );
         assert!(AssetKind::from(A::Weight).is_reserved(), "权重是常驻面");
         assert!(AssetKind::from(A::Pool).is_reserved(), "池骨架是常驻面");
-        assert!(!AssetKind::from(A::Unclassified).is_reserved(), "未分类不声称保留");
+        assert!(
+            !AssetKind::from(A::Unclassified).is_reserved(),
+            "未分类不声称保留"
+        );
     }
 
     /// **第 0 刀:owner 维**(每字节唯一归属;出账逐 owner 判,不替他人平账)
     #[test]
     fn owner_dimension_balances_and_rejects_cross_owner_release() {
         let mut l = ledger(1 << 20);
-        l.add_owned(Owner::Turn(7), Tier::Gpu, AssetKind::Elastic, 4096).expect("turn 入账");
-        l.add_owned(Owner::Cache, Tier::Gpu, AssetKind::KvBlock, 8192).expect("cache 入账");
+        l.add_owned(Owner::Turn(7), Tier::Gpu, AssetKind::Elastic, 4096)
+            .expect("turn 入账");
+        l.add_owned(Owner::Cache, Tier::Gpu, AssetKind::KvBlock, 8192)
+            .expect("cache 入账");
         // 存量入口落到 system(未接线桶)
-        l.add(Tier::Gpu, AssetKind::Floor, 1024).expect("system 入账");
+        l.add(Tier::Gpu, AssetKind::Floor, 1024)
+            .expect("system 入账");
         assert_eq!(l.owner_bytes(Owner::Turn(7)), 4096);
         assert_eq!(l.owner_bytes(Owner::Cache), 8192);
         assert_eq!(l.owner_bytes(Owner::System), 1024);
@@ -682,12 +749,17 @@ mod tests {
         assert_eq!(d[0].owner, Owner::Cache, "最大的排头:{d:?}");
         assert_eq!(d.iter().map(|r| r.bytes).sum::<usize>(), 4096 + 8192 + 1024);
         // 跨 owner 出账 = 不变量违反(响亮拒;不替别人平账)
-        let e = l.remove_owned(Owner::Turn(7), Tier::Gpu, AssetKind::KvBlock, 1).expect_err("跨 owner 必须拒");
+        let e = l
+            .remove_owned(Owner::Turn(7), Tier::Gpu, AssetKind::KvBlock, 1)
+            .expect_err("跨 owner 必须拒");
         assert!(matches!(e, StoreError::Invariant(_)), "得 {e:?}");
         // 本 owner 超发也拒
-        assert!(l.remove_owned(Owner::Turn(7), Tier::Gpu, AssetKind::Elastic, 8192).is_err());
+        assert!(l
+            .remove_owned(Owner::Turn(7), Tier::Gpu, AssetKind::Elastic, 8192)
+            .is_err());
         // 正常出账:两个账(分类 + owner)同步归零
-        l.remove_owned(Owner::Turn(7), Tier::Gpu, AssetKind::Elastic, 4096).expect("出账");
+        l.remove_owned(Owner::Turn(7), Tier::Gpu, AssetKind::Elastic, 4096)
+            .expect("出账");
         assert_eq!(l.owner_bytes(Owner::Turn(7)), 0);
         assert_eq!(l.kind_bytes(Tier::Gpu, AssetKind::Elastic), 0, "分类账同步");
         assert_eq!(l.used(Tier::Gpu), 8192 + 1024, "总量仍平");
@@ -773,7 +845,11 @@ impl LedgerBook {
 
     /// 某 owner 的出借字节(诊断面)。
     pub fn open_bytes(&self, owner: Owner) -> usize {
-        self.open.values().filter(|l| l.owner == owner).map(|l| l.bytes).sum()
+        self.open
+            .values()
+            .filter(|l| l.owner == owner)
+            .map(|l| l.bytes)
+            .sum()
     }
 
     /// **按块名前缀统计在借字节**(实测草稿权重等固定项;名称词表由调用方给)。
@@ -796,7 +872,9 @@ impl LedgerBook {
     pub fn open_rows(&self) -> Vec<EventRow> {
         let mut agg: BTreeMap<(u8, Owner, Tier, AssetKind), (usize, usize)> = BTreeMap::new();
         for l in self.open.values() {
-            let e = agg.entry((l.rank, l.owner, l.tier, l.kind)).or_insert((0, 0));
+            let e = agg
+                .entry((l.rank, l.owner, l.tier, l.kind))
+                .or_insert((0, 0));
             e.0 += l.bytes;
             e.1 += 1;
         }
@@ -812,7 +890,10 @@ impl LedgerBook {
             })
             .collect();
         rows.sort_by(|a, b| {
-            b.bytes.cmp(&a.bytes).then(a.rank.cmp(&b.rank)).then(a.owner.cmp(&b.owner))
+            b.bytes
+                .cmp(&a.bytes)
+                .then(a.rank.cmp(&b.rank))
+                .then(a.owner.cmp(&b.owner))
         });
         rows
     }
@@ -847,10 +928,7 @@ impl LedgerBook {
     /// `owner_filter`: `None` = 全部;`Some(f)` = 只留 `f(owner)` 为真的那些
     /// (报告面按需取 lifecycle 面 —— turn/session,即"本该在 N4/N5 归还"的那些)。
     /// 排序 = 点名 → owner → id(同名成组,便于"哪一处要的、要了几块")。
-    pub fn open_loans(
-        &self,
-        owner_filter: impl Fn(Owner) -> bool,
-    ) -> Vec<(u64, Loan)> {
+    pub fn open_loans(&self, owner_filter: impl Fn(Owner) -> bool) -> Vec<(u64, Loan)> {
         let mut out: Vec<(u64, Loan)> = self
             .open
             .iter()
@@ -898,9 +976,7 @@ impl LedgerBook {
             .open
             .iter()
             .filter(|(id, l)| {
-                l.owner == owner
-                    && rank.is_none_or(|r| l.rank == r)
-                    && !skip.contains(id)
+                l.owner == owner && rank.is_none_or(|r| l.rank == r) && !skip.contains(id)
             })
             .map(|(id, _)| *id)
             .collect();
@@ -956,7 +1032,10 @@ impl LedgerBook {
 
     /// 出借条目数(`None` = 全部)。
     pub fn open_count_rank(&self, rank: Option<u8>) -> usize {
-        self.open.values().filter(|l| rank.is_none_or(|r| l.rank == r)).count()
+        self.open
+            .values()
+            .filter(|l| rank.is_none_or(|r| l.rank == r))
+            .count()
     }
 
     fn fail(&mut self, what: &str, detail: String) {
@@ -973,7 +1052,10 @@ impl LedgerBook {
     /// 出借(登记 + 入账)。失败**响亮计数**,不 panic、不静默。
     pub fn on_alloc(&mut self, ev: &owl_iface::handle::AllocEvent) {
         if self.open.contains_key(&ev.id) {
-            self.fail("双持(同 id 重复 alloc)", format!("id={} name={}", ev.id, ev.name));
+            self.fail(
+                "双持(同 id 重复 alloc)",
+                format!("id={} name={}", ev.id, ev.name),
+            );
             return;
         }
         let kind = AssetKind::from(ev.class);
@@ -1042,7 +1124,10 @@ impl LedgerBook {
             (MoveDir::Out, Tier::Gpu) => Tier::Host,
             (MoveDir::In, Tier::Host) => Tier::Gpu,
             (d, t) => {
-                self.fail("换层方向与所在层不符", format!("id={} {d:?} from={t:?}", ev.id));
+                self.fail(
+                    "换层方向与所在层不符",
+                    format!("id={} {d:?} from={t:?}", ev.id),
+                );
                 return;
             }
         };

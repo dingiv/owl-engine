@@ -56,15 +56,16 @@ pub fn resolve_path(text_path: &Path, explicit: Option<&Path>) -> Result<PathBuf
         ))
     })?;
     let mut candidates = Vec::new();
-    let rd = owl_shared::file_loader::read_dir(dir).map_err(|e| {
-        ModelError::Msg(format!("GGUF 视觉塔:列目录 {} 失败: {e}", dir.display()))
-    })?;
+    let rd = owl_shared::file_loader::read_dir(dir)
+        .map_err(|e| ModelError::Msg(format!("GGUF 视觉塔:列目录 {} 失败: {e}", dir.display())))?;
     for entry in rd {
         let entry = entry.map_err(|e| {
             ModelError::Msg(format!("GGUF 视觉塔:读目录项 {} 失败: {e}", dir.display()))
         })?;
         let p = entry.path();
-        let Some(name) = p.file_name().and_then(|s| s.to_str()) else { continue };
+        let Some(name) = p.file_name().and_then(|s| s.to_str()) else {
+            continue;
+        };
         if name.starts_with("mmproj") && name.ends_with(".gguf") && p.is_file() {
             candidates.push(p);
         }
@@ -92,15 +93,23 @@ pub fn resolve_path(text_path: &Path, explicit: Option<&Path>) -> Result<PathBuf
 /// mmproj 的视觉超参(唯一入口;缺键/形态不符 = 响亮拒)
 pub fn vision_cfg(g: &Gguf) -> Result<VisionCfg, ModelError> {
     let ctx = |m: String| ModelError::Msg(format!("gguf mmproj({}): {m}", g.path.display()));
-    let arch = g.arch().map_err(|e| ModelError::Msg(format!("gguf mmproj: {e}")))?;
+    let arch = g
+        .arch()
+        .map_err(|e| ModelError::Msg(format!("gguf mmproj: {e}")))?;
     if arch != "clip" {
         return Err(ctx(format!(
             "general.architecture = `{arch}`,期望 `clip`(这不是 mmproj?)"
         )));
     }
     let kv = &g.kv;
-    if !kv.opt_bool("clip.has_vision_encoder").map_err(&ctx)?.unwrap_or(false) {
-        return Err(ctx("clip.has_vision_encoder 不为 true(没有视觉编码器)".into()));
+    if !kv
+        .opt_bool("clip.has_vision_encoder")
+        .map_err(&ctx)?
+        .unwrap_or(false)
+    {
+        return Err(ctx(
+            "clip.has_vision_encoder 不为 true(没有视觉编码器)".into()
+        ));
     }
     let proj = kv.str("clip.projector_type").map_err(&ctx)?;
     if proj != "qwen3vl_merger" {
@@ -134,7 +143,10 @@ pub fn vision_cfg(g: &Gguf) -> Result<VisionCfg, ModelError> {
         .unwrap_or(1e-6);
     // 预处理面(`vlm::preprocess`,2026-11-16 P5 从 server 迁入)固定 mean/std=0.5;mmproj 若声明别的值,
     // 塔的输入分布就不成立 —— 装载期拒,别让服务面静默错值。
-    for (key, want) in [("clip.vision.image_mean", 0.5f32), ("clip.vision.image_std", 0.5f32)] {
+    for (key, want) in [
+        ("clip.vision.image_mean", 0.5f32),
+        ("clip.vision.image_std", 0.5f32),
+    ] {
         if let Some(v) = kv.opt_f32s(key).map_err(&ctx)? {
             if v.iter().any(|x| (*x - want).abs() > 1e-6) {
                 return Err(ctx(format!(
@@ -243,7 +255,11 @@ impl MmprojSource {
     /// 从已解析容器构造(避免二次 mmap;loader 与 `vision_cfg` 共用同一份)
     pub fn from_gguf(g: Gguf) -> Result<Self, ModelError> {
         let cfg = vision_cfg(&g)?;
-        Ok(Self { g, cfg, cache: Mutex::new(HashMap::new()) })
+        Ok(Self {
+            g,
+            cfg,
+            cache: Mutex::new(HashMap::new()),
+        })
     }
 
     pub fn vision_cfg(&self) -> VisionCfg {
@@ -279,15 +295,15 @@ impl MmprojSource {
         if !fixed.is_empty() {
             return Ok(fixed.to_string());
         }
-        let blk = rest.strip_prefix("blocks.").ok_or_else(|| {
-            ModelError::Msg(format!("mmproj 源:未映射的塔键 `{key}`"))
-        })?;
-        let (idx, sub) = blk.split_once('.').ok_or_else(|| {
-            ModelError::Msg(format!("mmproj 源:块键缺局部名 `{key}`"))
-        })?;
-        let idx: usize = idx.parse().map_err(|_| {
-            ModelError::Msg(format!("mmproj 源:块号不是整数 `{key}`"))
-        })?;
+        let blk = rest
+            .strip_prefix("blocks.")
+            .ok_or_else(|| ModelError::Msg(format!("mmproj 源:未映射的塔键 `{key}`")))?;
+        let (idx, sub) = blk
+            .split_once('.')
+            .ok_or_else(|| ModelError::Msg(format!("mmproj 源:块键缺局部名 `{key}`")))?;
+        let idx: usize = idx
+            .parse()
+            .map_err(|_| ModelError::Msg(format!("mmproj 源:块号不是整数 `{key}`")))?;
         let local = match sub {
             "norm1.weight" => "ln1.weight",
             "norm1.bias" => "ln1.bias",
@@ -311,10 +327,13 @@ impl MmprojSource {
     }
 
     fn dequant(&self, phys: &str, rows: usize, inner: usize) -> Taken<Vec<f32>> {
-        let Some(t) = self.g.get_tensor(phys) else { return Ok(None) };
-        let ix = self.g.index_of(phys).ok_or_else(|| {
-            ModelError::Msg(format!("mmproj 源:张量 `{phys}` 无索引"))
-        })?;
+        let Some(t) = self.g.get_tensor(phys) else {
+            return Ok(None);
+        };
+        let ix = self
+            .g
+            .index_of(phys)
+            .ok_or_else(|| ModelError::Msg(format!("mmproj 源:张量 `{phys}` 无索引")))?;
         dequant_all(t.ty, self.g.bytes(ix), rows, inner)
             .map(Some)
             .map_err(|e| ModelError::Msg(format!("mmproj 解量化 `{phys}`: {e}")))
@@ -392,7 +411,9 @@ impl WeightSource for MmprojSource {
 
     fn elem_len(&self, key: &str) -> Taken<usize> {
         if Self::is_patch_weight(key) {
-            let Some(t) = self.g.get_tensor("v.patch_embd.weight") else { return Ok(None) };
+            let Some(t) = self.g.get_tensor("v.patch_embd.weight") else {
+                return Ok(None);
+            };
             if t.ne.len() != 4 {
                 return Err(ModelError::Msg(format!(
                     "mmproj patch_embd:ne={:?} 不是 4 维",
@@ -422,8 +443,12 @@ impl WeightSource for MmprojSource {
         dtype: crate::contract::Dtype,
     ) -> Taken<()> {
         use crate::contract::Dtype;
-        let Some(v) = self.load(key)? else { return Ok(None) };
-        let Some(slice) = v.get(offset..offset + len) else { return Ok(None) };
+        let Some(v) = self.load(key)? else {
+            return Ok(None);
+        };
+        let Some(slice) = v.get(offset..offset + len) else {
+            return Ok(None);
+        };
         let esz = match dtype {
             Dtype::F32 => 4,
             Dtype::F16 | Dtype::BF16 => 2,
@@ -443,10 +468,12 @@ impl WeightSource for MmprojSource {
         for (i, x) in slice.iter().enumerate() {
             match dtype {
                 Dtype::F32 => dst[i * 4..i * 4 + 4].copy_from_slice(&x.to_le_bytes()),
-                Dtype::F16 => dst[i * 2..i * 2 + 2]
-                    .copy_from_slice(&half::f16::from_f32(*x).to_le_bytes()),
-                Dtype::BF16 => dst[i * 2..i * 2 + 2]
-                    .copy_from_slice(&half::bf16::from_f32(*x).to_le_bytes()),
+                Dtype::F16 => {
+                    dst[i * 2..i * 2 + 2].copy_from_slice(&half::f16::from_f32(*x).to_le_bytes())
+                }
+                Dtype::BF16 => {
+                    dst[i * 2..i * 2 + 2].copy_from_slice(&half::bf16::from_f32(*x).to_le_bytes())
+                }
                 _ => unreachable!("上方已筛"),
             }
         }
@@ -475,7 +502,9 @@ mod tests {
                 if let Ok(rd) = owl_shared::file_loader::read_dir(dir) {
                     for e in rd.flatten() {
                         let p = e.path();
-                        let Some(n) = p.file_name().and_then(|s| s.to_str()) else { continue };
+                        let Some(n) = p.file_name().and_then(|s| s.to_str()) else {
+                            continue;
+                        };
                         if n.starts_with("mmproj") && n.ends_with(".gguf") {
                             hit = Some(p);
                             break;
@@ -496,7 +525,10 @@ mod tests {
         let Some(path) = mmproj_path(
             "mmproj:4b",
             "gguf:4b",
-            concat!(env!("CARGO_MANIFEST_DIR"), "/../../models/bartowski/Qwen_Qwen3.5-4B-GGUF/mmproj-Qwen_Qwen3.5-4B-f16.gguf"),
+            concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/../../models/bartowski/Qwen_Qwen3.5-4B-GGUF/mmproj-Qwen_Qwen3.5-4B-f16.gguf"
+            ),
         ) else {
             owl_shared::testkit::report::skip("4B mmproj 不在");
             return;
@@ -509,7 +541,10 @@ mod tests {
         assert_eq!(cfg.heads, 16, "4B 塔 heads");
         assert_eq!(cfg.out_hidden, 2560, "4B 塔 out");
         assert_eq!(cfg.num_pos, 2304, "position 表行数");
-        assert_eq!((cfg.patch, cfg.temporal, cfg.merge, cfg.in_channels), (16, 2, 2, 3));
+        assert_eq!(
+            (cfg.patch, cfg.temporal, cfg.merge, cfg.in_channels),
+            (16, 2, 2, 3)
+        );
         assert!((cfg.eps - 1e-6).abs() < 1e-9, "eps");
     }
 
@@ -518,7 +553,10 @@ mod tests {
         let Some(path) = mmproj_path(
             "mmproj:27b",
             "gguf:27b",
-            concat!(env!("CARGO_MANIFEST_DIR"), "/../../models/ggml-org/Qwen3.8-27B-GGUF/mmproj-Qwen3.8-27B-Q8_0.gguf"),
+            concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/../../models/ggml-org/Qwen3.8-27B-GGUF/mmproj-Qwen3.8-27B-Q8_0.gguf"
+            ),
         ) else {
             owl_shared::testkit::report::skip("27B mmproj 不在");
             return;
@@ -530,7 +568,10 @@ mod tests {
         assert_eq!(cfg.intermediate, 4304, "27B 塔 ffn");
         assert_eq!(cfg.out_hidden, 5120, "27B 塔 out");
         assert_eq!(cfg.num_pos, 2304, "position 表行数");
-        assert_eq!((cfg.patch, cfg.temporal, cfg.merge, cfg.in_channels), (16, 2, 2, 3));
+        assert_eq!(
+            (cfg.patch, cfg.temporal, cfg.merge, cfg.in_channels),
+            (16, 2, 2, 3)
+        );
     }
 
     #[test]
@@ -538,7 +579,10 @@ mod tests {
         let Some(path) = mmproj_path(
             "mmproj:27b",
             "gguf:27b",
-            concat!(env!("CARGO_MANIFEST_DIR"), "/../../models/ggml-org/Qwen3.8-27B-GGUF/mmproj-Qwen3.8-27B-Q8_0.gguf"),
+            concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/../../models/ggml-org/Qwen3.8-27B-GGUF/mmproj-Qwen3.8-27B-Q8_0.gguf"
+            ),
         ) else {
             owl_shared::testkit::report::skip("27B mmproj 不在");
             return;
@@ -559,18 +603,26 @@ mod tests {
         let Some(path) = mmproj_path(
             "mmproj:4b",
             "gguf:4b",
-            concat!(env!("CARGO_MANIFEST_DIR"), "/../../models/bartowski/Qwen_Qwen3.5-4B-GGUF/mmproj-Qwen_Qwen3.5-4B-f16.gguf"),
+            concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/../../models/bartowski/Qwen_Qwen3.5-4B-GGUF/mmproj-Qwen_Qwen3.5-4B-f16.gguf"
+            ),
         ) else {
             owl_shared::testkit::report::skip("4B mmproj 不在");
             return;
         };
         let src = MmprojSource::open(&path).expect("source");
         let tower = VisionTower::new(src.vision_cfg());
-        let ctx = LoaderCtx { dtype: Dtype::F16, ..Default::default() };
+        let ctx = LoaderCtx {
+            dtype: Dtype::F16,
+            ..Default::default()
+        };
         let ops = tower.layout(&ctx);
         for w in ops.wants() {
             let n: usize = w.shape.iter().product();
-            let got = src.elem_len(&w.key).unwrap_or_else(|e| panic!("{}: {e}", w.key));
+            let got = src
+                .elem_len(&w.key)
+                .unwrap_or_else(|e| panic!("{}: {e}", w.key));
             assert_eq!(got, Some(n), "键 `{}` 元素数/形状不符", w.key);
         }
         // patch 是唯一双时间片合成键:取一次验长度,防止 elem_len 只报单片的回归

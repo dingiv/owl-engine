@@ -423,8 +423,11 @@ pub(crate) struct ActiveTurn {
     /// 首 token 的墙钟毫秒(`now_ms()`;`None` = 还没产出 token)。
     pub(crate) first_token_ms: Option<u64>,
     /// **首 token 期限**（起跑时按新增 token 估；见 `crate::ttft_gate`）。
-    /// 到点仍无 `first_token_ms` ⇒ 泵循环强停该 turn（与客户端 cancel 同路径）。
+    /// 到点仍无 `first_token_ms` ⇒ 按 `[runtime] ttft_on_expire` 处置
+    /// （stop 强停 / warn 仅告警 / ignore 静默继续）。
     pub(crate) ttft_budget_ms: u64,
+    /// **已对本次超期打过 WARN**（`warn` 档只打一次，避免泵每拍刷屏）。
+    pub(crate) ttft_warned: bool,
     pub(crate) out: Vec<u32>,
     /// KV/prompt 推进指针(turn 起点由内容树命中面/历史决定 = 增量 prefill)
     pub(crate) fed: usize,
@@ -577,6 +580,8 @@ pub(crate) struct TtftExpired {
     pub(crate) new_tokens: usize,
     pub(crate) prompt_tokens: usize,
     pub(crate) cached_tokens: usize,
+    /// 本 turn 是否已打过 TTFT WARN（`warn` 档去重）。
+    pub(crate) warned: bool,
 }
 
 impl TurnLedger {
@@ -599,9 +604,20 @@ impl TurnLedger {
                     new_tokens: crate::ttft_gate::new_tokens(a.prompt_ids.len(), a.cached_start),
                     prompt_tokens: a.prompt_ids.len(),
                     cached_tokens: a.cached_start,
+                    warned: a.ttft_warned,
                 })
             })
             .collect()
+    }
+
+    /// **标记本 turn 的 TTFT WARN 已发出**（`warn` 档去重；纯账）。
+    /// 返回 `false` = turn 已不在活跃集（正常终态/取消）。
+    pub(crate) fn mark_ttft_warned(&mut self, turn: u64) -> bool {
+        let Some(a) = self.active.iter_mut().find(|a| a.id == turn) else {
+            return false;
+        };
+        a.ttft_warned = true;
+        true
     }
 
     /// **活跃 turn**(显式 `Result`;2026-10-17 用户裁决:引擎内部不变量失守

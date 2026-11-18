@@ -251,8 +251,28 @@ impl BlockLeg {
     /// (同一 slot 号在两侧池里有同形页)⇒ 一条链只能有一个宿主席位;
     /// 用槽内平面区分 rank,账仍然一本(预算 = 两 rank 合计)。
     pub fn open_planes(cfg: LegConfig, planes: usize) -> StoreResult<Self> {
+        Self::open_planes_inner(cfg, planes, None)
+    }
+
+    /// **共享宿主档开腿**：`host_bytes` 仍是总预算（`cfg.host_bytes` 必须 ≤ 总账），
+    /// 真实占用记在 `shared` 这一本跨腿账上。
+    pub fn open_planes_shared(
+        cfg: LegConfig,
+        planes: usize,
+        shared: crate::shared_budget::SharedTierBudgetRef,
+    ) -> StoreResult<Self> {
+        Self::open_planes_inner(cfg, planes, Some(shared))
+    }
+
+    fn open_planes_inner(
+        cfg: LegConfig,
+        planes: usize,
+        shared: Option<crate::shared_budget::SharedTierBudgetRef>,
+    ) -> StoreResult<Self> {
         if planes == 0 {
-            return Err(StoreError::Invariant("宿主腿平面数为 0(TP world 至少 1)".into()));
+            return Err(StoreError::Invariant(
+                "宿主腿平面数为 0(TP world 至少 1)".into(),
+            ));
         }
         if cfg.block_tokens == 0 || cfg.block_bytes == 0 {
             return Err(StoreError::Invariant(format!(
@@ -286,7 +306,10 @@ impl BlockLeg {
                     }
                 },
             ),
-            host: HostTier::new(cfg.block_bytes.saturating_mul(planes), cfg.host_bytes)?,
+            host: match shared {
+                Some(b) => HostTier::new_shared(cfg.block_bytes.saturating_mul(planes), b)?,
+                None => HostTier::new(cfg.block_bytes.saturating_mul(planes), cfg.host_bytes)?,
+            },
             layout: None,
             layout_peer: None,
             ops: LegOps::default(),
@@ -325,7 +348,11 @@ impl BlockLeg {
 
     /// 某平面的片规格(0 = 本 rank;>0 = peer)。
     fn pieces_at(&self, plane: usize) -> StoreResult<&[PieceSpec]> {
-        let l = if plane == 0 { self.layout.as_ref() } else { self.layout_peer.as_ref() };
+        let l = if plane == 0 {
+            self.layout.as_ref()
+        } else {
+            self.layout_peer.as_ref()
+        };
         let l = l.ok_or_else(|| {
             StoreError::Invariant(format!(
                 "块腿平面 {plane} 的池布局未注册(TP 档 engine 必须调 attach_pool_peer)"
@@ -397,7 +424,11 @@ impl BlockLeg {
         }
         let slots: Vec<Option<u32>> = pm.blocks.iter().map(|b| b.slot).collect();
         let hashes = pm.blocks.iter().map(|b| b.chain).collect();
-        Ok(ChainHit { matched_blocks: pm.matched_blocks, slots, hashes })
+        Ok(ChainHit {
+            matched_blocks: pm.matched_blocks,
+            slots,
+            hashes,
+        })
     }
 
     /// 块表增长（**纯分配**；腾位已归 engine 的 `StoreHook::Acquire(Grow)`）。
@@ -405,10 +436,12 @@ impl BlockLeg {
     /// 池不足 ⇒ 响亮 `Exhausted`（带链名）；不再逐缓存、不再丢宿主副本。
     /// `ops.ensure_evicted` 因此应恒为 0；非零 = 同步驱逐回归。
     pub fn ensure_for_len(&mut self, table: &mut Vec<u32>, target_len: usize) -> StoreResult<()> {
-        self.kv.ensure_for_len(table, target_len).map_err(|e| match e {
-            StoreError::Exhausted(m) => StoreError::Exhausted(format!("{} 链:{m}", self.label)),
-            other => other,
-        })
+        self.kv
+            .ensure_for_len(table, target_len)
+            .map_err(|e| match e {
+                StoreError::Exhausted(m) => StoreError::Exhausted(format!("{} 链:{m}", self.label)),
+                other => other,
+            })
     }
 
     /// 压力驱逐产出宿主条目 = 内容整体淘汰:把宿主副本**真的丢掉**(S3-3b 宿主面在位)。
@@ -575,11 +608,12 @@ impl BlockLeg {
     /// world 倍** ⇒ 计划按"有位"出票、`lend_slots` 走到一半才撞 `Exhausted`
     /// (双卡 1M 后第二个长 turn 的硬错就是这样来的,§23.11)。
     pub fn host_free_slots(&self) -> usize {
-        let used = self.host.used_bytes() + self.host.free_bytes();
-        self.host
-            .budget_bytes()
-            .saturating_sub(used)
-            / self.host.block_bytes().max(1)
+        self.host.free_slots()
+    }
+
+    /// **释放本腿的空转缓冲**（跨腿让位；共享档会把预算真正还给总账）。
+    pub fn host_drop_free(&mut self) {
+        self.host.drop_free();
     }
 
     /// **宿主让位计数**(执行面兜底真删的块数;>0 = 计划面曾乐观/滞后)。
@@ -603,6 +637,11 @@ impl BlockLeg {
             .budget_bytes()
             .checked_div(self.host.block_bytes().max(1))
             .unwrap_or(0)
+    }
+
+    /// 共享宿主预算句柄（`None` = 本腿独占）。
+    pub fn shared_host_budget(&self) -> Option<&crate::shared_budget::SharedTierBudgetRef> {
+        self.host.shared_budget()
     }
 
     /// 宿主层**空转缓冲**字节(真实 RAM;报告必须算上 —— 已 acquire 未 put 的池租约)。
@@ -668,14 +707,20 @@ impl BlockLeg {
         session: u64,
         tags: &[crate::kv::BlockTag],
     ) -> StoreResult<CacheUpdate> {
-        let up = self.kv.register_chain_owned_tagged(tokens, table, session, tags)?;
+        let up = self
+            .kv
+            .register_chain_owned_tagged(tokens, table, session, tags)?;
         self.finish_tree_update(&up)?;
         Ok(up)
     }
 
     /// **整链块身份**(从根到 `tail`;S6.1 的"整链溢写"与磁盘回填都用它)。
     pub fn chain_blocks(&self, tail: ChainHash) -> Vec<ChainHash> {
-        self.kv.chain_of(tail).into_iter().map(|b| b.chain).collect()
+        self.kv
+            .chain_of(tail)
+            .into_iter()
+            .map(|b| b.chain)
+            .collect()
     }
 
     /// **整链在宿主层的块数**(轮 1.5 的"整链搬盘"判据;0 = 链不在宿主)。
@@ -848,7 +893,9 @@ impl BlockLeg {
         let mut got = 0usize;
         for c in leaves {
             let Some(tail) = c.chain else { continue };
-            let Some(dev_blocks) = self.kv.chain_down_span(tail) else { continue };
+            let Some(dev_blocks) = self.kv.chain_down_span(tail) else {
+                continue;
+            };
             let chain = self.kv.chain_of(tail);
             let head = chain.first().map(|b| b.chain).unwrap_or(tail);
             out.push(ChainCand {
@@ -929,7 +976,10 @@ impl BlockLeg {
 
     /// 归还会话块表。
     /// **无设备绑定的链登记**(S6.1:启动按盘上索引重建树)。
-    pub fn register_chain_offloaded(&mut self, tokens: &[u32]) -> StoreResult<Vec<crate::id::ChainHash>> {
+    pub fn register_chain_offloaded(
+        &mut self,
+        tokens: &[u32],
+    ) -> StoreResult<Vec<crate::id::ChainHash>> {
         self.register_chain_offloaded_tagged(tokens, &[])
     }
 
@@ -1087,9 +1137,7 @@ impl BlockLeg {
             .as_ref()
             .map(|l| l.pieces.as_slice())
             .ok_or_else(|| {
-                StoreError::Invariant(
-                    "块腿未注册池布局(engine 应在 boot 调 attach_pool)".into(),
-                )
+                StoreError::Invariant("块腿未注册池布局(engine 应在 boot 调 attach_pool)".into())
             })
     }
 }
@@ -1162,10 +1210,7 @@ pub struct OutPlan {
 ///
 /// 纯 host(算片 + 借台);无票块**不影响**有票块;全无票 ⇒ `blocks` 为空、
 /// 不借宿主台(调用方零副作用即可早退)。
-pub fn plan_offload_blocks(
-    leg: &mut BlockLeg,
-    chains: &[ChainHash],
-) -> StoreResult<BlockOutPlan> {
+pub fn plan_offload_blocks(leg: &mut BlockLeg, chains: &[ChainHash]) -> StoreResult<BlockOutPlan> {
     leg.pieces()?; // 未注册布局 = 先拒
     let mut blocks: Vec<(ChainHash, u32)> = Vec::new();
     let mut skipped: Vec<(ChainHash, SkipWhy)> = Vec::new();
@@ -1196,7 +1241,12 @@ pub fn plan_offload_blocks(
     let pieces = (0..leg.planes)
         .map(|p| out_pieces(leg, &blocks, p))
         .collect::<StoreResult<Vec<_>>>()?;
-    Ok(BlockOutPlan { blocks, pieces, table: SlotTable::new(bufs), skipped })
+    Ok(BlockOutPlan {
+        blocks,
+        pieces,
+        table: SlotTable::new(bufs),
+        skipped,
+    })
 }
 
 /// **宿主占位符**(B-3e-2):会话块表里表示"该块内容在宿主层、无设备槽"的哨兵。
@@ -1343,9 +1393,12 @@ pub struct InPlan {
 
 /// 回执取回槽台(单主语义:命令把 connector 原箱奉还;类型不符 = 响亮拒)。
 pub fn reclaim_slot_table(conn: Box<dyn Connector + Send>) -> StoreResult<SlotTable> {
-    conn.unbox().downcast::<SlotTable>().map(|b| *b).map_err(|_| {
-        StoreError::Invariant("swap 回执的连接器不是 SlotTable(实现面自洽性违约)".into())
-    })
+    conn.unbox()
+        .downcast::<SlotTable>()
+        .map(|b| *b)
+        .map_err(|_| {
+            StoreError::Invariant("swap 回执的连接器不是 SlotTable(实现面自洽性违约)".into())
+        })
 }
 
 /// **换出计划**:整条链(§14.6 粒度律)—— 先整条校验(`chain_down_span`)再算片;
@@ -1372,7 +1425,11 @@ pub fn plan_offload(leg: &mut BlockLeg, tail: ChainHash) -> StoreResult<OutPlan>
     let pieces = (0..leg.planes)
         .map(|p| out_pieces(leg, &blocks, p))
         .collect::<StoreResult<Vec<_>>>()?;
-    Ok(OutPlan { blocks, pieces, table: SlotTable::new(bufs) })
+    Ok(OutPlan {
+        blocks,
+        pieces,
+        table: SlotTable::new(bufs),
+    })
 }
 
 /// **换出记账**(搬运成功后调用;纯 host):内容装回宿主层 + 摘绑定还槽 + 计数。
@@ -1382,8 +1439,11 @@ pub fn commit_offload(
     table: SlotTable,
 ) -> StoreResult<usize> {
     let n = blocks.len();
-    let items: Vec<(ChainHash, HostBlock)> =
-        blocks.iter().map(|(c, _)| *c).zip(table.into_slots()).collect();
+    let items: Vec<(ChainHash, HostBlock)> = blocks
+        .iter()
+        .map(|(c, _)| *c)
+        .zip(table.into_slots())
+        .collect();
     // **活性兜底（W2, 2026-10-28）**：宿主预算被**别的会话 / 在飞批次**占满时，
     // `land` 会以「宿主层越界 …（需先驱逐）」响亮拒 ⇒ 整发 500（实测现场 = 255k
     // 会话第 2 轮追加，过账 16 MiB）。
@@ -1394,10 +1454,7 @@ pub fn commit_offload(
     // ⇒ 落地前**再问一次**，越界就按与 `plan_capacity` **同一条政策**先逐最冷
     // （保护本批链：它们的内容马上要落宿主，让位不能反手删掉已在宿主的那几块），
     // 然后照常落。没有可削的面时仍由 `land` 响亮拒（不静默）。
-    let fresh = items
-        .iter()
-        .filter(|(c, _)| !leg.host_contains(*c))
-        .count();
+    let fresh = items.iter().filter(|(c, _)| !leg.host_contains(*c)).count();
     let deficit = leg.host.land_deficit(fresh, items.len());
     if deficit > 0 {
         let protect: Vec<ChainHash> = blocks.iter().map(|(c, _)| *c).collect();
@@ -1486,7 +1543,12 @@ pub fn plan_onload(leg: &mut BlockLeg, chains: &[ChainHash]) -> StoreResult<InPl
             return Err(e);
         }
     };
-    Ok(InPlan { chains: chains.to_vec(), slots, pieces, table: SlotTable::new(bufs) })
+    Ok(InPlan {
+        chains: chains.to_vec(),
+        slots,
+        pieces,
+        table: SlotTable::new(bufs),
+    })
 }
 
 /// 回灌计划失败时把**已取出的宿主内容原样放回**。
@@ -1602,7 +1664,11 @@ mod tests {
     /// **测试侧编排**(模拟 engine):取计划 → `face.swap` → 回执 → 记账。
     /// 生产里这段编排在 engine(§21);store 侧只出计划与记账 —— 这里替身是为了
     /// 让 store 的搬运闭环仍能在**无 engine** 下测到端到端。
-    async fn do_offload(leg: &mut BlockLeg, face: &mut CpuFace, tail: ChainHash) -> StoreResult<usize> {
+    async fn do_offload(
+        leg: &mut BlockLeg,
+        face: &mut CpuFace,
+        tail: ChainHash,
+    ) -> StoreResult<usize> {
         let (blocks, pieces, table) = {
             let p = plan_offload(leg, tail)?;
             (p.blocks, p.pieces, p.table)
@@ -1616,7 +1682,11 @@ mod tests {
     }
 
     /// 同上:回灌一条命令。
-    async fn do_onload(leg: &mut BlockLeg, face: &mut CpuFace, chains: &[ChainHash]) -> StoreResult<Vec<u32>> {
+    async fn do_onload(
+        leg: &mut BlockLeg,
+        face: &mut CpuFace,
+        chains: &[ChainHash],
+    ) -> StoreResult<Vec<u32>> {
         let (cs, slots, pieces, table) = {
             let p = plan_onload(leg, chains)?;
             (p.chains, p.slots, p.pieces, p.table)
@@ -1636,8 +1706,14 @@ mod tests {
     async fn pieces_n(face: &mut CpuFace, slots: usize) -> Vec<PieceSpec> {
         let mut out = Vec::new();
         for _ in 0..2 {
-            let b = face.alloc(Dtype::F32, PIECE_ELEMS * slots, "t").await.expect("池块");
-            out.push(PieceSpec { buf: b, stride_bytes: PAGE_BYTES });
+            let b = face
+                .alloc(Dtype::F32, PIECE_ELEMS * slots, "t")
+                .await
+                .expect("池块");
+            out.push(PieceSpec {
+                buf: b,
+                stride_bytes: PAGE_BYTES,
+            });
         }
         out
     }
@@ -1664,7 +1740,9 @@ mod tests {
     /// 这是**测试编排**（模拟 engine 的 I/O 执行面）；生产 store 不认 `DeviceClient`。
     async fn seed_slot(face: &mut CpuFace, pieces: &[PieceSpec], slot: u32, seed: u8) {
         for p in pieces {
-            let pat: Vec<u8> = (0..p.stride_bytes).map(|i| seed.wrapping_add(i as u8)).collect();
+            let pat: Vec<u8> = (0..p.stride_bytes)
+                .map(|i| seed.wrapping_add(i as u8))
+                .collect();
             let off = slot as usize * p.stride_bytes;
             let mut lease = face
                 .alloc_pinned(pat.len(), "store:test-seed")
@@ -1706,11 +1784,18 @@ mod tests {
         .expect("未启用腿可开");
         let mut t = Vec::new();
         assert!(
-            matches!(off.ensure_for_len(&mut t, 32), Err(StoreError::Exhausted(_))),
+            matches!(
+                off.ensure_for_len(&mut t, 32),
+                Err(StoreError::Exhausted(_))
+            ),
             "零槽腿误用必须响亮拒"
         );
         let mut l = leg();
-        let bad = PoolLayout { class: BlockClass::KvPage, epoch: 1, pieces: vec![] };
+        let bad = PoolLayout {
+            class: BlockClass::KvPage,
+            epoch: 1,
+            pieces: vec![],
+        };
         assert!(l.attach_pool(bad).is_err(), "空布局(0 字节)必须拒");
         assert!(l.layout_epoch().is_none());
     }
@@ -1720,7 +1805,15 @@ mod tests {
         let mut face = CpuFace::default();
         let pieces = pieces_n(&mut face, 2).await;
         let mut l = leg();
-        assert_eq!(l.attach_pool(PoolLayout { class: BlockClass::KvPage, epoch: 7, pieces: pieces.clone() }).expect("注册"), 7);
+        assert_eq!(
+            l.attach_pool(PoolLayout {
+                class: BlockClass::KvPage,
+                epoch: 7,
+                pieces: pieces.clone()
+            })
+            .expect("注册"),
+            7
+        );
         assert_eq!(l.layout_epoch(), Some(7));
 
         // 建一条链(两页 ⇒ 槽 0/1),登记缓存后释放会话引用 ⇒ 缓存独占(可换出)
@@ -1729,7 +1822,10 @@ mod tests {
         l.ensure_for_len(&mut table, 64).expect("块表");
         l.register_chain(&tokens, &table).expect("登记");
         let hit = l.match_prefix(&tokens).expect("命中");
-        assert_eq!((hit.matched_blocks, hit.slots.len(), hit.hashes.len()), (2, 2, 2));
+        assert_eq!(
+            (hit.matched_blocks, hit.slots.len(), hit.hashes.len()),
+            (2, 2, 2)
+        );
         let tail = hit.hashes[1];
         let tail_slot = hit.slots[1].expect("尾块在设备上");
         l.release_table(&mut table).expect("会话归还");
@@ -1744,16 +1840,26 @@ mod tests {
         // 新 API 是**链级**下沉(§14.6):tail 一站 ⇒ 整条链(2 块 = 4 片段)全部进宿主。
         assert_eq!(real(rep.host_bytes), PAGE_BYTES * 4, "宿主应持整条链(2 块)");
         assert_eq!(rep.slots_free, free_before + 2, "摘绑定 ⇒ 两槽回池");
-        assert_eq!(l.carrier_of(tail).expect("在账"), Carrier::Host, "载体 = 宿主");
+        assert_eq!(
+            l.carrier_of(tail).expect("在账"),
+            Carrier::Host,
+            "载体 = 宿主"
+        );
         // S3-3b:宿主格命中**不再整条拒** —— 命中面逐块给出载体,engine 段边界回灌
         let h2 = l.match_prefix(&tokens).expect("宿主格也可命中");
         assert_eq!(h2.matched_blocks, 2, "内容仍在(只是载体在宿主)");
         assert_eq!(h2.slots[1], None, "尾块在宿主层");
         assert!(!h2.all_resident(), "整条未全驻留");
-        assert_eq!(h2.pending_host(), vec![hit.hashes[0], tail], "整条链待回灌(链头段在内)");
+        assert_eq!(
+            h2.pending_host(),
+            vec![hit.hashes[0], tail],
+            "整条链待回灌(链头段在内)"
+        );
 
         // 换回:整条链回到设备(host 只留 0)
-        let back = do_onload(&mut l, &mut face, &h2.pending_host()).await.expect("换回");
+        let back = do_onload(&mut l, &mut face, &h2.pending_host())
+            .await
+            .expect("换回");
         assert_eq!(back.len(), 2, "整条回灌");
         let slot2 = back[1];
         assert_eq!(l.carrier_of(tail).expect("在账"), Carrier::Device(slot2));
@@ -1796,7 +1902,8 @@ mod tests {
         for i in 0..3u32 {
             let tokens: Vec<u32> = (i * 64..i * 64 + TOKENS_PER_BLOCK as u32).collect();
             let mut table = Vec::new();
-            l.ensure_for_len(&mut table, TOKENS_PER_BLOCK).expect("块表");
+            l.ensure_for_len(&mut table, TOKENS_PER_BLOCK)
+                .expect("块表");
             l.register_chain(&tokens, &table).expect("登记");
             let hit = l.match_prefix(&tokens).expect("命中");
             let tail = *hit.hashes.last().expect("尾块");
@@ -1808,7 +1915,8 @@ mod tests {
         // 第四条链 = 2 块:借台时账上看不出在飞 ⇒ 两槽都能借到
         let tokens: Vec<u32> = (1000..1000 + 2 * TOKENS_PER_BLOCK as u32).collect();
         let mut table = Vec::new();
-        l.ensure_for_len(&mut table, 2 * TOKENS_PER_BLOCK).expect("块表");
+        l.ensure_for_len(&mut table, 2 * TOKENS_PER_BLOCK)
+            .expect("块表");
         l.register_chain(&tokens, &table).expect("登记");
         let hit = l.match_prefix(&tokens).expect("命中");
         let tail = *hit.hashes.last().expect("尾块");
@@ -1892,8 +2000,16 @@ mod tests {
         assert_eq!(buf.len(), slot_bytes);
         recycle_read_plan(&mut l, tbl);
 
-        assert_eq!(real(l.report().host_bytes), host_before, "归还后宿主字节回到基线");
-        assert_eq!(l.carrier_of(h0).expect("在账"), Carrier::Device(s0), "块仍在设备");
+        assert_eq!(
+            real(l.report().host_bytes),
+            host_before,
+            "归还后宿主字节回到基线"
+        );
+        assert_eq!(
+            l.carrier_of(h0).expect("在账"),
+            Carrier::Device(s0),
+            "块仍在设备"
+        );
     }
 
     #[tokio::test]
@@ -1912,7 +2028,11 @@ mod tests {
         })
         .expect("开腿");
         closed
-            .attach_pool(PoolLayout { class: BlockClass::KvPage, epoch: 1, pieces: pieces.clone() })
+            .attach_pool(PoolLayout {
+                class: BlockClass::KvPage,
+                epoch: 1,
+                pieces: pieces.clone(),
+            })
             .expect("注册");
         let tokens: Vec<u32> = (0..32).collect();
         let mut table = Vec::new();
@@ -1920,19 +2040,30 @@ mod tests {
         closed.register_chain(&tokens, &table).expect("登记");
         let tail = closed.match_prefix(&tokens).expect("命中").hashes[0];
         closed.release_table(&mut table).expect("归还");
-        let err = do_offload(&mut closed, &mut face, tail).await.expect_err("关层必拒");
+        let err = do_offload(&mut closed, &mut face, tail)
+            .await
+            .expect_err("关层必拒");
         assert!(matches!(err, StoreError::Exhausted(_)), "得 {err:?}");
 
         // ② 会话仍持引用 ⇒ 活跃面不可下沉
         let mut l = leg();
-        l.attach_pool(PoolLayout { class: BlockClass::KvPage, epoch: 1, pieces: pieces.clone() })
-            .expect("注册");
+        l.attach_pool(PoolLayout {
+            class: BlockClass::KvPage,
+            epoch: 1,
+            pieces: pieces.clone(),
+        })
+        .expect("注册");
         let mut t2 = Vec::new();
         l.ensure_for_len(&mut t2, 32).expect("块表");
         l.register_chain(&tokens, &t2).expect("登记");
         let c2 = l.match_prefix(&tokens).expect("命中").hashes[0];
-        let err = do_offload(&mut l, &mut face, c2).await.expect_err("活跃面必拒");
-        assert!(matches!(err, StoreError::Busy(_)), "活跃面拒 = Busy(调用方据此跳过候选),得 {err:?}");
+        let err = do_offload(&mut l, &mut face, c2)
+            .await
+            .expect_err("活跃面必拒");
+        assert!(
+            matches!(err, StoreError::Busy(_)),
+            "活跃面拒 = Busy(调用方据此跳过候选),得 {err:?}"
+        );
     }
 
     /// **§14.6 链级卸载**:一条链(尾 → 头)一次搬完 —— 链头段也在宿主,
@@ -1942,8 +2073,12 @@ mod tests {
         let mut face = CpuFace::default();
         let pieces = pieces_n(&mut face, 3).await;
         let mut l = leg_with(3);
-        l.attach_pool(PoolLayout { class: BlockClass::KvPage, epoch: 1, pieces: pieces.clone() })
-            .expect("注册");
+        l.attach_pool(PoolLayout {
+            class: BlockClass::KvPage,
+            epoch: 1,
+            pieces: pieces.clone(),
+        })
+        .expect("注册");
 
         // 三块链(96 token);登记后会话归还 ⇒ 缓存独占
         let tokens: Vec<u32> = (0..96).collect();
@@ -1974,7 +2109,11 @@ mod tests {
         let moved = do_offload(&mut l, &mut face, tail).await.expect("整条下沉");
         assert_eq!(moved, 3);
         for (i, h) in hit.hashes.iter().enumerate() {
-            assert_eq!(l.carrier_of(*h).expect("在账"), Carrier::Host, "第 {i} 块应在宿主");
+            assert_eq!(
+                l.carrier_of(*h).expect("在账"),
+                Carrier::Host,
+                "第 {i} 块应在宿主"
+            );
         }
         assert_eq!(l.report().slots_free, 3, "三块设备槽全回池");
 
@@ -1985,13 +2124,19 @@ mod tests {
         assert!(!h2.all_resident());
 
         // 整条再搬一次:幂等(全在宿主 ⇒ 无槽可腾 ⇒ 响亮拒,零副作用)
-        let err = do_offload(&mut l, &mut face, tail).await.expect_err("空票必拒");
+        let err = do_offload(&mut l, &mut face, tail)
+            .await
+            .expect_err("空票必拒");
         assert!(matches!(err, StoreError::Busy(_)), "得 {err:?}");
 
         // 回灌:逐字节复原(逻辑序)
         for (i, h) in h2.hashes.iter().enumerate() {
             let slot = do_onload(&mut l, &mut face, &[*h]).await.expect("回灌")[0];
-            assert_eq!(read_slot(&mut face, &pieces, slot).await, before[i], "块 {i} 逐字节一致");
+            assert_eq!(
+                read_slot(&mut face, &pieces, slot).await,
+                before[i],
+                "块 {i} 逐字节一致"
+            );
         }
         assert_eq!(l.report().host_blocks, 0, "宿主副本已全部移出");
     }
@@ -2003,8 +2148,12 @@ mod tests {
         let mut face = CpuFace::default();
         let pieces = pieces_n(&mut face, 3).await;
         let mut l = leg_with(3);
-        l.attach_pool(PoolLayout { class: BlockClass::KvPage, epoch: 1, pieces: pieces.clone() })
-            .expect("注册");
+        l.attach_pool(PoolLayout {
+            class: BlockClass::KvPage,
+            epoch: 1,
+            pieces: pieces.clone(),
+        })
+        .expect("注册");
 
         // 两块的链;登记后归还 ⇒ 缓存独占
         let tokens: Vec<u32> = (0..64).collect();
@@ -2023,21 +2172,41 @@ mod tests {
             before.push(read_slot(&mut face, &pieces, slot).await);
         }
         let tail = *hashes.last().expect("尾块");
-        assert_eq!(do_offload(&mut l, &mut face, tail).await.expect("整条沉"), 2);
+        assert_eq!(
+            do_offload(&mut l, &mut face, tail).await.expect("整条沉"),
+            2
+        );
         let ops0 = l.report().ops;
-        assert_eq!((ops0.offload_batches, ops0.offloads), (1, 2), "换出:1 命令 2 块");
+        assert_eq!(
+            (ops0.offload_batches, ops0.offloads),
+            (1, 2),
+            "换出:1 命令 2 块"
+        );
 
         // 批量回灌:**一条命令**
-        let slots = do_onload(&mut l, &mut face, &hashes).await.expect("批量回灌");
+        let slots = do_onload(&mut l, &mut face, &hashes)
+            .await
+            .expect("批量回灌");
         assert_eq!(slots.len(), 2, "同序返回两个槽");
         let ops1 = l.report().ops;
-        assert_eq!((ops1.onload_batches, ops1.onloads), (1, 2), "回灌:1 命令 2 块");
+        assert_eq!(
+            (ops1.onload_batches, ops1.onloads),
+            (1, 2),
+            "回灌:1 命令 2 块"
+        );
         for (i, slot) in slots.iter().enumerate() {
-            assert_eq!(read_slot(&mut face, &pieces, *slot).await, before[i], "块 {i} 逐字节一致");
+            assert_eq!(
+                read_slot(&mut face, &pieces, *slot).await,
+                before[i],
+                "块 {i} 逐字节一致"
+            );
         }
         assert_eq!(l.report().host_blocks, 0, "宿主副本已全部取出");
         // 空表 = 空结果(不触命令、不报错 —— 调用方的"无待回灌"路径)
-        assert!(do_onload(&mut l, &mut face, &[]).await.expect("空表").is_empty());
+        assert!(do_onload(&mut l, &mut face, &[])
+            .await
+            .expect("空表")
+            .is_empty());
     }
 
     /// 活跃面(会话持有整条链)⇒ 链级候选不出票、整条搬**零副作用**拒。
@@ -2046,15 +2215,25 @@ mod tests {
         let mut face = CpuFace::default();
         let pieces = pieces_n(&mut face, 2).await;
         let mut l = leg();
-        l.attach_pool(PoolLayout { class: BlockClass::KvPage, epoch: 1, pieces }).expect("注册");
+        l.attach_pool(PoolLayout {
+            class: BlockClass::KvPage,
+            epoch: 1,
+            pieces,
+        })
+        .expect("注册");
         let tokens: Vec<u32> = (0..64).collect();
         let mut table = Vec::new();
         l.ensure_for_len(&mut table, 64).expect("块表");
         l.register_chain(&tokens, &table).expect("登记");
         let tail = l.match_prefix(&tokens).expect("命中").hashes[1];
         // 会话仍持引用
-        assert!(l.chain_offload_candidates(&[], 4).is_empty(), "活跃面不得出票");
-        let err = do_offload(&mut l, &mut face, tail).await.expect_err("活跃面必拒");
+        assert!(
+            l.chain_offload_candidates(&[], 4).is_empty(),
+            "活跃面不得出票"
+        );
+        let err = do_offload(&mut l, &mut face, tail)
+            .await
+            .expect_err("活跃面必拒");
         assert!(matches!(err, StoreError::Busy(_)), "得 {err:?}");
         assert_eq!(l.report().host_blocks, 0, "拒 = 零副作用(不许搬半截)");
         assert_eq!(l.report().ops.offloads, 0);
@@ -2076,7 +2255,8 @@ mod tests {
         .expect("开腿");
         let mut t = Vec::new();
         l.ensure_for_len(&mut t, 32).expect("块表");
-        l.register_chain(&(0..32u32).collect::<Vec<_>>(), &t).expect("登记");
+        l.register_chain(&(0..32u32).collect::<Vec<_>>(), &t)
+            .expect("登记");
         l.release_table(&mut t).expect("归还");
         l.kv.evict_cached(1).expect("显式逐一槽");
         let mut t2 = Vec::new();
@@ -2102,8 +2282,11 @@ mod tests {
         l.register_chain(&a_tokens, &table).expect("登记");
         let a = l.match_prefix(&a_tokens).expect("命中").hashes[0];
         l.release_table(&mut table).expect("归还");
-        l.put_host(a, crate::host::HostBlock::from_bytes(vec![7u8; block_bytes]))
-            .expect("入宿主");
+        l.put_host(
+            a,
+            crate::host::HostBlock::from_bytes(vec![7u8; block_bytes]),
+        )
+        .expect("入宿主");
         assert!(l.host_contains(a), "前置：宿主确有副本");
 
         // ② 按盘重建式登记（无设备槽），超上限 ⇒ 最冷的 a 被逐出树
@@ -2123,8 +2306,12 @@ mod tests {
         let mut face = CpuFace::default();
         let pieces = pieces_n(&mut face, 2).await;
         let mut l = leg(); // 2 槽
-        l.attach_pool(PoolLayout { class: BlockClass::KvPage, epoch: 1, pieces })
-            .expect("注册");
+        l.attach_pool(PoolLayout {
+            class: BlockClass::KvPage,
+            epoch: 1,
+            pieces,
+        })
+        .expect("注册");
 
         // A:一块;登记缓存后放会话引用 ⇒ 可下沉(腾出 1 槽)。
         let toks_a: Vec<u32> = (0..32).collect();
@@ -2133,7 +2320,9 @@ mod tests {
         l.register_chain(&toks_a, &ta).expect("A 登记");
         l.release_table(&mut ta).expect("A 会话归还");
         let tail_a = l.match_prefix(&toks_a).expect("A 命中").hashes[0];
-        do_offload(&mut l, &mut face, tail_a).await.expect("A 整链下沉");
+        do_offload(&mut l, &mut face, tail_a)
+            .await
+            .expect("A 整链下沉");
         assert!(l.host_contains(tail_a), "前置:宿主有副本");
         assert_eq!(l.report().slots_free, 2, "A 整链(1 块)下沉后两槽都空");
 
@@ -2173,8 +2362,12 @@ mod tests {
         let mut face = CpuFace::default();
         let pieces = pieces_n(&mut face, 2).await;
         let mut l = leg();
-        l.attach_pool(PoolLayout { class: BlockClass::KvPage, epoch: 1, pieces })
-            .expect("注册");
+        l.attach_pool(PoolLayout {
+            class: BlockClass::KvPage,
+            epoch: 1,
+            pieces,
+        })
+        .expect("注册");
         let toks: Vec<u32> = (0..64).collect();
         let mut t = Vec::new();
         l.ensure_for_len(&mut t, 64).expect("块表");
@@ -2187,7 +2380,8 @@ mod tests {
         // 模拟历史内容丢失(树未改):宿主副本先没。
         l.host.evict(tail).expect("模拟内容丢失");
         assert!(!l.host_contains(tail));
-        l.drop_host_evicted(&[(tail, None)]).expect("幂等删除不得上抛");
+        l.drop_host_evicted(&[(tail, None)])
+            .expect("幂等删除不得上抛");
         l.drop_host_chains(&[tail]).expect("重复幂等删除也不得上抛");
         assert_eq!(l.host_drop_missing(), 2, "两处缺失都要入账(响亮)");
     }

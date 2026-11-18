@@ -11,9 +11,9 @@
 //! 在 `ops/marlin.rs` 用一对互斥 cfg 常量挂 —— 表(零门)与 oracle(门内)
 //! 的接触点只有这一个。
 
+use crate::bootcheck::{BootCheck, CheckReport, CheckRunner};
 use crate::contract::{Arg, KernelSource, LaunchMsg, OpError};
 use crate::family::marlin::{c_tmp_float_len_v2, repack, v2_workspace_len};
-use crate::bootcheck::{BootCheck, CheckReport, CheckRunner};
 
 use super::{f16_bits, f16_to_f32};
 
@@ -46,11 +46,15 @@ pub struct Case {
 pub fn case() -> Case {
     let groups = K / G;
     // 确定性伪随机(与 parity 用例同族口径;幅值小 ⇒ f16 域信噪比可判)
-    let a_f: Vec<f32> = (0..M * K).map(|i| ((i as f32 * 0.31) - 4.0).sin() * 0.5).collect();
+    let a_f: Vec<f32> = (0..M * K)
+        .map(|i| ((i as f32 * 0.31) - 4.0).sin() * 0.5)
+        .collect();
     Case {
         a: a_f.iter().map(|f| f16_bits(*f)).collect(),
         q: (0..N * K).map(|i| ((i * 7 + 3) % 16) as u8).collect(),
-        s: (0..N * groups).map(|i| 0.02 + ((i * 13) % 13) as f32 * 0.004).collect(),
+        s: (0..N * groups)
+            .map(|i| 0.02 + ((i * 13) % 13) as f32 * 0.004)
+            .collect(),
         zp: (0..N * groups).map(|i| ((i * 5 + 2) % 16) as u8).collect(),
     }
 }
@@ -73,7 +77,11 @@ pub fn reference(c: &Case, symmetric: bool, transposed: bool) -> Vec<f32> {
                     (nn * K + kk, nn * groups + kk / G, nn * groups + kk / G)
                 };
                 let q = c.q[qi % c.q.len()] as f32;
-                let z = if symmetric { 8.0 } else { c.zp[zi % c.zp.len()] as f32 };
+                let z = if symmetric {
+                    8.0
+                } else {
+                    c.zp[zi % c.zp.len()] as f32
+                };
                 let s = c.s[si % c.s.len()];
                 acc += f16_to_f32(c.a[r * K + kk]) * (q - z) * s;
             }
@@ -140,7 +148,10 @@ pub fn run_case(r: &mut dyn CheckRunner, c: &Case) -> Result<Vec<u16>, OpError> 
     r.sync()?;
     let mut raw = vec![0u8; M * N * 2];
     r.download_block(&dout, &mut raw)?;
-    Ok(raw.chunks_exact(2).map(|x| u16::from_le_bytes([x[0], x[1]])).collect())
+    Ok(raw
+        .chunks_exact(2)
+        .map(|x| u16::from_le_bytes([x[0], x[1]]))
+        .collect())
 }
 
 /// (噪声/信号 RMS, max|err|, 首个越界)——与 parity 门同口径。
@@ -163,7 +174,11 @@ pub fn noise_metrics_floor(
     }
     let sig: f64 = want.iter().take(n).map(|w| (*w as f64) * (*w as f64)).sum();
     let rms = (sig / n as f64).sqrt().max(1e-6);
-    let floor = if floor_frac > 0.0 { (rms as f32) * floor_frac } else { 1e-3 };
+    let floor = if floor_frac > 0.0 {
+        (rms as f32) * floor_frac
+    } else {
+        1e-3
+    };
     let (mut sum_abs, mut max_abs) = (0f64, 0f32);
     let mut first = None;
     for i in 0..n {
@@ -177,7 +192,6 @@ pub fn noise_metrics_floor(
     }
     (sum_abs / n as f64 / rms, max_abs, first)
 }
-
 
 pub struct MarlinAwqOracle;
 
@@ -211,7 +225,11 @@ impl BootCheck for MarlinAwqOracle {
                 got: format!("{noise:.4}(max|err|={max_abs:.4})"),
             });
         }
-        Ok(CheckReport::numeric(crate::family::marlin::GEMM_W4A16_AWQ, max_abs, TOL))
+        Ok(CheckReport::numeric(
+            crate::family::marlin::GEMM_W4A16_AWQ,
+            max_abs,
+            TOL,
+        ))
     }
 }
 
@@ -294,7 +312,9 @@ pub fn case_a8() -> CaseA8 {
         }
     }
     CaseA8 {
-        a: (0..M * K).map(|i| ((i * 13 + 7) % 100 + 20) as i8).collect(),
+        a: (0..M * K)
+            .map(|i| ((i * 13 + 7) % 100 + 20) as i8)
+            .collect(),
         a_scale: (0..M).map(|m| 0.02 + m as f32 * 0.0031).collect(),
         q,
         s,
@@ -380,7 +400,13 @@ pub fn run_raw(
     let le16 = |v: &[u16]| -> Vec<u8> { v.iter().flat_map(|x| x.to_le_bytes()).collect() };
     let le32 = |v: &[i32]| -> Vec<u8> { v.iter().flat_map(|x| x.to_le_bytes()).collect() };
     r.upload_block(&da, &c.a.iter().map(|v| *v as u8).collect::<Vec<u8>>())?;
-    r.upload_block(&das, &a_scales.iter().flat_map(|v| v.to_le_bytes()).collect::<Vec<u8>>())?;
+    r.upload_block(
+        &das,
+        &a_scales
+            .iter()
+            .flat_map(|v| v.to_le_bytes())
+            .collect::<Vec<u8>>(),
+    )?;
     r.upload_block(&db, &le32(&b_packed))?;
     r.upload_block(&ds, &le16(&s_bits))?;
     r.upload_block(&dz, &le32(&z_packed))?;
@@ -417,7 +443,10 @@ pub fn run_raw(
     r.sync()?;
     let mut raw = vec![0u8; M * N * 2];
     r.download_block(&dout, &mut raw)?;
-    Ok(raw.chunks_exact(2).map(|x| u16::from_le_bytes([x[0], x[1]])).collect())
+    Ok(raw
+        .chunks_exact(2)
+        .map(|x| u16::from_le_bytes([x[0], x[1]]))
+        .collect())
 }
 
 /// **zp 布局判别探针**(2026-10-16):zp 只在一列置值 ⇒ 输出差落在哪一列

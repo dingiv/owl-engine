@@ -19,6 +19,12 @@ pub(crate) const MS_PER_NEW_TOKEN: u64 = 1;
 pub(crate) const MIN_MS: u64 = 5_000;
 pub(crate) const MAX_MS: u64 = 240_000;
 
+/// **prefill 快照下沉保护门**：首 token 预算 ≤ 本值时，快照槽满直接丢设备
+/// 最冷快照，不在关键路径上做宿主大块下沉（2026-11-18 现场：一次
+/// `srv.swap.out.put` 5.8s 把 5s 预算的 turn 打死）。decode / 宽松 prefill
+/// 仍走正常 host/disk 票。
+pub(crate) const PREFILL_SNAP_OFFLOAD_GUARD_MS: u64 = 8_000;
+
 /// 新增 token（真正要算的量）= prompt − 已命中前缀。
 pub(crate) fn new_tokens(prompt_tokens: usize, cached_tokens: usize) -> usize {
     prompt_tokens.saturating_sub(cached_tokens)

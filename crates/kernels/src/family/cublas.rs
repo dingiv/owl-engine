@@ -70,7 +70,9 @@ impl OwlCublas {
 
     /// 句柄创建并绑流(cublasSetStream;GEMM 与该流上 kernel 同序)
     pub fn new(stream: Arc<cudarc::driver::CudaStream>) -> Result<Self, String> {
-        CudaBlas::new(stream).map(|blas| Self { blas }).map_err(|e| format!("cublas init: {e:?}"))
+        CudaBlas::new(stream)
+            .map(|blas| Self { blas })
+            .map_err(|e| format!("cublas init: {e:?}"))
     }
 
     /// f16 GEMM:nt=true(owl Linear)C[T,n] = A[T,k]×W[m,k]^T;

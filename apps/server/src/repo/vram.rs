@@ -344,18 +344,14 @@ pub fn build_parts(
             delta_bytes: actual_pool_used_bytes as i64 - total as i64,
             delta_ex_reserve_bytes: actual_pool_used_bytes as i64 - total_ex_reserve as i64,
             draft_weights_bytes,
-            draft_weights_in_plan: p
-                .component(ComponentId::DraftWeights)
-                .is_some(),
+            draft_weights_in_plan: p.component(ComponentId::DraftWeights).is_some(),
             ranks: out.len(),
         }
     });
     let free_budget = plan.map(|p| FreeBudget {
         reserve_bytes: p.card.reserve_bytes as u64,
         runtime_headroom_bytes: (p.card.reserve_bytes as u64)
-            .saturating_sub(
-                owl_shared::config::POOL_GRAPH_WARMUP_RESERVE_MB << 20,
-            ),
+            .saturating_sub(owl_shared::config::POOL_GRAPH_WARMUP_RESERVE_MB << 20),
         min_slack_bytes: out
             .iter()
             .map(|r| r.free_bytes.saturating_sub(p.card.reserve_bytes as u64))

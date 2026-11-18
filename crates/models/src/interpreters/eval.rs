@@ -10,10 +10,10 @@
 //! 但互不依赖 —— 新变体(图捕获回放、量化装载、其他平台)另起文件。
 
 use crate::contract::{Bytes, Dtype, ModelError};
-use owl_iface::contract::Arg;
-use owl_iface::command::Command as DevCommand;
 use crate::ops::Op;
 use crate::tensor::TensorOps;
+use owl_iface::command::Command as DevCommand;
+use owl_iface::contract::Arg;
 use std::future::Future;
 use std::pin::Pin;
 
@@ -43,9 +43,9 @@ fn host_f8_compact_bytes(n_bytes: usize, dtype: Dtype) -> Result<usize, ModelErr
     let n = n_bytes / w;
     let sc_off = (n + 1) & !1;
     let ng = n.div_ceil(64);
-    let total = sc_off.checked_add(ng * 2).ok_or_else(|| {
-        ModelError::Msg(format!("host CE fp8: 紧凑长度溢出(n={n}, ng={ng})"))
-    })?;
+    let total = sc_off
+        .checked_add(ng * 2)
+        .ok_or_else(|| ModelError::Msg(format!("host CE fp8: 紧凑长度溢出(n={n}, ng={ng})")))?;
     if total > n_bytes {
         return Err(ModelError::Msg(format!(
             "host CE fp8: 紧凑载荷 {total}B > 原载荷 {n_bytes}B(布局异常)"
@@ -78,7 +78,10 @@ struct PerfCtx {
 
 impl Default for PerfCtx {
     fn default() -> Self {
-        Self { level: owl_shared::metrics::level::OFF, phase: "unk" }
+        Self {
+            level: owl_shared::metrics::level::OFF,
+            phase: "unk",
+        }
     }
 }
 
@@ -88,7 +91,10 @@ impl PerfCtx {
         if !owl_shared::metrics::PERF_BUILD {
             return Self::default();
         }
-        Self { level: owl_shared::metrics::level(), phase: env.phase.tag() }
+        Self {
+            level: owl_shared::metrics::level(),
+            phase: env.phase.tag(),
+        }
     }
 
     /// HOST 级以上(计时准入;非 perf 构建 = 常量假)
@@ -124,7 +130,9 @@ struct LapTimer {
 impl LapTimer {
     #[inline]
     fn start() -> Self {
-        Self { at: std::time::Instant::now() }
+        Self {
+            at: std::time::Instant::now(),
+        }
     }
     /// 落上一段账并重置
     #[inline]
@@ -172,8 +180,8 @@ where
     M: crate::module::Module,
     D: crate::contract::DeviceClient,
 {
-    let ops = layer.forward(xs, ctx);   // 层产出声明(ctx 引用透传)
-    eval_ops(ops.step(), face).await    // 解释器归约
+    let ops = layer.forward(xs, ctx); // 层产出声明(ctx 引用透传)
+    eval_ops(ops.step(), face).await // 解释器归约
 }
 
 /// 声明树求值(内部件;供手工子树/非层根的归约):自叶向根,
@@ -229,11 +237,18 @@ where
 {
     Box::pin(async move {
         let perf = PerfCtx::of(&env);
-        let mut ctx =
-            EvalCtx { face, memo: std::collections::HashMap::new(), tap: None, arena: Vec::new(),
-                arena_set: std::collections::HashSet::new(),
-                block_users: std::collections::HashMap::new(),
-                pending: std::collections::HashMap::new(), reclaim: false, perf, env, pool: None,
+        let mut ctx = EvalCtx {
+            face,
+            memo: std::collections::HashMap::new(),
+            tap: None,
+            arena: Vec::new(),
+            arena_set: std::collections::HashSet::new(),
+            block_users: std::collections::HashMap::new(),
+            pending: std::collections::HashMap::new(),
+            reclaim: false,
+            perf,
+            env,
+            pool: None,
             tp: tp.cloned(),
         };
         let root = match _eval_rec(t, &mut ctx).await {
@@ -307,12 +322,18 @@ where
 {
     Box::pin(async move {
         let perf = PerfCtx::of(&env);
-        let mut ctx =
-            EvalCtx { face, memo: std::collections::HashMap::new(), tap: None, arena: Vec::new(),
-                arena_set: std::collections::HashSet::new(),
-                block_users: std::collections::HashMap::new(),
-                pending: count_pending(t), reclaim: !env.interp.no_reclaim, perf, env,
-                pool: (pool_budget > 0).then(|| BlockPool::new(pool_budget)),
+        let mut ctx = EvalCtx {
+            face,
+            memo: std::collections::HashMap::new(),
+            tap: None,
+            arena: Vec::new(),
+            arena_set: std::collections::HashSet::new(),
+            block_users: std::collections::HashMap::new(),
+            pending: count_pending(t),
+            reclaim: !env.interp.no_reclaim,
+            perf,
+            env,
+            pool: (pool_budget > 0).then(|| BlockPool::new(pool_budget)),
             tp: tp.cloned(),
         };
         let r = _eval_rec(t, &mut ctx).await;
@@ -365,11 +386,18 @@ where
 {
     Box::pin(async move {
         let perf = PerfCtx::of(&env);
-        let mut ctx =
-            EvalCtx { face, memo: std::collections::HashMap::new(), tap: None, arena: Vec::new(),
-                arena_set: std::collections::HashSet::new(),
-                block_users: std::collections::HashMap::new(),
-                pending: std::collections::HashMap::new(), reclaim: false, perf, env, pool: None,
+        let mut ctx = EvalCtx {
+            face,
+            memo: std::collections::HashMap::new(),
+            tap: None,
+            arena: Vec::new(),
+            arena_set: std::collections::HashSet::new(),
+            block_users: std::collections::HashMap::new(),
+            pending: std::collections::HashMap::new(),
+            reclaim: false,
+            perf,
+            env,
+            pool: None,
             tp: tp.cloned(),
         };
         let mut out = Vec::with_capacity(roots.len());
@@ -466,12 +494,18 @@ where
         let perf = PerfCtx::of(&env);
         // 预算覆盖:显式给值优先(批量发射的开关就是它 > 0),否则按档位环境
         let pool_budget = pool_budget.unwrap_or(env.interp.block_pool_bytes);
-        let mut ctx =
-            EvalCtx { face, memo: std::collections::HashMap::new(), tap: None, arena: Vec::new(),
-                arena_set: std::collections::HashSet::new(),
-                block_users: std::collections::HashMap::new(),
-                pending, reclaim: true, perf, env,
-                pool: (pool_budget > 0).then(|| BlockPool::new(pool_budget)),
+        let mut ctx = EvalCtx {
+            face,
+            memo: std::collections::HashMap::new(),
+            tap: None,
+            arena: Vec::new(),
+            arena_set: std::collections::HashSet::new(),
+            block_users: std::collections::HashMap::new(),
+            pending,
+            reclaim: true,
+            perf,
+            env,
+            pool: (pool_budget > 0).then(|| BlockPool::new(pool_budget)),
             tp: tp.cloned(),
         };
         let mut out = Vec::with_capacity(roots.len());
@@ -518,7 +552,12 @@ where
             let top: Vec<String> = rows
                 .iter()
                 .take(6)
-                .map(|(by, nid, u, p, bid)| format!("{:.1}MB node{nid} block{bid} u={u} p={p}", *by as f64 / 1048576.0))
+                .map(|(by, nid, u, p, bid)| {
+                    format!(
+                        "{:.1}MB node{nid} block{bid} u={u} p={p}",
+                        *by as f64 / 1048576.0
+                    )
+                })
                 .collect();
             owl_shared::log_debug!(
                 "live-diag",
@@ -533,7 +572,8 @@ where
         let root_ids: std::collections::HashSet<u64> = out.iter().map(|b| b.id).collect();
         let mut candidates: Vec<u64> = std::mem::take(&mut ctx.arena);
         // `keep_roots = false`(副作用根口径)⇒ 根**也在候选里**(没人会再读它们)
-        candidates.retain(|id| ctx.arena_set.contains(id) && (!keep_roots || !root_ids.contains(id)));
+        candidates
+            .retain(|id| ctx.arena_set.contains(id) && (!keep_roots || !root_ids.contains(id)));
         candidates.sort_unstable();
         candidates.dedup();
         if !candidates.is_empty() {
@@ -570,11 +610,18 @@ where
     Box::pin(async move {
         let env = crate::env::EnvProvider::default();
         let perf = PerfCtx::of(&env);
-        let mut ctx =
-            EvalCtx { face, memo: std::collections::HashMap::new(), tap: Some(tap), arena: Vec::new(), env,
-                arena_set: std::collections::HashSet::new(),
-                block_users: std::collections::HashMap::new(),
-                pending: std::collections::HashMap::new(), reclaim: false, perf, pool: None,
+        let mut ctx = EvalCtx {
+            face,
+            memo: std::collections::HashMap::new(),
+            tap: Some(tap),
+            arena: Vec::new(),
+            env,
+            arena_set: std::collections::HashSet::new(),
+            block_users: std::collections::HashMap::new(),
+            pending: std::collections::HashMap::new(),
+            reclaim: false,
+            perf,
+            pool: None,
             tp: None,
         };
         _eval_rec(t, &mut ctx).await
@@ -650,11 +697,7 @@ where
             }
             *e += 1;
             let u = *e;
-            owl_shared::slab_hint::probe_refs(
-                id,
-                u,
-                self.pending.get(&id).copied().unwrap_or(0),
-            );
+            owl_shared::slab_hint::probe_refs(id, u, self.pending.get(&id).copied().unwrap_or(0));
         }
     }
 
@@ -870,10 +913,7 @@ where
     Box::pin(_eval_node(t, ctx))
 }
 
-async fn _eval_node<'a, D>(
-    t: &'a TensorOps,
-    ctx: &mut EvalCtx<'a, D>,
-) -> Result<Bytes, ModelError>
+async fn _eval_node<'a, D>(t: &'a TensorOps, ctx: &mut EvalCtx<'a, D>) -> Result<Bytes, ModelError>
 where
     D: crate::contract::DeviceClient,
 {
@@ -887,8 +927,7 @@ where
     // memo 键 = 节点 id(全局自增,克隆保留 → 同节点 = 同值)。
     if let Some(b) = ctx.memo.get(&t.id) {
         // 性能面:CSE 命中 = 白赚的节点(无计时样本 → counter 记)
-        if owl_shared::metrics::PERF_BUILD
-            && ctx.perf.level >= owl_shared::metrics::level::COUNTERS
+        if owl_shared::metrics::PERF_BUILD && ctx.perf.level >= owl_shared::metrics::level::COUNTERS
         {
             perf_cnt("interp.count.cse_hit", 1);
         }
@@ -956,7 +995,11 @@ where
     // 起表点在本行(父递归/ins 构造已完成)⇒ 样本 = 该节点自身的宿主成本;
     // 包住子节点的账留给外层(调用树由报告按 tag 层次承担)。
     let perf = ctx.perf;
-    let t_node = if perf.host() { Some(std::time::Instant::now()) } else { None };
+    let t_node = if perf.host() {
+        Some(std::time::Instant::now())
+    } else {
+        None
+    };
     // 类名先按内建词表;`Call` 臂 resolve 后用**核名**覆写(登记表有界集)
     let mut class: &'static str = builtin_class(&t.op);
 
@@ -973,19 +1016,28 @@ where
                 owl_iface::contract::UpStream::H2d
             };
             ctx.flush_batch().await?;
-            let b = ctx.face.htod_on(stream, dtype, &shape, bytes, class).await?;
+            let b = ctx
+                .face
+                .htod_on(stream, dtype, &shape, bytes, class)
+                .await?;
             ctx.track_new(b.id);
             b
         }
         Op::Zeros => {
-            let b = ctx.alloc_out(dtype, n_elems, true, class).await?.view(dtype, shape.len() as u8);
+            let b = ctx
+                .alloc_out(dtype, n_elems, true, class)
+                .await?
+                .view(dtype, shape.len() as u8);
             owl_shared::slab_hint::probe_name(b.id, class);
             ctx.track_new(b.id);
             b
         }
         // 无清零分配(scratch;内容未定义 —— 契约见 `Op::Uninit`)
         Op::Uninit => {
-            let b = ctx.alloc_out(dtype, n_elems, false, class).await?.view(dtype, shape.len() as u8);
+            let b = ctx
+                .alloc_out(dtype, n_elems, false, class)
+                .await?
+                .view(dtype, shape.len() as u8);
             owl_shared::slab_hint::probe_name(b.id, class);
             ctx.track_new(b.id);
             b
@@ -1042,12 +1094,23 @@ where
         }
         Op::Call { op, aux } | Op::CallDst { op, aux } => {
             // **CallDst**:parents[0] = dest(写入既有块;不新分配)。余下父 = 核输入。
-            let dst_in = if matches!(t.op, Op::CallDst { .. }) { Some(vals[0].clone()) } else { None };
+            let dst_in = if matches!(t.op, Op::CallDst { .. }) {
+                Some(vals[0].clone())
+            } else {
+                None
+            };
             let is_dst = dst_in.is_some();
-            let slot_ins: &[crate::contract::Arg] =
-                if dst_in.is_some() { &ins[1..] } else { &ins[..] };
+            let slot_ins: &[crate::contract::Arg] = if dst_in.is_some() {
+                &ins[1..]
+            } else {
+                &ins[..]
+            };
             // 性能面:宿主链分段(选核 / 构件 / 分配 / 线格式构造 / 发射)
-            let mut lap = if perf.host() { Some(LapTimer::start()) } else { None };
+            let mut lap = if perf.host() {
+                Some(LapTimer::start())
+            } else {
+                None
+            };
             // 硬件感知拾取(被动律):环境必传 —— hw 自 face(引擎感知),
             // page 自页策略单源;kernels/解释器零探测。CPU face 无环境 =
             // 结构化"需 GPU server"(与 Kernel 节点 CPU 口径同)。
@@ -1055,23 +1118,35 @@ where
             // 占位 —— 纯语义臂(add/mul/silu/sigmoid/rmsnorm)不消费 env,
             // 硬件感知臂在 CPU face 上本就不可达(launch 面结构化拒)
             let mut env = ctx.face.op_env().unwrap_or(owl_kernels::driver::OpEnv {
-                hw: owl_kernels::driver::Hw { arch: owl_kernels::Arch::Sm86 },
+                hw: owl_kernels::driver::Hw {
+                    arch: owl_kernels::Arch::Sm86,
+                },
                 page: 0,
                 head_dim: 0,
                 grp: 0,
             });
-            env.page = crate::module::kv_paged_policy(dtype).map(|p| p.page).unwrap_or(0);
+            env.page = crate::module::kv_paged_policy(dtype)
+                .map(|p| p.page)
+                .unwrap_or(0);
             // 几何事实自 env 单源补齐(与页同律:解释器 = env 注入点)
             env.head_dim = ctx.env.kv.head_dim;
             env.grp = ctx.env.kv.grp;
             let skip = if dst_in.is_some() { 1 } else { 0 };
-            let shapes: Vec<Vec<usize>> =
-                t.parents.iter().skip(skip).map(|p| p.shape.clone()).collect();
-            let scalars: Vec<i64> = t.args.iter().filter_map(|a| match a {
-                crate::ops::KernelArg::Bits(v) => Some(*v as i64),
-                crate::ops::KernelArg::I32(v) => Some(*v as i64),
-                _ => None,
-            }).collect();
+            let shapes: Vec<Vec<usize>> = t
+                .parents
+                .iter()
+                .skip(skip)
+                .map(|p| p.shape.clone())
+                .collect();
+            let scalars: Vec<i64> = t
+                .args
+                .iter()
+                .filter_map(|a| match a {
+                    crate::ops::KernelArg::Bits(v) => Some(*v as i64),
+                    crate::ops::KernelArg::I32(v) => Some(*v as i64),
+                    _ => None,
+                })
+                .collect();
             let pick = owl_kernels::driver::resolve(owl_kernels::driver::OpReq {
                 op: op.op_id(),
                 env: &env,
@@ -1085,8 +1160,16 @@ where
             }
             class = pick.name; // 类名 = 核名(报告里与图材料单同词表)
             if ctx.env.diag.resolve_trace {
-                owl_shared::log_debug!("interp-call", "{:?} -> {} grid={:?} block={:?} smem={} n_elems={}",
-                    op, pick.name, pick.shape.grid, pick.shape.block, pick.shape.smem, n_elems);
+                owl_shared::log_debug!(
+                    "interp-call",
+                    "{:?} -> {} grid={:?} block={:?} smem={} n_elems={}",
+                    op,
+                    pick.name,
+                    pick.shape.grid,
+                    pick.shape.block,
+                    pick.shape.smem,
+                    n_elems
+                );
             }
             // 统一构造(2026-10-13 P3 算子准入):
             // ① 已建表算子(meta 在场)⇒ 名字/源码/槽序全取算子元数据,
@@ -1108,7 +1191,9 @@ where
                 if od != dtype {
                     return Err(ModelError::Msg(format!(
                         "[dtype 守门] kernel \"{}\" 声明输出为 {:?},实得 {:?}\n{}",
-                        kernel.name, od, dtype,
+                        kernel.name,
+                        od,
+                        dtype,
                         std::backtrace::Backtrace::force_capture()
                     )));
                 }
@@ -1147,7 +1232,10 @@ where
             }
             out
         }
-        Op::SlotWrite => { ctx.track_alias(vals[0].id); vals[0].clone() }
+        Op::SlotWrite => {
+            ctx.track_alias(vals[0].id);
+            vals[0].clone()
+        }
         #[allow(unreachable_patterns)] // 防御臂:Op 新增变体时给运行时错值而非静默
         other => return Err(ModelError::Msg(format!("eval 未覆盖: {other:?}"))),
     };
@@ -1161,28 +1249,28 @@ where
         {
             match ctx.tp.as_ref() {
                 Some(tp) => {
-                if n_bytes as u64 > tp.slot_bytes {
-                    return Err(ModelError::Msg(format!(
+                    if n_bytes as u64 > tp.slot_bytes {
+                        return Err(ModelError::Msg(format!(
                         "TP allreduce: 载荷 {n_bytes}B > slot {}B(v1 单块;多块是 S5 ——                          调大 staging 或改计划)",
                         tp.slot_bytes
                     )));
-                }
-                // ★ **rank 标记点(K1;用户裁决"注入点打标")** —— 层键不在
-                //   节点上(layer 零改动的代价),故标记 = 静态 tag 计数(per
-                //   rank;store 缺席 = 静默跳过,纯观测面)+ debug 日志(节点
-                //   id/label/字节数;log 未开 = 编译期零成本)。
-                //   位置 = 决策点(发射之前):即便发射失败,标记也如实记下
-                //   "此处该 AR"(观测与执行解耦)。
-                let rank = tp.plan.rank();
-                let tag = match rank {
-                    0 => "tp.ar.r0",
-                    1 => "tp.ar.r1",
-                    _ => "tp.ar.rN",
-                };
-                owl_shared::metrics::with_metrics_store(|s| {
-                    s.counter_add(tag, 1, file!(), line!())
-                });
-                owl_shared::log_debug!(
+                    }
+                    // ★ **rank 标记点(K1;用户裁决"注入点打标")** —— 层键不在
+                    //   节点上(layer 零改动的代价),故标记 = 静态 tag 计数(per
+                    //   rank;store 缺席 = 静默跳过,纯观测面)+ debug 日志(节点
+                    //   id/label/字节数;log 未开 = 编译期零成本)。
+                    //   位置 = 决策点(发射之前):即便发射失败,标记也如实记下
+                    //   "此处该 AR"(观测与执行解耦)。
+                    let rank = tp.plan.rank();
+                    let tag = match rank {
+                        0 => "tp.ar.r0",
+                        1 => "tp.ar.r1",
+                        _ => "tp.ar.rN",
+                    };
+                    owl_shared::metrics::with_metrics_store(|s| {
+                        s.counter_add(tag, 1, file!(), line!())
+                    });
+                    owl_shared::log_debug!(
                     "tp",
                     "AR 注入 rank={rank} node={} op={:?} tp_role={:?} label={:?} bytes={n_bytes} slot={}",
                     t.id(),
@@ -1191,13 +1279,13 @@ where
                     t.label(),
                     tp.slot_bytes
                 );
-                // ★ **1-stage(§35)**:本次输出落在对称槽里 ⇒ 融合核**原地加对端槽**
-                // (没有 stage 段、没有拷贝、少一个图节点)。判据 = `out.id` 是不是
-                // arena 的槽(alloc 时选的那一个)—— 不需额外字段/标志。
-                // ★ **路径存在性判据**(2026-10-18):`tp.ar.1stage` / `tp.ar.v1`
-                // 两个 counter —— 门断言"开 1-stage 时前者 > 0 且后者 == 0"。
-                // 动机是现场教训:融合核写好了、门全绿,但它**一次都没被走到**
-                // (只改了 `Op::Call` 的 alloc,payload 却来自 `Op::Matmul`)。
+                    // ★ **1-stage(§35)**:本次输出落在对称槽里 ⇒ 融合核**原地加对端槽**
+                    // (没有 stage 段、没有拷贝、少一个图节点)。判据 = `out.id` 是不是
+                    // arena 的槽(alloc 时选的那一个)—— 不需额外字段/标志。
+                    // ★ **路径存在性判据**(2026-10-18):`tp.ar.1stage` / `tp.ar.v1`
+                    // 两个 counter —— 门断言"开 1-stage 时前者 > 0 且后者 == 0"。
+                    // 动机是现场教训:融合核写好了、门全绿,但它**一次都没被走到**
+                    // (只改了 `Op::Call` 的 alloc,payload 却来自 `Op::Matmul`)。
                     // ★ **push 档(§36.6/§36.7)**:两核把 `own`/`peer` **实参对调** ——
                     //   v1 : stage 写**本端**槽 → reduce 读**对端**槽（数据腿 = 读对端）
                     //   push: stage 写**对端**槽 → reduce 读**本端**槽（数据腿 = 写对端）
@@ -1291,7 +1379,10 @@ where
                             emit_launch_pooled(ctx.face, ctx.pool.is_some(), quant).await?;
                             // signal 核按 payload dtype 选实例;q 本身是 U8 raw,
                             // 只借用其字节视图(16B 幂等写)。
-                            (q.clone().view(dtype, 1), host_f8_compact_bytes(n_bytes, dtype)?)
+                            (
+                                q.clone().view(dtype, 1),
+                                host_f8_compact_bytes(n_bytes, dtype)?,
+                            )
                         } else {
                             (out.clone(), n_bytes)
                         }
@@ -1310,8 +1401,7 @@ where
                             src: stage_local.id,
                             src_off_bytes: src_off,
                             dst: tp.peer.id,
-                            dst_off_bytes: owl_kernels::family::comm::asset::AR_HDR_BYTES
-                                as usize,
+                            dst_off_bytes: owl_kernels::family::comm::asset::AR_HDR_BYTES as usize,
                             len_bytes: copy_len,
                         };
                         if ctx.pool.is_some() {
@@ -1450,7 +1540,7 @@ where
                         *u -= 1;
                     }
                     let left_u = *u; // ← 取完即放(下面要调 ctx.* ⇒ 不能揣着可变借)
-                    // 引用计数推送(诊断):此刻 users 已减、pending 已减(上面那行)
+                                     // 引用计数推送(诊断):此刻 users 已减、pending 已减(上面那行)
                     owl_shared::slab_hint::probe_refs(
                         bid,
                         left_u,
@@ -1522,7 +1612,10 @@ where
             shape: &t.shape,
             depth: t.depth,
             tag: t.label.as_deref(),
-            out: BlockRef { block_id: out.id, len: out.len },
+            out: BlockRef {
+                block_id: out.id,
+                len: out.len,
+            },
         };
         match tap.on_node(&ev) {
             Want::Quiet | Want::Keep => {} // Keep:MVP 未实施,按 Quiet 落空
@@ -1564,7 +1657,13 @@ mod tp_injection_tests {
     #[tokio::test]
     async fn no_tp_means_no_injection() {
         let mut face = owl_cpu::CpuFace::new();
-        let r = eval_ops_scoped_env(&row_node(), &mut face, crate::env::EnvProvider::default(), None).await;
+        let r = eval_ops_scoped_env(
+            &row_node(),
+            &mut face,
+            crate::env::EnvProvider::default(),
+            None,
+        )
+        .await;
         assert!(r.is_ok(), "tp = None 不应触发任何 comm 发射:{:?}", r.err());
     }
 
@@ -1573,18 +1672,24 @@ mod tp_injection_tests {
     async fn tp_injects_ar_and_marks_rank() {
         let _ = owl_shared::metrics::init_metrics(owl_shared::metrics::MetricsStore::new());
         let mut face = owl_cpu::CpuFace::new();
-        let own = face.alloc(Dtype::F32, 16, "tp.own").await.expect("own staging 块(64B)");
-        let peer = face.alloc(Dtype::F32, 16, "tp.peer").await.expect("peer staging 块(64B)");
+        let own = face
+            .alloc(Dtype::F32, 16, "tp.own")
+            .await
+            .expect("own staging 块(64B)");
+        let peer = face
+            .alloc(Dtype::F32, 16, "tp.peer")
+            .await
+            .expect("peer staging 块(64B)");
         let tp = crate::module::TpCtx {
             plan: TpPlan::new(1, 2).expect("rank 1/2"),
             own,
             peer,
             slot_bytes: 64,
-            ar_f8: false, // 测试档:载荷走 f16(装配期由配置填)
+            ar_f8: false,    // 测试档:载荷走 f16(装配期由配置填)
             ar_fused: false, // 测试档:两核路(融合档由配置开)
-            ar2: false, // 测试档:不走 barrier-only
+            ar2: false,      // 测试档:不走 barrier-only
             ar2_push: false, // 测试档:pull
-            host_own: 0, // 测试档:P2P
+            host_own: 0,     // 测试档:P2P
             host_quant: None,
             host_dummy: None,
         };
@@ -1616,17 +1721,20 @@ mod tp_injection_tests {
     async fn payload_over_slot_is_loud() {
         let mut face = owl_cpu::CpuFace::new();
         let own = face.alloc(Dtype::F32, 4, "tp.own").await.expect("own(16B)");
-        let peer = face.alloc(Dtype::F32, 4, "tp.peer").await.expect("peer(16B)");
+        let peer = face
+            .alloc(Dtype::F32, 4, "tp.peer")
+            .await
+            .expect("peer(16B)");
         let tp = crate::module::TpCtx {
             plan: TpPlan::new(0, 2).expect("rank 0/2"),
             own,
             peer,
-            slot_bytes: 4, // < 载荷 8B
-            ar_f8: false, // 测试档:载荷走 f16(装配期由配置填)
+            slot_bytes: 4,   // < 载荷 8B
+            ar_f8: false,    // 测试档:载荷走 f16(装配期由配置填)
             ar_fused: false, // 测试档:两核路(融合档由配置开)
-            ar2: false, // 测试档:不走 barrier-only
+            ar2: false,      // 测试档:不走 barrier-only
             ar2_push: false, // 测试档:pull
-            host_own: 0, // 测试档:P2P
+            host_own: 0,     // 测试档:P2P
             host_quant: None,
             host_dummy: None,
         };
@@ -1675,7 +1783,6 @@ mod liveness_tests {
         let v = f32::from_le_bytes([buf[0], buf[1], buf[2], buf[3]]);
         assert!((v - 129.0).abs() < 1e-5, "链值应 129.0,得 {v}");
     }
-
 
     /// **引用计数推送**(2026-10-16):求值器在改动点把 `(users, pending)` 推给
     /// 探针 —— 这是"它凭什么是活的"数据源。
@@ -1727,7 +1834,7 @@ mod liveness_tests {
         let outs =
             eval_ops_multi_scoped_env(&roots, &mut face, crate::env::EnvProvider::default(), None)
                 .await
-            .expect("多根 scoped");
+                .expect("多根 scoped");
         let peak_multi = slab_hint::probe_end();
         assert_eq!(outs.len(), 2, "两根本都必须拿到值");
 
@@ -1765,15 +1872,16 @@ mod liveness_tests {
         // CPU 面执行可能结构化拒(块账房/语义面限制);本测只关心**推送**
         let _ = eval_ops_scoped(&root, &mut face).await;
         let pushed = owl_shared::slab_hint::refs_pushed();
-        assert!(
-            pushed > 0,
-            "求值必须推送引用计数(0 次 = 推送面断了)"
-        );
+        assert!(pushed > 0, "求值必须推送引用计数(0 次 = 推送面断了)");
         owl_shared::slab_hint::probe_on(false);
         // 关探针后不再推(探针关 = 零动作)
         let before = owl_shared::slab_hint::refs_pushed();
         let _ = eval_ops_scoped(&root, &mut face).await;
-        assert_eq!(owl_shared::slab_hint::refs_pushed(), before, "探针关必须零推送");
+        assert_eq!(
+            owl_shared::slab_hint::refs_pushed(),
+            before,
+            "探针关必须零推送"
+        );
     }
 
     /// 菱形 + 透传别名:x 被四方引用(mul 两参 + reshape 透传 + mul 右参)
@@ -1787,7 +1895,9 @@ mod liveness_tests {
         let sq = x.mul(&x); // x 两次出现
         let r = x.reshape(vec![1]); // 透传别名(与 x 同块)
         let root = sq.mul(&r); // x 第三次出现
-        let (root, candidates) = eval_ops_scoped(&root, &mut face).await.expect("scoped eval");
+        let (root, candidates) = eval_ops_scoped(&root, &mut face)
+            .await
+            .expect("scoped eval");
         assert!(candidates.is_empty(), "菱形/别名候选表应为空");
         let mut buf = vec![0u8; 4];
         face.dtoh(&root, &mut buf).await.expect("根 dtoh");
@@ -1814,7 +1924,11 @@ mod liveness_tests {
             let a = x.mul(&c).add(&one);
             let v = a.add(&TensorOps::zeros(Dtype::F32, vec![4]));
             let (root, cands) = eval_ops_scoped_env_pool(
-                &v, &mut face, crate::env::EnvProvider::default(), None, budget,
+                &v,
+                &mut face,
+                crate::env::EnvProvider::default(),
+                None,
+                budget,
             )
             .await
             .expect("scoped eval");
@@ -1828,7 +1942,11 @@ mod liveness_tests {
                 );
             }
             // 池收尾已抽干 ⇒ 候选表不应包含池内块(两口径都不重复交还)
-            assert!(cands.is_empty(), "budget={budget}: 候选表应空,得 {}", cands.len());
+            assert!(
+                cands.is_empty(),
+                "budget={budget}: 候选表应空,得 {}",
+                cands.len()
+            );
         }
     }
 
@@ -1837,8 +1955,16 @@ mod liveness_tests {
     #[tokio::test]
     async fn pool_reuse_matches_pool_off_bit_exact() {
         let build = || {
-            let c = TensorOps::from_host(Dtype::F32, vec![8], &f32b(&(0..8).map(|i| i as f32 * 0.5).collect::<Vec<f32>>()));
-            let b = TensorOps::from_host(Dtype::F32, vec![8], &f32b(&(0..8).map(|i| 1.0 + i as f32).collect::<Vec<f32>>()));
+            let c = TensorOps::from_host(
+                Dtype::F32,
+                vec![8],
+                &f32b(&(0..8).map(|i| i as f32 * 0.5).collect::<Vec<f32>>()),
+            );
+            let b = TensorOps::from_host(
+                Dtype::F32,
+                vec![8],
+                &f32b(&(0..8).map(|i| 1.0 + i as f32).collect::<Vec<f32>>()),
+            );
             let mut x = TensorOps::from_host(Dtype::F32, vec![8], &f32b(&[1.5; 8]));
             for _ in 0..6 {
                 x = x.mul(&c).add(&b);
@@ -1847,7 +1973,11 @@ mod liveness_tests {
         };
         let mut f_off = owl_cpu::CpuFace::new();
         let (r_off, _) = eval_ops_scoped_env_pool(
-            &build(), &mut f_off, crate::env::EnvProvider::default(), None, 0,
+            &build(),
+            &mut f_off,
+            crate::env::EnvProvider::default(),
+            None,
+            0,
         )
         .await
         .expect("池关");
@@ -1855,7 +1985,11 @@ mod liveness_tests {
         f_off.dtoh(&r_off, &mut off).await.expect("dtoh off");
         let mut f_on = owl_cpu::CpuFace::new();
         let (r_on, cands_on) = eval_ops_scoped_env_pool(
-            &build(), &mut f_on, crate::env::EnvProvider::default(), None, 1 << 20,
+            &build(),
+            &mut f_on,
+            crate::env::EnvProvider::default(),
+            None,
+            1 << 20,
         )
         .await
         .expect("池开");
@@ -1900,12 +2034,12 @@ mod dtype_guard_tests {
         let mut face = owl_cpu::CpuFace::new();
         let src = TensorOps::of_block(903, Dtype::F16, vec![4]);
         let decl = TensorOps::call(SemanticKernel::Narrow)
-        .arg(&src)
-        .arg_usize(1)
-        .arg_usize(4)
-        .arg_usize(0)
-        .arg_usize(2)
-        .with_shape(Dtype::F16, vec![2]);
+            .arg(&src)
+            .arg_usize(1)
+            .arg_usize(4)
+            .arg_usize(0)
+            .arg_usize(2)
+            .with_shape(Dtype::F16, vec![2]);
         assert!(
             eval_ops(decl.step(), &mut face).await.is_err(),
             "CPU 面执行 f16 narrow 必须显式报错,不得静默"
@@ -1921,16 +2055,36 @@ mod dtype_guard_tests {
         }
         use crate::testkit::gpu_client;
         let n = 1024usize;
-        let x: Vec<f32> = (0..n).map(|i| ((i as f32 * 0.21) - 5.0).sin() * 2.0).collect();
-        let yv: Vec<f32> = (0..n).map(|i| ((i as f32 * 0.13) - 1.0).cos() * 1.5).collect();
+        let x: Vec<f32> = (0..n)
+            .map(|i| ((i as f32 * 0.21) - 5.0).sin() * 2.0)
+            .collect();
+        let yv: Vec<f32> = (0..n)
+            .map(|i| ((i as f32 * 0.13) - 1.0).cos() * 1.5)
+            .collect();
         let alpha: Vec<f32> = (0..n).map(|i| (i as f32 * 0.01) - 0.5).collect();
         let xb: Vec<u8> = x.iter().flat_map(|f| half_le(*f)).collect();
 
         let mut gpu = gpu_client().await;
         let shape = crate::contract::Shape::from(vec![n]);
-        let dx_b = owl_iface::htod!(gpu, Dtype::F16, &shape, &xb).await.expect("htod x");
-        let dy_b = owl_iface::htod!(gpu, Dtype::F16, &shape, &yv.iter().flat_map(|f| half_le(*f)).collect::<Vec<u8>>()).await.expect("htod y");
-        let da_b = owl_iface::htod!(gpu, Dtype::F16, &shape, &alpha.iter().flat_map(|f| half_le(*f)).collect::<Vec<u8>>()).await.expect("htod alpha");
+        let dx_b = owl_iface::htod!(gpu, Dtype::F16, &shape, &xb)
+            .await
+            .expect("htod x");
+        let dy_b = owl_iface::htod!(
+            gpu,
+            Dtype::F16,
+            &shape,
+            &yv.iter().flat_map(|f| half_le(*f)).collect::<Vec<u8>>()
+        )
+        .await
+        .expect("htod y");
+        let da_b = owl_iface::htod!(
+            gpu,
+            Dtype::F16,
+            &shape,
+            &alpha.iter().flat_map(|f| half_le(*f)).collect::<Vec<u8>>()
+        )
+        .await
+        .expect("htod alpha");
         // 契约:rmsnorm x/out 皆 r2(行视图)
         let dx = TensorOps::of_block(dx_b.id, Dtype::F16, vec![1, n]);
         let dy = TensorOps::of_block(dy_b.id, Dtype::F16, vec![1, n]);
@@ -1977,7 +2131,10 @@ mod dtype_guard_tests {
             let want = silu * sig * inv * (alpha[i] + 1.0);
             let diff = (g_val - want).abs();
             max_diff = max_diff.max(diff);
-            assert!(diff < 5e-2 * (1.0 + want.abs()), "[{i}] f16 {g_val} vs host {want}");
+            assert!(
+                diff < 5e-2 * (1.0 + want.abs()),
+                "[{i}] f16 {g_val} vs host {want}"
+            );
         }
         eprintln!("[f16 语义链] max_diff = {max_diff:.5}");
         gpu.close().await.expect("关机");

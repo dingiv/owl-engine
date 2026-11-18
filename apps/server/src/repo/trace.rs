@@ -295,7 +295,11 @@ impl AgentTrace {
             Ok(g) => g,
             Err(p) => p.into_inner(),
         };
-        let take = if n == 0 { ring.len() } else { n.min(ring.len()) };
+        let take = if n == 0 {
+            ring.len()
+        } else {
+            n.min(ring.len())
+        };
         let turns: Vec<Json> = ring
             .iter()
             .skip(ring.len() - take)
@@ -398,7 +402,13 @@ impl TurnLedger {
 
     /// 显式失败结算(错误路径;**不建议省** —— 让错误原因落进 outcome.error)
     pub fn fail(self, err: impl Into<String>) {
-        self.commit(UsageFacts::default(), OutcomeFacts { error: Some(err.into()), ..Default::default() });
+        self.commit(
+            UsageFacts::default(),
+            OutcomeFacts {
+                error: Some(err.into()),
+                ..Default::default()
+            },
+        );
     }
 }
 
@@ -473,7 +483,11 @@ mod tests {
         let p = unit.repeat(4096); // ≈ 40 KiB > HEAD+TAIL
         let f = PromptFacts::clip(&p);
         assert!(f.omitted_bytes > 0, "超长必须截断");
-        assert_eq!(f.head.len() + f.tail.len() + f.omitted_bytes, p.len(), "省略量账要平");
+        assert_eq!(
+            f.head.len() + f.tail.len() + f.omitted_bytes,
+            p.len(),
+            "省略量账要平"
+        );
         assert_eq!(f.head, p[..f.head.len()], "head 必须是真前缀(且 char 边界)");
         assert!(p.ends_with(&f.tail), "tail 必须是真后缀");
         assert_eq!(f.bytes, p.len());
@@ -503,7 +517,10 @@ mod tests {
         let t = Arc::new(AgentTrace::with_capacity(4));
         {
             let mut led = TurnLedger::new(&t);
-            led.set_req(ReqFacts { model: "m".into(), ..Default::default() });
+            led.set_req(ReqFacts {
+                model: "m".into(),
+                ..Default::default()
+            });
             // 不 commit,直接 drop
         }
         let snap = t.snapshot(0);
@@ -520,8 +537,17 @@ mod tests {
         led.set_prompt("hello");
         led.first_token();
         led.commit(
-            UsageFacts { prompt: 3, completion: 9, cached: 1, reasoning: 4 },
-            OutcomeFacts { finish: Some("stop"), tools_called: 1, ..Default::default() },
+            UsageFacts {
+                prompt: 3,
+                completion: 9,
+                cached: 1,
+                reasoning: 4,
+            },
+            OutcomeFacts {
+                finish: Some("stop"),
+                tools_called: 1,
+                ..Default::default()
+            },
         );
         let snap = t.snapshot(0);
         let turns = snap["turns"].as_array().unwrap();

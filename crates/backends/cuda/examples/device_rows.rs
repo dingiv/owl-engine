@@ -10,7 +10,10 @@ fn main() {
     match owl_cuda::ffi::device_rows() {
         Ok(rows) => {
             for r in rows {
-                println!("ordinal={} name={:?} bdf={} uuid={}", r.ordinal, r.name, r.bdf, r.uuid);
+                println!(
+                    "ordinal={} name={:?} bdf={} uuid={}",
+                    r.ordinal, r.name, r.bdf, r.uuid
+                );
             }
         }
         Err(e) => {

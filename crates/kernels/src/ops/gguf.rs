@@ -54,7 +54,6 @@ pub struct GgufGemmIq2S;
 /// `owl_gguf_gemm_iq1s` —— IQ1_S(27B UD 档)
 pub struct GgufGemmIq1S;
 
-
 /// GEMM 公共参数表(四型同形;名字逐字对 `.cu` 实例行)
 const GEMM_PARAMS: &[Param] = &[
     // 权重 = GGUF 块字节(**零解量化驻留**;行 = 权重的外维)
@@ -101,7 +100,6 @@ gguf_gemm_spec!(GgufGemmIq2Xxs, crate::family::gguf::GEMM_Iq2Xxs);
 gguf_gemm_spec!(GgufGemmIq2Xs, crate::family::gguf::GEMM_Iq2Xs);
 gguf_gemm_spec!(GgufGemmIq2S, crate::family::gguf::GEMM_Iq2S);
 gguf_gemm_spec!(GgufGemmIq1S, crate::family::gguf::GEMM_Iq1S);
-
 
 // ---- **head 版 int8-MMA MMQ**(W-2f;设计 §二十二)---------------------------
 //
@@ -166,7 +164,10 @@ macro_rules! gguf_mmq2_quant_spec_bf16 {
         }
     };
 }
-gguf_mmq2_quant_spec_bf16!(GgufMmq2QuantDs4Bf16, crate::family::gguf::MMQ2_QUANT_DS4_BF16);
+gguf_mmq2_quant_spec_bf16!(
+    GgufMmq2QuantDs4Bf16,
+    crate::family::gguf::MMQ2_QUANT_DS4_BF16
+);
 gguf_mmq2_quant_spec_bf16!(GgufMmq2QuantD4Bf16, crate::family::gguf::MMQ2_QUANT_D4_BF16);
 
 /// `owl_mmq2_q8_0_j128` 等 8 个(type × J)
@@ -352,7 +353,6 @@ pub struct GgufRangeIq2S;
 /// 行窗解量化(IQ1_S)
 pub struct GgufRangeIq1S;
 
-
 gguf_range_spec!(GgufRangeQ4K, crate::family::gguf::RANGE_Q4K);
 gguf_range_spec!(GgufRangeQ5K, crate::family::gguf::RANGE_Q5K);
 gguf_range_spec!(GgufRangeQ6K, crate::family::gguf::RANGE_Q6K);
@@ -366,7 +366,6 @@ gguf_range_spec!(GgufRangeIq2Xxs, crate::family::gguf::RANGE_Iq2Xxs);
 gguf_range_spec!(GgufRangeIq2Xs, crate::family::gguf::RANGE_Iq2Xs);
 gguf_range_spec!(GgufRangeIq2S, crate::family::gguf::RANGE_Iq2S);
 gguf_range_spec!(GgufRangeIq1S, crate::family::gguf::RANGE_Iq1S);
-
 
 // ---- **内维列序 gather**(W-2e;`ssm_out` tiled → grouped)------------------------
 //
@@ -713,7 +712,6 @@ pub struct GgufRowsIq2S;
 /// 行解量化(IQ1_S)
 pub struct GgufRowsIq1S;
 
-
 gguf_rows_spec!(GgufRowsQ4K, crate::family::gguf::ROWS_Q4K);
 gguf_rows_spec!(GgufRowsQ5K, crate::family::gguf::ROWS_Q5K);
 gguf_rows_spec!(GgufRowsQ6K, crate::family::gguf::ROWS_Q6K);
@@ -728,7 +726,6 @@ gguf_rows_spec!(GgufRowsIq2Xs, crate::family::gguf::ROWS_Iq2Xs);
 gguf_rows_spec!(GgufRowsIq2S, crate::family::gguf::ROWS_Iq2S);
 gguf_rows_spec!(GgufRowsIq1S, crate::family::gguf::ROWS_Iq1S);
 
-
 pub static ROWS_Q4K: KernelMeta = meta_of::<GgufRowsQ4K>();
 pub static ROWS_Q5K: KernelMeta = meta_of::<GgufRowsQ5K>();
 pub static ROWS_Q6K: KernelMeta = meta_of::<GgufRowsQ6K>();
@@ -742,7 +739,6 @@ pub static ROWS_IQ2XXS: KernelMeta = meta_of::<GgufRowsIq2Xxs>();
 pub static ROWS_IQ2XS: KernelMeta = meta_of::<GgufRowsIq2Xs>();
 pub static ROWS_IQ2S: KernelMeta = meta_of::<GgufRowsIq2S>();
 pub static ROWS_IQ1S: KernelMeta = meta_of::<GgufRowsIq1S>();
-
 
 // ---- 复用臂(W-2):四个 prefill 入口的元数据表项 ----
 pub static TILE_Q8_0: KernelMeta = meta_of::<GgufTileQ8_0>();
@@ -775,7 +771,6 @@ pub static RANGE_IQ2XXS: KernelMeta = meta_of::<GgufRangeIq2Xxs>();
 pub static RANGE_IQ2XS: KernelMeta = meta_of::<GgufRangeIq2Xs>();
 pub static RANGE_IQ2S: KernelMeta = meta_of::<GgufRangeIq2S>();
 pub static RANGE_IQ1S: KernelMeta = meta_of::<GgufRangeIq1S>();
-
 
 // ---- 内维列序 gather 的元数据表项(W-2e)----
 pub static GATHER_COLS_F16: KernelMeta = meta_of::<GgufGatherCols>();

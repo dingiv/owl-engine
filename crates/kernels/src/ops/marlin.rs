@@ -152,7 +152,6 @@ pub static W4A16_BF16: KernelMeta = meta_of::<MarlinGemmW4a16Bf16>();
 pub static W4A16_F16: KernelMeta = meta_of::<MarlinGemmW4a16F16>();
 pub static W4A8_AWQ: KernelMeta = meta_of::<MarlinGemmW4a8Awq>();
 
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -162,7 +161,10 @@ mod tests {
     /// 一致 —— 漂移即红
     #[test]
     fn awq_slot_order_matches_legacy_sig() {
-        assert_eq!(meta_of::<MarlinGemmW4a16Awq>().args_str(), "T,T,O,T,T,T,T,sz,sz,sz,sz");
+        assert_eq!(
+            meta_of::<MarlinGemmW4a16Awq>().args_str(),
+            "T,T,O,T,T,T,T,sz,sz,sz,sz"
+        );
     }
 
     /// 输出槽在第 2 位(**不是末位**)—— `O` 的角色标注必须能表达这点
@@ -204,7 +206,11 @@ mod tests {
             other => panic!("槽 {i} 不是张量槽: {other:?}"),
         };
         assert_eq!(meta_of::<MarlinGemmW4a8Awq>().params[0].name, "a");
-        assert_eq!(dt_of(0), Dtype::I8, "int8 激活 = I8(有符号;与 fp8 池 F8E4M3 不同族)");
+        assert_eq!(
+            dt_of(0),
+            Dtype::I8,
+            "int8 激活 = I8(有符号;与 fp8 池 F8E4M3 不同族)"
+        );
         // a_scales = f32(与同形的 U32 槽可区分 —— 同型槽对调由事实门拦)
         assert_eq!(dt_of(5), Dtype::F32);
         assert_eq!(meta_of::<MarlinGemmW4a8Awq>().params[5].name, "a_scales");

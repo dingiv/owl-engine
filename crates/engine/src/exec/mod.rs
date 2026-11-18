@@ -51,6 +51,27 @@ pub(crate) const DEGRADE_CONFIRM_WINDOWS: u8 = 2;
 /// 实测不触发。
 pub(crate) const DEGRADE_DEEP_RATIO: f32 = 0.95;
 
+/// **降级裸步的同步节流**（2026-11-12 修：计数器曾只在同步分支里自增）。
+///
+/// `spec_steps_degraded` 是“距离下一次探测还剩多少裸步”的**步进计数器**，
+/// 必须每一步都自增；同步（草稿池 encode）只是每 8 步 + 探测前最后一步做。
+/// 旧实现把自增放在同步分支内 ⇒ 第一次同步后计数恒为 1、永远到不了
+/// `probe_every`，降级态**一次探测都不会发生**（真机签名：
+/// `spec.degrade=8 / spec.undegrad=0 / spec.probe.round=0`，
+/// 每 turn 只记 1 个 `decode.step.deg`，随后整段裸 decode 到 50 t/s）。
+pub(crate) const DEGRADED_SYNC_EVERY: usize = 8;
+
+/// 降级态本步是否同步草稿池（每 [`DEGRADED_SYNC_EVERY`] 步 + 探测前最后一步）。
+pub(crate) fn degraded_sync_due(steps: usize, probe_every: usize) -> bool {
+    let probe_every = probe_every.max(1);
+    steps % DEGRADED_SYNC_EVERY == 0 || steps + 1 >= probe_every
+}
+
+/// 降级态本步是否已到探测点（调度面在发 SpecRound 前判）。
+pub(crate) fn degraded_probe_due(steps: usize, probe_every: usize) -> bool {
+    steps >= probe_every.max(1)
+}
+
 /// **恢复需要的连续探测命中数**（2026-11-03 第二版）。
 ///
 /// 旧实现 = 一次探测 `m ≥ 1` 就恢复。真机 3 条创作请求（363 轮）实测
@@ -376,6 +397,45 @@ mod bare_cost_rearm_tests {
 }
 
 #[cfg(test)]
+mod degraded_cadence_tests {
+    use super::*;
+
+    /// 计数器必须逐步走到探测点；同步只发生在 0/8/16… 与探测前最后一步。
+    /// 本门直接钉住 2026-11-12 的“降级永不探测”回归。
+    #[test]
+    fn degraded_counter_reaches_probe_and_syncs_last_step() {
+        let probe_every = 8;
+        let mut steps = 0usize;
+        let mut syncs = Vec::new();
+        while !degraded_probe_due(steps, probe_every) {
+            assert!(steps < probe_every, "计数器未在周期内到达探测点");
+            if degraded_sync_due(steps, probe_every) {
+                syncs.push(steps);
+            }
+            steps += 1;
+        }
+        assert_eq!(steps, probe_every, "探针应在第 probe_every 个裸步后到达");
+        assert_eq!(syncs, vec![0, 7], "同步点 = 起步 + 探测前最后一步");
+    }
+
+    /// 退避后的周期（8→16→32）同样能走到；同步点仍按每 8 步 + 末尾。
+    #[test]
+    fn degraded_counter_reaches_backoff_probe() {
+        let probe_every = 16;
+        let mut steps = 0usize;
+        let mut syncs = Vec::new();
+        while !degraded_probe_due(steps, probe_every) {
+            if degraded_sync_due(steps, probe_every) {
+                syncs.push(steps);
+            }
+            steps += 1;
+        }
+        assert_eq!(steps, probe_every);
+        assert_eq!(syncs, vec![0, 8, 15]);
+    }
+}
+
+#[cfg(test)]
 mod break_even_tests {
     use super::*;
 
@@ -529,7 +589,10 @@ pub(crate) fn spec_sampled_accept_prefix(drafts: &[u32], sampled: &[u32]) -> usi
 /// 重抽(可能全接受 ⇒ 末位 = 第 live 行抽样 = bonus)。
 pub(crate) fn sample_accept(drafts: &[u32], sampled: &[u32]) -> (usize, Vec<u32>) {
     let m = spec_sampled_accept_prefix(drafts, sampled);
-    (m, sampled[..=m.min(sampled.len().saturating_sub(1))].to_vec())
+    (
+        m,
+        sampled[..=m.min(sampled.len().saturating_sub(1))].to_vec(),
+    )
 }
 
 /// **惩罚历史入账**(`rep_penalty` 的成员集):只吃**已提交**的 token。

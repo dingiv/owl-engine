@@ -1,5 +1,10 @@
 # store = 状态存储(GPU 池 → host pinned → 磁盘)设计与迁移
 
+> **2026-11-18 配置变更**：`snap_host_mb` / `snap_disk_mb` 已删除；
+> `ram_pool_size` / `disk_pool_size` 是**一层一个共享总池**，KV 与 GDN 快照
+> 竞争同一本账（`crates/store/src/shared_budget.rs`）。下文历史段落的
+> “KV 分片 / 状态腿分片”只作当时设计记录。
+
 > 立项:2026-10-16,用户令「KV cache 专项立项」;**落点由用户指定:
 > `crates/store`(新 crate `owl-store`)**。
 > 方法:code-master 模式二(画现状 → 定痛点 → 定目标 → 分阶段迁移)+

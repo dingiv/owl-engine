@@ -43,7 +43,11 @@ fn e4m3_decode(code: u8) -> f32 {
     if e == 15 && m == 7 {
         return f32::NAN;
     }
-    let v = if e == 0 { (m as f32) * 2f32.powi(-9) } else { (1.0 + m as f32 / 8.0) * 2f32.powi(e - 7) };
+    let v = if e == 0 {
+        (m as f32) * 2f32.powi(-9)
+    } else {
+        (1.0 + m as f32 / 8.0) * 2f32.powi(e - 7)
+    };
     s * v
 }
 fn e4m3_encode(v: f32) -> u8 {
@@ -114,7 +118,9 @@ fn run_one(ctx_c: &std::sync::Arc<CudaContext>, cfg: &Cfg) -> Vec<u16> {
     stream.memcpy_htod(&q_f16, &mut d_q).unwrap();
     let d_out = unsafe { stream.alloc::<u16>(S * H * HD) }.unwrap();
     let mut d_bt = unsafe { stream.alloc::<i32>(nb) }.unwrap();
-    stream.memcpy_htod(&(0..nb as i32).collect::<Vec<_>>(), &mut d_bt).unwrap();
+    stream
+        .memcpy_htod(&(0..nb as i32).collect::<Vec<_>>(), &mut d_bt)
+        .unwrap();
     let mut d_seq = unsafe { stream.alloc::<u32>(1) }.unwrap();
     stream.memcpy_htod(&[ctx as u32], &mut d_seq).unwrap();
     let mask: Vec<u32> = (0..S).map(|i| (1u32 << (i + 1)) - 1).collect();
@@ -122,7 +128,9 @@ fn run_one(ctx_c: &std::sync::Arc<CudaContext>, cfg: &Cfg) -> Vec<u16> {
     stream.memcpy_htod(&mask, &mut d_mask).unwrap();
     let sem_len = HKV.div_ceil(2) * 2 + 2 + HKV + 2;
     let mut d_sem = unsafe { stream.alloc::<u32>(sem_len) }.unwrap();
-    stream.memcpy_htod(&vec![0u32; sem_len], &mut d_sem).unwrap();
+    stream
+        .memcpy_htod(&vec![0u32; sem_len], &mut d_sem)
+        .unwrap();
     let d_scratch = unsafe { stream.alloc::<u8>(256 << 20) }.unwrap();
 
     let (kernel, consts) =

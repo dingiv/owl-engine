@@ -108,7 +108,10 @@ pub fn kv_manifest_gate(
             Dtype::F8E4M3 => owl_kernels::family::flashinfer::PREFILL_FI_FP8KV,
             _ => owl_kernels::family::flashinfer::PREFILL_FI,
         };
-        owl_shared::log_info!("kv-manifest", "FI prefill = {fi_name}(server plan 路径,适配器自校验)");
+        owl_shared::log_info!(
+            "kv-manifest",
+            "FI prefill = {fi_name}(server plan 路径,适配器自校验)"
+        );
     }
     let bad: Vec<&str> = expected
         .iter()
@@ -124,14 +127,15 @@ pub fn kv_manifest_gate(
             "kv_manifest_gate(pool={pool:?}): 声明面 POOL 投影出的池面内核缺失或 .cu 源无定义: {bad:?} —— 池 dtype 改造漏网(pitfall §14 写者穷举律)"
         )));
     }
-    owl_shared::log_info!("kv-manifest", "pool={pool:?} fi={fi_on}:声明面投影 {} 名池面内核全部在场 ✓(外族自理 {} 名:{:?})",
+    owl_shared::log_info!(
+        "kv-manifest",
+        "pool={pool:?} fi={fi_on}:声明面投影 {} 名池面内核全部在场 ✓(外族自理 {} 名:{:?})",
         expected.len(),
         foreign.len(),
         foreign
     );
     Ok(())
 }
-
 
 #[cfg(test)]
 mod tests {
@@ -152,7 +156,9 @@ mod tests {
         }
         let e = kv_manifest_gate(Dtype::F8E5M2, false).expect_err("e5m2 无核臂必须拒");
         assert!(e.to_string().contains("e5m2"), "{e}");
-        let n = owl_kernels::ops::all().filter(|m| !m.pool.is_empty()).count();
+        let n = owl_kernels::ops::all()
+            .filter(|m| !m.pool.is_empty())
+            .count();
         assert!(n >= 30, "池面声明数异常少({n})—— 投影断了门就静默失效");
         // **覆盖地板**(不是真源;真源恒为 `POOL` 声明):下列 = 原手抄清单里的
         // **生产池路**核。派生的残留风险 = “谁把某条的 POOL 声明删了 ⇒ 投影

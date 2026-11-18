@@ -37,6 +37,7 @@ use std::path::{Path, PathBuf};
 
 use crate::error::{StoreError, StoreResult};
 use crate::id::{ChainHash, SnapKey};
+use crate::shared_budget::SharedTierBudgetRef;
 
 /// 磁盘层的键:内容身份 → **文件名**(可逆)。
 ///
@@ -116,7 +117,10 @@ pub struct DiskEvictPlanOf<K> {
 
 impl<K> Default for DiskEvictPlanOf<K> {
     fn default() -> Self {
-        Self { victims: Vec::new(), freed_bytes: 0 }
+        Self {
+            victims: Vec::new(),
+            freed_bytes: 0,
+        }
     }
 }
 
@@ -148,7 +152,10 @@ impl AdoptReport {
 pub struct DiskTier<K = ChainHash> {
     root: PathBuf,
     block_bytes: usize,
+    /// 本层上限；共享档 = 两腿总池（真实占用由 `shared` 记）。
     budget_bytes: usize,
+    /// **跨腿共享预算**（`None` = 本层独占的旧式预算）。
+    shared: Option<SharedTierBudgetRef>,
     resident: BTreeMap<K, DiskEntry>,
     used: usize,
     tick: u64,
@@ -157,7 +164,11 @@ pub struct DiskTier<K = ChainHash> {
 
 impl<K: DiskKey> DiskTier<K> {
     /// 构造(不碰盘;`root` 只作路径前缀 —— 目录创建/扫描归 engine)。
-    pub fn new(root: impl Into<PathBuf>, block_bytes: usize, budget_bytes: usize) -> StoreResult<Self> {
+    pub fn new(
+        root: impl Into<PathBuf>,
+        block_bytes: usize,
+        budget_bytes: usize,
+    ) -> StoreResult<Self> {
         if block_bytes == 0 {
             return Err(StoreError::Invariant("磁盘层块字节为 0".into()));
         }
@@ -170,6 +181,33 @@ impl<K: DiskKey> DiskTier<K> {
             root: root.into(),
             block_bytes,
             budget_bytes,
+            shared: None,
+            resident: BTreeMap::new(),
+            used: 0,
+            tick: 0,
+            evicted_bytes: 0,
+        })
+    }
+
+    /// **共享档构造**：`budget_bytes` = 两腿总池；本层不再单独切分。
+    pub fn new_shared(
+        root: impl Into<PathBuf>,
+        block_bytes: usize,
+        shared: SharedTierBudgetRef,
+    ) -> StoreResult<Self> {
+        if block_bytes == 0 {
+            return Err(StoreError::Invariant("磁盘层块字节为 0".into()));
+        }
+        let budget_bytes = shared
+            .lock()
+            .map_err(|_| StoreError::Invariant("共享层预算锁中毒".into()))?
+            .total_bytes();
+        // 共享档允许“本腿单块 > 总池”（该腿永远借不到，但另一腿仍可用）。
+        Ok(Self {
+            root: root.into(),
+            block_bytes,
+            budget_bytes,
+            shared: Some(shared),
             resident: BTreeMap::new(),
             used: 0,
             tick: 0,
@@ -187,9 +225,14 @@ impl<K: DiskKey> DiskTier<K> {
         self.block_bytes
     }
 
-    /// 本层上限(0 = 关层)。
+    /// 本层上限(0 = 关层；共享档 = 两腿总池)。
     pub fn budget_bytes(&self) -> usize {
         self.budget_bytes
+    }
+
+    /// 共享预算句柄（`None` = 本层独占）。
+    pub fn shared_budget(&self) -> Option<&SharedTierBudgetRef> {
+        self.shared.as_ref()
     }
 
     /// 是否关层。
@@ -212,7 +255,12 @@ impl<K: DiskKey> DiskTier<K> {
         if self.is_disabled() {
             return 0;
         }
-        self.budget_bytes.saturating_sub(self.used) / self.block_bytes
+        let available = self
+            .shared
+            .as_ref()
+            .and_then(|b| b.lock().ok().map(|g| g.available_bytes()))
+            .unwrap_or_else(|| self.budget_bytes.saturating_sub(self.used));
+        available / self.block_bytes
     }
 
     /// 累计驱逐字节(报告面)。
@@ -271,7 +319,11 @@ impl<K: DiskKey> DiskTier<K> {
     /// ⇒ 一旦根块被裁掉,整条链就重建不出来(实测:配置调小后 `重建 0 链`)。
     /// 所以 boot 期先全量入账(允许 `used > budget`),等索引重建完再做
     /// **带保护集的配额对账**(删尾部、保前缀),然后 `commit_evict` 回账。
-    pub fn adopt_with(&mut self, entries: Vec<(K, PathBuf, usize)>, enforce_budget: bool) -> AdoptReport {
+    pub fn adopt_with(
+        &mut self,
+        entries: Vec<(K, PathBuf, usize)>,
+        enforce_budget: bool,
+    ) -> AdoptReport {
         let mut rep = AdoptReport::default();
         for (key, path, bytes) in entries {
             if bytes != self.block_bytes {
@@ -282,10 +334,33 @@ impl<K: DiskKey> DiskTier<K> {
                 continue;
             }
             if self.resident.contains_key(&key) {
-                rep.skipped.push((path, "重复键(同内容身份出现两次)".into()));
+                rep.skipped
+                    .push((path, "重复键(同内容身份出现两次)".into()));
                 continue;
             }
-            if enforce_budget && !self.is_disabled() && self.used + bytes > self.budget_bytes {
+            if let Some(shared) = self.shared.as_ref() {
+                let reserved = shared
+                    .lock()
+                    .map_err(|_| StoreError::Invariant("共享层预算锁中毒".into()))
+                    .and_then(|mut g| {
+                        if enforce_budget {
+                            if g.try_reserve(bytes) {
+                                Ok(())
+                            } else {
+                                Err(StoreError::Exhausted(format!(
+                                    "共享磁盘层超预算:装不下 {bytes}B"
+                                )))
+                            }
+                        } else {
+                            g.reserve_unchecked(bytes)
+                        }
+                    });
+                if let Err(e) = reserved {
+                    rep.skipped.push((path, format!("共享预算:{e}")));
+                    continue;
+                }
+            } else if enforce_budget && !self.is_disabled() && self.used + bytes > self.budget_bytes
+            {
                 rep.skipped.push((
                     path,
                     format!("超预算:{}+{} > {}", self.used, bytes, self.budget_bytes),
@@ -295,7 +370,14 @@ impl<K: DiskKey> DiskTier<K> {
             self.tick += 1;
             let last_use = self.tick;
             self.used += bytes;
-            self.resident.insert(key, DiskEntry { path, bytes, last_use });
+            self.resident.insert(
+                key,
+                DiskEntry {
+                    path,
+                    bytes,
+                    last_use,
+                },
+            );
             rep.adopted += 1;
             rep.bytes += bytes;
         }
@@ -313,11 +395,23 @@ impl<K: DiskKey> DiskTier<K> {
             ));
         }
         let bytes = self.block_bytes;
-        if !self.resident.contains_key(&key) && self.used + bytes > self.budget_bytes {
-            return Err(StoreError::Exhausted(format!(
-                "磁盘层越界:{}+{} > {}(先 plan_evict 腾位,或调大 disk_pool_size)",
-                self.used, bytes, self.budget_bytes
-            )));
+        if !self.resident.contains_key(&key) {
+            if let Some(shared) = self.shared.as_ref() {
+                let available = shared
+                    .lock()
+                    .map_err(|_| StoreError::Invariant("共享层预算锁中毒".into()))?
+                    .available_bytes();
+                if available < bytes {
+                    return Err(StoreError::Exhausted(format!(
+                        "共享磁盘层越界:余 {available}B < {bytes}B(先 plan_evict 腾位,或调大 disk_pool_size)"
+                    )));
+                }
+            } else if self.used + bytes > self.budget_bytes {
+                return Err(StoreError::Exhausted(format!(
+                    "磁盘层越界:{}+{} > {}(先 plan_evict 腾位,或调大 disk_pool_size)",
+                    self.used, bytes, self.budget_bytes
+                )));
+            }
         }
         Ok(SpillPlanOf {
             key,
@@ -343,7 +437,18 @@ impl<K: DiskKey> DiskTier<K> {
                 e.path = plan.path.clone();
             }
             None => {
-                if !self.is_disabled() && self.used + plan.bytes > self.budget_bytes {
+                if let Some(shared) = self.shared.as_ref() {
+                    let ok = shared
+                        .lock()
+                        .map_err(|_| StoreError::Invariant("共享层预算锁中毒".into()))?
+                        .try_reserve(plan.bytes);
+                    if !ok {
+                        return Err(StoreError::Exhausted(format!(
+                            "共享磁盘层越界(commit 重验):装不下 {}B",
+                            plan.bytes
+                        )));
+                    }
+                } else if !self.is_disabled() && self.used + plan.bytes > self.budget_bytes {
                     return Err(StoreError::Exhausted(format!(
                         "磁盘层越界(commit 重验):{}+{} > {}",
                         self.used, plan.bytes, self.budget_bytes
@@ -481,6 +586,24 @@ impl<K: DiskKey> DiskTier<K> {
         for k in keys {
             if let Some(e) = self.resident.remove(k) {
                 self.used = self.used.saturating_sub(e.bytes);
+                if let Some(shared) = self.shared.as_ref() {
+                    match shared.lock() {
+                        Ok(mut g) => {
+                            if let Err(err) = g.release(e.bytes) {
+                                owl_shared::log_warn!(
+                                    "store",
+                                    "磁盘层共享预算释放失败({}B):{err}",
+                                    e.bytes
+                                );
+                            }
+                        }
+                        Err(_) => owl_shared::log_warn!(
+                            "store",
+                            "磁盘层共享预算释放失败:锁中毒({}B)",
+                            e.bytes
+                        ),
+                    }
+                }
                 freed += e.bytes;
                 self.evicted_bytes += e.bytes as u64;
             }
@@ -530,13 +653,25 @@ mod tests {
         let c = ChainHash::new(0xDEAD_BEEF);
         assert_eq!(c.stem(), "kv-00000000deadbeef");
         assert_eq!(ChainHash::parse_stem(&c.stem()), Some(c));
-        assert_eq!(DiskTier::<ChainHash>::key_of_file("kv-00000000deadbeef.bin"), Some(c));
-        assert_eq!(DiskTier::<ChainHash>::key_of_file("kv-00000000deadbeef.bin.tmp"), None);
+        assert_eq!(
+            DiskTier::<ChainHash>::key_of_file("kv-00000000deadbeef.bin"),
+            Some(c)
+        );
+        assert_eq!(
+            DiskTier::<ChainHash>::key_of_file("kv-00000000deadbeef.bin.tmp"),
+            None
+        );
         let s = SnapKey::at_boundary(ChainHash::new(7));
         assert_eq!(s.stem(), "snap-0000000000000007");
-        assert_eq!(DiskTier::<SnapKey>::key_of_file("snap-0000000000000007.bin"), Some(s));
+        assert_eq!(
+            DiskTier::<SnapKey>::key_of_file("snap-0000000000000007.bin"),
+            Some(s)
+        );
         // 腿前缀不串(kv 文件不能被 snap 层解析)
-        assert_eq!(DiskTier::<SnapKey>::key_of_file("kv-0000000000000007.bin"), None);
+        assert_eq!(
+            DiskTier::<SnapKey>::key_of_file("kv-0000000000000007.bin"),
+            None
+        );
     }
 
     /// **重挂**(前缀无感删除的盘层半):计划给路径、落账换键;字节不变。
@@ -556,14 +691,21 @@ mod tests {
         assert!(to.ends_with(d.file_name(b)), "新路径按新键算出:{to:?}");
         d.commit_rekey(a, b).expect("重挂落账");
         assert!(!d.contains(a), "旧键消失");
-        assert_eq!(d.path_of(b), Some(d.path_for(b).as_path()), "新键拿到内容路径");
+        assert_eq!(
+            d.path_of(b),
+            Some(d.path_for(b).as_path()),
+            "新键拿到内容路径"
+        );
         assert_eq!(d.used_bytes(), BLK, "字节随账走(没有复制)");
         assert_eq!(d.resident_count(), 1);
         // 目标已在账 ⇒ 计划与落账都拒(不许覆盖)
         let p2 = d.plan_spill(a).expect("再写回旧键");
         d.commit_spill(&p2).expect("落账");
         assert!(matches!(d.plan_rekey(a, b), Err(StoreError::Invariant(_))));
-        assert!(matches!(d.commit_rekey(a, b), Err(StoreError::Invariant(_))));
+        assert!(matches!(
+            d.commit_rekey(a, b),
+            Err(StoreError::Invariant(_))
+        ));
         assert!(d.contains(a) && d.contains(b), "拒绝不许半改");
     }
 
@@ -571,7 +713,10 @@ mod tests {
     fn disabled_tier_rejects_spill_loudly() {
         let d = tier(0);
         assert!(d.is_disabled());
-        assert!(matches!(d.plan_spill(ChainHash::new(1)), Err(StoreError::Exhausted(_))));
+        assert!(matches!(
+            d.plan_spill(ChainHash::new(1)),
+            Err(StoreError::Exhausted(_))
+        ));
     }
 
     #[test]
@@ -582,7 +727,10 @@ mod tests {
             d.commit_spill(&p).expect("落账");
         }
         // 第三块:越界 ⇒ 响亮拒
-        assert!(matches!(d.plan_spill(ChainHash::new(3)), Err(StoreError::Exhausted(_))));
+        assert!(matches!(
+            d.plan_spill(ChainHash::new(3)),
+            Err(StoreError::Exhausted(_))
+        ));
         // 触达 1(它变新)⇒ 最老 = 2
         d.touch(ChainHash::new(1)).expect("触达");
         let plan = d.plan_evict(BLK, &[]);
@@ -616,14 +764,34 @@ mod tests {
     fn adopt_restores_ledger_and_isolates_bad_entries() {
         let mut d = tier(2 * BLK);
         let rep = d.adopt(vec![
-            (ChainHash::new(1), PathBuf::from("/tmp/owl-disk-test/kv-0000000000000001.bin"), BLK),
-            (ChainHash::new(2), PathBuf::from("/tmp/owl-disk-test/kv-0000000000000002.bin"), BLK),
+            (
+                ChainHash::new(1),
+                PathBuf::from("/tmp/owl-disk-test/kv-0000000000000001.bin"),
+                BLK,
+            ),
+            (
+                ChainHash::new(2),
+                PathBuf::from("/tmp/owl-disk-test/kv-0000000000000002.bin"),
+                BLK,
+            ),
             // 半块(崩在 rename 前的残件不该出现;出现即隔离)
-            (ChainHash::new(3), PathBuf::from("/tmp/owl-disk-test/kv-0000000000000003.bin"), BLK / 2),
+            (
+                ChainHash::new(3),
+                PathBuf::from("/tmp/owl-disk-test/kv-0000000000000003.bin"),
+                BLK / 2,
+            ),
             // 超预算(配额是硬约束)
-            (ChainHash::new(4), PathBuf::from("/tmp/owl-disk-test/kv-0000000000000004.bin"), BLK),
+            (
+                ChainHash::new(4),
+                PathBuf::from("/tmp/owl-disk-test/kv-0000000000000004.bin"),
+                BLK,
+            ),
             // 重复键
-            (ChainHash::new(1), PathBuf::from("/tmp/owl-disk-test/dup.bin"), BLK),
+            (
+                ChainHash::new(1),
+                PathBuf::from("/tmp/owl-disk-test/dup.bin"),
+                BLK,
+            ),
         ]);
         assert_eq!(rep.adopted, 2);
         assert_eq!(rep.bytes, 2 * BLK);
@@ -648,5 +816,28 @@ mod tests {
         d.commit_spill(&p2).expect("落账");
         assert_eq!(d.used_bytes(), BLK, "同键覆盖不重复记账");
         assert_eq!(d.resident_count(), 1);
+    }
+
+    /// 2026-11-18 共享盘池：KV 与快照两腿吃同一本预算，合计不得超发。
+    #[test]
+    fn shared_budget_is_one_pool_across_kv_and_snap() {
+        let shared = crate::shared_budget::SharedTierBudget::new(2 * BLK);
+        let mut kv =
+            DiskTier::<ChainHash>::new_shared("/tmp/owl-disk-shared-kv", BLK, shared.clone())
+                .expect("KV 盘");
+        let mut snap = DiskTier::<SnapKey>::new_shared("/tmp/owl-disk-shared-snap", BLK, shared)
+            .expect("快照盘");
+        let p = kv.plan_spill(ChainHash::new(1)).expect("KV 计划");
+        kv.commit_spill(&p).expect("KV 落账");
+        let k = SnapKey::at_boundary(ChainHash::new(2));
+        let p = snap.plan_spill(k).expect("快照计划");
+        snap.commit_spill(&p).expect("快照落账");
+        assert_eq!(kv.free_slots(), 0, "两腿合计吃满总池");
+        assert_eq!(snap.free_slots(), 0, "两腿合计吃满总池");
+        assert!(
+            snap.plan_spill(SnapKey::at_boundary(ChainHash::new(3)))
+                .is_err(),
+            "总池满 ⇒ 任一腿都不得超发"
+        );
     }
 }

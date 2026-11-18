@@ -4,11 +4,11 @@
 //! 方法:同形 K 次链式捕获(输出→下输入)→ 暖机 → 重放计时,
 //! 对照内核裸时长(marlin [16384,16384] ≈ 134MB/BW ≈ 65µs)。
 
-use std::time::Instant;
 use owl_cuda::{
     test_device_ordinal, Arg, DeviceClient as _, DeviceSelector, Dtype, GpuClient, GpuServer,
     LaunchMsg, Shape,
 };
+use std::time::Instant;
 
 fn assemble() -> GpuClient {
     let ordinal = test_device_ordinal();
@@ -42,26 +42,58 @@ async fn marlin_graph_dispatch_probe() {
 
     let (m, n, k, g) = (1usize, 16384usize, 16384usize, 32usize);
     let q: Vec<u8> = (0..n * k).map(|i| ((i * 7 + 3) % 16) as u8).collect();
-    let s: Vec<f32> = (0..n * (k / g)).map(|i| 0.5 + ((i * 13) % 13) as f32 * 0.08).collect();
+    let s: Vec<f32> = (0..n * (k / g))
+        .map(|i| 0.5 + ((i * 13) % 13) as f32 * 0.08)
+        .collect();
     let t0 = Instant::now();
     let b_packed = owl_kernels::family::marlin::repack::pack_marlin_b(&q, k, n);
     let s_packed = owl_kernels::family::marlin::repack::pack_marlin_s(&s, n, k / g);
     eprintln!("[m-probe] repack {:.1}s", t0.elapsed().as_secs_f32());
 
-    let da = owl_iface::htod!(client, Dtype::F16, &Shape::from(vec![m, k]), &le_u16(
-            &(0..m * k).map(|_i| half::f16::from_f32(0.1).to_bits()).collect::<Vec<_>>(),
-        ))
-        .await
-        .expect("htod a");
-    let db = owl_iface::htod!(client, Dtype::U32, &Shape::from(vec![b_packed.len()]), &le_i32(&b_packed)).await.expect("htod b");
-    let ds = owl_iface::htod!(client, Dtype::F16, &Shape::from(vec![s_packed.len()]), &le_u16(&s_packed)).await.expect("htod s");
+    let da = owl_iface::htod!(
+        client,
+        Dtype::F16,
+        &Shape::from(vec![m, k]),
+        &le_u16(
+            &(0..m * k)
+                .map(|_i| half::f16::from_f32(0.1).to_bits())
+                .collect::<Vec<_>>(),
+        )
+    )
+    .await
+    .expect("htod a");
+    let db = owl_iface::htod!(
+        client,
+        Dtype::U32,
+        &Shape::from(vec![b_packed.len()]),
+        &le_i32(&b_packed)
+    )
+    .await
+    .expect("htod b");
+    let ds = owl_iface::htod!(
+        client,
+        Dtype::F16,
+        &Shape::from(vec![s_packed.len()]),
+        &le_u16(&s_packed)
+    )
+    .await
+    .expect("htod s");
     let ws_len = owl_kernels::family::marlin::v2_workspace_len(n).max(n / 128 * 16);
-    let dws = owl_iface::client_alloc!(client, Dtype::U32, ws_len).await.expect("ws");
-    let dctmp = owl_iface::client_alloc!(client, Dtype::U32, 1).await.expect("ctmp");
-    let dc = owl_iface::client_alloc!(client, Dtype::F16, m * n).await.expect("c");
+    let dws = owl_iface::client_alloc!(client, Dtype::U32, ws_len)
+        .await
+        .expect("ws");
+    let dctmp = owl_iface::client_alloc!(client, Dtype::U32, 1)
+        .await
+        .expect("ctmp");
+    let dc = owl_iface::client_alloc!(client, Dtype::F16, m * n)
+        .await
+        .expect("c");
 
     let msg = |a: &owl_cuda::Bytes| LaunchMsg {
-        kernel: owl_cuda::KernelSource { name: "marlin_gemm_w4a16".into(), source: String::new() },
+        kernel: owl_cuda::KernelSource {
+            name: "marlin_gemm_w4a16".into(),
+            source: String::new(),
+        },
         args: vec![
             Arg::block(a.id, a.dtype, a.rank),
             Arg::block(db.id, db.dtype, db.rank),
@@ -97,31 +129,44 @@ async fn marlin_graph_dispatch_probe() {
     let mut cur = dc.clone();
     client.graph_begin().await.expect("graph_begin");
     for _ in 0..K {
-        let nxt = owl_iface::client_alloc!(client, Dtype::F16, m * n).await.expect("captured c");
+        let nxt = owl_iface::client_alloc!(client, Dtype::F16, m * n)
+            .await
+            .expect("captured c");
         client.launch(msg(&cur)).await.expect("captured marlin");
         cur = nxt;
     }
-    let sentinel_out = owl_iface::client_alloc!(client, Dtype::F32, 4).await.expect("sentinel out");
-    let sentinel_in = owl_iface::client_alloc!(client, Dtype::F32, 4).await.expect("sentinel in");
-    client.launch(LaunchMsg {
-        kernel: owl_cuda::KernelSource { name: "probe_add_f32".into(), source: r#"
+    let sentinel_out = owl_iface::client_alloc!(client, Dtype::F32, 4)
+        .await
+        .expect("sentinel out");
+    let sentinel_in = owl_iface::client_alloc!(client, Dtype::F32, 4)
+        .await
+        .expect("sentinel in");
+    client
+        .launch(LaunchMsg {
+            kernel: owl_cuda::KernelSource {
+                name: "probe_add_f32".into(),
+                source: r#"
 extern "C" __global__ void probe_add_f32(
     const float* a, const float* b, float* out, const size_t n) {
     int i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i < (int)n) { out[i] = a[i] + b[i]; }
 }
-"#.into() },
-        args: vec![
-            Arg::block(sentinel_in.id, sentinel_in.dtype, sentinel_in.rank),
-            Arg::block(sentinel_in.id, sentinel_in.dtype, sentinel_in.rank),
-            Arg::block(sentinel_out.id, sentinel_out.dtype, sentinel_out.rank),
-            Arg::U64(4),
-        ],
-        grid: (1, 1, 1),
-        block: (256, 1, 1),
-        shared_mem: 0,
-        out_elems: 4,
-    }).await.expect("sentinel native launch");
+"#
+                .into(),
+            },
+            args: vec![
+                Arg::block(sentinel_in.id, sentinel_in.dtype, sentinel_in.rank),
+                Arg::block(sentinel_in.id, sentinel_in.dtype, sentinel_in.rank),
+                Arg::block(sentinel_out.id, sentinel_out.dtype, sentinel_out.rank),
+                Arg::U64(4),
+            ],
+            grid: (1, 1, 1),
+            block: (256, 1, 1),
+            shared_mem: 0,
+            out_elems: 4,
+        })
+        .await
+        .expect("sentinel native launch");
     let gid = client.graph_end().await.expect("graph_end");
     for _ in 0..3 {
         client.graph_launch(gid).await.expect("warm");
@@ -152,12 +197,21 @@ async fn cublas_graph_dispatch_probe() {
     client.sync().await.unwrap();
     // b/a 同款 gemv 形状:nt [48, 5120] × [1, 5120] → [1, 48]
     let (mm, kk, nn) = (48usize, 5120usize, 1usize);
-    let w = owl_iface::client_alloc!(client, Dtype::F16, mm * kk).await.expect("w");
-    let x = owl_iface::client_alloc!(client, Dtype::F16, nn * kk).await.expect("x");
-    let dc = owl_iface::client_alloc!(client, Dtype::F16, nn * mm).await.expect("c");
+    let w = owl_iface::client_alloc!(client, Dtype::F16, mm * kk)
+        .await
+        .expect("w");
+    let x = owl_iface::client_alloc!(client, Dtype::F16, nn * kk)
+        .await
+        .expect("x");
+    let dc = owl_iface::client_alloc!(client, Dtype::F16, nn * mm)
+        .await
+        .expect("c");
 
     let msg = |_a: &owl_cuda::Bytes| LaunchMsg {
-        kernel: owl_cuda::KernelSource { name: "cublas_gemm_f16".into(), source: String::new() },
+        kernel: owl_cuda::KernelSource {
+            name: "cublas_gemm_f16".into(),
+            source: String::new(),
+        },
         args: vec![
             Arg::block(x.id, x.dtype, x.rank),
             Arg::block(w.id, w.dtype, w.rank),
@@ -193,20 +247,28 @@ extern "C" __global__ void probe_scale_f32(
 }
 "#;
     client.graph_begin().await.expect("graph_begin");
-    let sentinel_out = owl_iface::client_alloc!(client, Dtype::F32, 4).await.expect("sentinel out");
-    client.launch(LaunchMsg {
-        kernel: owl_cuda::KernelSource { name: "probe_scale_f32".into(), source: SCALE_CU.into() },
-        args: vec![
-            Arg::block(x.id, x.dtype, x.rank),
-            Arg::F32(2.0),
-            Arg::U64(4),
-            Arg::block(sentinel_out.id, sentinel_out.dtype, sentinel_out.rank),
-        ],
-        grid: (1, 1, 1),
-        block: (256, 1, 1),
-        shared_mem: 0,
-        out_elems: 4,
-    }).await.expect("sentinel native launch");
+    let sentinel_out = owl_iface::client_alloc!(client, Dtype::F32, 4)
+        .await
+        .expect("sentinel out");
+    client
+        .launch(LaunchMsg {
+            kernel: owl_cuda::KernelSource {
+                name: "probe_scale_f32".into(),
+                source: SCALE_CU.into(),
+            },
+            args: vec![
+                Arg::block(x.id, x.dtype, x.rank),
+                Arg::F32(2.0),
+                Arg::U64(4),
+                Arg::block(sentinel_out.id, sentinel_out.dtype, sentinel_out.rank),
+            ],
+            grid: (1, 1, 1),
+            block: (256, 1, 1),
+            shared_mem: 0,
+            out_elems: 4,
+        })
+        .await
+        .expect("sentinel native launch");
     for _ in 0..K {
         client.launch(msg(&x)).await.expect("captured gemv");
     }

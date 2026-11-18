@@ -2,8 +2,7 @@
 # 具体 workspace / max_context_length / 池大小由 leaf 用 --set 或少量键定。
 [store]
 prefix_cache = true
-ram_pool_size = 10240
-snap_host_mb = 1024
+ram_pool_size = 11264
 vram_activation_reserve = 1482
 
 # 超卖档「池外瞬态余量」MiB(池 = cap − 本值/per_tok;缺省 1024 = 旧硬编码值)

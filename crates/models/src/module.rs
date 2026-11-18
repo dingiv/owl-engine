@@ -144,7 +144,6 @@ impl TpCtx {
     pub fn needs_ar(&self, key: &str) -> bool {
         crate::plan::rules::needs_ar(key)
     }
-
 }
 
 pub struct ForwardCtx<'a> {
@@ -293,12 +292,7 @@ impl<'a> ForwardCtx<'a> {
     }
 
     /// decode 步 ctx(attention 全量动态依赖;gdn 置 None)
-    pub fn decode(
-        tokens: usize,
-        pos: &'a TensorOps,
-        kv: &'a KvBuffers,
-        rope: &'a Rope,
-    ) -> Self {
+    pub fn decode(tokens: usize, pos: &'a TensorOps, kv: &'a KvBuffers, rope: &'a Rope) -> Self {
         Self {
             tokens,
             kind: StepKind::Decode,
@@ -543,10 +537,7 @@ impl<'a> ForwardCtx<'a> {
     /// Q 输出槽接线(B 轴覆盖率探针;与 `with_pos` 同族 —— 只改自身字段,
     /// 不做 I/O)。调用方持 `RefCell` 并在执行后读;不调 ⇒ 槽恒 `None`,
     /// 层内零写入(生产路径逐字不变)。
-    pub fn with_q_sink(
-        mut self,
-        sink: &'a std::cell::RefCell<Vec<Option<TensorOps>>>,
-    ) -> Self {
+    pub fn with_q_sink(mut self, sink: &'a std::cell::RefCell<Vec<Option<TensorOps>>>) -> Self {
         self.q_sink = Some(sink);
         self
     }
@@ -878,11 +869,19 @@ impl<'a> TableSource<'a> {
 
 impl WeightSource for TableSource<'_> {
     fn take(&self, key: &str) -> Taken<Vec<f32>> {
-        Ok(self.entries.iter().find(|(k, _)| *k == key).map(|(_, v)| v.to_vec()))
+        Ok(self
+            .entries
+            .iter()
+            .find(|(k, _)| *k == key)
+            .map(|(_, v)| v.to_vec()))
     }
 
     fn elem_len(&self, key: &str) -> Taken<usize> {
-        Ok(self.entries.iter().find(|(k, _)| *k == key).map(|(_, v)| v.len()))
+        Ok(self
+            .entries
+            .iter()
+            .find(|(k, _)| *k == key)
+            .map(|(_, v)| v.len()))
     }
 
     /// 表即 host f32:直接切片转写字节 —— F16 走 crate::f16c(F16C 单
@@ -896,7 +895,12 @@ impl WeightSource for TableSource<'_> {
         dst: &mut [u8],
         dtype: Dtype,
     ) -> Taken<()> {
-        let Some(v) = self.entries.iter().find(|(k, _)| *k == key).map(|(_, v)| *v) else {
+        let Some(v) = self
+            .entries
+            .iter()
+            .find(|(k, _)| *k == key)
+            .map(|(_, v)| *v)
+        else {
             return Ok(None);
         };
         let Some(src) = v.get(offset_elems..offset_elems + len) else {
@@ -987,7 +991,6 @@ impl KeyConvention for LlamaFamily {
         format!("{}.{local}.weight", self.base)
     }
 }
-
 
 /// f32 → LE 字节(host 装载辅助;装载域唯一权威)
 pub(crate) fn f32b(v: &[f32]) -> Vec<u8> {
@@ -1113,7 +1116,8 @@ impl ScalarSink {
 
     /// 装载期回填(f32 位型走 `AtomicU32`:`Model` 要 `Sync`,写入晚于构造)
     pub fn store(&self, v: f32) {
-        self.0.store(v.to_bits(), std::sync::atomic::Ordering::Relaxed);
+        self.0
+            .store(v.to_bits(), std::sync::atomic::Ordering::Relaxed);
     }
 
     /// 取值(发射面读)
@@ -1152,8 +1156,8 @@ impl Sink {
 }
 
 /// 单条数据需求(纯元数据 + 回填口)。key 为 owned:容器聚合
-    /// (Model::layout)经 map_keys 改写为 checkpoint 全键 —— 键名
-    /// 约定在声明期应用,Want 清单里已是最终键。
+/// (Model::layout)经 map_keys 改写为 checkpoint 全键 —— 键名
+/// 约定在声明期应用,Want 清单里已是最终键。
 #[derive(Clone)]
 pub struct Want {
     pub key: String,
@@ -1487,7 +1491,10 @@ enum PlanKind<'a> {
 
 impl<'a> From<QuantPlan> for PlanSource<'a> {
     fn from(p: QuantPlan) -> Self {
-        Self { kind: PlanKind::Uniform(p), facts: SourceFacts::HF }
+        Self {
+            kind: PlanKind::Uniform(p),
+            facts: SourceFacts::HF,
+        }
     }
 }
 
@@ -1498,7 +1505,14 @@ impl<'a> PlanSource<'a> {
         keys: &'a dyn KeyConvention,
         facts: SourceFacts,
     ) -> Self {
-        Self { kind: PlanKind::Keyed { table, keys, layer: 0 }, facts }
+        Self {
+            kind: PlanKind::Keyed {
+                table,
+                keys,
+                layer: 0,
+            },
+            facts,
+        }
     }
 
     /// 覆写源事实(既有牌位一律 [`SourceFacts::HF`],无需调用)
@@ -1524,9 +1538,14 @@ impl<'a> PlanSource<'a> {
     /// 绑定层号(`Model::new` 每层造一份;Uniform 臂原样返回)
     pub fn at_layer(self, i: usize) -> Self {
         match self.kind {
-            PlanKind::Keyed { table, keys, .. } => {
-                Self { kind: PlanKind::Keyed { table, keys, layer: i }, facts: self.facts }
-            }
+            PlanKind::Keyed { table, keys, .. } => Self {
+                kind: PlanKind::Keyed {
+                    table,
+                    keys,
+                    layer: i,
+                },
+                facts: self.facts,
+            },
             _ => self,
         }
     }
@@ -1615,7 +1634,6 @@ pub struct LoaderCtx {
     pub staging_mb: usize,
     /// 逐键字节 dump(原 `OWL_LOAD_DUMP`;诊断面)
     pub dump: bool,
-
 }
 
 /// repack 路径(装载域**唯一收口**;2026-10-01 用户裁决:默认 GPU 优先,
@@ -1657,7 +1675,16 @@ impl RepackPath {
 
 impl Default for LoaderCtx {
     fn default() -> Self {
-        Self { dtype: Dtype::F32, shard: 1, slice_id: 0, device_repack: false, verify: false, debug_tap: false, staging_mb: 128, dump: false }
+        Self {
+            dtype: Dtype::F32,
+            shard: 1,
+            slice_id: 0,
+            device_repack: false,
+            verify: false,
+            debug_tap: false,
+            staging_mb: 128,
+            dump: false,
+        }
     }
 }
 
@@ -1809,7 +1836,15 @@ impl Weight {
     /// 转置权重:源 [rows, cols] 行主序 → 装载声明 [cols, rows]
     /// (Linear 惯例:forward 直 matmul,decode 零转置)
     pub fn new_transposed(key: &'static str, rows: usize, cols: usize) -> Self {
-        Self { key, shape: vec![cols, rows], transposed: true, cell: SlotCell::default(), dtype: std::sync::atomic::AtomicUsize::new(dtype_code(Dtype::F32)), dtype_override: None, scales_arm: false }
+        Self {
+            key,
+            shape: vec![cols, rows],
+            transposed: true,
+            cell: SlotCell::default(),
+            dtype: std::sync::atomic::AtomicUsize::new(dtype_code(Dtype::F32)),
+            dtype_override: None,
+            scales_arm: false,
+        }
     }
 
     /// 装载生命周期:按语境声明需求(元数据直出 + 回填口;零 src 零数据)
@@ -1824,16 +1859,25 @@ impl Weight {
         // (E3:qweight U32 / scales F16 不随整模 dtype 漂移)
         let dtype = if self.scales_arm {
             // 尺度槽:bf16 臂 ⇒ BF16、f16 臂 ⇒ F16(其余含 F32 单元面落 F16)
-            if ctx.dtype == Dtype::BF16 { Dtype::BF16 } else { Dtype::F16 }
+            if ctx.dtype == Dtype::BF16 {
+                Dtype::BF16
+            } else {
+                Dtype::F16
+            }
         } else {
             self.dtype_override.unwrap_or(ctx.dtype)
         };
-        self.dtype.store(dtype_code(dtype), std::sync::atomic::Ordering::Relaxed);
+        self.dtype
+            .store(dtype_code(dtype), std::sync::atomic::Ordering::Relaxed);
         LoaderOps::want(Want {
             key: key.into(),
             dtype,
             shape: self.shape.clone(),
-            layout: if self.transposed { Layout::Transposed } else { Layout::Direct },
+            layout: if self.transposed {
+                Layout::Transposed
+            } else {
+                Layout::Direct
+            },
             segments: None,
             rule: None,
             extra: Vec::new(),
@@ -1855,7 +1899,8 @@ impl Weight {
         ctx: &LoaderCtx,
     ) -> LoaderOps {
         let dtype = self.dtype_override.unwrap_or(ctx.dtype);
-        self.dtype.store(dtype_code(dtype), std::sync::atomic::Ordering::Relaxed);
+        self.dtype
+            .store(dtype_code(dtype), std::sync::atomic::Ordering::Relaxed);
         LoaderOps::want(Want {
             key: key.into(),
             dtype,
@@ -2007,12 +2052,11 @@ pub async fn load_weight<D: DeviceClient, S: WeightSource + ?Sized>(
     Ok(())
 }
 
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::layers::linear::Linear;
-    use crate::testkit::{f32b, f32_of, Src};
+    use crate::testkit::{f32_of, f32b, Src};
 
     /// TP2 并行装载的前提:`Model` 必须能跨线程移动/共享(Weight.dtype 原子化)。
     #[test]
@@ -2044,10 +2088,16 @@ mod tests {
         assert!(!w.is_loaded(), "初始未装载");
 
         let src = Src::from([("w".to_string(), vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0])]);
-        load_weight(&mut w, &mut face, &src).await.expect("load_weight");
+        load_weight(&mut w, &mut face, &src)
+            .await
+            .expect("load_weight");
         assert!(w.is_loaded(), "装载后应有块句柄");
 
-        let xs = crate::TensorOps::from_host(crate::contract::Dtype::F32, vec![1, 3], &f32b(&[0.5, -1.0, 2.0]));
+        let xs = crate::TensorOps::from_host(
+            crate::contract::Dtype::F32,
+            vec![1, 3],
+            &f32b(&[0.5, -1.0, 2.0]),
+        );
         let got = {
             // F5-2:Linear 原生 [out,in],forward = matmul_nt
             let bytes = crate::interpreters::eval_ops(xs.matmul_nt(&w.decl()).step(), &mut face)
@@ -2061,7 +2111,10 @@ mod tests {
 
         let mut w2 = Linear::new("w", 2, 3, QuantPlan::F16).into_weight();
         let empty = Src::new();
-        assert!(load_weight(&mut w2, &mut face, &empty).await.is_err(), "缺键应 Err");
+        assert!(
+            load_weight(&mut w2, &mut face, &empty).await.is_err(),
+            "缺键应 Err"
+        );
         assert!(!w2.is_loaded(), "失败装载不应污染容器");
     }
 
@@ -2082,7 +2135,8 @@ mod tests {
             .await
             .expect("eval_load");
 
-        let x = crate::TensorOps::from_host(crate::contract::Dtype::F32, vec![1, 4], &f32b(&[0.5; 4]));
+        let x =
+            crate::TensorOps::from_host(crate::contract::Dtype::F32, vec![1, 4], &f32b(&[0.5; 4]));
         let ctx = ForwardCtx::minimal(1);
         let a = crate::testkit::harvest(&mut face, &run_through(&mlp, &x, &ctx)).await;
         let layers: Vec<&dyn Module> = vec![&mlp];

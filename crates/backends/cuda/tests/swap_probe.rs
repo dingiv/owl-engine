@@ -46,10 +46,15 @@ impl Connector for VecConn {
             .slots
             .get_mut(slot.0 as usize)
             .ok_or_else(|| ModelError::Msg(format!("VecConn: 槽 {} ≥ {n}", slot.0)))?;
-        let end = off.checked_add(bytes.len())
+        let end = off
+            .checked_add(bytes.len())
             .ok_or_else(|| ModelError::Msg("VecConn: 偏移溢出".into()))?;
         if end > s.len() {
-            return Err(ModelError::Msg(format!("VecConn: 槽 {} 越界 {end} > {}", slot.0, s.len())));
+            return Err(ModelError::Msg(format!(
+                "VecConn: 槽 {} 越界 {end} > {}",
+                slot.0,
+                s.len()
+            )));
         }
         s[off..end].copy_from_slice(bytes);
         Ok(())
@@ -61,10 +66,15 @@ impl Connector for VecConn {
             .slots
             .get(slot.0 as usize)
             .ok_or_else(|| ModelError::Msg(format!("VecConn: 槽 {} ≥ {n}", slot.0)))?;
-        let end = off.checked_add(out.len())
+        let end = off
+            .checked_add(out.len())
             .ok_or_else(|| ModelError::Msg("VecConn: 偏移溢出".into()))?;
         if end > s.len() {
-            return Err(ModelError::Msg(format!("VecConn: 槽 {} 越界 {end} > {}", slot.0, s.len())));
+            return Err(ModelError::Msg(format!(
+                "VecConn: 槽 {} 越界 {end} > {}",
+                slot.0,
+                s.len()
+            )));
         }
         out.copy_from_slice(&s[off..end]);
         Ok(())
@@ -100,16 +110,28 @@ async fn swap_out_then_in_is_byte_exact() {
     let mut client = boot();
     client.sync().await.expect("sync");
 
-    let src = client.alloc(Dtype::U32, BLOCK / 4, "probe").await.expect("src");
-    let dst = client.alloc(Dtype::U32, BLOCK / 4, "probe").await.expect("dst");
+    let src = client
+        .alloc(Dtype::U32, BLOCK / 4, "probe")
+        .await
+        .expect("src");
+    let dst = client
+        .alloc(Dtype::U32, BLOCK / 4, "probe")
+        .await
+        .expect("dst");
     // 源块:三段图样(带偏移写入)
     let a = pattern(1024, 1);
     let b = pattern(1024, 2);
     let c = pattern(2048, 3);
     for (data, off) in [(&a, 0usize), (&b, 1024), (&c, 2048)] {
-        let mut lease = client.alloc_pinned(data.len(), "probe:swap").await.expect("pinned");
+        let mut lease = client
+            .alloc_pinned(data.len(), "probe:swap")
+            .await
+            .expect("pinned");
         lease.slice_bytes_mut()[..data.len()].copy_from_slice(data);
-        client.upload_pinned(lease, &src, off, data.len()).await.expect("upload");
+        client
+            .upload_pinned(lease, &src, off, data.len())
+            .await
+            .expect("upload");
     }
     client.sync().await.expect("sync");
 
@@ -118,30 +140,87 @@ async fn swap_out_then_in_is_byte_exact() {
     //  片 1: dev[0..1024)               → conn[0..1024)
     //  片 2: dev[1024..2048)            → conn[1024..2048)
     let pieces_out = vec![
-        SwapPiece { block: src.id, dev_off: 2048, conn_off: 2048, len: 2048, slot: ConnSlot(0) },
-        SwapPiece { block: src.id, dev_off: 0, conn_off: 0, len: 1024, slot: ConnSlot(0) },
-        SwapPiece { block: src.id, dev_off: 1024, conn_off: 1024, len: 1024, slot: ConnSlot(0) },
+        SwapPiece {
+            block: src.id,
+            dev_off: 2048,
+            conn_off: 2048,
+            len: 2048,
+            slot: ConnSlot(0),
+        },
+        SwapPiece {
+            block: src.id,
+            dev_off: 0,
+            conn_off: 0,
+            len: 1024,
+            slot: ConnSlot(0),
+        },
+        SwapPiece {
+            block: src.id,
+            dev_off: 1024,
+            conn_off: 1024,
+            len: 1024,
+            slot: ConnSlot(0),
+        },
     ];
-    let conn = VecConn { slots: vec![vec![0u8; BLOCK]] };
-    let conn = client.swap(SwapDir::Out, &pieces_out, Box::new(conn)).await.expect("swap out");
+    let conn = VecConn {
+        slots: vec![vec![0u8; BLOCK]],
+    };
+    let conn = client
+        .swap(SwapDir::Out, &pieces_out, Box::new(conn))
+        .await
+        .expect("swap out");
     // 回执 = 原箱奉还(unbox 取回具体类型)
-    let conn = *conn.unbox().downcast::<VecConn>().expect("原箱奉还的必须是 VecConn");
+    let conn = *conn
+        .unbox()
+        .downcast::<VecConn>()
+        .expect("原箱奉还的必须是 VecConn");
     let got = &conn.slots[0];
     assert_eq!(&got[0..1024], &a[..], "片 1(dev[0..1024))落 conn[0..1024)");
-    assert_eq!(&got[1024..2048], &b[..], "片 2(dev[1024..2048))落 conn[1024..2048)");
-    assert_eq!(&got[2048..4096], &c[..], "片 0(dev[2048..4096),2048B)落 conn[2048..4096)");
+    assert_eq!(
+        &got[1024..2048],
+        &b[..],
+        "片 2(dev[1024..2048))落 conn[1024..2048)"
+    );
+    assert_eq!(
+        &got[2048..4096],
+        &c[..],
+        "片 0(dev[2048..4096),2048B)落 conn[2048..4096)"
+    );
 
     // ── In:槽 0 → 目标块(片序再换一次:先尾后头)
     //  片 0: conn[2048..4096) → dst[2048..4096)
     //  片 1: conn[0..1024)    → dst[0..1024)
     //  片 2: conn[1024..2048) → dst[1024..2048)
     let pieces_in = vec![
-        SwapPiece { block: dst.id, dev_off: 2048, conn_off: 2048, len: 2048, slot: ConnSlot(0) },
-        SwapPiece { block: dst.id, dev_off: 0, conn_off: 0, len: 1024, slot: ConnSlot(0) },
-        SwapPiece { block: dst.id, dev_off: 1024, conn_off: 1024, len: 1024, slot: ConnSlot(0) },
+        SwapPiece {
+            block: dst.id,
+            dev_off: 2048,
+            conn_off: 2048,
+            len: 2048,
+            slot: ConnSlot(0),
+        },
+        SwapPiece {
+            block: dst.id,
+            dev_off: 0,
+            conn_off: 0,
+            len: 1024,
+            slot: ConnSlot(0),
+        },
+        SwapPiece {
+            block: dst.id,
+            dev_off: 1024,
+            conn_off: 1024,
+            len: 1024,
+            slot: ConnSlot(0),
+        },
     ];
-    let conn2 = VecConn { slots: vec![got.clone()] };
-    let conn2 = client.swap(SwapDir::In, &pieces_in, Box::new(conn2)).await.expect("swap in");
+    let conn2 = VecConn {
+        slots: vec![got.clone()],
+    };
+    let conn2 = client
+        .swap(SwapDir::In, &pieces_in, Box::new(conn2))
+        .await
+        .expect("swap in");
     let conn2 = *conn2.unbox().downcast::<VecConn>().expect("In 也原箱奉还");
     assert_eq!(conn2.slots[0], got[..], "In 不该改连接器内容(只是读源)");
     client.sync().await.expect("sync");
@@ -165,17 +244,36 @@ async fn swap_rejects_bounds_and_empty_loudly() {
     }
     let mut client = boot();
     client.sync().await.expect("sync");
-    let dev = client.alloc(Dtype::U32, BLOCK / 4, "probe").await.expect("dev");
+    let dev = client
+        .alloc(Dtype::U32, BLOCK / 4, "probe")
+        .await
+        .expect("dev");
 
     // ① 设备侧越界
-    let bad = vec![SwapPiece { block: dev.id, dev_off: BLOCK - 8, conn_off: 0, len: 16, slot: ConnSlot(0) }];
-    let conn = VecConn { slots: vec![vec![0u8; BLOCK]] };
+    let bad = vec![SwapPiece {
+        block: dev.id,
+        dev_off: BLOCK - 8,
+        conn_off: 0,
+        len: 16,
+        slot: ConnSlot(0),
+    }];
+    let conn = VecConn {
+        slots: vec![vec![0u8; BLOCK]],
+    };
     let err = must_err!(client.swap(SwapDir::Out, &bad, Box::new(conn)));
     eprintln!("[swap 门] 设备越界拒原文: {err}");
 
     // ② 连接器侧越界(put 自己拒 —— 契约要求响亮)
-    let ok = vec![SwapPiece { block: dev.id, dev_off: 0, conn_off: BLOCK - 8, len: 16, slot: ConnSlot(0) }];
-    let conn = VecConn { slots: vec![vec![0u8; BLOCK]] };
+    let ok = vec![SwapPiece {
+        block: dev.id,
+        dev_off: 0,
+        conn_off: BLOCK - 8,
+        len: 16,
+        slot: ConnSlot(0),
+    }];
+    let conn = VecConn {
+        slots: vec![vec![0u8; BLOCK]],
+    };
     let err = must_err!(client.swap(SwapDir::Out, &ok, Box::new(conn)));
     eprintln!("[swap 门] 连接器越界拒原文: {err}");
 
@@ -183,5 +281,8 @@ async fn swap_rejects_bounds_and_empty_loudly() {
     let conn = VecConn { slots: vec![] };
     let err = must_err!(client.swap(SwapDir::Out, &[], Box::new(conn)));
     eprintln!("[swap 门] 空表拒原文: {err}");
-    assert!(format!("{err}").contains("空片段表"), "错误须自带定位:{err}");
+    assert!(
+        format!("{err}").contains("空片段表"),
+        "错误须自带定位:{err}"
+    );
 }

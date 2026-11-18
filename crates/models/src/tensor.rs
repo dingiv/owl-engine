@@ -272,7 +272,10 @@ impl TensorOps {
             id: next_id(),
             parents: vec![std::sync::Arc::new(dst.clone())],
             depth: 0,
-            op: crate::ops::Op::CallDst { op, aux: Vec::new() },
+            op: crate::ops::Op::CallDst {
+                op,
+                aux: Vec::new(),
+            },
             dtype: dst.dtype,
             shape: dst.shape.clone(),
             args: vec![],
@@ -294,7 +297,9 @@ impl TensorOps {
             id: next_id(),
             parents: vec![],
             depth: 0,
-            op: Op::Htod { bytes: data.to_vec() },
+            op: Op::Htod {
+                bytes: data.to_vec(),
+            },
             dtype,
             shape,
             args: vec![],
@@ -332,7 +337,10 @@ impl TensorOps {
             id: next_id(),
             parents: vec![],
             depth: 0,
-            op: crate::ops::Op::Call { op, aux: Vec::new() },
+            op: crate::ops::Op::Call {
+                op,
+                aux: Vec::new(),
+            },
             dtype: Dtype::F32,
             shape: vec![],
             args: vec![],
@@ -345,7 +353,8 @@ impl TensorOps {
     /// 拾取推导常数(层语义几何:kd/vd/batch/rows…;**非核参数**,不进
     /// 签名 —— 序 = 各族 driver 文档;核签名标量仍走 arg_usize/arg_i32)
     pub fn aux(mut self, v: &[usize]) -> TensorOps {
-        if let crate::ops::Op::Call { aux, .. } | crate::ops::Op::CallDst { aux, .. } = &mut self.op {
+        if let crate::ops::Op::Call { aux, .. } | crate::ops::Op::CallDst { aux, .. } = &mut self.op
+        {
             aux.extend_from_slice(v);
         }
         self
@@ -368,7 +377,10 @@ impl TensorOps {
             dtype,
             shape,
             args: vec![],
-            err: Some(LazyError { at_depth: 0, detail: detail.into() }),
+            err: Some(LazyError {
+                at_depth: 0,
+                detail: detail.into(),
+            }),
             label: None,
             tp_role: crate::plan::rules::WeightRule::Replicate,
         }
@@ -399,7 +411,10 @@ impl TensorOps {
         if want != have {
             return self.poisoned_local(LazyError {
                 at_depth: self.depth + 1,
-                detail: format!("reshape: 元素数不符 {have}({:?}) → {want}({:?})", self.shape, shape),
+                detail: format!(
+                    "reshape: 元素数不符 {have}({:?}) → {want}({:?})",
+                    self.shape, shape
+                ),
             });
         }
         // 刀3b 修正(2026-10-04):SliceView 父的重解释 = 声明期合成的新
@@ -422,7 +437,9 @@ impl TensorOps {
             _ => 0,
         };
         self.join(
-            Op::SliceView { offset_elems: base + offset_elems },
+            Op::SliceView {
+                offset_elems: base + offset_elems,
+            },
             None,
             (self.dtype, shape),
             vec![],
@@ -445,7 +462,10 @@ impl TensorOps {
         let (Some(n), Ok(_)) = (b.shape.last().copied(), self.dim_last()) else {
             return self.poisoned_local(LazyError {
                 at_depth: self.depth + 1,
-                detail: format!("matmul: 空形状(self {:?} / b {:?},需 rank ≥ 1)", self.shape, b.shape),
+                detail: format!(
+                    "matmul: 空形状(self {:?} / b {:?},需 rank ≥ 1)",
+                    self.shape, b.shape
+                ),
             });
         };
         let mut shape = self.shape.clone();
@@ -465,7 +485,10 @@ impl TensorOps {
         let (Some(n), Ok(_)) = (b.shape.first().copied(), self.dim_last()) else {
             return self.poisoned_local(LazyError {
                 at_depth: self.depth + 1,
-                detail: format!("matmul_nt: 空形状(self {:?} / b {:?},需 rank ≥ 1)", self.shape, b.shape),
+                detail: format!(
+                    "matmul_nt: 空形状(self {:?} / b {:?},需 rank ≥ 1)",
+                    self.shape, b.shape
+                ),
             });
         };
         let mut shape = self.shape.clone();
@@ -482,7 +505,10 @@ impl TensorOps {
         let n: usize = self.shape.iter().product();
         let meta = (self.dtype, self.shape.clone());
         self.join(
-            Op::Call { op: SemanticKernel::Add, aux: vec![] },
+            Op::Call {
+                op: SemanticKernel::Add,
+                aux: vec![],
+            },
             Some(b),
             meta,
             vec![KernelArg::Bits(n as u64)],
@@ -497,7 +523,10 @@ impl TensorOps {
         let n: usize = self.shape.iter().product();
         let meta = (self.dtype, self.shape.clone());
         self.join(
-            Op::Call { op: SemanticKernel::Mul, aux: vec![] },
+            Op::Call {
+                op: SemanticKernel::Mul,
+                aux: vec![],
+            },
             Some(b),
             meta,
             vec![KernelArg::Bits(n as u64)],
@@ -508,7 +537,10 @@ impl TensorOps {
         let n: usize = self.shape.iter().product();
         let meta = (self.dtype, self.shape.clone());
         self.join(
-            Op::Call { op: SemanticKernel::Silu, aux: vec![] },
+            Op::Call {
+                op: SemanticKernel::Silu,
+                aux: vec![],
+            },
             None,
             meta,
             vec![KernelArg::Bits(n as u64)],
@@ -520,7 +552,10 @@ impl TensorOps {
         let n: usize = self.shape.iter().product();
         let meta = (self.dtype, self.shape.clone());
         self.join(
-            Op::Call { op: SemanticKernel::Sigmoid, aux: vec![] },
+            Op::Call {
+                op: SemanticKernel::Sigmoid,
+                aux: vec![],
+            },
             None,
             meta,
             vec![KernelArg::Bits(n as u64)],
@@ -543,7 +578,10 @@ impl TensorOps {
         let cols: usize = alpha.shape.iter().product();
         let meta = (self.dtype, self.shape.clone());
         self.join(
-            Op::Call { op: SemanticKernel::Rmsnorm, aux: vec![] },
+            Op::Call {
+                op: SemanticKernel::Rmsnorm,
+                aux: vec![],
+            },
             Some(alpha),
             meta,
             // 标量槽序 = 线契约:cols(i32)/ eps(f32)/ w_off(i32)
@@ -577,7 +615,10 @@ impl TensorOps {
         }
         let meta = (self.dtype, self.shape.clone());
         self.join(
-            Op::Call { op: SemanticKernel::Layernorm, aux: vec![] },
+            Op::Call {
+                op: SemanticKernel::Layernorm,
+                aux: vec![],
+            },
             Some(weight),
             meta,
             vec![KernelArg::I32(n as i32), KernelArg::F32(eps)],
@@ -590,7 +631,10 @@ impl TensorOps {
         let n: usize = self.shape.iter().product();
         let meta = (self.dtype, self.shape.clone());
         self.join(
-            Op::Call { op: SemanticKernel::GeluTanh, aux: vec![] },
+            Op::Call {
+                op: SemanticKernel::GeluTanh,
+                aux: vec![],
+            },
             None,
             meta,
             vec![KernelArg::Bits(n as u64)],
@@ -602,7 +646,10 @@ impl TensorOps {
         let n: usize = self.shape.iter().product();
         let meta = (self.dtype, self.shape.clone());
         self.join(
-            Op::Call { op: SemanticKernel::GeluErf, aux: vec![] },
+            Op::Call {
+                op: SemanticKernel::GeluErf,
+                aux: vec![],
+            },
             None,
             meta,
             vec![KernelArg::Bits(n as u64)],
@@ -621,7 +668,10 @@ impl TensorOps {
         }
         let meta = (self.dtype, self.shape.clone());
         self.join(
-            Op::Call { op: SemanticKernel::BiasAdd, aux: vec![] },
+            Op::Call {
+                op: SemanticKernel::BiasAdd,
+                aux: vec![],
+            },
             Some(bias),
             meta,
             vec![KernelArg::Bits(cols as u64)],
@@ -642,7 +692,10 @@ impl TensorOps {
         if dim == 0 || self.shape.len() != 2 || merged.shape.len() != 2 {
             return self.poisoned_local(LazyError {
                 at_depth: self.depth + 1,
-                detail: format!("image_scatter: h {:?} / merged {:?} 需为 2 维且末维非零", self.shape, merged.shape),
+                detail: format!(
+                    "image_scatter: h {:?} / merged {:?} 需为 2 维且末维非零",
+                    self.shape, merged.shape
+                ),
             });
         }
         if merged.shape[1] != dim {
@@ -663,7 +716,10 @@ impl TensorOps {
         }
         let meta = (self.dtype, self.shape.clone());
         self.join(
-            Op::Call { op: SemanticKernel::ImageScatter, aux: vec![] },
+            Op::Call {
+                op: SemanticKernel::ImageScatter,
+                aux: vec![],
+            },
             Some(merged),
             meta,
             vec![KernelArg::Bits(dim as u64)],
@@ -678,7 +734,10 @@ impl TensorOps {
         if idx.shape != wts.shape {
             return self.poisoned_local(LazyError {
                 at_depth: self.depth + 1,
-                detail: format!("pos_embed: idx 形状 {:?} ≠ wts 形状 {:?}", idx.shape, wts.shape),
+                detail: format!(
+                    "pos_embed: idx 形状 {:?} ≠ wts 形状 {:?}",
+                    idx.shape, wts.shape
+                ),
             });
         }
         let dim = match self.dim_last() {
@@ -701,7 +760,10 @@ impl TensorOps {
         };
         let meta = (self.dtype, vec![rows, dim]);
         self.join(
-            Op::Call { op: SemanticKernel::PosEmbedBilinear, aux: vec![] },
+            Op::Call {
+                op: SemanticKernel::PosEmbedBilinear,
+                aux: vec![],
+            },
             Some(idx),
             meta,
             vec![KernelArg::Bits(taps as u64), KernelArg::Bits(dim as u64)],
@@ -724,24 +786,37 @@ impl TensorOps {
         if q.len() != 3 || k.shape.len() != 3 || v.shape != k.shape {
             return self.poisoned_local(LazyError {
                 at_depth: self.depth + 1,
-                detail: format!("attn_full: q {:?} / k {:?} / v {:?} 形状不符(需 3 维且 k==v)", q, k.shape, v.shape),
+                detail: format!(
+                    "attn_full: q {:?} / k {:?} / v {:?} 形状不符(需 3 维且 k==v)",
+                    q, k.shape, v.shape
+                ),
             });
         }
         if q[1] != k.shape[1] || q[2] != k.shape[2] {
             return self.poisoned_local(LazyError {
                 at_depth: self.depth + 1,
-                detail: format!("attn_full: q 头数/维度 {:?} ≠ k {:?}(本核无 GQA)", q, k.shape),
+                detail: format!(
+                    "attn_full: q 头数/维度 {:?} ≠ k {:?}(本核无 GQA)",
+                    q, k.shape
+                ),
             });
         }
         if cu.shape.iter().product::<usize>() != n_seq + 1 {
             return self.poisoned_local(LazyError {
                 at_depth: self.depth + 1,
-                detail: format!("attn_full: cu_seqlens 长 {:?} ≠ n_seq+1 = {}", cu.shape, n_seq + 1),
+                detail: format!(
+                    "attn_full: cu_seqlens 长 {:?} ≠ n_seq+1 = {}",
+                    cu.shape,
+                    n_seq + 1
+                ),
             });
         }
         let meta = (self.dtype, q.clone());
         self.join(
-            Op::Call { op: SemanticKernel::AttnFull, aux: vec![] },
+            Op::Call {
+                op: SemanticKernel::AttnFull,
+                aux: vec![],
+            },
             Some(k),
             meta,
             vec![
@@ -867,7 +942,13 @@ impl TensorOps {
     }
 
     /// append:新节点浅挂输入(parents Arc 共享;同 id 不变量的根基)
-    fn join(&self, op: Op, rhs: Option<&TensorOps>, meta: (Dtype, Shape), args: Vec<KernelArg>) -> TensorOps {
+    fn join(
+        &self,
+        op: Op,
+        rhs: Option<&TensorOps>,
+        meta: (Dtype, Shape),
+        args: Vec<KernelArg>,
+    ) -> TensorOps {
         let mut parents = vec![std::sync::Arc::new(self.clone())];
         if let Some(r) = rhs {
             parents.push(std::sync::Arc::new(r.clone()));
@@ -889,7 +970,6 @@ impl TensorOps {
         }
     }
 }
-
 
 #[cfg(test)]
 mod tests {
@@ -927,7 +1007,7 @@ mod tests {
         let a = t(&[1.0; 4], vec![4]);
         let bad = t(&[1.0; 3], vec![3]);
         let mid = a.add(&bad);
-        assert!(mid.is_poisoned());        
+        assert!(mid.is_poisoned());
         let out = mid.silu().add(&mid);
         assert!(out.is_poisoned(), "毒必须流过下游,不能中途消失");
         let err = reduce(out.step(), &mut CpuInterpreter::new()).unwrap_err();
@@ -1040,11 +1120,23 @@ mod tests {
         assert!(a.matmul_nt(&empty).is_poisoned(), "matmul_nt(空 b)");
         assert!(empty.matmul_nt(&a).is_poisoned(), "matmul_nt(空 self)");
         // image_scatter / pos_embed:空 self/idx ⇒ 毒
-        assert!(empty.image_scatter(&a, &a).is_poisoned(), "image_scatter(空 h)");
-        assert!(empty.pos_embed_bilinear(&a, &a).is_poisoned(), "pos_embed(空 table)");
-        assert!(a.pos_embed_bilinear(&empty, &empty).is_poisoned(), "pos_embed(空 idx)");
+        assert!(
+            empty.image_scatter(&a, &a).is_poisoned(),
+            "image_scatter(空 h)"
+        );
+        assert!(
+            empty.pos_embed_bilinear(&a, &a).is_poisoned(),
+            "pos_embed(空 table)"
+        );
+        assert!(
+            a.pos_embed_bilinear(&empty, &empty).is_poisoned(),
+            "pos_embed(空 idx)"
+        );
         // 对照组:正常形状不毒
         assert!(!a.matmul(&a).is_poisoned(), "正常 matmul 不该毒");
-        assert!(!a.image_scatter(&a, &t(&[1., 2.], vec![2])).is_poisoned(), "正常 scatter 不该毒");
+        assert!(
+            !a.image_scatter(&a, &t(&[1., 2.], vec![2])).is_poisoned(),
+            "正常 scatter 不该毒"
+        );
     }
 }

@@ -12,8 +12,8 @@
 //! 语义权威:与异步解释器/lower_*/.cu 注释同源 —— 唯一权威出处见
 //! `docs/arch/qwen3-mini-demo.md` §四(C8 定案后回写)。
 
-use crate::contract::{ModelError, Shape};
 use crate::contract::numel;
+use crate::contract::{ModelError, Shape};
 use crate::interpreters::observe::{BlockRef, BlockStats, NodeEvent, Tap, Want};
 use crate::ops::{KernelArg, Op, SemanticKernel};
 use crate::tensor::{Dtype, TensorOps};
@@ -29,9 +29,21 @@ pub trait Interpreter {
     /// Zeros:清零分配
     fn zeros(&mut self, dtype: Dtype, shape: &Shape) -> Result<Value, ModelError>;
     /// Matmul:[m,k]×[k,n]
-    fn matmul(&mut self, a: &Value, b: &Value, dtype: Dtype, shape: &Shape) -> Result<Value, ModelError>;
+    fn matmul(
+        &mut self,
+        a: &Value,
+        b: &Value,
+        dtype: Dtype,
+        shape: &Shape,
+    ) -> Result<Value, ModelError>;
     /// MatmulNt:[m,k]×(B [n,k] 直读)→ [m,n]
-    fn matmul_nt(&mut self, a: &Value, b: &Value, dtype: Dtype, shape: &Shape) -> Result<Value, ModelError>;
+    fn matmul_nt(
+        &mut self,
+        a: &Value,
+        b: &Value,
+        dtype: Dtype,
+        shape: &Shape,
+    ) -> Result<Value, ModelError>;
     /// Add(同形)—— **不是过时方法**(2026-10-15 复核):`reduce` 的
     /// `Op::Call { SemanticKernel::Add }` 臂就派发到这里,而层侧
     /// (decoder 残差 / dflash2 累加 / mtp)真发 Add/Mul 语义算子 ⇒
@@ -178,10 +190,7 @@ impl Value {
 }
 
 /// 同步归约驱动:自叶向根。毒值在此落地;资源错误直接 Err 过线。
-pub fn reduce(
-    t: &TensorOps,
-    itp: &mut impl Interpreter,
-) -> Result<Value, ModelError> {
+pub fn reduce(t: &TensorOps, itp: &mut impl Interpreter) -> Result<Value, ModelError> {
     reduce_tap(t, itp, None)
 }
 
@@ -223,11 +232,26 @@ fn reduce_rec(
         Op::MatmulNt => itp.matmul_nt(&ins[0], &ins[1], t.dtype, &t.shape),
         // 纯算子动作(2026-10-12 瘦身):Op::Call 枚举臂 —— CPU 解释器
         // match 同一词表落 host 实现(硬件无关动作契约的 CPU 面)
-        Op::Call { op: SemanticKernel::Add, .. } => itp.add(&ins[0], &ins[1]),
-        Op::Call { op: SemanticKernel::Mul, .. } => itp.mul(&ins[0], &ins[1]),
-        Op::Call { op: SemanticKernel::Silu, .. } => itp.silu(&ins[0]),
-        Op::Call { op: SemanticKernel::Sigmoid, .. } => itp.sigmoid(&ins[0]),
-        Op::Call { op: SemanticKernel::Rmsnorm, .. } => {
+        Op::Call {
+            op: SemanticKernel::Add,
+            ..
+        } => itp.add(&ins[0], &ins[1]),
+        Op::Call {
+            op: SemanticKernel::Mul,
+            ..
+        } => itp.mul(&ins[0], &ins[1]),
+        Op::Call {
+            op: SemanticKernel::Silu,
+            ..
+        } => itp.silu(&ins[0]),
+        Op::Call {
+            op: SemanticKernel::Sigmoid,
+            ..
+        } => itp.sigmoid(&ins[0]),
+        Op::Call {
+            op: SemanticKernel::Rmsnorm,
+            ..
+        } => {
             // 标量槽序 = 线契约:cols(i32)/ eps(f32)/ w_off(i32)
             let eps = match t.args.get(1) {
                 Some(KernelArg::F32(v)) => *v,
@@ -239,7 +263,10 @@ fn reduce_rec(
             };
             itp.rmsnorm(&ins[0], &ins[1], eps, w_off)
         }
-        Op::Call { op: SemanticKernel::Layernorm, .. } => {
+        Op::Call {
+            op: SemanticKernel::Layernorm,
+            ..
+        } => {
             // 标量槽序 = vis.layernorm 线契约:n(i32) / eps(f32)
             let n = match t.args.first() {
                 Some(KernelArg::I32(v)) => *v as usize,
@@ -251,25 +278,54 @@ fn reduce_rec(
             };
             itp.layernorm(&ins[0], &ins[1], &ins[2], n, eps)
         }
-        Op::Call { op: SemanticKernel::Rope, .. } => {
+        Op::Call {
+            op: SemanticKernel::Rope,
+            ..
+        } => {
             // 标量槽序 = ops.rope 线契约:heads(sz)/head_dim(sz)/half(sz)
             let sz = |i: usize, what: &str| match t.args.get(i) {
                 Some(KernelArg::Bits(v)) => *v as usize,
                 other => panic!("rope 标量槽 {i}({what})期望 sz,实得 {other:?}"),
             };
-            itp.rope_half_partial(&ins[0], &ins[1], &ins[2], &ins[3], sz(0, "heads"), sz(1, "head_dim"), sz(2, "half"))
+            itp.rope_half_partial(
+                &ins[0],
+                &ins[1],
+                &ins[2],
+                &ins[3],
+                sz(0, "heads"),
+                sz(1, "head_dim"),
+                sz(2, "half"),
+            )
         }
-        Op::Call { op: SemanticKernel::Narrow, .. } => {
+        Op::Call {
+            op: SemanticKernel::Narrow,
+            ..
+        } => {
             // 标量槽序 = ops.narrow 线契约:outer/src_dim/start/out_dim(sz)
             let sz = |i: usize, what: &str| match t.args.get(i) {
                 Some(KernelArg::Bits(v)) => *v as usize,
                 other => panic!("narrow 标量槽 {i}({what})期望 sz,实得 {other:?}"),
             };
-            itp.narrow_strided(&ins[0], sz(0, "outer"), sz(1, "src_dim"), sz(2, "start"), sz(3, "out_dim"))
+            itp.narrow_strided(
+                &ins[0],
+                sz(0, "outer"),
+                sz(1, "src_dim"),
+                sz(2, "start"),
+                sz(3, "out_dim"),
+            )
         }
-        Op::Call { op: SemanticKernel::GeluTanh, .. } => itp.gelu_tanh(&ins[0]),
-        Op::Call { op: SemanticKernel::GeluErf, .. } => itp.gelu_erf(&ins[0]),
-        Op::Call { op: SemanticKernel::BiasAdd, .. } => {
+        Op::Call {
+            op: SemanticKernel::GeluTanh,
+            ..
+        } => itp.gelu_tanh(&ins[0]),
+        Op::Call {
+            op: SemanticKernel::GeluErf,
+            ..
+        } => itp.gelu_erf(&ins[0]),
+        Op::Call {
+            op: SemanticKernel::BiasAdd,
+            ..
+        } => {
             // 标量槽序 = vis.bias_add 线契约:cols(sz)
             let cols = match t.args.first() {
                 Some(KernelArg::Bits(v)) => *v as usize,
@@ -277,7 +333,10 @@ fn reduce_rec(
             };
             itp.bias_add(&ins[0], &ins[1], cols)
         }
-        Op::Call { op: SemanticKernel::PosEmbedBilinear, .. } => {
+        Op::Call {
+            op: SemanticKernel::PosEmbedBilinear,
+            ..
+        } => {
             // 标量槽序 = vis.pos_embed 线契约:n_taps(sz) / dim(sz)
             let n_taps = match t.args.first() {
                 Some(KernelArg::Bits(v)) => *v as usize,
@@ -289,7 +348,10 @@ fn reduce_rec(
             };
             itp.pos_embed_bilinear(&ins[0], &ins[1], &ins[2], n_taps, dim)
         }
-        Op::Call { op: SemanticKernel::ImageScatter, .. } => {
+        Op::Call {
+            op: SemanticKernel::ImageScatter,
+            ..
+        } => {
             // 标量槽序 = vis.image_scatter 线契约:dim(sz)
             let dim = match t.args.first() {
                 Some(KernelArg::Bits(v)) => *v as usize,
@@ -297,7 +359,10 @@ fn reduce_rec(
             };
             itp.image_scatter(&ins[0], &ins[1], &ins[2], dim)
         }
-        Op::Call { op: SemanticKernel::AttnFull, .. } => {
+        Op::Call {
+            op: SemanticKernel::AttnFull,
+            ..
+        } => {
             // 标量槽序 = vis.attn_full 线契约:rows/heads/head_dim(sz) / n_seq(i32) / scale(f32)
             let sz = |i: usize, what: &str| match t.args.get(i) {
                 Some(KernelArg::Bits(v)) => *v as usize,
@@ -312,8 +377,15 @@ fn reduce_rec(
                 other => panic!("attn_full 标量槽 4 期望 f32 scale,实得 {other:?}"),
             };
             itp.attn_full(
-                &ins[0], &ins[1], &ins[2], &ins[3],
-                sz(0, "rows"), sz(1, "heads"), sz(2, "head_dim"), n_seq, scale,
+                &ins[0],
+                &ins[1],
+                &ins[2],
+                &ins[3],
+                sz(0, "rows"),
+                sz(1, "heads"),
+                sz(2, "head_dim"),
+                n_seq,
+                scale,
             )
         }
         // 其余动作(gdn/attn/ln/mlp/dflash/marlin/fi…)= GPU/引擎路径;
@@ -326,9 +398,18 @@ fn reduce_rec(
         Op::Uninit => itp.zeros(t.dtype, &t.shape),
         // 写入既有块(dest = parents[0]):CPU 面只做别名透传 —— host 解释器
         // 的语义臂按值搬运(不模拟原地写),与 GPU 面的"同块别名"外形一致
-        Op::CallDst { .. } => Ok(Value { f32: ins[0].f32.clone(), shape: t.shape.clone() }),
-        Op::Reshape => Ok(Value { f32: ins[0].f32.clone(), shape: t.shape.clone() }),
-        Op::SliceView { .. } => Ok(Value { f32: ins[0].f32.clone(), shape: t.shape.clone() }),
+        Op::CallDst { .. } => Ok(Value {
+            f32: ins[0].f32.clone(),
+            shape: t.shape.clone(),
+        }),
+        Op::Reshape => Ok(Value {
+            f32: ins[0].f32.clone(),
+            shape: t.shape.clone(),
+        }),
+        Op::SliceView { .. } => Ok(Value {
+            f32: ins[0].f32.clone(),
+            shape: t.shape.clone(),
+        }),
         Op::Block { id } => itp.block(*id, t.dtype, &t.shape),
     }?;
     // ── Tap:After 窗口(CPU 无池块,block_id = NO_POOL 哨兵)──
@@ -340,7 +421,10 @@ fn reduce_rec(
             shape: &t.shape,
             depth: t.depth,
             tag: t.label.as_deref(),
-            out: BlockRef { block_id: BlockRef::NO_POOL, len: value.f32.len() },
+            out: BlockRef {
+                block_id: BlockRef::NO_POOL,
+                len: value.f32.len(),
+            },
         };
         match tp.on_node(&ev) {
             Want::Quiet | Want::Keep => {} // Keep:MVP 未实施,按 Quiet 落空
@@ -374,7 +458,10 @@ impl Default for CpuInterpreter {
 
 impl CpuInterpreter {
     pub fn new() -> Self {
-        Self { blocks: std::collections::HashMap::new(), debug: false }
+        Self {
+            blocks: std::collections::HashMap::new(),
+            debug: false,
+        }
     }
 
     /// 登记 Block 叶子的数据(id = rt::Tensor 的全局 id)
@@ -403,7 +490,11 @@ impl Interpreter for CpuInterpreter {
             owl_shared::log_debug!(
                 "dbg-mm",
                 "a.shape={:?} a.len={} b.shape={:?} b.len={} shape={:?}",
-                a.shape, a.f32.len(), b.shape, b.f32.len(), shape
+                a.shape,
+                a.f32.len(),
+                b.shape,
+                b.f32.len(),
+                shape
             );
         }
         // k = 内维 = a 的元素数 / m(行主序)
@@ -419,7 +510,10 @@ impl Interpreter for CpuInterpreter {
                 }
             }
         }
-        Ok(Value { f32: out, shape: shape.clone() })
+        Ok(Value {
+            f32: out,
+            shape: shape.clone(),
+        })
     }
 
     fn matmul_nt(
@@ -444,7 +538,10 @@ impl Interpreter for CpuInterpreter {
                 out[i * n + j] = acc;
             }
         }
-        Ok(Value { f32: out, shape: shape.clone() })
+        Ok(Value {
+            f32: out,
+            shape: shape.clone(),
+        })
     }
 
     fn add(&mut self, a: &Value, b: &Value) -> Result<Value, ModelError> {
@@ -462,9 +559,10 @@ impl Interpreter for CpuInterpreter {
     }
 
     fn block(&mut self, id: u64, _dtype: Dtype, _shape: &Shape) -> Result<Value, ModelError> {
-        self.blocks.get(&id).cloned().ok_or_else(|| {
-            ModelError::Msg(format!("Block {id} 未绑定(需先登记物化数据)"))
-        })
+        self.blocks
+            .get(&id)
+            .cloned()
+            .ok_or_else(|| ModelError::Msg(format!("Block {id} 未绑定(需先登记物化数据)")))
     }
 
     fn silu(&mut self, x: &Value) -> Result<Value, ModelError> {
@@ -498,11 +596,18 @@ impl Interpreter for CpuInterpreter {
             let ms = xs.iter().map(|v| v * v).sum::<f32>() / cols as f32;
             let inv = 1.0 / (ms + eps).sqrt();
             for (c, v) in xs.iter().enumerate() {
-                let g = if w_off { alpha.f32[c] + 1.0 } else { alpha.f32[c] };
+                let g = if w_off {
+                    alpha.f32[c] + 1.0
+                } else {
+                    alpha.f32[c]
+                };
                 out[r * cols + c] = v * inv * g;
             }
         }
-        Ok(Value { f32: out, shape: x.shape.clone() })
+        Ok(Value {
+            f32: out,
+            shape: x.shape.clone(),
+        })
     }
 
     /// Layernorm(affine;two-pass mean/var —— 与 torch.nn.LayerNorm 同序;
@@ -534,7 +639,10 @@ impl Interpreter for CpuInterpreter {
                 out[r * n + c] = (xs[c] - mean) * inv * weight.f32[c] + bias.f32[c];
             }
         }
-        Ok(Value { f32: out, shape: x.shape.clone() })
+        Ok(Value {
+            f32: out,
+            shape: x.shape.clone(),
+        })
     }
 
     fn rope_half_partial(
@@ -575,7 +683,10 @@ impl Interpreter for CpuInterpreter {
                 }
             }
         }
-        Ok(Value { f32: out, shape: x.shape.clone() })
+        Ok(Value {
+            f32: out,
+            shape: x.shape.clone(),
+        })
     }
 
     fn narrow_strided(
@@ -596,7 +707,10 @@ impl Interpreter for CpuInterpreter {
             let s = r * src_dim + start;
             out.extend_from_slice(&src.f32[s..s + out_dim]);
         }
-        Ok(Value { f32: out, shape: vec![outer, out_dim] })
+        Ok(Value {
+            f32: out,
+            shape: vec![outer, out_dim],
+        })
     }
 
     fn gelu_tanh(&mut self, x: &Value) -> Result<Value, ModelError> {
@@ -610,7 +724,10 @@ impl Interpreter for CpuInterpreter {
                 (0.5 * vf * (1.0 + (c * (vf + 0.044715 * vf * vf * vf)).tanh())) as f32
             })
             .collect();
-        Ok(Value { f32: vals, shape: x.shape.clone() })
+        Ok(Value {
+            f32: vals,
+            shape: x.shape.clone(),
+        })
     }
 
     fn gelu_erf(&mut self, x: &Value) -> Result<Value, ModelError> {
@@ -639,7 +756,10 @@ impl Interpreter for CpuInterpreter {
                 (0.5 * vf * (1.0 + erf_series(vf / std::f64::consts::SQRT_2))) as f32
             })
             .collect();
-        Ok(Value { f32: vals, shape: x.shape.clone() })
+        Ok(Value {
+            f32: vals,
+            shape: x.shape.clone(),
+        })
     }
 
     fn bias_add(&mut self, x: &Value, bias: &Value, cols: usize) -> Result<Value, ModelError> {
@@ -657,7 +777,10 @@ impl Interpreter for CpuInterpreter {
                 out[r * cols + c] += bias.f32[c];
             }
         }
-        Ok(Value { f32: out, shape: x.shape.clone() })
+        Ok(Value {
+            f32: out,
+            shape: x.shape.clone(),
+        })
     }
 
     fn pos_embed_bilinear(
@@ -689,7 +812,10 @@ impl Interpreter for CpuInterpreter {
             }
             out[r * dim..(r + 1) * dim].copy_from_slice(&acc);
         }
-        Ok(Value { f32: out, shape: vec![rows, dim] })
+        Ok(Value {
+            f32: out,
+            shape: vec![rows, dim],
+        })
     }
 
     /// 图像 token 注入(独立副本;与 owl-cpu / CUDA 互为对照,禁止互引):
@@ -702,14 +828,25 @@ impl Interpreter for CpuInterpreter {
         dim: usize,
     ) -> Result<Value, ModelError> {
         let dim = dim.max(1);
-        let rows = h.f32.len().checked_div(dim).filter(|r| *r * dim == h.f32.len()).ok_or_else(|| {
-            ModelError::Msg(format!("image_scatter: h 长 {} 不是 dim {dim} 的整数倍", h.f32.len()))
-        })?;
+        let rows = h
+            .f32
+            .len()
+            .checked_div(dim)
+            .filter(|r| *r * dim == h.f32.len())
+            .ok_or_else(|| {
+                ModelError::Msg(format!(
+                    "image_scatter: h 长 {} 不是 dim {dim} 的整数倍",
+                    h.f32.len()
+                ))
+            })?;
         let n_merged = merged.f32.len() / dim;
         let mut out = Vec::with_capacity(h.f32.len());
         for r in 0..rows {
             let pick = idx.f32.get(r).copied().ok_or_else(|| {
-                ModelError::Msg(format!("image_scatter: idx 缺第 {r} 行(长 {})", idx.f32.len()))
+                ModelError::Msg(format!(
+                    "image_scatter: idx 缺第 {r} 行(长 {})",
+                    idx.f32.len()
+                ))
             })?;
             // 负 = 文本位保留 embed;非负 = 取塔输出行(越界响亮拒)
             let (src, base) = if pick < 0.0 {
@@ -729,7 +866,10 @@ impl Interpreter for CpuInterpreter {
                 ))
             })?);
         }
-        Ok(Value { f32: out, shape: vec![rows, dim] })
+        Ok(Value {
+            f32: out,
+            shape: vec![rows, dim],
+        })
     }
 
     // 结构性豁免(2026-11-02 clippy 清理):循环变量是**维度序**(多数组同索引 / 手工归约要显式序);zip 会藏住对应关系
@@ -748,7 +888,9 @@ impl Interpreter for CpuInterpreter {
     ) -> Result<Value, ModelError> {
         // 两趟 softmax(先 max 后加权和);与 CUDA 的在线 softmax 数学同值
         let mut out = vec![0.0f32; rows * heads * head_dim];
-        let elem = |b: &Value, row: usize, head: usize, d: usize| b.f32[(row * heads + head) * head_dim + d];
+        let elem = |b: &Value, row: usize, head: usize, d: usize| {
+            b.f32[(row * heads + head) * head_dim + d]
+        };
         for row in 0..rows {
             let mut span = (0usize, 0usize);
             for s in 0..n_seq {
@@ -789,6 +931,9 @@ impl Interpreter for CpuInterpreter {
                 }
             }
         }
-        Ok(Value { f32: out, shape: vec![rows, heads, head_dim] })
+        Ok(Value {
+            f32: out,
+            shape: vec![rows, heads, head_dim],
+        })
     }
 }

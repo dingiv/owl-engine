@@ -36,13 +36,17 @@ fn family_names() -> Vec<&'static str> {
 }
 
 fn walk_rs(dir: &Path, hits: &mut Vec<(PathBuf, String)>) {
-    let Ok(entries) = std::fs::read_dir(dir) else { return };
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
     for e in entries.flatten() {
         let p = e.path();
         if p.is_dir() {
             walk_rs(&p, hits);
         } else if p.extension().is_some_and(|x| x == "rs") {
-            let Ok(src) = std::fs::read_to_string(&p) else { continue };
+            let Ok(src) = std::fs::read_to_string(&p) else {
+                continue;
+            };
             for bad in family_names() {
                 if src.contains(bad) {
                     hits.push((p.clone(), bad.to_string()));
@@ -60,7 +64,10 @@ fn kernels_family_dir() -> PathBuf {
 #[test]
 fn server_shall_not_know_operator_names() {
     let names = family_names();
-    assert!(names.len() >= 11, "派生清单异常小({names:?})—— 声明面/门坏了?");
+    assert!(
+        names.len() >= 11,
+        "派生清单异常小({names:?})—— 声明面/门坏了?"
+    );
     let src = Path::new(env!("CARGO_MANIFEST_DIR")).join("src/server");
     let mut hits = Vec::new();
     walk_rs(&src, &mut hits);
@@ -81,7 +88,11 @@ fn names_really_live_in_family_files() {
     let mut src_all = String::new();
     let mut files = Vec::new();
     walk_rs(&dir, &mut files);
-    assert!(!files.is_empty(), "未扫到 family 源({})—— 路径推导错了?", dir.display());
+    assert!(
+        !files.is_empty(),
+        "未扫到 family 源({})—— 路径推导错了?",
+        dir.display()
+    );
     for (p, _) in &files {
         if let Ok(t) = std::fs::read_to_string(p) {
             src_all.push_str(&t);

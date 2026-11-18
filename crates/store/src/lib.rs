@@ -63,6 +63,7 @@ pub mod rel;
 pub mod reservations;
 pub mod select;
 pub mod session;
+pub mod shared_budget;
 pub mod state;
 pub mod tier;
 
@@ -79,8 +80,7 @@ pub use host::{HostBlock, HostTier, SlotTable};
 pub use id::{ChainHash, PrefixId, SnapKey, TOKENS_PER_BLOCK};
 pub use kv::{
     hash_block, tail_hash, BlockTag, CacheUpdate, ChainCursor, KvDiag, KvStats, KvStore,
-    MatchedBlock,
-    PrefixMatch,
+    MatchedBlock, PrefixMatch,
 };
 pub use leg::CachePolicy;
 pub use leg::{
@@ -89,18 +89,18 @@ pub use leg::{
     BlockClass, BlockLeg, BlockOutPlan, Carrier, ChainCand, ChainHit, InPlan, LegConfig, LegOps,
     LegStats, OutPlan, PieceSpec, PoolLayout, ReadPlan, SkipWhy, HOST_PLACEHOLDER,
 };
-pub use pressure::{PressurePolicy, PressureSignals};
 pub use plan::{
     auto_pool_tokens, CardPlan, ComponentId, MemComponent, MemoryPlan, PlanCheck, PlanPolicy,
     PlanSource, PoolPlan, TierPlan,
-};
-pub use pool_budget::{
-    pool_cap_tokens, PoolCap, PoolCapInputs, PoolFixedInputs, PoolFixedTerms, PoolTokenTerms,
 };
 pub use policy::{
     AdmissionPolicy, EvictCandidate, EvictPolicy, EvictPolicyKind, Leg, LrfuPolicy, LruPolicy,
     QueuePolicy,
 };
+pub use pool_budget::{
+    pool_cap_tokens, PoolCap, PoolCapInputs, PoolFixedInputs, PoolFixedTerms, PoolTokenTerms,
+};
+pub use pressure::{PressurePolicy, PressureSignals};
 pub use rel::{
     AdmissionApplied, AdmissionPlan, AdoptChainsReport, DiskAttach, DiskSessionUsage, EventBook,
     KvCheckpointPlan, KvConfig, OpenLoan, Protected, RecallHit, RecallMode, Rel, SnapEvictPreview,
@@ -113,9 +113,8 @@ pub use select::{
     MeanKEntry, MeanKIndex, PosAction, PosFrame, QueryFace, ScoreMode, ScoreTuning, SelectBudget,
     ViewPlan,
 };
-pub use state::{
-    SnapAdmit, SnapAdmitPolicy, SnapDurability, SnapRole, SnapSkip, StateStore,
-};
+pub use shared_budget::{SharedTierBudget, SharedTierBudgetRef};
+pub use state::{SnapAdmit, SnapAdmitPolicy, SnapDurability, SnapRole, SnapSkip, StateStore};
 pub use tier::{
     book_lock, ledger_entry, shared_ledger, tier_budget_of, AssetKind, EventRow, LedgerBook,
     LedgerEntry, Loan, Owner, OwnerRow, SharedLedger, Tier, TierBudget, TierLedger, TierReport,

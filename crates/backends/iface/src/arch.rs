@@ -38,10 +38,7 @@ pub enum Arch {
     /// Blackwell(2025):**RTX 50 系**(sm_120)
     Sm120,
     /// 驱动给到、本仓未收录的代际(数据中心卡 / 未上市代际)⇒ 如实记录
-    Other {
-        major: u8,
-        minor: u8,
-    },
+    Other { major: u8, minor: u8 },
 }
 
 /// 世代标签:只用于日志/文档/告警归类,**不参与能力判定**
@@ -236,7 +233,9 @@ impl Arch {
     pub fn parse(s: &str) -> Result<Arch, ArchParseError> {
         let raw = s.trim();
         if raw.is_empty() {
-            return Err(ArchParseError { input: s.to_string() });
+            return Err(ArchParseError {
+                input: s.to_string(),
+            });
         }
         let low = raw.to_ascii_lowercase();
         let body = low
@@ -255,27 +254,22 @@ impl Arch {
         } else {
             let digits: String = body.chars().filter(|c| c.is_ascii_digit()).collect();
             if digits.len() != body.len() {
-                return Err(ArchParseError { input: s.to_string() });
+                return Err(ArchParseError {
+                    input: s.to_string(),
+                });
             }
             match digits.len() {
                 1 => (digits.parse::<u8>(), Ok(0)),
-                2 => (
-                    digits[0..1].parse::<u8>(),
-                    digits[1..2].parse::<u8>(),
-                ),
-                3 => (
-                    digits[0..2].parse::<u8>(),
-                    digits[2..3].parse::<u8>(),
-                ),
-                _ => (
-                    digits[0..2].parse::<u8>(),
-                    digits[2..4].parse::<u8>(),
-                ),
+                2 => (digits[0..1].parse::<u8>(), digits[1..2].parse::<u8>()),
+                3 => (digits[0..2].parse::<u8>(), digits[2..3].parse::<u8>()),
+                _ => (digits[0..2].parse::<u8>(), digits[2..4].parse::<u8>()),
             }
         };
         match (maj, min) {
             (Ok(major), Ok(minor)) => Ok(Arch::from_cc(major, minor)),
-            _ => Err(ArchParseError { input: s.to_string() }),
+            _ => Err(ArchParseError {
+                input: s.to_string(),
+            }),
         }
     }
 }

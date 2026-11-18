@@ -2,8 +2,8 @@
 //! 无 offset —— Qwen3.5 主干 norm 全系 use_offset=false)。
 //! 容器 + LoaderOps 装载形态。
 
-use crate::module::{Loadable, LoaderCtx, LoaderOps, SourceFacts, Weight};
 use crate::module::{ForwardCtx, Module};
+use crate::module::{Loadable, LoaderCtx, LoaderOps, SourceFacts, Weight};
 use crate::TensorOps;
 
 pub struct RmsNorm {
@@ -17,12 +17,20 @@ pub struct RmsNorm {
 impl RmsNorm {
     /// 准备容器(`key` = 数据源槽键;主干 norm ×w 语义)
     pub fn new(key: &'static str, n: usize, eps: f32) -> RmsNorm {
-        RmsNorm { w: Weight::new(key, vec![n]), eps, w_off: false }
+        RmsNorm {
+            w: Weight::new(key, vec![n]),
+            eps,
+            w_off: false,
+        }
     }
 
     /// ×(1+w) 语义变体(Qwen3.5 qk-norm:per-head add_one)
     pub fn new_add_one(key: &'static str, n: usize, eps: f32) -> RmsNorm {
-        RmsNorm { w: Weight::new(key, vec![n]), eps, w_off: true }
+        RmsNorm {
+            w: Weight::new(key, vec![n]),
+            eps,
+            w_off: true,
+        }
     }
 
     /// **按源事实选档**(源事实的唯一消费者;设计 §11.3 语义法):
@@ -32,7 +40,11 @@ impl RmsNorm {
     /// 为什么不在源侧减 1:那要动每一个 norm 张量的字节(6 类变换多一类),
     /// 而语义法零成本、零精度损失 —— 源交出什么就存什么。
     pub fn new_by_facts(key: &'static str, n: usize, eps: f32, facts: SourceFacts) -> RmsNorm {
-        RmsNorm { w: Weight::new(key, vec![n]), eps, w_off: facts.rmsnorm_w_off() }
+        RmsNorm {
+            w: Weight::new(key, vec![n]),
+            eps,
+            w_off: facts.rmsnorm_w_off(),
+        }
     }
 
     /// gamma 槽声明(融合核接线用;norm_rope 等跨模块融合读 w)
@@ -52,7 +64,6 @@ impl RmsNorm {
     pub fn is_loaded(&self) -> bool {
         self.w.is_loaded()
     }
-
 }
 
 impl Module for RmsNorm {
@@ -66,15 +77,16 @@ impl Loadable for RmsNorm {
     fn layout(&self, ctx: &LoaderCtx) -> LoaderOps {
         self.w.layout(ctx)
     }
-
 }
-
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::testkit::{assert_close, f32b, harvest, hf_python, parity_enabled, skip_note, st_read, st_write, tmp_path, Src};
     use crate::tensor::Dtype;
+    use crate::testkit::{
+        assert_close, f32b, harvest, hf_python, parity_enabled, skip_note, st_read, st_write,
+        tmp_path, Src,
+    };
 
     #[tokio::test]
     async fn multirow_perchannel_matches_host() {
@@ -98,7 +110,11 @@ mod tests {
             let inv = 1.0 / (ms + 1e-6).sqrt();
             for (c, v) in row.iter().enumerate() {
                 let want = v * inv * gamma[c];
-                assert!((got[r * n + c] - want).abs() < 1e-5, "[{r},{c}] {} vs {want}", got[r * n + c]);
+                assert!(
+                    (got[r * n + c] - want).abs() < 1e-5,
+                    "[{r},{c}] {} vs {want}",
+                    got[r * n + c]
+                );
             }
         }
     }
@@ -133,7 +149,9 @@ mod tests {
             return;
         }
         let (rows, n) = (3usize, 8usize);
-        let x: Vec<f32> = (0..rows * n).map(|i| ((i as f32 * 0.37) - 2.1).sin()).collect();
+        let x: Vec<f32> = (0..rows * n)
+            .map(|i| ((i as f32 * 0.37) - 2.1).sin())
+            .collect();
         let gamma: Vec<f32> = (0..n).map(|i| (i as f32 * 0.21) - 0.7).collect();
         let eps = 1e-6f32;
         let xs = TensorOps::from_host(Dtype::F32, vec![rows, n], &f32b(&x));
@@ -142,7 +160,10 @@ mod tests {
         for (tag, w_off) in [("main_xw", false), ("qknorm_x1pw", true)] {
             let inp = tmp_path(&format!("rmsnorm_in_{tag}"));
             let outp = tmp_path(&format!("rmsnorm_out_{tag}"));
-            st_write(&inp, &[("x", &x, vec![rows, n]), ("weight", &gamma, vec![n])]);
+            st_write(
+                &inp,
+                &[("x", &x, vec![rows, n]), ("weight", &gamma, vec![n])],
+            );
 
             let contract = format!(r#"{{"eps": {eps}, "w_off": {}}}"#, w_off as i32);
             let manifest = hf_python(

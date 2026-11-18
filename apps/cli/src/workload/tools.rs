@@ -79,8 +79,12 @@ pub fn schemas() -> Vec<Value> {
 }
 
 pub fn execute(root: &Path, call: &ToolCall) -> Result<Value, String> {
-    let args: Value = serde_json::from_str(&call.arguments)
-        .map_err(|e| format!("tool {} arguments 非法 JSON: {e}: {}", call.name, call.arguments))?;
+    let args: Value = serde_json::from_str(&call.arguments).map_err(|e| {
+        format!(
+            "tool {} arguments 非法 JSON: {e}: {}",
+            call.name, call.arguments
+        )
+    })?;
     match call.name.as_str() {
         "bash" => Ok(bash(root, &args)),
         "read" => Ok(read(root, &args)),
@@ -121,7 +125,11 @@ fn read(root: &Path, args: &Value) -> Value {
         Ok(t) => t,
         Err(e) => return json!({"error": format!("read {}: {e}", path.display())}),
     };
-    let offset = args.get("offset").and_then(Value::as_u64).unwrap_or(1).max(1) as usize;
+    let offset = args
+        .get("offset")
+        .and_then(Value::as_u64)
+        .unwrap_or(1)
+        .max(1) as usize;
     let limit = args.get("limit").and_then(Value::as_u64).unwrap_or(0) as usize;
     let lines: Vec<&str> = text.lines().collect();
     let start = (offset - 1).min(lines.len());

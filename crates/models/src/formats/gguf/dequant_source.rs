@@ -103,7 +103,9 @@ impl WeightSource for GgufDequantSource {
 
     fn elem_len(&self, key: &str) -> Taken<usize> {
         if let Some((phys, _)) = Self::fc_half(key) {
-            let Some(t) = self.g.get_tensor(&phys) else { return Ok(None) };
+            let Some(t) = self.g.get_tensor(&phys) else {
+                return Ok(None);
+            };
             let rows = t.rows() as usize;
             let inner = t.inner() as usize;
             if !inner.is_multiple_of(2) {
@@ -113,7 +115,10 @@ impl WeightSource for GgufDequantSource {
             }
             return Ok(Some(rows * inner / 2));
         }
-        Ok(self.g.get_tensor(key).map(|t| t.rows() as usize * t.inner() as usize))
+        Ok(self
+            .g
+            .get_tensor(key)
+            .map(|t| t.rows() as usize * t.inner() as usize))
     }
 
     fn native_dtype(&self, _key: &str) -> Taken<Dtype> {
@@ -129,8 +134,12 @@ impl WeightSource for GgufDequantSource {
         dst: &mut [u8],
         dtype: Dtype,
     ) -> Taken<()> {
-        let Some(v) = self.load(key)? else { return Ok(None) };
-        let Some(slice) = v.get(offset..offset + len) else { return Ok(None) };
+        let Some(v) = self.load(key)? else {
+            return Ok(None);
+        };
+        let Some(slice) = v.get(offset..offset + len) else {
+            return Ok(None);
+        };
         let esz = match dtype {
             Dtype::F32 => 4,
             Dtype::F16 | Dtype::BF16 => 2,
@@ -150,10 +159,12 @@ impl WeightSource for GgufDequantSource {
         for (i, x) in slice.iter().enumerate() {
             match dtype {
                 Dtype::F32 => dst[i * 4..i * 4 + 4].copy_from_slice(&x.to_le_bytes()),
-                Dtype::F16 => dst[i * 2..i * 2 + 2]
-                    .copy_from_slice(&half::f16::from_f32(*x).to_le_bytes()),
-                Dtype::BF16 => dst[i * 2..i * 2 + 2]
-                    .copy_from_slice(&half::bf16::from_f32(*x).to_le_bytes()),
+                Dtype::F16 => {
+                    dst[i * 2..i * 2 + 2].copy_from_slice(&half::f16::from_f32(*x).to_le_bytes())
+                }
+                Dtype::BF16 => {
+                    dst[i * 2..i * 2 + 2].copy_from_slice(&half::bf16::from_f32(*x).to_le_bytes())
+                }
                 _ => unreachable!("上方已筛"),
             }
         }

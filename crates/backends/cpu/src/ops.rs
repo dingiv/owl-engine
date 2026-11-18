@@ -22,7 +22,13 @@ pub(crate) fn zeros(dtype: Dtype, shape: &Shape) -> Result<Value, ModelError> {
 /// [m,k] × [k,n](行主序;m/k/n = launch 标量权威 —— 2026-09-26 修:
 /// 原 k 自推 a.shape[0],alloc 块无形状(平面 [len])时 k 被压成 1,
 /// 被 engine M0 session 测试逮到;块账长只作容量,维度不参与语义)
-pub(crate) fn matmul(a: &Value, b: &Value, m: usize, k: usize, n: usize) -> Result<Value, ModelError> {
+pub(crate) fn matmul(
+    a: &Value,
+    b: &Value,
+    m: usize,
+    k: usize,
+    n: usize,
+) -> Result<Value, ModelError> {
     debug_assert_eq!(a.f32.len(), m * k, "matmul: a 账长 = m×k");
     debug_assert_eq!(b.f32.len(), k * n, "matmul: b 账长 = k×n");
     let mut out = vec![0.0f32; m * n];
@@ -34,10 +40,19 @@ pub(crate) fn matmul(a: &Value, b: &Value, m: usize, k: usize, n: usize) -> Resu
             }
         }
     }
-    Ok(Value { f32: out, shape: vec![m, n] })
+    Ok(Value {
+        f32: out,
+        shape: vec![m, n],
+    })
 }
 
-pub(crate) fn matmul_nt(a: &Value, b: &Value, m: usize, k: usize, n: usize) -> Result<Value, ModelError> {
+pub(crate) fn matmul_nt(
+    a: &Value,
+    b: &Value,
+    m: usize,
+    k: usize,
+    n: usize,
+) -> Result<Value, ModelError> {
     // B 按 [n, k] 行主序直读(nt;与 owl_matmul_nt_f32 同式)
     // m/k/n = launch 标量权威(同上修:alloc 块无形状,k 自推不可靠)
     debug_assert_eq!(a.f32.len(), m * k, "matmul_nt: a 账长 = m×k");
@@ -53,7 +68,10 @@ pub(crate) fn matmul_nt(a: &Value, b: &Value, m: usize, k: usize, n: usize) -> R
             out[i * n + j] = acc;
         }
     }
-    Ok(Value { f32: out, shape: vec![m, n] })
+    Ok(Value {
+        f32: out,
+        shape: vec![m, n],
+    })
 }
 
 /// 同形逐元素加
@@ -87,7 +105,6 @@ pub(crate) fn sigmoid(x: &Value) -> Result<Value, ModelError> {
         shape: x.shape.clone(),
     })
 }
-
 
 /// 旋转位置编码(rotate-half;表驱动):x [tokens, heads*head_dim] × cos/sin [rows, half],
 /// pos[t] 选表行;前 2·half 维旋转,余直通(partial)。与 `owl_rope_half_partial_f32` 同式。
@@ -135,7 +152,10 @@ pub(crate) fn rope_half_partial(
             }
         }
     }
-    Ok(Value { f32: out, shape: x.shape.clone() })
+    Ok(Value {
+        f32: out,
+        shape: x.shape.clone(),
+    })
 }
 
 /// 非连续窄切物化:dst[r·out_dim + d] = src[r·src_dim + start + d]
@@ -157,7 +177,10 @@ pub(crate) fn narrow_strided(
         let s = r * src_dim + start;
         out[r * out_dim..(r + 1) * out_dim].copy_from_slice(&src.f32[s..s + out_dim]);
     }
-    Ok(Value { f32: out, shape: vec![outer, out_dim] })
+    Ok(Value {
+        f32: out,
+        shape: vec![outer, out_dim],
+    })
 }
 
 /// LayerNorm(affine;two-pass mean/var —— 与 torch.nn.LayerNorm 同序，
@@ -188,9 +211,11 @@ pub(crate) fn layernorm(
             out[r * n + c] = (xs[c] - mean) * inv * weight.f32[c] + bias.f32[c];
         }
     }
-    Ok(Value { f32: out, shape: x.shape.clone() })
+    Ok(Value {
+        f32: out,
+        shape: x.shape.clone(),
+    })
 }
-
 
 // ============================================================================
 // 视觉塔算子批二(2026-10-15):Gelu / BiasAdd / PosEmbed / AttnFull
@@ -267,7 +292,10 @@ pub(crate) fn bias_add(x: &Value, bias: &Value, cols: usize) -> Result<Value, Mo
             out[r * cols + c] = x.f32[r * cols + c] + bias.f32[c];
         }
     }
-    Ok(Value { f32: out, shape: x.shape.clone() })
+    Ok(Value {
+        f32: out,
+        shape: x.shape.clone(),
+    })
 }
 
 /// VLM 图像 token 注入:out[t] = idx[t] ≥ 0 ? merged[idx[t]] : h[t]
@@ -309,7 +337,10 @@ pub(crate) fn image_scatter(
         }
         out[r * dim..(r + 1) * dim].copy_from_slice(&merged.f32[src * dim..(src + 1) * dim]);
     }
-    Ok(Value { f32: out, shape: h.shape.clone() })
+    Ok(Value {
+        f32: out,
+        shape: h.shape.clone(),
+    })
 }
 
 /// 位置嵌入 4-tap 重采样:out[n,d] = Σ_k wts[n,k]·table[idx[n,k],d]
@@ -351,7 +382,10 @@ pub(crate) fn pos_embed_bilinear(
             }
         }
     }
-    Ok(Value { f32: out, shape: vec![rows, dim] })
+    Ok(Value {
+        f32: out,
+        shape: vec![rows, dim],
+    })
 }
 
 /// 非因果 varlen 全注意力(逐图;无 GQA;两趟 softmax 参考实现)
@@ -424,7 +458,10 @@ pub(crate) fn attn_full(
             }
         }
     }
-    Ok(Value { f32: out, shape: vec![rows, heads, head_dim] })
+    Ok(Value {
+        f32: out,
+        shape: vec![rows, heads, head_dim],
+    })
 }
 
 /// RMSNorm(per-channel alpha([cols] 广播,与 GPU owl_rmsnorm_f32 同一语义);w_off = ×(1+w))
@@ -451,11 +488,18 @@ pub(crate) fn rmsnorm(
         let ms = xs.iter().map(|v| v * v).sum::<f32>() / cols as f32;
         let inv = 1.0 / (ms + eps).sqrt();
         for (c, v) in xs.iter().enumerate() {
-            let g = if w_off { alpha.f32[c] + 1.0 } else { alpha.f32[c] };
+            let g = if w_off {
+                alpha.f32[c] + 1.0
+            } else {
+                alpha.f32[c]
+            };
             out[r * cols + c] = v * inv * g;
         }
     }
-    Ok(Value { f32: out, shape: x.shape.clone() })
+    Ok(Value {
+        f32: out,
+        shape: x.shape.clone(),
+    })
 }
 
 #[cfg(test)]

@@ -60,7 +60,6 @@ pub struct ChatRequest {
     pub chat_template_kwargs: Option<Value>,
 }
 
-
 pub struct Client {
     host: String,
     model: Option<String>,
@@ -113,7 +112,8 @@ impl Client {
         if let Some(rows) = v.get("rows").and_then(|r| r.as_array()) {
             for row in rows {
                 if row.get("tag").and_then(|t| t.as_str()) == Some(tag) {
-                    total = total.saturating_add(row.get("counter").and_then(|c| c.as_u64()).unwrap_or(0));
+                    total = total
+                        .saturating_add(row.get("counter").and_then(|c| c.as_u64()).unwrap_or(0));
                 }
             }
         }
@@ -239,7 +239,9 @@ fn parse_sse(raw: &str) -> io::Result<ChatReply> {
     let mut acc = SseAccum::default();
     for line in raw.lines() {
         let line = line.trim_end_matches('\r');
-        let Some(data) = line.strip_prefix("data: ") else { continue };
+        let Some(data) = line.strip_prefix("data: ") else {
+            continue;
+        };
         if data.trim() == "[DONE]" {
             acc.done = true;
             break;
@@ -266,7 +268,9 @@ fn pump_sse<R: BufRead, F: FnMut(&str)>(
             break;
         }
         let line = line.trim_end_matches('\n').trim_end_matches('\r');
-        let Some(data) = line.strip_prefix("data: ") else { continue };
+        let Some(data) = line.strip_prefix("data: ") else {
+            continue;
+        };
         if data.trim() == "[DONE]" {
             acc.done = true;
             break;
@@ -306,8 +310,10 @@ impl SseAccum {
         }
         if let Some(u) = v.get("usage") {
             self.usage.prompt_tokens = u.get("prompt_tokens").and_then(Value::as_u64).unwrap_or(0);
-            self.usage.completion_tokens =
-                u.get("completion_tokens").and_then(Value::as_u64).unwrap_or(0);
+            self.usage.completion_tokens = u
+                .get("completion_tokens")
+                .and_then(Value::as_u64)
+                .unwrap_or(0);
             self.usage.cached_tokens = u
                 .get("prompt_tokens_details")
                 .and_then(|d| d.get("cached_tokens"))
@@ -329,7 +335,9 @@ impl SseAccum {
         if let Some(fr) = choice.get("finish_reason").and_then(Value::as_str) {
             self.finish = Some(fr.to_string());
         }
-        let Some(delta) = choice.get("delta") else { return Ok(None) };
+        let Some(delta) = choice.get("delta") else {
+            return Ok(None);
+        };
         let mut piece = String::new();
         if let Some(s) = delta.get("content").and_then(Value::as_str) {
             self.content.push_str(s);
@@ -374,7 +382,10 @@ impl SseAccum {
                 tc.arguments = "{}".to_string();
             }
             if tc.name.is_empty() {
-                return Err(io::Error::other(format!("tool_call[{0}] 缺 name", tc.index)));
+                return Err(io::Error::other(format!(
+                    "tool_call[{0}] 缺 name",
+                    tc.index
+                )));
             }
         }
         if !self.done && self.finish.is_none() {

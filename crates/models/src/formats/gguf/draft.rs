@@ -35,7 +35,7 @@ use owl_kernels::family::gguf::GgmlTy;
 
 use crate::layers::dflash2::DFlash2Draft;
 
-use super::dequant::{dequant_row, dequant_all};
+use super::dequant::{dequant_all, dequant_row};
 use super::draft_meta::{DraftSpec, TargetFacts};
 use super::reader::Gguf;
 
@@ -101,7 +101,10 @@ pub struct DraftGgufPlan<'g> {
 
 impl<'g> DraftGgufPlan<'g> {
     pub fn new(g: &'g Gguf) -> Self {
-        Self { g, unresolved: Mutex::new(Default::default()) }
+        Self {
+            g,
+            unresolved: Mutex::new(Default::default()),
+        }
     }
 
     fn note(&self, key: &str, why: &str) {
@@ -122,7 +125,11 @@ impl crate::module::PlanTable for DraftGgufPlan<'_> {
             self.note(key, "GGUF 草稿索引里没有该键(译表漏臂 / 文件不含该张量)");
             return QuantPlan::F16;
         };
-        let inner_ok = if virt { t.inner() as usize == in_dim * 2 } else { t.inner() as usize == in_dim };
+        let inner_ok = if virt {
+            t.inner() as usize == in_dim * 2
+        } else {
+            t.inner() as usize == in_dim
+        };
         if t.rows() as usize != out_dim || !inner_ok {
             self.note(
                 key,
@@ -142,7 +149,10 @@ impl crate::module::PlanTable for DraftGgufPlan<'_> {
         if owl_kernels::family::gguf::entry_for(t.ty).is_none() {
             self.note(
                 key,
-                &format!("型 {} 未移植(内核族无入口;见 family::gguf PORTED)", t.ty.name()),
+                &format!(
+                    "型 {} 未移植(内核族无入口;见 family::gguf PORTED)",
+                    t.ty.name()
+                ),
             );
             return QuantPlan::F16;
         }
@@ -177,7 +187,11 @@ pub struct GgufDraftSource<'g> {
 impl<'g> GgufDraftSource<'g> {
     /// 由已打开的容器建立(借用 —— 装载期不重开 mmap)
     pub fn new(g: &'g Gguf, spec: DraftSpec) -> Self {
-        Self { g, spec, asked: Mutex::new(BTreeSet::new()) }
+        Self {
+            g,
+            spec,
+            asked: Mutex::new(BTreeSet::new()),
+        }
     }
 
     /// 本轮**未被请求**的文件键(装载后必须为空 —— G0-a 双向覆盖)
@@ -203,9 +217,9 @@ impl<'g> GgufDraftSource<'g> {
             let (i, tail) = rest.split_once('.').ok_or_else(|| {
                 ModelError::Msg(format!("GGUF 草稿键 `{key}` 形态不符(缺层内路径)"))
             })?;
-            let i: usize = i.parse().map_err(|_| {
-                ModelError::Msg(format!("GGUF 草稿键 `{key}` 的层号不是整数"))
-            })?;
+            let i: usize = i
+                .parse()
+                .map_err(|_| ModelError::Msg(format!("GGUF 草稿键 `{key}` 的层号不是整数")))?;
             let name = match tail {
                 "attention_conv.base_kernel" => "attn_conv_base",
                 "attention_conv.kernel_projection.weight" => "attn_conv_proj.weight",
@@ -235,7 +249,9 @@ impl<'g> GgufDraftSource<'g> {
                 .strip_suffix(".weight")
                 .and_then(|s| s.parse().ok())
                 .ok_or_else(|| {
-                    ModelError::Msg(format!("GGUF 草稿译表:fc 键 `{key}` 形态不符(应 fc_N.weight)"))
+                    ModelError::Msg(format!(
+                        "GGUF 草稿译表:fc 键 `{key}` 形态不符(应 fc_N.weight)"
+                    ))
                 })?;
             return Ok(Target::FcTap(i));
         }
@@ -270,7 +286,10 @@ impl<'g> GgufDraftSource<'g> {
 
     /// 码本名单(唯一允许在 host 端反量化的量化键)
     fn codebook_allowed(gkey: &str) -> bool {
-        matches!(gkey, "selector_predecessor.weight" | "selector_successor.weight")
+        matches!(
+            gkey,
+            "selector_predecessor.weight" | "selector_successor.weight"
+        )
     }
 
     /// fc 张量几何(开箱验一次)
@@ -317,16 +336,19 @@ impl<'g> GgufDraftSource<'g> {
                 dst.len()
             )));
         }
-        let ix = self.g.index_of(gkey).ok_or_else(|| {
-            ModelError::Msg(format!("GGUF 草稿源:索引里没有 `{gkey}`"))
-        })?;
+        let ix = self
+            .g
+            .index_of(gkey)
+            .ok_or_else(|| ModelError::Msg(format!("GGUF 草稿源:索引里没有 `{gkey}`")))?;
         let src = self.g.bytes(ix);
         let dst_row = match tap {
             Some(_) => src_row_bytes / self.spec.layers,
             None => src_row_bytes,
         };
         if dst_row == 0 || rows == 0 {
-            return Err(ModelError::Msg(format!("GGUF 草稿源:键 `{gkey}` 行几何为 0")));
+            return Err(ModelError::Msg(format!(
+                "GGUF 草稿源:键 `{gkey}` 行几何为 0"
+            )));
         }
         if src.len() < rows * src_row_bytes {
             return Err(ModelError::Msg(format!(
@@ -364,13 +386,17 @@ impl<'g> GgufDraftSource<'g> {
         dst: &mut [u8],
         dtype: Dtype,
     ) -> Taken<()> {
-        let t = self.g.get_tensor(gkey).ok_or_else(|| {
-            ModelError::Msg(format!("GGUF 草稿源:索引里没有 `{gkey}`"))
-        })?;
+        let t = self
+            .g
+            .get_tensor(gkey)
+            .ok_or_else(|| ModelError::Msg(format!("GGUF 草稿源:索引里没有 `{gkey}`")))?;
         let (rows, inner) = (t.rows() as usize, t.inner() as usize);
         let (be, bb) = t.ty.block();
         let row_bytes = inner / be * bb;
-        let ix = self.g.index_of(gkey).ok_or_else(|| ModelError::Msg(format!("GGUF 草稿源:索引里没有 `{gkey}`")))?;
+        let ix = self
+            .g
+            .index_of(gkey)
+            .ok_or_else(|| ModelError::Msg(format!("GGUF 草稿源:索引里没有 `{gkey}`")))?;
         let src = self.g.bytes(ix);
         let esz = dtype.size_bytes();
         if dst.len() < len_elems * esz {
@@ -394,8 +420,9 @@ impl<'g> GgufDraftSource<'g> {
             let r = abs / inner;
             let c = abs % inner;
             let n = (inner - c).min(len_elems - done);
-            dequant_row(t.ty, &src[r * row_bytes..(r + 1) * row_bytes], &mut row_buf)
-                .map_err(|e| ModelError::Msg(format!("GGUF 草稿源:键 `{gkey}` 第 {r} 行解量化: {e}")))?;
+            dequant_row(t.ty, &src[r * row_bytes..(r + 1) * row_bytes], &mut row_buf).map_err(
+                |e| ModelError::Msg(format!("GGUF 草稿源:键 `{gkey}` 第 {r} 行解量化: {e}")),
+            )?;
             let out = &mut dst[done * esz..(done + n) * esz];
             for (k, v) in row_buf[c..c + n].iter().enumerate() {
                 match dtype {
@@ -425,11 +452,15 @@ impl<'g> GgufDraftSource<'g> {
         dst: &mut [u8],
         dtype: Dtype,
     ) -> Taken<()> {
-        let t = self.g.get_tensor(gkey).ok_or_else(|| {
-            ModelError::Msg(format!("GGUF 草稿源:索引里没有 `{gkey}`"))
-        })?;
+        let t = self
+            .g
+            .get_tensor(gkey)
+            .ok_or_else(|| ModelError::Msg(format!("GGUF 草稿源:索引里没有 `{gkey}`")))?;
         let (rows, inner) = (t.rows() as usize, t.inner() as usize);
-        let ix = self.g.index_of(gkey).ok_or_else(|| ModelError::Msg(format!("GGUF 草稿源:索引里没有 `{gkey}`")))?;
+        let ix = self
+            .g
+            .index_of(gkey)
+            .ok_or_else(|| ModelError::Msg(format!("GGUF 草稿源:索引里没有 `{gkey}`")))?;
         let v = dequant_all(t.ty, self.g.bytes(ix), rows, inner)
             .map_err(|e| ModelError::Msg(format!("GGUF 草稿源:键 `{gkey}` 原生解包: {e}")))?;
         let Some(slice) = v.get(offset_elems..offset_elems + len_elems) else {
@@ -482,19 +513,31 @@ impl WeightSource for GgufDraftSource<'_> {
             return Ok(None);
         };
         if t.ty.native_dtype().is_some() {
-            let ix = self.g.index_of(&gkey).ok_or_else(|| {
-                ModelError::Msg(format!("GGUF 草稿源:索引里没有 `{gkey}`"))
-            })?;
-            let v = dequant_all(t.ty, self.g.bytes(ix), t.rows() as usize, t.inner() as usize)
-                .map_err(|e| ModelError::Msg(format!("GGUF 草稿源:键 `{gkey}`: {e}")))?;
+            let ix = self
+                .g
+                .index_of(&gkey)
+                .ok_or_else(|| ModelError::Msg(format!("GGUF 草稿源:索引里没有 `{gkey}`")))?;
+            let v = dequant_all(
+                t.ty,
+                self.g.bytes(ix),
+                t.rows() as usize,
+                t.inner() as usize,
+            )
+            .map_err(|e| ModelError::Msg(format!("GGUF 草稿源:键 `{gkey}`: {e}")))?;
             return Ok(Some(v));
         }
         if Self::codebook_allowed(&gkey) {
-            let ix = self.g.index_of(&gkey).ok_or_else(|| {
-                ModelError::Msg(format!("GGUF 草稿源:索引里没有 `{gkey}`"))
-            })?;
-            let v = dequant_all(t.ty, self.g.bytes(ix), t.rows() as usize, t.inner() as usize)
-                .map_err(|e| ModelError::Msg(format!("GGUF 草稿源:键 `{gkey}` 码本反量化: {e}")))?;
+            let ix = self
+                .g
+                .index_of(&gkey)
+                .ok_or_else(|| ModelError::Msg(format!("GGUF 草稿源:索引里没有 `{gkey}`")))?;
+            let v = dequant_all(
+                t.ty,
+                self.g.bytes(ix),
+                t.rows() as usize,
+                t.inner() as usize,
+            )
+            .map_err(|e| ModelError::Msg(format!("GGUF 草稿源:键 `{gkey}` 码本反量化: {e}")))?;
             return Ok(Some(v));
         }
         Err(ModelError::Msg(format!(
@@ -514,9 +557,13 @@ impl WeightSource for GgufDraftSource<'_> {
             (Some(t), None) if t.ty.native_dtype().is_some() => {
                 Some((t.rows() * t.inner()) as usize)
             }
-            (Some(_t), None) => Some(self.g.bytes(self.g.index_of(&gkey).ok_or_else(|| {
-                ModelError::Msg(format!("GGUF 草稿源:索引里没有 `{gkey}`"))
-            })?).len()),
+            (Some(_t), None) => Some(
+                self.g
+                    .bytes(self.g.index_of(&gkey).ok_or_else(|| {
+                        ModelError::Msg(format!("GGUF 草稿源:索引里没有 `{gkey}`"))
+                    })?)
+                    .len(),
+            ),
         })
     }
 
@@ -647,7 +694,12 @@ impl GgufDraftBoot {
             return Err(ModelError::Msg(format!(
                 "GGUF 草稿计划表有 {} 个未解析键(构造期响亮拒):{}",
                 unresolved.len(),
-                unresolved.iter().take(6).cloned().collect::<Vec<_>>().join(" | ")
+                unresolved
+                    .iter()
+                    .take(6)
+                    .cloned()
+                    .collect::<Vec<_>>()
+                    .join(" | ")
             )));
         }
         Ok(draft)
@@ -671,7 +723,12 @@ impl GgufDraftBoot {
                 missed.len(),
                 asked,
                 total,
-                missed.iter().take(6).cloned().collect::<Vec<_>>().join(", "),
+                missed
+                    .iter()
+                    .take(6)
+                    .cloned()
+                    .collect::<Vec<_>>()
+                    .join(", "),
                 if missed.len() > 6 { ", …" } else { "" }
             )));
         }
@@ -688,14 +745,18 @@ impl GgufDraftBoot {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use owl_macros::owl_test;
-    use owl_shared::testkit::resource;
     use crate::module::Module as _;
     use crate::{ForwardCtx, TensorOps};
+    use owl_macros::owl_test;
+    use owl_shared::testkit::resource;
 
     /// 27B target 事实(草稿共享 target 的词表/层数/hidden)
     fn target() -> TargetFacts {
-        TargetFacts { vocab: 248_320, layers: 64, hidden: 5120 }
+        TargetFacts {
+            vocab: 248_320,
+            layers: 64,
+            hidden: 5120,
+        }
     }
 
     fn boot_key(key: &str) -> Option<GgufDraftBoot> {
@@ -740,14 +801,26 @@ mod tests {
                 }
             }
         }
-        assert!(matches!(plan.plan_at("fc.weight", hid, s.layers * hid), QuantPlan::Gguf(_)));
-        assert!(matches!(plan.plan_at("selector_hidden.weight", s.rank, hid), QuantPlan::Gguf(_)));
-        assert!(plan.take_unresolved().is_empty(), "[{key}] 计划表未解析键非空");
+        assert!(matches!(
+            plan.plan_at("fc.weight", hid, s.layers * hid),
+            QuantPlan::Gguf(_)
+        ));
+        assert!(matches!(
+            plan.plan_at("selector_hidden.weight", s.rank, hid),
+            QuantPlan::Gguf(_)
+        ));
+        assert!(
+            plan.take_unresolved().is_empty(),
+            "[{key}] 计划表未解析键非空"
+        );
 
         // 覆盖双向(85 wants ↔ 81 张量)
         use crate::module::Loadable;
         let d = b.draft(Dtype::BF16, Dtype::BF16).expect("声明草稿");
-        let ctx = crate::module::LoaderCtx { dtype: Dtype::BF16, ..Default::default() };
+        let ctx = crate::module::LoaderCtx {
+            dtype: Dtype::BF16,
+            ..Default::default()
+        };
         let ops = d.layout(&ctx);
         let mut wanted = std::collections::BTreeSet::new();
         for w in ops.wants() {
@@ -757,14 +830,24 @@ mod tests {
                 Target::Key(k) => k,
                 Target::FcTap(_) => "fc.weight".to_string(),
             };
-            assert!(b.gguf.get_tensor(&gkey).is_some(), "[{key}] 译表产出不存在的键 {gkey}");
+            assert!(
+                b.gguf.get_tensor(&gkey).is_some(),
+                "[{key}] 译表产出不存在的键 {gkey}"
+            );
             wanted.insert(gkey);
         }
         let file: std::collections::BTreeSet<String> =
             b.gguf.tensors.iter().map(|t| t.name.clone()).collect();
-        assert!(file.difference(&wanted).next().is_none(), "[{key}] 有未被请求的张量");
+        assert!(
+            file.difference(&wanted).next().is_none(),
+            "[{key}] 有未被请求的张量"
+        );
         assert_eq!(file.len(), 81, "[{key}] 张量数");
-        eprintln!("[{key}] 声明/计划/覆盖绿({} 项 want → {} 张量)", ops.wants().len(), file.len());
+        eprintln!(
+            "[{key}] 声明/计划/覆盖绿({} 项 want → {} 张量)",
+            ops.wants().len(),
+            file.len()
+        );
     }
 
     #[test]
@@ -793,12 +876,19 @@ mod tests {
                 .map_err(|e| ModelError::Msg(format!("HF safetensors 解析: {e}")))?;
             let mut idx = std::collections::HashMap::new();
             for name in st.names() {
-                let v = st.tensor(name).map_err(|e| ModelError::Msg(format!("HF {name}: {e}")))?;
+                let v = st
+                    .tensor(name)
+                    .map_err(|e| ModelError::Msg(format!("HF {name}: {e}")))?;
                 // 偏移 = 视图指针 − 文件基址(同进程内一次 mmap/读,指针可用)
                 let start = v.data().as_ptr() as usize - data.as_ptr() as usize;
                 idx.insert(
                     name.to_string(),
-                    (start, v.data().len(), format!("{:?}", v.dtype()), v.shape().to_vec()),
+                    (
+                        start,
+                        v.data().len(),
+                        format!("{:?}", v.dtype()),
+                        v.shape().to_vec(),
+                    ),
                 );
             }
             Ok(Self { data, idx })
@@ -904,7 +994,11 @@ mod tests {
                 Target::Key(k) => k,
                 Target::FcTap(_) => "fc.weight".to_string(),
             };
-            assert!(b.gguf.get_tensor(&gkey).is_some(), "译表产出了不存在的键 {gkey}(源 {})", w.key);
+            assert!(
+                b.gguf.get_tensor(&gkey).is_some(),
+                "译表产出了不存在的键 {gkey}(源 {})",
+                w.key
+            );
             wanted.insert(gkey);
         }
         let file: std::collections::BTreeSet<String> =
@@ -930,7 +1024,11 @@ mod tests {
         let s = b.spec.clone();
         let src = GgufDraftSource::new(&b.gguf, s.clone());
         let (fc, shape) = hf.f32("fc.weight").expect("HF fc");
-        assert_eq!(shape, vec![s.hidden, s.layers * s.hidden], "HF fc [out, in]");
+        assert_eq!(
+            shape,
+            vec![s.hidden, s.layers * s.hidden],
+            "HF fc [out, in]"
+        );
         let (ty, rows, _row_bytes, tap_row) = src.fc_geom().expect("fc 几何");
         assert_eq!(rows, s.hidden);
         let mut full = vec![0u8; rows * tap_row];
@@ -972,11 +1070,26 @@ mod tests {
         let cases = [
             ("hidden_norm.weight", "hidden_norm.weight"),
             ("norm.weight", "norm.weight"),
-            ("layers.0.input_layernorm.weight", "layers.0.input_layernorm.weight"),
-            ("layers.3.post_attention_layernorm.weight", "layers.3.post_attention_layernorm.weight"),
-            ("layers.0.self_attn.q_norm.weight", "layers.0.self_attn.q_norm.weight"),
-            ("layers.0.attention_conv.base_kernel", "layers.0.attention_conv.base_kernel"),
-            ("layers.4.mlp_conv.base_kernel", "layers.4.mlp_conv.base_kernel"),
+            (
+                "layers.0.input_layernorm.weight",
+                "layers.0.input_layernorm.weight",
+            ),
+            (
+                "layers.3.post_attention_layernorm.weight",
+                "layers.3.post_attention_layernorm.weight",
+            ),
+            (
+                "layers.0.self_attn.q_norm.weight",
+                "layers.0.self_attn.q_norm.weight",
+            ),
+            (
+                "layers.0.attention_conv.base_kernel",
+                "layers.0.attention_conv.base_kernel",
+            ),
+            (
+                "layers.4.mlp_conv.base_kernel",
+                "layers.4.mlp_conv.base_kernel",
+            ),
         ];
         for (only, hk) in cases {
             let (want, shape) = hf.f32(hk).expect("HF 张量");
@@ -1009,8 +1122,14 @@ mod tests {
         let src = GgufDraftSource::new(&b.gguf, b.spec.clone());
         let rank = b.spec.rank;
         for (owl, hk) in [
-            ("candidate_selector.predecessor_codebook", "candidate_selector.predecessor_codebook"),
-            ("candidate_selector.successor_codebook", "candidate_selector.successor_codebook"),
+            (
+                "candidate_selector.predecessor_codebook",
+                "candidate_selector.predecessor_codebook",
+            ),
+            (
+                "candidate_selector.successor_codebook",
+                "candidate_selector.successor_codebook",
+            ),
         ] {
             let (want, shape) = hf.f32(hk).expect("HF 码本");
             assert_eq!(shape, vec![248_320, rank]);
@@ -1065,7 +1184,9 @@ mod tests {
     // ========================================================================
 
     fn bf16b(v: &[f32]) -> Vec<u8> {
-        v.iter().flat_map(|f| half::bf16::from_f32(*f).to_le_bytes()).collect()
+        v.iter()
+            .flat_map(|f| half::bf16::from_f32(*f).to_le_bytes())
+            .collect()
     }
 
     fn gen(n: usize, seed: f32) -> Vec<f32> {
@@ -1105,10 +1226,9 @@ mod tests {
         let hf = crate::formats::qwen35::dflash2_draft(std::path::Path::new(&hf_dir), Dtype::BF16)
             .expect("HF 草稿声明");
         let opts = crate::formats::load::LoadOpts::new(&gpu, Dtype::BF16);
-        let src = crate::formats::safetensors::SafeTensorsSource::open_dir(std::path::Path::new(
-            &hf_dir,
-        ))
-        .expect("HF 源");
+        let src =
+            crate::formats::safetensors::SafeTensorsSource::open_dir(std::path::Path::new(&hf_dir))
+                .expect("HF 源");
         crate::interpreters::eval_load(&hf, &mut gpu, &src, &opts.ctx())
             .await
             .expect("HF 草稿装载");
@@ -1118,7 +1238,11 @@ mod tests {
         let hid = b.spec.hidden;
         let taps: Vec<TensorOps> = (0..5)
             .map(|i| {
-                TensorOps::from_host(Dtype::BF16, vec![t, hid], &bf16b(&gen(t * hid, 3.0 + i as f32)))
+                TensorOps::from_host(
+                    Dtype::BF16,
+                    vec![t, hid],
+                    &bf16b(&gen(t * hid, 3.0 + i as f32)),
+                )
             })
             .collect();
         let ctx = ForwardCtx::minimal(t);
@@ -1127,11 +1251,7 @@ mod tests {
         assert_close_tol(&got, &want, 1e-1, "project_memory(gguf vs hf)");
 
         // ③ 层 0 的 conv 前包裹 + mlp(gate/up/down + silu)+ conv 后包裹
-        let x = TensorOps::from_host(
-            Dtype::BF16,
-            vec![t, hid],
-            &bf16b(&gen(t * hid, 77.0)),
-        );
+        let x = TensorOps::from_host(Dtype::BF16, vec![t, hid], &bf16b(&gen(t * hid, 77.0)));
         for tag in ["l0"] {
             let (gin, gdel) = g.layers()[0].attn_conv().prepare(&x, &ctx);
             let (hin, hdel) = hf.layers()[0].attn_conv().prepare(&x, &ctx);
@@ -1152,8 +1272,14 @@ mod tests {
             let b2 = crate::testkit::harvest_bf16(&mut gpu, &hy).await;
             let stat = |v: &[f32]| {
                 let nan = v.iter().filter(|x| !x.is_finite()).count();
-                let mx = v.iter().filter(|x| x.is_finite()).fold(0f32, |m, x| m.max(x.abs()));
-                format!("{nan} 非有限 / max|·| {mx:.3e} / 首值 {:?}", &v[..3.min(v.len())])
+                let mx = v
+                    .iter()
+                    .filter(|x| x.is_finite())
+                    .fold(0f32, |m, x| m.max(x.abs()));
+                format!(
+                    "{nan} 非有限 / max|·| {mx:.3e} / 首值 {:?}",
+                    &v[..3.min(v.len())]
+                )
             };
             eprintln!("[l0.mlp_out] gguf={} hf={}", stat(&a), stat(&b2));
             assert_close_tol(&a, &b2, 2e-1, &format!("{tag}.mlp_out"));
@@ -1168,10 +1294,7 @@ mod tests {
         //    (2 的幂在 bf16 上精确;布局错/常量错会给 4096 倍级偏差)
         let raw: Vec<f32> = gen(64, 5.0);
         let x0 = TensorOps::from_host(Dtype::BF16, vec![4, 16], &bf16b(&raw));
-        let pair = crate::layers::scale16(
-            &crate::layers::scale16(&x0, 1.0 / 64.0),
-            64.0,
-        );
+        let pair = crate::layers::scale16(&crate::layers::scale16(&x0, 1.0 / 64.0), 64.0);
         let a = crate::testkit::harvest_bf16(&mut gpu, &pair).await;
         let b = crate::testkit::harvest_bf16(&mut gpu, &x0).await;
         assert_eq!(a, b, "[scale] 成对移位必须逐位复原");

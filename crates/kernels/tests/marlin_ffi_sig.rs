@@ -73,7 +73,10 @@ fn marlin_ffi_param_order_matches_c_shell() {
     for name in ENTRIES {
         let c = c_param_names(&cu, name);
         let r = rs_param_names(&rs, name);
-        assert!(!c.is_empty() && !r.is_empty(), "{name}: 空形参表(解析器/锚点失配?)");
+        assert!(
+            !c.is_empty() && !r.is_empty(),
+            "{name}: 空形参表(解析器/锚点失配?)"
+        );
         let c_lc: Vec<String> = c.iter().map(|s| s.to_ascii_lowercase()).collect();
         let r_lc: Vec<String> = r.iter().map(|s| s.to_ascii_lowercase()).collect();
         assert_eq!(

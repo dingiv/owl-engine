@@ -7,11 +7,13 @@
 //! 跨参耦合(表表达不了的那类)在 `check()` 里覆写:`mask` 的元素数必须
 //! 覆盖 `q_seq_len`(SPEC_DEC 掩码按 `ceil(q/32)` 行组织)。
 
-use owl_macros::kernel_tags;
+use crate::bootcheck::CheckCtx;
 use crate::contract::{Dtype, Law, OpError};
-use crate::bootcheck::{CheckCtx};
-use crate::spec::{meta_of, CaptureEvidence, Determinism, KernelMeta, KernelSpec, Param, RangeRule, ShapeFamily};
 use crate::family::xqa;
+use crate::spec::{
+    meta_of, CaptureEvidence, Determinism, KernelMeta, KernelSpec, Param, RangeRule, ShapeFamily,
+};
+use owl_macros::kernel_tags;
 
 /// 双臂共用的 20 槽参数表(两份实例化签名逐字同型,故共用一张表)。
 ///
@@ -41,14 +43,38 @@ const XQA_PARAMS: &[Param] = &[
     Param::t_in("wr", Dtype::F16, 0),
     Param::t_out("out", Dtype::F16, 2),
     // ---- 10 个 sz 标量 ----
-    Param::sz("q_seq_len").range(RangeRule { min: Some(1.0), max: None, set: None }),
-    Param::sz("hkv").range(RangeRule { min: Some(1.0), max: None, set: None }),
-    Param::sz("hd").range(RangeRule { min: None, max: None, set: Some(&[128, 256]) }),
-    Param::sz("page").range(RangeRule { min: None, max: None, set: Some(&[16, 32, 64, 128]) }),
-    Param::sz("max_context_length_len").range(RangeRule { min: Some(1.0), max: None, set: None }),
+    Param::sz("q_seq_len").range(RangeRule {
+        min: Some(1.0),
+        max: None,
+        set: None,
+    }),
+    Param::sz("hkv").range(RangeRule {
+        min: Some(1.0),
+        max: None,
+        set: None,
+    }),
+    Param::sz("hd").range(RangeRule {
+        min: None,
+        max: None,
+        set: Some(&[128, 256]),
+    }),
+    Param::sz("page").range(RangeRule {
+        min: None,
+        max: None,
+        set: Some(&[16, 32, 64, 128]),
+    }),
+    Param::sz("max_context_length_len").range(RangeRule {
+        min: Some(1.0),
+        max: None,
+        set: None,
+    }),
     // f32 位型走私(显式 token):= attn_scale·sqrt(hd)
     Param::s("q_scale_bits", crate::spec::ScalarTy::F32Bits),
-    Param::sz("sm_count").range(RangeRule { min: Some(1.0), max: None, set: None }),
+    Param::sz("sm_count").range(RangeRule {
+        min: Some(1.0),
+        max: None,
+        set: None,
+    }),
     Param::sz("stride_page"),
     Param::sz("stride_token"),
     Param::sz("stride_head"),
@@ -112,12 +138,11 @@ impl KernelSpec for XqaVerify {
     const SRC: &'static str = "";
     const PARAMS: &'static [Param] = XQA_PARAMS;
     const SHAPE: ShapeFamily = XQA_SHAPE;
-    const POOL: &'static [crate::spec::PoolAccess] =
-        &[crate::spec::PoolAccess::read(
-            crate::spec::pools::KV_MAIN,
-            crate::spec::LayoutTag::Knhd,
-            Dtype::F8E4M3,
-        )];
+    const POOL: &'static [crate::spec::PoolAccess] = &[crate::spec::PoolAccess::read(
+        crate::spec::pools::KV_MAIN,
+        crate::spec::LayoutTag::Knhd,
+        Dtype::F8E4M3,
+    )];
     const LAWS: &'static [Law] = &[Law::OutputFinite];
     const CAPTURE: CaptureEvidence = CaptureEvidence::NoHostWork;
     const DETERMINISM: Determinism = Determinism::Deterministic;
@@ -137,12 +162,11 @@ impl KernelSpec for XqaDecode {
     const SRC: &'static str = "";
     const PARAMS: &'static [Param] = XQA_PARAMS;
     const SHAPE: ShapeFamily = XQA_SHAPE;
-    const POOL: &'static [crate::spec::PoolAccess] =
-        &[crate::spec::PoolAccess::read(
-            crate::spec::pools::KV_MAIN,
-            crate::spec::LayoutTag::Knhd,
-            Dtype::F8E4M3,
-        )];
+    const POOL: &'static [crate::spec::PoolAccess] = &[crate::spec::PoolAccess::read(
+        crate::spec::pools::KV_MAIN,
+        crate::spec::LayoutTag::Knhd,
+        Dtype::F8E4M3,
+    )];
     const LAWS: &'static [Law] = &[Law::OutputFinite];
     const CAPTURE: CaptureEvidence = CaptureEvidence::NoHostWork;
     const DETERMINISM: Determinism = Determinism::Deterministic;
@@ -182,12 +206,11 @@ impl KernelSpec for XqaPrefill {
         grp: Some(6),
         tile: None,
     };
-    const POOL: &'static [crate::spec::PoolAccess] =
-        &[crate::spec::PoolAccess::read(
-            crate::spec::pools::KV_MAIN,
-            crate::spec::LayoutTag::Knhd,
-            Dtype::F8E4M3,
-        )];
+    const POOL: &'static [crate::spec::PoolAccess] = &[crate::spec::PoolAccess::read(
+        crate::spec::pools::KV_MAIN,
+        crate::spec::LayoutTag::Knhd,
+        Dtype::F8E4M3,
+    )];
     const LAWS: &'static [Law] = &[Law::OutputFinite];
     const CAPTURE: CaptureEvidence = CaptureEvidence::NoHostWork;
     const DETERMINISM: Determinism = Determinism::Deterministic;
@@ -198,15 +221,19 @@ impl KernelSpec for XqaPrefill {
 
 pub static XQA_PREFILL: KernelMeta = meta_of::<XqaPrefill>();
 
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::bootcheck::Geom;
     use crate::contract::Arg;
-    use crate::bootcheck::{Geom};
-use crate::spec::{meta_of};
+    use crate::spec::meta_of;
 
-    const GEOM: Geom = Geom { grid: (1, 1, 1), block: (128, 1, 1), smem: 0, out_elems: 256 };
+    const GEOM: Geom = Geom {
+        grid: (1, 1, 1),
+        block: (128, 1, 1),
+        smem: 0,
+        out_elems: 256,
+    };
 
     /// 槽序与 `family::xqa::VERIFY_XQA_SIG`(历史权威串)**逐字一致** ——
     /// 表接管后旧常量仍作对拍锚,不允许悄悄漂移。
@@ -250,8 +277,17 @@ use crate::spec::{meta_of};
     fn xqa_check_accepts_wellformed() {
         let probe = |id: u64| if id == 6 { Some(32usize) } else { Some(64) };
         let args = xqa_args(8);
-        let c = CheckCtx { op: "xqa", args: &args, geom: &GEOM, len: &probe };
-        assert!(meta_of::<XqaVerify>().check(&c).is_ok(), "{}", meta_of::<XqaVerify>().check(&c).unwrap_err());
+        let c = CheckCtx {
+            op: "xqa",
+            args: &args,
+            geom: &GEOM,
+            len: &probe,
+        };
+        assert!(
+            meta_of::<XqaVerify>().check(&c).is_ok(),
+            "{}",
+            meta_of::<XqaVerify>().check(&c).unwrap_err()
+        );
     }
 
     /// 负例:mask 太小 ⇒ 跨参耦合报错(带算子名 + mask + 期望元素数)
@@ -259,10 +295,18 @@ use crate::spec::{meta_of};
     fn xqa_check_rejects_short_mask() {
         let probe = |id: u64| if id == 6 { Some(4usize) } else { Some(64) };
         let args = xqa_args(128);
-        let c = CheckCtx { op: "xqa", args: &args, geom: &GEOM, len: &probe };
+        let c = CheckCtx {
+            op: "xqa",
+            args: &args,
+            geom: &GEOM,
+            len: &probe,
+        };
         let e = meta_of::<XqaVerify>().check(&c).unwrap_err();
         let s = e.to_string();
-        assert!(s.contains("mask") && s.contains("ceil(q_seq_len/32)"), "{s}");
+        assert!(
+            s.contains("mask") && s.contains("ceil(q_seq_len/32)"),
+            "{s}"
+        );
     }
 
     /// 负例:hd 不在声明集 ⇒ 表驱动的集合检查拦下
@@ -271,7 +315,12 @@ use crate::spec::{meta_of};
         let probe = |_id: u64| Some(64usize);
         let mut args = xqa_args(8);
         args[12] = Arg::U64(192); // hd = 192(不在 {128,256})
-        let c = CheckCtx { op: "xqa", args: &args, geom: &GEOM, len: &probe };
+        let c = CheckCtx {
+            op: "xqa",
+            args: &args,
+            geom: &GEOM,
+            len: &probe,
+        };
         let e = meta_of::<XqaVerify>().check(&c).unwrap_err();
         assert!(e.to_string().contains("hd"), "{e}");
     }

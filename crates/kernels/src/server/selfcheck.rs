@@ -4,10 +4,10 @@
 //! 为什么需要适配器:oracle 住 `ops/`(零 feature 门,与算子声明同居),
 //! 而设备面是 `feature = "device"` 门控的 —— 适配器是两者唯一的接触点。
 
-use crate::contract::{OpError, OpId, LaunchVal, Stage};
+use crate::bootcheck::{CheckBuf, CheckReport, CheckRunner};
+use crate::contract::{LaunchVal, OpError, OpId, Stage};
 use crate::device::{DeviceRes, Exec};
-use crate::bootcheck::{CheckBuf, CheckRunner, CheckReport};
-use crate::spec::{KernelMeta};
+use crate::spec::KernelMeta;
 
 /// 自检运行时(设备侧实现)
 ///
@@ -22,10 +22,17 @@ pub struct Runner<'a> {
 impl CheckRunner for Runner<'_> {
     fn alloc(&mut self, bytes: usize, tag: &'static str) -> Result<CheckBuf, OpError> {
         let b = self.res.alloc(bytes, tag)?;
-        Ok(CheckBuf { ptr: b.ptr, bytes: b.bytes })
+        Ok(CheckBuf {
+            ptr: b.ptr,
+            bytes: b.bytes,
+        })
     }
 
-    fn alloc_block(&mut self, bytes: usize, tag: &'static str) -> Result<crate::contract::Bytes, OpError> {
+    fn alloc_block(
+        &mut self,
+        bytes: usize,
+        tag: &'static str,
+    ) -> Result<crate::contract::Bytes, OpError> {
         self.res.alloc_block(bytes, tag)
     }
 
@@ -33,7 +40,11 @@ impl CheckRunner for Runner<'_> {
         self.res.upload_block(b, src)
     }
 
-    fn download_block(&mut self, b: &crate::contract::Bytes, dst: &mut [u8]) -> Result<(), OpError> {
+    fn download_block(
+        &mut self,
+        b: &crate::contract::Bytes,
+        dst: &mut [u8],
+    ) -> Result<(), OpError> {
         let p = self.res.resolve(b.id)?;
         self.res.download(p, dst)
     }
@@ -71,14 +82,25 @@ impl CheckRunner for Runner<'_> {
         vals: &[LaunchVal],
     ) -> Result<(), OpError> {
         let f = self.exec.load_aot(self.res, source, name, OpId(name))?;
-        self.exec.launch(self.res, OpId(name), &f, name, grid, block, shared_mem, vals)
+        self.exec.launch(
+            self.res,
+            OpId(name),
+            &f,
+            name,
+            grid,
+            block,
+            shared_mem,
+            vals,
+        )
     }
 
     fn sync(&mut self) -> Result<(), OpError> {
         let stream = self.res.stream()?;
-        stream
-            .synchronize()
-            .map_err(|e| OpError::Launch { op: "selfcheck".into(), stage: Stage::Compute, detail: format!("sync: {e:?}") })
+        stream.synchronize().map_err(|e| OpError::Launch {
+            op: "selfcheck".into(),
+            stage: Stage::Compute,
+            detail: format!("sync: {e:?}"),
+        })
     }
 }
 
@@ -99,13 +121,17 @@ pub fn run_selfchecks(
         // 2026-10-21:走统一输出口(INFO 级;默认级别 warn 不出,排障用
         // `--log-level info` 或 tag 白名单 `kernels`)。
         owl_shared::log_info!("selfcheck", "{} …({})", m.entry, c.name());
-        let mut r = Runner { res, exec, registry: Some(&mut *registry) };
-        let rep: CheckReport = c.run(&mut r as &mut dyn CheckRunner).map_err(|e| {
-            OpError::Asset {
-                op: m.entry.to_string(),
-                detail: format!("装配期自检 `{}` 失败:{e}", c.name()),
-            }
-        })?;
+        let mut r = Runner {
+            res,
+            exec,
+            registry: Some(&mut *registry),
+        };
+        let rep: CheckReport =
+            c.run(&mut r as &mut dyn CheckRunner)
+                .map_err(|e| OpError::Asset {
+                    op: m.entry.to_string(),
+                    detail: format!("装配期自检 `{}` 失败:{e}", c.name()),
+                })?;
         let poison = match rep.poison_untouched {
             Some(k) => format!("毒值律 ✓(未写字节 {k})"),
             None => "毒值律 —(非池算子)".to_string(),
@@ -113,7 +139,10 @@ pub fn run_selfchecks(
         owl_shared::log_debug!(
             "selfcheck",
             "{} ✓ {} max|err|={:.3e} ≤ {:.1e} {poison}",
-            m.entry, c.name(), rep.worst_abs_err, rep.tolerance
+            m.entry,
+            c.name(),
+            rep.worst_abs_err,
+            rep.tolerance
         );
         n += 1;
     }

@@ -129,8 +129,7 @@ fn drain_once(st: &State) {
             // 图内逐节点:唯一能在生产图态分辨"图里哪个核"的标签面
             st.sink
                 .timer(&format!("gpu.graph.{}.{name}", r.graph_id), dur);
-            st.sink
-                .count(&format!("gpu.nodes.{}", r.graph_id), 1);
+            st.sink.count(&format!("gpu.nodes.{}", r.graph_id), 1);
         }
     }
 }

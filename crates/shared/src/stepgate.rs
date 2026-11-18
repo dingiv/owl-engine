@@ -297,7 +297,7 @@ mod imp {
             return;
         }
         let _ = tag; // 站点已由 file/line 携带;tag 供日志/扩展
-        // 单步:先吃"预放行信用"(release/<n> 立即入池),信用耗尽才真等
+                     // 单步:先吃"预放行信用"(release/<n> 立即入池),信用耗尽才真等
         if g.take_credit() {
             g.advanced.fetch_add(1, Ordering::Relaxed);
             return;
@@ -329,7 +329,7 @@ mod imp {
                         break; // 有信用(放行 N 步中的一步)⇒ 走
                     }
                     match rx.recv().await {
-                        None => break, // 纪律 2:通道关闭 = 放行
+                        None => break,                   // 纪律 2:通道关闭 = 放行
                         Some(StepMsg::Wake) => continue, // 重读状态再判
                     }
                 }
@@ -367,7 +367,9 @@ mod imp {
 
     /// 便捷:改粘滞间隔(ms;立即生效 + 唤醒)
     pub fn set_interval_ms(ms: u64) -> bool {
-        gate().interval_us.store(ms.max(1) * 1000, Ordering::Relaxed);
+        gate()
+            .interval_us
+            .store(ms.max(1) * 1000, Ordering::Relaxed);
         send(StepMsg::Wake)
     }
 
@@ -483,7 +485,15 @@ mod imp {
 
     /// 带 µs 覆盖的武装(生产档 = 同 configure)
     pub fn configure_ex(mode: StepMode, interval_ms: u64, interval_us: u64, every: u64) {
-        configure(mode, if interval_us > 0 { interval_us.div_ceil(1000) } else { interval_ms }, every)
+        configure(
+            mode,
+            if interval_us > 0 {
+                interval_us.div_ceil(1000)
+            } else {
+                interval_ms
+            },
+            every,
+        )
     }
 
     /// 未编入 feature 时的 configure:**非 off 档要可见地报出来**(不静默失效)
@@ -545,7 +555,6 @@ mod tests {
     #[tokio::test]
     async fn single_step_advances_exactly_on_release() {
         with_gate(|| async {
-
             reset();
             configure(StepMode::Single, 1, 1);
             let h = tokio::spawn(async {
@@ -554,7 +563,11 @@ mod tests {
                 }
             });
             tokio::time::sleep(Duration::from_millis(50)).await;
-            assert_eq!(state().advanced, 0, "未放行前不应有任何检查点通过(已进入并阻塞:hits=1)");
+            assert_eq!(
+                state().advanced,
+                0,
+                "未放行前不应有任何检查点通过(已进入并阻塞:hits=1)"
+            );
             assert_eq!(state().hits, 1, "第一个检查点应已进入并阻塞");
             release(1);
             tokio::time::sleep(Duration::from_millis(50)).await;
@@ -576,7 +589,6 @@ mod tests {
     #[tokio::test]
     async fn sticky_sleeps_per_checkpoint() {
         with_gate(|| async {
-
             reset();
             configure(StepMode::Sticky, 20, 1);
             let t0 = std::time::Instant::now();
@@ -584,7 +596,10 @@ mod tests {
                 crate::step_gate!("test").await;
             }
             let el = t0.elapsed();
-            assert!(el >= Duration::from_millis(55), "3×20ms 应 ≥55ms,实得 {el:?}");
+            assert!(
+                el >= Duration::from_millis(55),
+                "3×20ms 应 ≥55ms,实得 {el:?}"
+            );
             assert_eq!(state().hits, 3);
             configure(StepMode::Off, 1, 1);
         })
@@ -595,7 +610,6 @@ mod tests {
     #[tokio::test]
     async fn every_n_coarsens() {
         with_gate(|| async {
-
             reset();
             configure(StepMode::Sticky, 15, 3);
             let t0 = std::time::Instant::now();
@@ -603,7 +617,10 @@ mod tests {
                 crate::step_gate!("test").await;
             }
             let el = t0.elapsed();
-            assert!(el >= Duration::from_millis(25), "6 个检查点每 3 停 1 ⇒ ≥30ms 量级,实得 {el:?}");
+            assert!(
+                el >= Duration::from_millis(25),
+                "6 个检查点每 3 停 1 ⇒ ≥30ms 量级,实得 {el:?}"
+            );
             assert_eq!(state().hits, 6);
             assert_eq!(state().waits, 2, "6/3 = 2 次真等");
             configure(StepMode::Off, 1, 1);
@@ -646,14 +663,16 @@ mod tests {
     #[tokio::test]
     async fn off_is_free() {
         with_gate(|| async {
-
             reset();
             configure(StepMode::Off, 500, 1);
             let t0 = std::time::Instant::now();
             for _ in 0..100 {
                 crate::step_gate!("test").await;
             }
-            assert!(t0.elapsed() < Duration::from_millis(50), "off 档不许有任何等待");
+            assert!(
+                t0.elapsed() < Duration::from_millis(50),
+                "off 档不许有任何等待"
+            );
             assert_eq!(state().hits, 0);
         })
         .await;
@@ -663,7 +682,6 @@ mod tests {
     #[tokio::test]
     async fn metrics_records_gate_activity() {
         with_gate(|| async {
-
             reset();
             crate::metrics::init_metrics(crate::metrics::MetricsStore::default()).ok();
             configure(StepMode::Sticky, 1, 1);
@@ -676,7 +694,10 @@ mod tests {
                 .iter()
                 .find(|r| r.tag.contains("stepgate.hits"))
                 .expect("应有 stepgate.hits 指标");
-            assert_eq!(hit.counter, 4, "4 个检查点 ⇒ counter=4(与 state().hits 同口径)");
+            assert_eq!(
+                hit.counter, 4,
+                "4 个检查点 ⇒ counter=4(与 state().hits 同口径)"
+            );
             let wait = reports.iter().find(|r| r.tag == "stepgate.wait");
             assert!(wait.is_some_and(|r| r.count == 4), "4 次等待各有计时样本");
         })

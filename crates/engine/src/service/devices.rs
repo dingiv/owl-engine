@@ -129,7 +129,12 @@ fn pick_distinct(
                 for r in free {
                     match m.get(&r.uuid) {
                         Some(ratio) if *ratio < min_free_ratio => {
-                            skipped.push(format!("{} {} free={:.0}%", r.uuid, r.bdf, ratio * 100.0));
+                            skipped.push(format!(
+                                "{} {} free={:.0}%",
+                                r.uuid,
+                                r.bdf,
+                                ratio * 100.0
+                            ));
                         }
                         _ => keep.push(r),
                     }
@@ -172,7 +177,10 @@ fn pick_distinct(
 /// `nvidia-smi` 的每卡空闲占比（UUID → free/total）。不可用 = `None`（只按卡锁避让）。
 fn vram_free_ratio_map() -> Option<std::collections::HashMap<String, f64>> {
     let out = std::process::Command::new("nvidia-smi")
-        .args(["--query-gpu=uuid,memory.free,memory.total", "--format=csv,noheader,nounits"])
+        .args([
+            "--query-gpu=uuid,memory.free,memory.total",
+            "--format=csv,noheader,nounits",
+        ])
         .output()
         .ok()?;
     if !out.status.success() {

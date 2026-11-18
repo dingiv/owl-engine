@@ -121,7 +121,12 @@ struct Guard {
 
 impl Guard {
     fn new(bytes: usize) -> Self {
-        Self { va: None, bytes, handle: None, mapped: false }
+        Self {
+            va: None,
+            bytes,
+            handle: None,
+            mapped: false,
+        }
     }
 
     fn reserve(&mut self, gran: u64) -> Result<(), ModelError> {
@@ -179,7 +184,10 @@ impl Guard {
                 ))
             }
         };
-        check(unsafe { ffi::cuMemMap(va, self.bytes, 0, handle, 0) }, "cuMemMap")?;
+        check(
+            unsafe { ffi::cuMemMap(va, self.bytes, 0, handle, 0) },
+            "cuMemMap",
+        )?;
         self.mapped = true;
         Ok(())
     }
@@ -187,8 +195,15 @@ impl Guard {
     /// 交出所有权(不再回滚)。
     fn disarm(mut self) -> VmmMapping {
         let va = self.va.take().expect("VMM disarm:va 缺失(编程错误)");
-        let handle = self.handle.take().expect("VMM disarm:handle 缺失(编程错误)");
-        let m = VmmMapping { va, bytes: self.bytes, handle };
+        let handle = self
+            .handle
+            .take()
+            .expect("VMM disarm:handle 缺失(编程错误)");
+        let m = VmmMapping {
+            va,
+            bytes: self.bytes,
+            handle,
+        };
         // 显式说明:所有权已交出,Drop 不得再动
         std::mem::forget(self);
         m
@@ -202,7 +217,10 @@ impl Drop for Guard {
         // (与 release 的 Err 面同一序列;此处失败不覆盖主错误)。
         if self.mapped {
             if let Some(va) = self.va {
-                if let Err(e) = check(unsafe { ffi::cuMemUnmap(va, self.bytes) }, "cuMemUnmap(回滚)") {
+                if let Err(e) = check(
+                    unsafe { ffi::cuMemUnmap(va, self.bytes) },
+                    "cuMemUnmap(回滚)",
+                ) {
                     eprintln!("[vmm] 回滚失败(泄漏风险,记录在案): {e}");
                 }
             }
@@ -213,8 +231,10 @@ impl Drop for Guard {
             }
         }
         if let Some(va) = self.va {
-            if let Err(e) = check(unsafe { ffi::cuMemAddressFree(va, self.bytes) }, "cuMemAddressFree(回滚)")
-            {
+            if let Err(e) = check(
+                unsafe { ffi::cuMemAddressFree(va, self.bytes) },
+                "cuMemAddressFree(回滚)",
+            ) {
                 eprintln!("[vmm] 回滚失败(泄漏风险,记录在案): {e}");
             }
         }
@@ -224,10 +244,7 @@ impl Drop for Guard {
 /// 本端分配:`reserve → create → map`(不含 setAccess/export —— 调用方显式做)。
 ///
 /// 返回 `(映射, 粒度)`。`bytes` = 请求字节数(函数内部向上取整到粒度)。
-pub(super) fn alloc_mapped(
-    ordinal: usize,
-    bytes: u64,
-) -> Result<(VmmMapping, u64), ModelError> {
+pub(super) fn alloc_mapped(ordinal: usize, bytes: u64) -> Result<(VmmMapping, u64), ModelError> {
     if bytes == 0 {
         return Err(ModelError::Msg("VMM alloc(bytes=0;拒绝)".into()));
     }
@@ -344,7 +361,10 @@ pub(super) fn release(m: VmmMapping) -> Result<(), ModelError> {
     if let Err(e) = check(unsafe { ffi::cuMemRelease(m.handle) }, "cuMemRelease") {
         errs.push(e.to_string());
     }
-    if let Err(e) = check(unsafe { ffi::cuMemAddressFree(m.va, m.bytes) }, "cuMemAddressFree") {
+    if let Err(e) = check(
+        unsafe { ffi::cuMemAddressFree(m.va, m.bytes) },
+        "cuMemAddressFree",
+    ) {
         errs.push(e.to_string());
     }
     if errs.is_empty() {

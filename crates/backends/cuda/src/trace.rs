@@ -225,11 +225,19 @@ mod tests {
     fn ring_keeps_last_n_in_order() {
         let r = TraceRing::new(3);
         for i in 1..=5u64 {
-            r.push(TraceEntry::new("launch", "compute").name(format!("k{i}")).id(i));
+            r.push(
+                TraceEntry::new("launch", "compute")
+                    .name(format!("k{i}"))
+                    .id(i),
+            );
         }
         let v = r.recent(10, None);
         assert_eq!(v.len(), 3, "定容 3 ⇒ 只留最后 3 条");
-        assert_eq!(v.iter().map(|e| e.seq).collect::<Vec<_>>(), vec![3, 4, 5], "按发射序返回");
+        assert_eq!(
+            v.iter().map(|e| e.seq).collect::<Vec<_>>(),
+            vec![3, 4, 5],
+            "按发射序返回"
+        );
         assert_eq!(v[0].name, "k3");
         let (n, total, cap) = r.stats();
         assert_eq!((n, total, cap), (3, 5, 3), "总发射数不被淘汰影响");

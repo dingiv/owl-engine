@@ -44,23 +44,42 @@ fn gguf_arms_from_env() -> owl_models::env::GgufEnv {
     }
 }
 
-fn gguf_cfg(ordinal: usize, max_context_length: usize, pool_tokens: usize, gdn_slots: usize) -> EngineConfig {
-    let mut knobs = EngineKnobs { sampler_enabled: false, raw_completion: true, ..Default::default() };
+fn gguf_cfg(
+    ordinal: usize,
+    max_context_length: usize,
+    pool_tokens: usize,
+    gdn_slots: usize,
+) -> EngineConfig {
+    let mut knobs = EngineKnobs {
+        sampler_enabled: false,
+        raw_completion: true,
+        ..Default::default()
+    };
     knobs.pool_tokens = Some(pool_tokens);
     knobs.gdn_slots = gdn_slots;
     knobs.ram_pool_size = 32;
-    knobs.snap_host_mb = 0;
     knobs.snap_max = 0;
     // 臂集 = env 入参(测试例外);生产由 `[dispatch] gguf_*` 给
     knobs.env.gguf = gguf_arms_from_env();
-    EngineConfig { device_ordinal: ordinal, max_context_length_tokens: max_context_length, prefill_chunk: 128, knobs }
+    EngineConfig {
+        device_ordinal: ordinal,
+        max_context_length_tokens: max_context_length,
+        prefill_chunk: 128,
+        knobs,
+    }
 }
 
 /// 冒烟场景(参数化;M1 = 4B,M2 = 27B)。
 ///
 /// `n_layers` / `n_gdn` 是**模型的声明事实**(32 层/24 GDN vs 64 层/48 GDN):
 /// 既验层型表推导,也验"列序表张数 = GDN 层数"(虚拟键的落点数)。
-async fn smoke_scenario(key: &str, n_layers: usize, n_gdn: usize, want_first: &str, cfg: EngineConfig) {
+async fn smoke_scenario(
+    key: &str,
+    n_layers: usize,
+    n_gdn: usize,
+    want_first: &str,
+    cfg: EngineConfig,
+) {
     if !resource_ok(key) {
         owl_shared::testkit::report::skip("资源清单缺 \"{key}\"");
         return;
@@ -147,10 +166,15 @@ async fn smoke_scenario(key: &str, n_layers: usize, n_gdn: usize, want_first: &s
     // 这一步是 GGUF 档的关键:**权重槽是 U8 块字节 + 虚拟键列序表**,若哪条链
     // 在捕获期做了 Htod(树审计)或 face 不支持(能力门),这里会诚实地降级 ——
     // 降级不是错,但"以为捕获了其实没捕获"会让 decode 步时翻倍(级联回归源)。
-    if let crate::graph_plan::PlanOutcome::EagerFallback { reason } = &running.dev.graphs.capture_outcome {
+    if let crate::graph_plan::PlanOutcome::EagerFallback { reason } =
+        &running.dev.graphs.capture_outcome
+    {
         panic!("GGUF 档图捕获降级(eager 回退):{reason}");
     }
-    eprintln!("[gguf-e2e] 捕获预检:PlanOutcome::{:?}", running.dev.graphs.capture_outcome);
+    eprintln!(
+        "[gguf-e2e] 捕获预检:PlanOutcome::{:?}",
+        running.dev.graphs.capture_outcome
+    );
 
     // ---- 刀 8 面②:**decode 步时账**(引擎既有 `mrec(\"decode.step\")`,GGUF 档必须同样在账)----
     let reps = owl_shared::metrics::query_metrics(
@@ -159,9 +183,17 @@ async fn smoke_scenario(key: &str, n_layers: usize, n_gdn: usize, want_first: &s
     let step = reps
         .iter()
         .find(|r| r.tag == "decode.step")
-        .unwrap_or_else(|| panic!("`decode.step` 无样本(metrics 未 init 或 decode 路没记账);实得 {:?}",
-            reps.iter().map(|r| r.tag.as_str()).collect::<Vec<_>>()));
-    assert!(step.count >= 16, "`decode.step` 样本 {}(应 ≥ 生成步数)", step.count);
+        .unwrap_or_else(|| {
+            panic!(
+                "`decode.step` 无样本(metrics 未 init 或 decode 路没记账);实得 {:?}",
+                reps.iter().map(|r| r.tag.as_str()).collect::<Vec<_>>()
+            )
+        });
+    assert!(
+        step.count >= 16,
+        "`decode.step` 样本 {}(应 ≥ 生成步数)",
+        step.count
+    );
     eprintln!(
         "[gguf-e2e] decode 步时账:{} 步 · avg {:.3}ms · p50 {:.3}ms · p99 {:.3}ms",
         step.count,
@@ -193,8 +225,13 @@ async fn smoke_scenario(key: &str, n_layers: usize, n_gdn: usize, want_first: &s
         assert!(js.contains("wt.token_embd.weight"), "tied 量化表未入账");
     }
     // 连贯判据(廉价但有力):不得是同一字符/词的无脑重复(错变换的典型签名)
-    let uniq: std::collections::HashSet<char> = text.chars().filter(|c| !c.is_whitespace()).collect();
-    assert!(uniq.len() >= 4, "输出字符种类过少({:?})—— 疑似错变换导致的退化", text);
+    let uniq: std::collections::HashSet<char> =
+        text.chars().filter(|c| !c.is_whitespace()).collect();
+    assert!(
+        uniq.len() >= 4,
+        "输出字符种类过少({:?})—— 疑似错变换导致的退化",
+        text
+    );
 }
 
 /// **M1 冒烟(4B)**
@@ -319,7 +356,11 @@ async fn gpu_gguf_4b_vs_hf_4b() {
     let ordinal = owl_cuda::test_device_ordinal();
     // ---- 臂 A:GGUF(Q4_K_M) ----
     let mut eng_g = Engine::new(gguf_cfg(ordinal, 1024, 1024, 1)).expect("引擎 G");
-    let lg = eng_g.loader().load_gguf(&gguf_path).await.expect("GGUF 装载");
+    let lg = eng_g
+        .loader()
+        .load_gguf(&gguf_path)
+        .await
+        .expect("GGUF 装载");
     let mut run_g = eng_g.run(lg).await.expect("装配 G");
     // ---- 臂 B:HF 快照(f16;rope 事实与 GGUF 同源 ⇒ 只差权重) ----
     let mut eng_h = Engine::new(gguf_cfg(ordinal, 1024, 1024, 1)).expect("引擎 H");
@@ -346,7 +387,10 @@ async fn gpu_gguf_4b_vs_hf_4b() {
         );
         let eq = t_g == t_h;
         same_all += eq as usize;
-        eprintln!("[3way] {i} 首token同 · 全序列{} · {p:?}", if eq { "同" } else { "分叉(near-tie)" });
+        eprintln!(
+            "[3way] {i} 首token同 · 全序列{} · {p:?}",
+            if eq { "同" } else { "分叉(near-tie)" }
+        );
         if !eq {
             eprintln!("        GGUF={t_g:?}\n        HF  ={t_h:?}");
         }
@@ -381,7 +425,6 @@ async fn greedy_in<D: owl_iface::contract::DeviceClient + 'static>(
     }
     text
 }
-
 
 // ============================================================================
 // **W-1:GGUF + TP2**(2026-10-19)—— 分片几何的真机门
@@ -420,7 +463,9 @@ fn tp2_entry(key: &'static str, layers: usize, want_first: &'static str) {
             .map(|bdf| owl_cuda::resolve_ordinal_by_bdf(&bdf).unwrap_or_else(|e| panic!("{e}")))
     };
     let (Some(oa), Some(ob)) = (dev("OWL_GGUF_TP_DEV_A"), dev("OWL_GGUF_TP_DEV_B")) else {
-        owl_shared::testkit::report::skip("需 OWL_GGUF_TP_DEV_A / OWL_GGUF_TP_DEV_B(两张空闲卡的 BDF)");
+        owl_shared::testkit::report::skip(
+            "需 OWL_GGUF_TP_DEV_A / OWL_GGUF_TP_DEV_B(两张空闲卡的 BDF)",
+        );
         return;
     };
     assert_ne!(oa, ob, "TP2 需要两张不同的卡");
@@ -449,13 +494,18 @@ async fn first_logits_gguf<D: owl_iface::contract::DeviceClient>(
     running: &mut RunningEngine<D>,
     prompt: &str,
 ) -> Vec<f32> {
-    let (sid, turn) = running.submit_session_ex(Some(1), prompt, 1, true).expect("submit");
+    let (sid, turn) = running
+        .submit_session_ex(Some(1), prompt, 1, true)
+        .expect("submit");
     let _ = sid;
     let mut logits: Option<Vec<f32>> = None;
     loop {
         let ev = running.pump().await.expect("pump");
         if matches!(&ev, TurnEvent::Token { turn: t, .. } if *t == turn) && logits.is_none() {
-            logits = running.read_output_f32("logits").await.expect("read logits");
+            logits = running
+                .read_output_f32("logits")
+                .await
+                .expect("read logits");
         }
         match ev {
             TurnEvent::Idle => break,
@@ -479,8 +529,11 @@ async fn tp2_body(key: &str, layers: usize, want_first: &str, oa: usize, ob: usi
     // 会把上一份 18GB 误算进"卡可用"(实测 5.34GB)。跑在 rank1 卡上,rank0 快照干净;
     // rank1 的 boot 快照不参与预算(TP 只取 rank0 那份)。
     let ref_logits = {
-        let mut e = Engine::new(EngineConfig { device_ordinal: ob, ..cfg.clone() })
-            .expect("engine(单卡参考)");
+        let mut e = Engine::new(EngineConfig {
+            device_ordinal: ob,
+            ..cfg.clone()
+        })
+        .expect("engine(单卡参考)");
         let loaded = e.loader().load_gguf(&path).await.expect("单卡装载");
         let mut r = e.run(loaded).await.expect("单卡装配");
         let v = first_logits_gguf(&mut r, "The capital of France is").await;
@@ -494,15 +547,28 @@ async fn tp2_body(key: &str, layers: usize, want_first: &str, oa: usize, ob: usi
     // 退化为幂等复核)。
     let ledger0 = e0.ledger_cell();
     let live0 = owl_shared::vram::live_bytes();
-    let l0 = e0.loader().slice(0, 2).load_gguf(&path).await.expect("rank0 分片装载");
+    let l0 = e0
+        .loader()
+        .slice(0, 2)
+        .load_gguf(&path)
+        .await
+        .expect("rank0 分片装载");
     let g0 = owl_shared::vram::live_bytes().saturating_sub(live0) as f64 / (1u64 << 30) as f64;
     let mut e1 = Engine::new_with_ledger(
-        EngineConfig { device_ordinal: ob, ..cfg },
+        EngineConfig {
+            device_ordinal: ob,
+            ..cfg
+        },
         ledger0,
         1,
     )
     .expect("engine(rank1)");
-    let l1 = e1.loader().slice(1, 2).load_gguf(&path).await.expect("rank1 分片装载");
+    let l1 = e1
+        .loader()
+        .slice(1, 2)
+        .load_gguf(&path)
+        .await
+        .expect("rank1 分片装载");
     eprintln!(
         "[gguf-tp2] 分片装载:rank0 {g0:.2} GiB(文件 {file_gib:.2});两侧层数 {}/{}",
         l0.model.layers.len(),
@@ -534,7 +600,13 @@ async fn tp2_body(key: &str, layers: usize, want_first: &str, oa: usize, ob: usi
     }
     let cos = dot / (n1.sqrt() * n2.sqrt()).max(1e-30);
     let arg = |v: &[f32]| -> usize {
-        v.iter().enumerate().fold((0, f32::MIN), |acc, (i, x)| if *x > acc.1 { (i, *x) } else { acc }).0
+        v.iter()
+            .enumerate()
+            .fold(
+                (0, f32::MIN),
+                |acc, (i, x)| if *x > acc.1 { (i, *x) } else { acc },
+            )
+            .0
     };
     eprintln!(
         "[gguf-tp2] logits 对拍:max|Δ| = {dmax:.4}(max|L| = {amax:.3})· cos = {cos:.8} · top1 {} == {}",
@@ -569,13 +641,24 @@ async fn tp2_body(key: &str, layers: usize, want_first: &str, oa: usize, ob: usi
         dmax < 12.0,
         "TP2 与单卡 max|Δ| = {dmax:.3} 超出既有 TP2 噪声量级(AWQ 对照 10.83)⇒ 回查分片/AR"
     );
-    let peer = running.read_peer_output_f32("logits").await.expect("读 peer logits");
+    let peer = running
+        .read_peer_output_f32("logits")
+        .await
+        .expect("读 peer logits");
     if let Some(p) = peer {
-        let nbit = p.iter().zip(tp_logits.iter()).filter(|(a, b)| a.to_bits() != b.to_bits()).count();
+        let nbit = p
+            .iter()
+            .zip(tp_logits.iter())
+            .filter(|(a, b)| a.to_bits() != b.to_bits())
+            .count();
         eprintln!("[gguf-tp2] 两 rank logits:{nbit} 项不同(应 0)");
         assert_eq!(nbit, 0, "两 rank logits 不逐位相同(AR 没把两侧统一?)");
     }
-    eprintln!("[gguf-tp2] 捕获态:{:?} · peer 束 {}", running.capture_outcome(), running.has_peer());
+    eprintln!(
+        "[gguf-tp2] 捕获态:{:?} · peer 束 {}",
+        running.capture_outcome(),
+        running.has_peer()
+    );
     if let crate::graph_plan::PlanOutcome::EagerFallback { reason } = running.capture_outcome() {
         panic!("GGUF TP2 图捕获降级:{reason}");
     }
@@ -611,7 +694,10 @@ async fn tp2_body(key: &str, layers: usize, want_first: &str, oa: usize, ob: usi
         }
     }
     let dt = t.elapsed().as_secs_f32();
-    eprintln!("[gguf-tp2] 24 token / {dt:.2}s({:.1} tok/s)· {text:?}", 24.0 / dt.max(1e-6));
+    eprintln!(
+        "[gguf-tp2] 24 token / {dt:.2}s({:.1} tok/s)· {text:?}",
+        24.0 / dt.max(1e-6)
+    );
     let 单卡: &str = if layers == 64 {
         " Paris.\nThe capital of Germany is Berlin.\nThe capital of Italy is Rome.\nThe capital of Spain is"
     } else {
@@ -622,8 +708,12 @@ async fn tp2_body(key: &str, layers: usize, want_first: &str, oa: usize, ob: usi
     } else {
         eprintln!("[gguf-tp2] 全 24 token 与单卡逐字相同 ✓");
     }
-    let uniq: std::collections::HashSet<char> = text.chars().filter(|c| !c.is_whitespace()).collect();
-    assert!(uniq.len() >= 4, "输出字符种类过少({text:?})—— 疑似错几何导致的退化");
+    let uniq: std::collections::HashSet<char> =
+        text.chars().filter(|c| !c.is_whitespace()).collect();
+    assert!(
+        uniq.len() >= 4,
+        "输出字符种类过少({text:?})—— 疑似错几何导致的退化"
+    );
 }
 
 /// **prefill 探针**(W-2e A/B):长 prompt 的 TTFT ⇒ prefill tok/s。
@@ -721,7 +811,10 @@ async fn gpu_gguf_prefill_4b_probe() {
     }
     let path = std::path::PathBuf::from(resource("gguf:4b").expect("列了就有"));
     let prompt: String = "The quick brown fox jumps over the lazy dog. ".repeat(100);
-    let chunk: usize = std::env::var("OWL_GGUF_CHUNK").ok().and_then(|s| s.parse().ok()).unwrap_or(512);
+    let chunk: usize = std::env::var("OWL_GGUF_CHUNK")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(512);
     let ord = owl_cuda::test_device_ordinal();
     let mut cfg = gguf_cfg(ord, 8192, 8192, 1);
     cfg.prefill_chunk = chunk;
@@ -730,7 +823,9 @@ async fn gpu_gguf_prefill_4b_probe() {
     let mut running = engine.run(loaded).await.expect("装配");
     // 预热一次(图捕获/桶装配落在窗外;剖析看的是**第二次**)
     for i in 0..2 {
-        let (_, tid) = running.submit_session(Some(10 + i), &prompt, 1).expect("submit");
+        let (_, tid) = running
+            .submit_session(Some(10 + i), &prompt, 1)
+            .expect("submit");
         let ntok = running.turn_prompt_len(tid).unwrap_or(0);
         let t0 = std::time::Instant::now();
         loop {
@@ -772,7 +867,10 @@ async fn gpu_gguf_prefill_single() {
     }
     let path = std::path::PathBuf::from(resource("gguf:27b").expect("列了就有"));
     let prompt: String = "The quick brown fox jumps over the lazy dog. ".repeat(100);
-    let chunk: usize = std::env::var("OWL_GGUF_CHUNK").ok().and_then(|s| s.parse().ok()).unwrap_or(1024);
+    let chunk: usize = std::env::var("OWL_GGUF_CHUNK")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(1024);
     let ord = owl_cuda::test_device_ordinal();
     let mut cfg = gguf_cfg(ord, 8192, 8192, 1);
     cfg.prefill_chunk = chunk;
@@ -780,7 +878,9 @@ async fn gpu_gguf_prefill_single() {
     let mut engine = Engine::new(cfg).expect("引擎");
     let loaded = engine.loader().load_gguf(&path).await.expect("装载");
     let mut running = engine.run(loaded).await.expect("装配");
-    let (_, tid) = running.submit_session(Some(11), &prompt, 1).expect("submit");
+    let (_, tid) = running
+        .submit_session(Some(11), &prompt, 1)
+        .expect("submit");
     let ntok = running.turn_prompt_len(tid).unwrap_or(0);
     let t0 = std::time::Instant::now();
     let mut first = String::new();
@@ -811,8 +911,8 @@ async fn gpu_gguf_prefill_single() {
 #[cfg(test)]
 #[owl_test(gpu)]
 async fn gpu_gguf_4b_vlm_image_smoke() {
-    use owl_models::formats::gguf::resolve_mmproj_path;
     use crate::turn::TurnOpts;
+    use owl_models::formats::gguf::resolve_mmproj_path;
 
     if !resource_ok("gguf:4b") {
         owl_shared::testkit::report::skip("资源清单缺 \"gguf:4b\"");
@@ -843,8 +943,16 @@ async fn gpu_gguf_4b_vlm_image_smoke() {
     cfg.knobs.vision = true;
     cfg.knobs.mmproj = Some(mmproj.clone());
     let mut engine = Engine::new(cfg).expect("引擎构造");
-    let loaded = engine.loader().load_gguf(&path).await.expect("GGUF + mmproj 装载");
-    assert!(loaded.vlm.is_some(), "vision=true 必须有视觉塔(mmproj={})", mmproj.display());
+    let loaded = engine
+        .loader()
+        .load_gguf(&path)
+        .await
+        .expect("GGUF + mmproj 装载");
+    assert!(
+        loaded.vlm.is_some(),
+        "vision=true 必须有视觉塔(mmproj={})",
+        mmproj.display()
+    );
     let mut running = engine.run(loaded).await.expect("装配");
 
     // 先跑一轮纯文本,避开历史 F1 "首轮带图"变量(4B 是否复现另案)。
@@ -874,7 +982,15 @@ async fn gpu_gguf_4b_vlm_image_smoke() {
         "<|image_pad|>".repeat(l_img)
     );
     let (_, t) = running
-        .submit_session_opts(Some(2), prompt.as_str(), 8, TurnOpts { images: vec![img.into()], ..Default::default() })
+        .submit_session_opts(
+            Some(2),
+            prompt.as_str(),
+            8,
+            TurnOpts {
+                images: vec![img.into()],
+                ..Default::default()
+            },
+        )
         .expect("image submit");
     let mut text = String::new();
     loop {
@@ -886,10 +1002,11 @@ async fn gpu_gguf_4b_vlm_image_smoke() {
             _ => {}
         }
     }
-    eprintln!(
-        "[gguf-vlm] 4B + mmproj · grid (1,4,4) · {l_img} image tokens ⇒ {text:?}"
+    eprintln!("[gguf-vlm] 4B + mmproj · grid (1,4,4) · {l_img} image tokens ⇒ {text:?}");
+    assert!(
+        !text.trim().is_empty(),
+        "GGUF 视觉 prefill 必须产出非空文本"
     );
-    assert!(!text.trim().is_empty(), "GGUF 视觉 prefill 必须产出非空文本");
 }
 
 /// **27B GGUF + mmproj 视觉塔冒烟**(2026-10-21):生产 27B GGUF 主干 +
@@ -898,8 +1015,8 @@ async fn gpu_gguf_4b_vlm_image_smoke() {
 #[cfg(test)]
 #[owl_test(gpu)]
 async fn gpu_gguf_27b_vlm_image_smoke() {
-    use owl_models::formats::gguf::resolve_mmproj_path;
     use crate::turn::TurnOpts;
+    use owl_models::formats::gguf::resolve_mmproj_path;
 
     if !resource_ok("gguf:27b") {
         owl_shared::testkit::report::skip("资源清单缺 \"gguf:27b\"");
@@ -918,8 +1035,16 @@ async fn gpu_gguf_27b_vlm_image_smoke() {
     cfg.knobs.vision = true;
     cfg.knobs.mmproj = Some(mmproj.clone());
     let mut engine = Engine::new(cfg).expect("引擎构造");
-    let loaded = engine.loader().load_gguf(&path).await.expect("27B GGUF + mmproj 装载");
-    assert!(loaded.vlm.is_some(), "vision=true 必须有视觉塔(mmproj={})", mmproj.display());
+    let loaded = engine
+        .loader()
+        .load_gguf(&path)
+        .await
+        .expect("27B GGUF + mmproj 装载");
+    assert!(
+        loaded.vlm.is_some(),
+        "vision=true 必须有视觉塔(mmproj={})",
+        mmproj.display()
+    );
     let mut running = engine.run(loaded).await.expect("装配");
 
     let l_img = 4usize;
@@ -936,7 +1061,15 @@ async fn gpu_gguf_27b_vlm_image_smoke() {
         "<|image_pad|>".repeat(l_img)
     );
     let (_, t) = running
-        .submit_session_opts(Some(2), prompt.as_str(), 8, TurnOpts { images: vec![img.into()], ..Default::default() })
+        .submit_session_opts(
+            Some(2),
+            prompt.as_str(),
+            8,
+            TurnOpts {
+                images: vec![img.into()],
+                ..Default::default()
+            },
+        )
         .expect("image submit");
     let mut text = String::new();
     loop {
@@ -948,8 +1081,9 @@ async fn gpu_gguf_27b_vlm_image_smoke() {
             _ => {}
         }
     }
-    eprintln!(
-        "[gguf-vlm] 27B + mmproj · grid (1,4,4) · {l_img} image tokens ⇒ {text:?}"
+    eprintln!("[gguf-vlm] 27B + mmproj · grid (1,4,4) · {l_img} image tokens ⇒ {text:?}");
+    assert!(
+        !text.trim().is_empty(),
+        "27B GGUF 视觉 prefill 必须产出非空文本"
     );
-    assert!(!text.trim().is_empty(), "27B GGUF 视觉 prefill 必须产出非空文本");
 }

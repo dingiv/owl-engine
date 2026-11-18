@@ -13,162 +13,174 @@
 use crate::command::Command;
 use owl_iface::contract::ModelError;
 
-    /// Closing 态拒绝:每条命令的 ack 都必须回 ServerClosed
-    /// (否则客户端 Future 永远 pending —— 本轮挂死根因)
+/// Closing 态拒绝:每条命令的 ack 都必须回 ServerClosed
+/// (否则客户端 Future 永远 pending —— 本轮挂死根因)
 pub(super) fn reject_closed(cmd: Command) {
-        macro_rules! closed { ($ack:expr) => { $ack.send(Err(ModelError::ServerClosed)) } }
-        match cmd {
-            Command::Close { ack } => ack.send(Ok(())), // 幂等
-            Command::Alloc { ack, .. } => closed!(ack),
-            Command::MemsetZero { ack, .. } => closed!(ack),
-            Command::Htod { ack, .. } => closed!(ack),
-            Command::HtodChunk { ack, .. } => closed!(ack),
-            Command::HtodChunks { ack, .. } => closed!(ack),
-            Command::AllocPinned { ack, .. } => closed!(ack),
-            Command::PinnedPrewarm { ack, .. } => closed!(ack),
-            Command::LedgerReport { ack, .. } => closed!(ack),
-            Command::LedgerJson { ack, .. } => closed!(ack),
-            Command::UploadPinned { ack, .. } => closed!(ack),
-            Command::DeviceSmCount { ack } => closed!(ack),
-            Command::DeviceArch { ack } => closed!(ack),
-            Command::BlockLedgerDump { ack } => closed!(ack),
-            Command::MemPoolTrim { ack } => closed!(ack),
-            Command::MemPoolStats { ack } => closed!(ack),
-            Command::MemInfo { ack } => closed!(ack),
-            Command::UploadAndLaunch { ack, .. } => closed!(ack),
-            Command::LaunchAndHarvest { ack, .. } => closed!(ack),
-            Command::Dtoh { ack, .. } => closed!(ack),
-            Command::DtohAt { ack, .. } => closed!(ack),
-            Command::DtohBatch { ack, .. } => closed!(ack),
-            Command::Swap { ack, .. } => closed!(ack),
-            Command::Free { ack, .. } => closed!(ack),
-            Command::Batch { ack, .. } => closed!(ack),
-            Command::CopyBlock { ack, .. } => closed!(ack),
-            Command::CopyBatch { ack, .. } => closed!(ack),
-            Command::Launch { ack, .. } => closed!(ack),
-            Command::Sync { ack, .. } => closed!(ack),
-            Command::GraphBegin { ack, .. } => closed!(ack),
-            Command::GraphEnd { ack, .. } => closed!(ack),
-            Command::GraphLaunch { ack, .. } => closed!(ack),
-            Command::GraphAbort { ack, .. } => closed!(ack),
-            Command::GraphDestroy { ack, .. } => closed!(ack),
-            Command::PeerAlloc { ack, .. } => closed!(ack),
-            Command::PeerImport { ack, .. } => closed!(ack),
-            Command::PeerRelease { ack, .. } => closed!(ack),
-            Command::HostAlloc { ack, .. } => closed!(ack),
-            Command::HostAttach { ack, .. } => closed!(ack),
-            Command::HostRelease { ack, .. } => closed!(ack),
-            Command::CaptureRoute { ack, .. } => closed!(ack),
-            Command::CaptureJoin { ack, .. } => closed!(ack),
-        }
+    macro_rules! closed {
+        ($ack:expr) => {
+            $ack.send(Err(ModelError::ServerClosed))
+        };
     }
+    match cmd {
+        Command::Close { ack } => ack.send(Ok(())), // 幂等
+        Command::Alloc { ack, .. } => closed!(ack),
+        Command::MemsetZero { ack, .. } => closed!(ack),
+        Command::Htod { ack, .. } => closed!(ack),
+        Command::HtodChunk { ack, .. } => closed!(ack),
+        Command::HtodChunks { ack, .. } => closed!(ack),
+        Command::AllocPinned { ack, .. } => closed!(ack),
+        Command::PinnedPrewarm { ack, .. } => closed!(ack),
+        Command::LedgerReport { ack, .. } => closed!(ack),
+        Command::LedgerJson { ack, .. } => closed!(ack),
+        Command::UploadPinned { ack, .. } => closed!(ack),
+        Command::DeviceSmCount { ack } => closed!(ack),
+        Command::DeviceArch { ack } => closed!(ack),
+        Command::BlockLedgerDump { ack } => closed!(ack),
+        Command::MemPoolTrim { ack } => closed!(ack),
+        Command::MemPoolStats { ack } => closed!(ack),
+        Command::MemInfo { ack } => closed!(ack),
+        Command::UploadAndLaunch { ack, .. } => closed!(ack),
+        Command::LaunchAndHarvest { ack, .. } => closed!(ack),
+        Command::Dtoh { ack, .. } => closed!(ack),
+        Command::DtohAt { ack, .. } => closed!(ack),
+        Command::DtohBatch { ack, .. } => closed!(ack),
+        Command::Swap { ack, .. } => closed!(ack),
+        Command::Free { ack, .. } => closed!(ack),
+        Command::Batch { ack, .. } => closed!(ack),
+        Command::CopyBlock { ack, .. } => closed!(ack),
+        Command::CopyBatch { ack, .. } => closed!(ack),
+        Command::Launch { ack, .. } => closed!(ack),
+        Command::Sync { ack, .. } => closed!(ack),
+        Command::GraphBegin { ack, .. } => closed!(ack),
+        Command::GraphEnd { ack, .. } => closed!(ack),
+        Command::GraphLaunch { ack, .. } => closed!(ack),
+        Command::GraphAbort { ack, .. } => closed!(ack),
+        Command::GraphDestroy { ack, .. } => closed!(ack),
+        Command::PeerAlloc { ack, .. } => closed!(ack),
+        Command::PeerImport { ack, .. } => closed!(ack),
+        Command::PeerRelease { ack, .. } => closed!(ack),
+        Command::HostAlloc { ack, .. } => closed!(ack),
+        Command::HostAttach { ack, .. } => closed!(ack),
+        Command::HostRelease { ack, .. } => closed!(ack),
+        Command::CaptureRoute { ack, .. } => closed!(ack),
+        Command::CaptureJoin { ack, .. } => closed!(ack),
+    }
+}
 
 /// 捕获窗负门:按 `why` 逐命令响亮拒(负门清单见模块头)。
 pub(super) fn reject_with(cmd: Command, why: String, sink: owl_shared::log::LogSink) {
-        macro_rules! reject { ($ack:expr) => { $ack.send(Err(ModelError::Msg(why.clone()))) } }
-        let name = |c: &Command| match c {
-            // E2 复合(分相计时标签;与 Command::kind() 同名单一真源)
-            Command::DeviceSmCount { .. } => "device_sm_count",
-            Command::DeviceArch { .. } => "device_arch",
-            Command::BlockLedgerDump { .. } => "block_ledger_dump",
-            Command::MemPoolTrim { .. } => "mem_pool_trim",
-            Command::MemPoolStats { .. } => "mem_pool_stats",
-            Command::MemInfo { .. } => "mem_info",
-            Command::UploadAndLaunch { .. } => "upload_and_launch",
-            Command::LaunchAndHarvest { .. } => "launch_and_harvest",
-            Command::GraphBegin { .. } => "GraphBegin",
-            Command::GraphEnd { .. } => "GraphEnd",
-            Command::GraphLaunch { .. } => "GraphLaunch",
-            Command::GraphAbort { .. } => "GraphAbort",
-            Command::GraphDestroy { .. } => "GraphDestroy",
-            Command::Dtoh { .. } => "Dtoh",
-            Command::DtohAt { .. } => "DtohAt",
-            Command::DtohBatch { .. } => "DtohBatch",
-            Command::Swap { .. } => "Swap",
-            Command::Alloc { .. } => "Alloc",
-            Command::MemsetZero { .. } => "MemsetZero",
-            Command::Htod { .. } => "Htod",
-            Command::HtodChunk { .. } => "HtodChunk",
-            Command::HtodChunks { .. } => "HtodChunks",
-            Command::AllocPinned { .. } => "AllocPinned",
-            Command::PinnedPrewarm { .. } => "PinnedPrewarm",
-            Command::LedgerReport { .. } => "LedgerReport",
-            Command::LedgerJson { .. } => "LedgerJson",
-            Command::UploadPinned { .. } => "UploadPinned",
-            Command::Free { .. } => "Free",
-            Command::CopyBlock { .. } => "CopyBlock",
-            Command::CopyBatch { .. } => "CopyBatch",
-            Command::Sync { .. } => "Sync",
-            Command::Launch { .. } => "Launch",
-            Command::PeerAlloc { .. } => "PeerAlloc",
-            Command::PeerImport { .. } => "PeerImport",
-            Command::PeerRelease { .. } => "PeerRelease",
-            Command::HostAlloc { .. } => "HostAlloc",
-            Command::HostAttach { .. } => "HostAttach",
-            Command::HostRelease { .. } => "HostRelease",
-            Command::CaptureRoute { .. } => "CaptureRoute",
-            Command::CaptureJoin { .. } => "CaptureJoin",
-            Command::Batch { .. } => "Batch",
-            Command::Close { .. } => "Close",
+    macro_rules! reject {
+        ($ack:expr) => {
+            $ack.send(Err(ModelError::Msg(why.clone())))
         };
-        sink.logf(owl_shared::log::LVL_WARN, "owl-gpu", format_args!("捕获期拒绝: {} —— {why}", name(&cmd)));
-        match cmd {
-            Command::GraphBegin { ack } => reject!(ack),
-            Command::GraphEnd { ack } => reject!(ack),
-            Command::GraphLaunch { ack, .. } => reject!(ack),
-            Command::GraphAbort { ack, .. } => reject!(ack),
-            Command::GraphDestroy { ack, .. } => reject!(ack),
-            // 注:**FI plan 表同步**已收编成虚拟算子 `flashinfer_fi_plan_sync`
-            // (2026-11-01),不再是命令变体 ⇒ 捕获期禁令改由准入面按算子的
-            // `CAPTURE = NeedsHostPrep` 声明统一拒(`admission_check`)。
-            Command::Alloc { ack, .. } => reject!(ack),
-            Command::MemsetZero { ack, .. } => reject!(ack),
-            Command::Htod { ack, .. } => reject!(ack),
-            Command::HtodChunk { ack, .. } => reject!(ack),
-            Command::HtodChunks { ack, .. } => reject!(ack),
-            Command::AllocPinned { ack, .. } => reject!(ack),
-            Command::PinnedPrewarm { ack, .. } => reject!(ack),
-            Command::LedgerReport { ack, .. } => reject!(ack),
-            Command::LedgerJson { ack, .. } => reject!(ack),
-            Command::UploadPinned { ack, .. } => reject!(ack),
-            // **E2 负门**:复合命令内含搬运/回读(不可捕获)⇒ 捕获期结构化拒
-            // 设备 SM 数 = 恒定属性查询(**不碰设备状态、不发射**)⇒ 捕获期**放行**
-            // (与 LedgerDump/Trim 不同:那两个要排空/改池;本命令纯读属性)
-            Command::DeviceSmCount { .. } => {}
-            // 设备代际 = 恒定的属性查询(不碰设备状态、不发射)⇒ 捕获期放行
-            Command::DeviceArch { .. } => {}
-            Command::BlockLedgerDump { ack } => reject!(ack),
-            // 池回收 = host 侧池操作(与图捕获无关的全局动作)⇒ 捕获期拒
-            Command::MemPoolTrim { ack } => reject!(ack),
-            Command::MemPoolStats { ack } => reject!(ack),
-            Command::MemInfo { ack } => reject!(ack),
-            Command::UploadAndLaunch { ack, .. } => reject!(ack),
-            Command::LaunchAndHarvest { ack, .. } => reject!(ack),
-            Command::Dtoh { ack, .. } => reject!(ack),
-            // 带偏移读同 Dtoh:捕获窗内**结构化拒**(状态存储的搬运只在段边界)
-            Command::DtohAt { ack, .. } => reject!(ack),
-            Command::DtohBatch { ack, .. } => reject!(ack),
-            // **swap 同 Dtoh/Batch**:搬运只在段边界,捕获窗内结构化拒
-            Command::Swap { ack, .. } => reject!(ack),
-            Command::Sync { ack, .. } => reject!(ack),
-            Command::Free { ack, .. } => reject!(ack),
-            Command::CopyBlock { ack, .. } => reject!(ack),
-            Command::CopyBatch { ack, .. } => reject!(ack),
-            Command::Launch { ack, .. } => reject!(ack),
-            // **捕获期专属口**(图内 fork/join;B1 门):捕获窗内**放行** ——
-            // 它们本就是为捕获期而生的(非捕获期由 `dispatch` 正门拒)
-            Command::CaptureRoute { .. } => {}
-            Command::CaptureJoin { .. } => {}
-            // peer 面(VMM 分配/映射):要动 BAR1/映射表(host 侧动作)⇒ 捕获期结构化拒
-            Command::PeerAlloc { ack, .. } => reject!(ack),
-            Command::PeerImport { ack, .. } => reject!(ack),
-            Command::PeerRelease { ack, .. } => reject!(ack),
-            // host relay 分配/attach/释放 = host 侧映射动作 ⇒ 捕获期结构化拒
-            Command::HostAlloc { ack, .. } => reject!(ack),
-            Command::HostAttach { ack, .. } => reject!(ack),
-            Command::HostRelease { ack, .. } => reject!(ack),
-            // 批外壳:本条路径不该到(捕获期由 `handle_batch` 逐条过白名单)
-            Command::Batch { ack, .. } => reject!(ack),
-            Command::Close { ack } => ack.send(Ok(())), // 幂等
-        }
     }
+    let name = |c: &Command| match c {
+        // E2 复合(分相计时标签;与 Command::kind() 同名单一真源)
+        Command::DeviceSmCount { .. } => "device_sm_count",
+        Command::DeviceArch { .. } => "device_arch",
+        Command::BlockLedgerDump { .. } => "block_ledger_dump",
+        Command::MemPoolTrim { .. } => "mem_pool_trim",
+        Command::MemPoolStats { .. } => "mem_pool_stats",
+        Command::MemInfo { .. } => "mem_info",
+        Command::UploadAndLaunch { .. } => "upload_and_launch",
+        Command::LaunchAndHarvest { .. } => "launch_and_harvest",
+        Command::GraphBegin { .. } => "GraphBegin",
+        Command::GraphEnd { .. } => "GraphEnd",
+        Command::GraphLaunch { .. } => "GraphLaunch",
+        Command::GraphAbort { .. } => "GraphAbort",
+        Command::GraphDestroy { .. } => "GraphDestroy",
+        Command::Dtoh { .. } => "Dtoh",
+        Command::DtohAt { .. } => "DtohAt",
+        Command::DtohBatch { .. } => "DtohBatch",
+        Command::Swap { .. } => "Swap",
+        Command::Alloc { .. } => "Alloc",
+        Command::MemsetZero { .. } => "MemsetZero",
+        Command::Htod { .. } => "Htod",
+        Command::HtodChunk { .. } => "HtodChunk",
+        Command::HtodChunks { .. } => "HtodChunks",
+        Command::AllocPinned { .. } => "AllocPinned",
+        Command::PinnedPrewarm { .. } => "PinnedPrewarm",
+        Command::LedgerReport { .. } => "LedgerReport",
+        Command::LedgerJson { .. } => "LedgerJson",
+        Command::UploadPinned { .. } => "UploadPinned",
+        Command::Free { .. } => "Free",
+        Command::CopyBlock { .. } => "CopyBlock",
+        Command::CopyBatch { .. } => "CopyBatch",
+        Command::Sync { .. } => "Sync",
+        Command::Launch { .. } => "Launch",
+        Command::PeerAlloc { .. } => "PeerAlloc",
+        Command::PeerImport { .. } => "PeerImport",
+        Command::PeerRelease { .. } => "PeerRelease",
+        Command::HostAlloc { .. } => "HostAlloc",
+        Command::HostAttach { .. } => "HostAttach",
+        Command::HostRelease { .. } => "HostRelease",
+        Command::CaptureRoute { .. } => "CaptureRoute",
+        Command::CaptureJoin { .. } => "CaptureJoin",
+        Command::Batch { .. } => "Batch",
+        Command::Close { .. } => "Close",
+    };
+    sink.logf(
+        owl_shared::log::LVL_WARN,
+        "owl-gpu",
+        format_args!("捕获期拒绝: {} —— {why}", name(&cmd)),
+    );
+    match cmd {
+        Command::GraphBegin { ack } => reject!(ack),
+        Command::GraphEnd { ack } => reject!(ack),
+        Command::GraphLaunch { ack, .. } => reject!(ack),
+        Command::GraphAbort { ack, .. } => reject!(ack),
+        Command::GraphDestroy { ack, .. } => reject!(ack),
+        // 注:**FI plan 表同步**已收编成虚拟算子 `flashinfer_fi_plan_sync`
+        // (2026-11-01),不再是命令变体 ⇒ 捕获期禁令改由准入面按算子的
+        // `CAPTURE = NeedsHostPrep` 声明统一拒(`admission_check`)。
+        Command::Alloc { ack, .. } => reject!(ack),
+        Command::MemsetZero { ack, .. } => reject!(ack),
+        Command::Htod { ack, .. } => reject!(ack),
+        Command::HtodChunk { ack, .. } => reject!(ack),
+        Command::HtodChunks { ack, .. } => reject!(ack),
+        Command::AllocPinned { ack, .. } => reject!(ack),
+        Command::PinnedPrewarm { ack, .. } => reject!(ack),
+        Command::LedgerReport { ack, .. } => reject!(ack),
+        Command::LedgerJson { ack, .. } => reject!(ack),
+        Command::UploadPinned { ack, .. } => reject!(ack),
+        // **E2 负门**:复合命令内含搬运/回读(不可捕获)⇒ 捕获期结构化拒
+        // 设备 SM 数 = 恒定属性查询(**不碰设备状态、不发射**)⇒ 捕获期**放行**
+        // (与 LedgerDump/Trim 不同:那两个要排空/改池;本命令纯读属性)
+        Command::DeviceSmCount { .. } => {}
+        // 设备代际 = 恒定的属性查询(不碰设备状态、不发射)⇒ 捕获期放行
+        Command::DeviceArch { .. } => {}
+        Command::BlockLedgerDump { ack } => reject!(ack),
+        // 池回收 = host 侧池操作(与图捕获无关的全局动作)⇒ 捕获期拒
+        Command::MemPoolTrim { ack } => reject!(ack),
+        Command::MemPoolStats { ack } => reject!(ack),
+        Command::MemInfo { ack } => reject!(ack),
+        Command::UploadAndLaunch { ack, .. } => reject!(ack),
+        Command::LaunchAndHarvest { ack, .. } => reject!(ack),
+        Command::Dtoh { ack, .. } => reject!(ack),
+        // 带偏移读同 Dtoh:捕获窗内**结构化拒**(状态存储的搬运只在段边界)
+        Command::DtohAt { ack, .. } => reject!(ack),
+        Command::DtohBatch { ack, .. } => reject!(ack),
+        // **swap 同 Dtoh/Batch**:搬运只在段边界,捕获窗内结构化拒
+        Command::Swap { ack, .. } => reject!(ack),
+        Command::Sync { ack, .. } => reject!(ack),
+        Command::Free { ack, .. } => reject!(ack),
+        Command::CopyBlock { ack, .. } => reject!(ack),
+        Command::CopyBatch { ack, .. } => reject!(ack),
+        Command::Launch { ack, .. } => reject!(ack),
+        // **捕获期专属口**(图内 fork/join;B1 门):捕获窗内**放行** ——
+        // 它们本就是为捕获期而生的(非捕获期由 `dispatch` 正门拒)
+        Command::CaptureRoute { .. } => {}
+        Command::CaptureJoin { .. } => {}
+        // peer 面(VMM 分配/映射):要动 BAR1/映射表(host 侧动作)⇒ 捕获期结构化拒
+        Command::PeerAlloc { ack, .. } => reject!(ack),
+        Command::PeerImport { ack, .. } => reject!(ack),
+        Command::PeerRelease { ack, .. } => reject!(ack),
+        // host relay 分配/attach/释放 = host 侧映射动作 ⇒ 捕获期结构化拒
+        Command::HostAlloc { ack, .. } => reject!(ack),
+        Command::HostAttach { ack, .. } => reject!(ack),
+        Command::HostRelease { ack, .. } => reject!(ack),
+        // 批外壳:本条路径不该到(捕获期由 `handle_batch` 逐条过白名单)
+        Command::Batch { ack, .. } => reject!(ack),
+        Command::Close { ack } => ack.send(Ok(())), // 幂等
+    }
+}

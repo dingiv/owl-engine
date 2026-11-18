@@ -70,7 +70,8 @@ impl Housekeeping {
     /// 判据住在本户(与 `host_pressure_due` 同律):调用点只问"到点了吗",
     /// 不自己存时间戳 —— 否则每个调用点各有一份"上次是什么时候"。
     pub(crate) fn kv_checkpoint_due(&self, interval: Duration) -> bool {
-        self.last_kv_checkpoint.is_none_or(|t| t.elapsed() >= interval)
+        self.last_kv_checkpoint
+            .is_none_or(|t| t.elapsed() >= interval)
     }
 
     /// 记一次 KV checkpoint(按"尝试"计,空链也有节拍,避免每 turn 空转)。
@@ -172,7 +173,10 @@ mod tests {
     #[test]
     fn host_pressure_interval_gates_idle_compaction() {
         let mut hk = Housekeeping::default();
-        assert!(hk.host_pressure_due(Duration::from_millis(1000)), "首拍应到点");
+        assert!(
+            hk.host_pressure_due(Duration::from_millis(1000)),
+            "首拍应到点"
+        );
         hk.mark_host_pressure();
         assert!(
             !hk.host_pressure_due(Duration::from_secs(1)),

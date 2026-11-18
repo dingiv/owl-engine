@@ -30,7 +30,7 @@ async fn main() {
         prefill_chunk: 32,
         knobs: owl_engine::EngineKnobs::default(),
     })
-        .expect("engine 构造");
+    .expect("engine 构造");
     let model = engine
         .loader()
         .load_qwen35_0_8b(&dir)
@@ -40,7 +40,9 @@ async fn main() {
 
     // 并发形态:两个 turn 入队(M0.5 单槽串行;M2 batching 真并发)
     let t1 = running.submit(&prompt, max_new).expect("submit t1");
-    let t2 = running.submit("用一句话说明什么是 P2P。", max_new).expect("submit t2");
+    let t2 = running
+        .submit("用一句话说明什么是 P2P。", max_new)
+        .expect("submit t2");
     println!("[gen] turn t{t1} t{t2} 已入队");
 
     let t_gen = std::time::Instant::now();
@@ -71,5 +73,8 @@ async fn main() {
         t_gen.elapsed().as_secs_f32(),
         t_gen.elapsed().as_secs_f32() / (max_new * 2) as f32
     );
-    println!("[gen] 队列排空,引擎 Idle(总耗时 {:.1}s)", t0.elapsed().as_secs_f32());
+    println!(
+        "[gen] 队列排空,引擎 Idle(总耗时 {:.1}s)",
+        t0.elapsed().as_secs_f32()
+    );
 }

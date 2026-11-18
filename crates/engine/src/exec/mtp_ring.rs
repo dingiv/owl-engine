@@ -60,26 +60,21 @@ impl MtpRingPlan {
         }
         if cfg.sink >= cfg.window {
             return Err(ModelError::EngineInvariant {
-                what: format!(
-                    "MTP ring: sink={} 必须小于 window={}",
-                    cfg.sink, cfg.window
-                ),
+                what: format!("MTP ring: sink={} 必须小于 window={}", cfg.sink, cfg.window),
             });
         }
         let sink_tokens = align_up(cfg.sink, page)?;
         // 窗口生效后读集 = sink + 最近 window；再留 depth（本轮草稿写）
         // 与 page（读视图按页向下取整的余量）。最后再页对齐。
-        let need = min_ctx
-            .max(sink_tokens)
-            .max(
-                sink_tokens
-                    .checked_add(cfg.window)
-                    .and_then(|v| v.checked_add(depth.max(1)))
-                    .and_then(|v| v.checked_add(page))
-                    .ok_or_else(|| ModelError::EngineInvariant {
-                        what: "MTP ring: 容量计算溢出".into(),
-                    })?,
-            );
+        let need = min_ctx.max(sink_tokens).max(
+            sink_tokens
+                .checked_add(cfg.window)
+                .and_then(|v| v.checked_add(depth.max(1)))
+                .and_then(|v| v.checked_add(page))
+                .ok_or_else(|| ModelError::EngineInvariant {
+                    what: "MTP ring: 容量计算溢出".into(),
+                })?,
+        );
         let capacity_tokens = align_up(need, page)?;
         let ring_tokens = capacity_tokens.checked_sub(sink_tokens).ok_or_else(|| {
             ModelError::EngineInvariant {
@@ -224,9 +219,7 @@ mod tests {
         // 窗口刚生效、以及几个长 ctx 位置
         for pos in [p.min_ctx(), p.min_ctx() + 1, 16_000, 57_343, 65_535] {
             let tokens = pos + 1;
-            let recent_start = tokens
-                .saturating_sub(cfg().window)
-                .max(p.sink_tokens());
+            let recent_start = tokens.saturating_sub(cfg().window).max(p.sink_tokens());
             let aligned_start = recent_start / p.page * p.page;
             let mut read = BTreeSet::new();
             // sink 固定页 + 最近窗口（与 MtpWindowPlan 的读集同口径）
@@ -234,10 +227,7 @@ mod tests {
                 assert!(read.insert(p.slot_of(q)), "sink 读集重复 pos={pos}");
             }
             for q in aligned_start..=pos {
-                assert!(
-                    read.insert(p.slot_of(q)),
-                    "窗口读集重复 pos={pos} q={q}"
-                );
+                assert!(read.insert(p.slot_of(q)), "窗口读集重复 pos={pos} q={q}");
             }
             // 本轮/后续草稿写入位置不能落在本轮读集里
             for w in (pos + 1)..=(pos + p.depth()) {
@@ -271,7 +261,17 @@ mod tests {
     fn capacity_formula_keeps_depth_slack() {
         let p = MtpRingPlan::new(32, cfg(), 7, 12288).unwrap();
         assert!(p.capacity_tokens() >= p.sink_tokens() + 4032 + 7 + 32);
-        let p0 = MtpRingPlan::new(32, MtpWindowCfg { window: 8, sink: 4, min_ctx: 0 }, 8, 0).unwrap();
+        let p0 = MtpRingPlan::new(
+            32,
+            MtpWindowCfg {
+                window: 8,
+                sink: 4,
+                min_ctx: 0,
+            },
+            8,
+            0,
+        )
+        .unwrap();
         assert!(p0.capacity_tokens() >= 4 + 8 + 8 + 32);
     }
 }

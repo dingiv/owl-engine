@@ -7,9 +7,9 @@
 //!
 //! 无 GPU 跳过(OWL_TEST_DEVICE)。
 
-use owl_macros::owl_test;
 use cudarc::driver::{CudaContext, DevicePtr, LaunchConfig, PushKernelArg};
 use half::f16;
+use owl_macros::owl_test;
 
 const NK: usize = 16;
 const NV: usize = 48;
@@ -87,7 +87,10 @@ fn scalar_matches_varlen_big_t() {
         .expect("fn scalar");
     // varlen 源(nvrtc)
     let ptx = cudarc::nvrtc::compile_ptx_with_opts(
-        owl_kernels::cu_sig::cu_text(owl_kernels::ops::source("owl_gdn_recurrence_varlen_gqa_f16")).as_str(),
+        owl_kernels::cu_sig::cu_text(owl_kernels::ops::source(
+            "owl_gdn_recurrence_varlen_gqa_f16",
+        ))
+        .as_str(),
         cudarc::nvrtc::CompileOptions {
             arch: Some("compute_86"),
             include_paths: vec!["/usr/local/cuda/include".into()],
@@ -174,12 +177,19 @@ fn scalar_matches_varlen_big_t() {
                 .arg(&vd_u)
                 .arg(&qs)
                 .arg(&o_p);
-            let cfg = LaunchConfig { grid_dim: grid, block_dim: block, shared_mem_bytes: smem };
+            let cfg = LaunchConfig {
+                grid_dim: grid,
+                block_dim: block,
+                shared_mem_bytes: smem,
+            };
             unsafe { b.launch(cfg) }.unwrap();
         }
         let mut var_o16 = vec![0u16; t * NV * VD];
         stream.memcpy_dtoh(&v_out, &mut var_o16).unwrap();
-        let var_o: Vec<f32> = var_o16.iter().map(|&b| f16::from_bits(b).to_f32()).collect();
+        let var_o: Vec<f32> = var_o16
+            .iter()
+            .map(|&b| f16::from_bits(b).to_f32())
+            .collect();
         let mut var_st = vec![0f32; NV * KD * VD];
         stream.memcpy_dtoh(&v_state, &mut var_st).unwrap();
 
@@ -243,7 +253,11 @@ fn scalar_matches_varlen_big_t() {
         let (oi, od) = max_dev(&s_o, &var_o);
         let (si, sd) = max_dev(&s_st, &var_st);
         let o_rel = if var_o.iter().any(|x| x.abs() > 1e-6) {
-            od / var_o.iter().map(|x| x.abs()).fold(0.0f32, f32::max).max(1e-9)
+            od / var_o
+                .iter()
+                .map(|x| x.abs())
+                .fold(0.0f32, f32::max)
+                .max(1e-9)
         } else {
             f32::INFINITY
         };
@@ -252,6 +266,9 @@ fn scalar_matches_varlen_big_t() {
         );
         // 容差:双臂同 f16 输入 + f32 累加,理论应 ~1e-5 级;放 1e-2 硬门
         assert!(od < 1e-2, "{tag}: o 分歧 {od:.3e} @ {oi}(scalar vs varlen)");
-        assert!(sd < 1e-2, "{tag}: 终态分歧 {sd:.3e} @ {si}(scalar vs varlen)");
+        assert!(
+            sd < 1e-2,
+            "{tag}: 终态分歧 {sd:.3e} @ {si}(scalar vs varlen)"
+        );
     }
 }

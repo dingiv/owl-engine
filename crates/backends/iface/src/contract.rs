@@ -112,31 +112,51 @@ impl VramAccount {
 #[macro_export]
 macro_rules! client_alloc {
     ($f:expr, $dtype:expr, $elems:expr) => {
-        $f.alloc($dtype, $elems, concat!("alloc@", file!(), ":", line!(), ":", column!()))
+        $f.alloc(
+            $dtype,
+            $elems,
+            concat!("alloc@", file!(), ":", line!(), ":", column!()),
+        )
     };
 }
 #[macro_export]
 macro_rules! alloc_uninit {
     ($f:expr, $dtype:expr, $elems:expr) => {
-        $f.alloc_uninit($dtype, $elems, concat!("alloc_uninit@", file!(), ":", line!(), ":", column!()))
+        $f.alloc_uninit(
+            $dtype,
+            $elems,
+            concat!("alloc_uninit@", file!(), ":", line!(), ":", column!()),
+        )
     };
 }
 #[macro_export]
 macro_rules! htod {
     ($f:expr, $dtype:expr, $shape:expr, $bytes:expr) => {
-        $f.htod($dtype, $shape, $bytes, concat!("htod@", file!(), ":", line!(), ":", column!()))
+        $f.htod(
+            $dtype,
+            $shape,
+            $bytes,
+            concat!("htod@", file!(), ":", line!(), ":", column!()),
+        )
     };
 }
 #[macro_export]
 macro_rules! htod_f32 {
     ($f:expr, $shape:expr, $data:expr) => {
-        $f.htod_f32($shape, $data, concat!("htod_f32@", file!(), ":", line!(), ":", column!()))
+        $f.htod_f32(
+            $shape,
+            $data,
+            concat!("htod_f32@", file!(), ":", line!(), ":", column!()),
+        )
     };
 }
 #[macro_export]
 macro_rules! alloc_pinned {
     ($f:expr, $bytes:expr) => {
-        $f.alloc_pinned($bytes, concat!("pin@", file!(), ":", line!(), ":", column!()))
+        $f.alloc_pinned(
+            $bytes,
+            concat!("pin@", file!(), ":", line!(), ":", column!()),
+        )
     };
 }
 
@@ -161,13 +181,25 @@ pub enum ModelError {
     /// 权重键缺失(vb 路径 + 键名;键名双约定问题的结构化出口)
     MissingKey { path: String, key: String },
     /// 形状不符(期望 vs 实际)
-    ShapeMismatch { path: String, expected: Vec<usize>, got: Vec<usize> },
+    ShapeMismatch {
+        path: String,
+        expected: Vec<usize>,
+        got: Vec<usize>,
+    },
     /// dtype 不符
-    DtypeMismatch { path: String, expected: Dtype, got: Dtype },
+    DtypeMismatch {
+        path: String,
+        expected: Dtype,
+        got: Dtype,
+    },
 
     // ---- 执行期(interpret/to_host;server 回执)----
     /// 池容量不足
-    PoolExhausted { pool: String, needed: u64, available: u64 },
+    PoolExhausted {
+        pool: String,
+        needed: u64,
+        available: u64,
+    },
     /// 池块句柄死亡后被引用(令牌世代校验失败;哨兵①词汇)
     DeadBlock { id: u64 },
     /// 跨账本解析:块 id 被拿到别家账本解析(pitfall §27 撞号案;
@@ -211,18 +243,33 @@ impl std::fmt::Display for ModelError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             ModelError::MissingKey { path, key } => write!(f, "MissingKey: {path}::{key}"),
-            ModelError::ShapeMismatch { path, expected, got } => {
+            ModelError::ShapeMismatch {
+                path,
+                expected,
+                got,
+            } => {
                 write!(f, "ShapeMismatch: {path} 期望 {expected:?} 实得 {got:?}")
             }
-            ModelError::DtypeMismatch { path, expected, got } => {
+            ModelError::DtypeMismatch {
+                path,
+                expected,
+                got,
+            } => {
                 write!(f, "DtypeMismatch: {path} 期望 {expected:?} 实得 {got:?}")
             }
-            ModelError::PoolExhausted { pool, needed, available } => {
+            ModelError::PoolExhausted {
+                pool,
+                needed,
+                available,
+            } => {
                 write!(f, "PoolExhausted: {pool} 需 {needed}B 余 {available}B")
             }
             ModelError::DeadBlock { id } => write!(f, "DeadBlock: {id}"),
             ModelError::CrossLedger { id, owner, reader } => {
-                write!(f, "跨账本块: 块 id={id} 属 ledger {owner},被 ledger {reader} 解析")
+                write!(
+                    f,
+                    "跨账本块: 块 id={id} 属 ledger {owner},被 ledger {reader} 解析"
+                )
             }
             ModelError::CaptureViolation { detail } => write!(f, "CaptureViolation: {detail}"),
             ModelError::ServerClosed => write!(f, "ServerClosed"),
@@ -259,7 +306,6 @@ impl PinnedRegion for HeapRegion {
         &self.0
     }
 }
-
 
 // ============================================================================
 // 能力契约:DeviceClient(五原语 + 图三原语;全异步)
@@ -446,10 +492,7 @@ pub trait DeviceClient: Send {
     // - `exec_batch`:**一条信箱消息**把整批交给后端(省掉逐条线程间往返),
     //   `BatchOutcome.outcomes` 与投递顺序严格对应,失败不回滚已投递部分。
     //   CPU/mock 面没有往返可省,逐条即序(segments = N)是合法实现。
-    fn exec(
-        &mut self,
-        cmd: Command,
-    ) -> impl Future<Output = Result<Outcome, ModelError>> + Send;
+    fn exec(&mut self, cmd: Command) -> impl Future<Output = Result<Outcome, ModelError>> + Send;
 
     /// **批量执行**(原生批:后端看见整批;判据 = `segments` 与往返次数下降)。
     fn exec_batch(
@@ -493,7 +536,11 @@ pub trait DeviceClient: Send {
     fn set_class(&self, _c: crate::handle::AssetClass) {}
 
     /// **作用域化上下文**(RAII:出作用域自动还原;缺省 = 空作用域)。
-    fn scoped_ctx(&self, _o: crate::handle::Owner, _c: crate::handle::AssetClass) -> crate::handle::CtxScope {
+    fn scoped_ctx(
+        &self,
+        _o: crate::handle::Owner,
+        _c: crate::handle::AssetClass,
+    ) -> crate::handle::CtxScope {
         crate::handle::CtxScope::noop()
     }
 
@@ -532,7 +579,11 @@ pub trait DeviceClient: Send {
     /// - 数据须在图外先物化(Block 叶子)—— warmup 契约:先 eager 跑
     ///   同一声明树,验证逻辑正确后再捕获
     fn graph_begin(&mut self) -> impl Future<Output = Result<(), ModelError>> + Send {
-        async { self.exec(Command::GraphBegin).await?.into_done("graph_begin") }
+        async {
+            self.exec(Command::GraphBegin)
+                .await?
+                .into_done("graph_begin")
+        }
     }
     /// 图捕获结束:实例化并登记,返回图 id(空捕获窗拒绝 —— 发射数须 > 0)
     fn graph_end(&mut self) -> impl Future<Output = Result<GraphId, ModelError>> + Send {
@@ -545,7 +596,9 @@ pub trait DeviceClient: Send {
         graph: GraphId,
     ) -> impl Future<Output = Result<(), ModelError>> + Send {
         async move {
-            self.exec(Command::GraphLaunch { graph }).await?.into_done("graph_launch")
+            self.exec(Command::GraphLaunch { graph })
+                .await?
+                .into_done("graph_launch")
         }
     }
     /// **捕获窗作废**(窗内出错/空窗的收尾):退出捕获态 + 销毁半成品图 +
@@ -557,7 +610,11 @@ pub trait DeviceClient: Send {
     /// 缺省实现 = `Command::GraphAbort`(后端自知"窗内自产块去哪了";
     /// 无捕获能力的 face 由自己的 `exec` 响亮拒)。
     fn graph_abort(&mut self) -> impl Future<Output = Result<(), ModelError>> + Send {
-        async { self.exec(Command::GraphAbort).await?.into_done("graph_abort") }
+        async {
+            self.exec(Command::GraphAbort)
+                .await?
+                .into_done("graph_abort")
+        }
     }
     /// **销毁已登记图**(单图退休:LRU 驱逐 / plan `close()` 的底层)。
     /// 语义 = 排空回放 → 解除本图块租约 → 本图 slab 块移出账房。
@@ -568,7 +625,9 @@ pub trait DeviceClient: Send {
         graph: GraphId,
     ) -> impl Future<Output = Result<(), ModelError>> + Send {
         async move {
-            self.exec(Command::GraphDestroy { graph }).await?.into_done("graph_destroy")
+            self.exec(Command::GraphDestroy { graph })
+                .await?
+                .into_done("graph_destroy")
         }
     }
     /// 清零分配:块登记 + COMPUTE 流序 memset 入队(异步;捕获期 slab
@@ -582,13 +641,21 @@ pub trait DeviceClient: Send {
     /// 为什么必填不默认:OOM dump 的"按名清单"(块账房按名聚合)就是
     /// 靠它;默认值会让漏报静默(空名块在 dump 里单独计 "未命名!",
     /// 那是漏网信号,不是合法状态)。
-    fn alloc(&mut self, dtype: Dtype, elems: usize, name: &str)
-        -> impl Future<Output = Result<Bytes, ModelError>> + Send
-    {
+    fn alloc(
+        &mut self,
+        dtype: Dtype,
+        elems: usize,
+        name: &str,
+    ) -> impl Future<Output = Result<Bytes, ModelError>> + Send {
         async move {
-            self.exec(Command::Alloc { dtype, elems, zero: true, name: name.to_string() })
-                .await?
-                .into_buf("alloc")
+            self.exec(Command::Alloc {
+                dtype,
+                elems,
+                zero: true,
+                name: name.to_string(),
+            })
+            .await?
+            .into_buf("alloc")
         }
     }
 
@@ -607,9 +674,14 @@ pub trait DeviceClient: Send {
         name: &str,
     ) -> impl Future<Output = Result<Bytes, ModelError>> + Send {
         async move {
-            self.exec(Command::Alloc { dtype, elems, zero: false, name: name.to_string() })
-                .await?
-                .into_buf("alloc_uninit")
+            self.exec(Command::Alloc {
+                dtype,
+                elems,
+                zero: false,
+                name: name.to_string(),
+            })
+            .await?
+            .into_buf("alloc_uninit")
         }
     }
     /// host 数据入块(H2D 流异步拷贝 + finish 回调携 ack):**回执即数据
@@ -652,9 +724,15 @@ pub trait DeviceClient: Send {
                     src.len()
                 )));
             }
-            self.exec(Command::Htod { dtype, shape, src, stream, name })
-                .await?
-                .into_buf("htod")
+            self.exec(Command::Htod {
+                dtype,
+                shape,
+                src,
+                stream,
+                name,
+            })
+            .await?
+            .into_buf("htod")
         }
     }
 
@@ -662,13 +740,19 @@ pub trait DeviceClient: Send {
     /// D2H 异步拷贝 —— 回执时 out = 块在全部先前已回执命令之后的值。
     /// 与 [`DeviceClient::sync`] 的分工:本命令为读数据;sync 为不读
     /// 数据的显式栅栏(计时/步边界/捕获前净空)
-    fn dtoh(&mut self, b: &Bytes, out: &mut [u8])
-        -> impl Future<Output = Result<(), ModelError>> + Send
-    {
+    fn dtoh(
+        &mut self,
+        b: &Bytes,
+        out: &mut [u8],
+    ) -> impl Future<Output = Result<(), ModelError>> + Send {
         let (id, want) = (b.id, out.len());
         async move {
             let bytes = self
-                .exec(Command::Dtoh { id, off_bytes: 0, want_bytes: want })
+                .exec(Command::Dtoh {
+                    id,
+                    off_bytes: 0,
+                    want_bytes: want,
+                })
                 .await?
                 .into_bytes("dtoh")?;
             if bytes.len() != want {
@@ -699,7 +783,11 @@ pub trait DeviceClient: Send {
         let (id, want) = (b.id, out.len());
         async move {
             let bytes = self
-                .exec(Command::Dtoh { id, off_bytes, want_bytes: want })
+                .exec(Command::Dtoh {
+                    id,
+                    off_bytes,
+                    want_bytes: want,
+                })
                 .await?
                 .into_bytes("dtoh_at")?;
             if bytes.len() != want {
@@ -727,8 +815,10 @@ pub trait DeviceClient: Send {
         Self: Sized,
     {
         #[allow(clippy::unnecessary_to_owned)]
-        let owned: Vec<(Bytes, usize, usize)> =
-            pieces.iter().map(|(b, o, l)| ((*b).clone(), *o, *l)).collect();
+        let owned: Vec<(Bytes, usize, usize)> = pieces
+            .iter()
+            .map(|(b, o, l)| ((*b).clone(), *o, *l))
+            .collect();
         async move {
             let mut out = Vec::new();
             for (b, off, len) in &owned {
@@ -806,8 +896,14 @@ pub trait DeviceClient: Send {
                         conn.get(p.slot, p.conn_off, &mut buf)?;
                         let mut lease = self.alloc_pinned(p.len, "iface:swap_in").await?;
                         lease.slice_bytes_mut()[..p.len].copy_from_slice(&buf);
-                        self.upload_pinned_on(UpStream::Compute, lease, &handle(p), p.dev_off, p.len)
-                            .await?;
+                        self.upload_pinned_on(
+                            UpStream::Compute,
+                            lease,
+                            &handle(p),
+                            p.dev_off,
+                            p.len,
+                        )
+                        .await?;
                     }
                 }
             }
@@ -851,9 +947,7 @@ pub trait DeviceClient: Send {
 
     /// 算子发射(COMPUTE 流,火后不理):Ok = 提交成功;同流保序,
     /// 与数据搬运的跨流先后靠回执时序/sync 建立(顺序语义,见 trait 级文档)
-    fn launch(&mut self, msg: LaunchMsg)
-        -> impl Future<Output = Result<Bytes, ModelError>> + Send
-    {
+    fn launch(&mut self, msg: LaunchMsg) -> impl Future<Output = Result<Bytes, ModelError>> + Send {
         async move { self.exec(Command::Launch { msg }).await?.into_buf("launch") }
     }
 
@@ -896,7 +990,8 @@ pub trait DeviceClient: Send {
     {
         async move {
             let bytes: Vec<u8> = data.iter().flat_map(|f| f.to_le_bytes()).collect();
-            self.htod_on(UpStream::Compute, Dtype::F32, shape, &bytes, name).await
+            self.htod_on(UpStream::Compute, Dtype::F32, shape, &bytes, name)
+                .await
         }
     }
 
@@ -918,7 +1013,10 @@ pub trait DeviceClient: Send {
     ///
     /// 默认 = 无操作(无 pinned 码头的后端不需要):"没有这回事"与"预热了 0 个桶"
     /// 在返回的计数上区分得开。
-    fn prewarm_pinned(&mut self, _bytes: usize) -> impl Future<Output = Result<(usize, usize), ModelError>> + Send
+    fn prewarm_pinned(
+        &mut self,
+        _bytes: usize,
+    ) -> impl Future<Output = Result<(usize, usize), ModelError>> + Send
     where
         Self: Sized,
     {
@@ -967,9 +1065,7 @@ pub trait DeviceClient: Send {
         _offset_elems: usize,
         _data: &[f32],
     ) -> impl Future<Output = Result<(), ModelError>> + Send {
-        async {
-            Err(ModelError::Msg("write_block_f32: 此后端未实现".into()))
-        }
+        async { Err(ModelError::Msg("write_block_f32: 此后端未实现".into())) }
     }
 
     /// **带流选择的块内写入**(2026-10-17;用户裁决"参数面必须与消费方同流"):
@@ -1018,7 +1114,8 @@ pub trait DeviceClient: Send {
         async move {
             // 参数面(槽/小表)批量写 ⇒ Compute(同流;H2D 面留给显式批量口)
             for (dst, off, data) in writes {
-                self.write_block_f32_on(UpStream::Compute, dst, *off, data).await?;
+                self.write_block_f32_on(UpStream::Compute, dst, *off, data)
+                    .await?;
             }
             Ok(())
         }
@@ -1060,7 +1157,9 @@ pub trait DeviceClient: Send {
     }
 
     /// **块账本投影**(调试面;默认不支持):全活块 (id, 字节, dtype, 地址, 账本)。
-    fn block_ledger_dump(&mut self) -> impl Future<Output = Result<Vec<BlockLedgerRow>, ModelError>> + Send {
+    fn block_ledger_dump(
+        &mut self,
+    ) -> impl Future<Output = Result<Vec<BlockLedgerRow>, ModelError>> + Send {
         async { Err(ModelError::Msg("block_ledger_dump: 此后端未实现".into())) }
     }
 
@@ -1093,9 +1192,7 @@ pub trait DeviceClient: Send {
     /// 为什么必须走设备线程:查询(`cuMemGetInfo`)要求**当前上下文**在调用
     /// 线程上;只有 server 线程持有 CUDA ctx。boot 分相取证(`[vram-phase]`)
     /// 与 `/debug/vram` 的驱动残差都吃这口。默认 = 不支持(CPU/mock 后端)。
-    fn mem_info(
-        &mut self,
-    ) -> impl Future<Output = Result<(u64, u64), ModelError>> + Send {
+    fn mem_info(&mut self) -> impl Future<Output = Result<(u64, u64), ModelError>> + Send {
         async { Err(ModelError::Msg("mem_info: 此后端未实现".into())) }
     }
 
@@ -1110,9 +1207,7 @@ pub trait DeviceClient: Send {
         _dst_off_bytes: usize,
         _len_bytes: usize,
     ) -> impl Future<Output = Result<(), ModelError>> + Send {
-        async {
-            Err(ModelError::Msg("copy_block_at: 此后端未实现".into()))
-        }
+        async { Err(ModelError::Msg("copy_block_at: 此后端未实现".into())) }
     }
 
     /// **图窗块的回收语义**(2026-10-19 步 3):捕获窗内自产的块是否**由后端回收**
@@ -1171,7 +1266,11 @@ pub trait DeviceClient: Send {
     where
         Self: Sized,
     {
-        async { Err(ModelError::Msg("device_arch: 该后端未提供设备代际查询".into())) }
+        async {
+            Err(ModelError::Msg(
+                "device_arch: 该后端未提供设备代际查询".into(),
+            ))
+        }
     }
 
     /// 设备内批量块→块拷贝(E5-M4:spec 快照 capture/restore 的 192 次

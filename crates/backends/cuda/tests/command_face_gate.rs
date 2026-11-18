@@ -43,7 +43,12 @@ async fn exec_and_native_batch_round_trip() {
 
     // ① alloc(事实面:dtype/元素数)
     let a = c
-        .exec(Command::Alloc { dtype: Dtype::F32, elems: 64, zero: true, name: "cmd.alloc".into() })
+        .exec(Command::Alloc {
+            dtype: Dtype::F32,
+            elems: 64,
+            zero: true,
+            name: "cmd.alloc".into(),
+        })
         .await
         .expect("exec alloc")
         .into_buf("exec alloc")
@@ -68,7 +73,11 @@ async fn exec_and_native_batch_round_trip() {
 
     // ③ dtoh(字节逐位相等)
     let got = c
-        .exec(Command::Dtoh { id: h.id, off_bytes: 0, want_bytes: 32 })
+        .exec(Command::Dtoh {
+            id: h.id,
+            off_bytes: 0,
+            want_bytes: 32,
+        })
         .await
         .expect("exec dtoh")
         .into_bytes("exec dtoh")
@@ -78,16 +87,30 @@ async fn exec_and_native_batch_round_trip() {
     // ④ 原生批:一条信箱消息,结果按投递序对位
     let r = c
         .exec_batch(vec![
-            Command::Alloc { dtype: Dtype::F32, elems: 4, zero: true, name: "batch.0".into() },
-            Command::Alloc { dtype: Dtype::F32, elems: 8, zero: true, name: "batch.1".into() },
+            Command::Alloc {
+                dtype: Dtype::F32,
+                elems: 4,
+                zero: true,
+                name: "batch.0".into(),
+            },
+            Command::Alloc {
+                dtype: Dtype::F32,
+                elems: 8,
+                zero: true,
+                name: "batch.1".into(),
+            },
             Command::Sync,
         ])
         .await
         .expect("exec_batch 本体不失败(逐条结果在内)");
     assert_eq!(r.segments, 1, "原生批 = 一条信箱消息(不是逐条转发)");
     assert_eq!(r.outcomes.len(), 3);
-    assert!(r.all_ok(), "first_err={:?} err={:?}", r.first_err,
-        r.outcomes.iter().find(|o| o.is_err()));
+    assert!(
+        r.all_ok(),
+        "first_err={:?} err={:?}",
+        r.first_err,
+        r.outcomes.iter().find(|o| o.is_err())
+    );
     match &r.outcomes[0] {
         Ok(Outcome::Buf(b)) => assert_eq!(b.len, 4),
         other => panic!("批内第 0 条应为 Buf,得 {other:?}"),
@@ -101,8 +124,15 @@ async fn exec_and_native_batch_round_trip() {
     let bad = c
         .exec_batch(vec![
             // 未知块 id ⇒ 服务端**硬拒**(§79 的显式拒绝律)
-            Command::Free { ids: vec![u64::MAX] },
-            Command::Alloc { dtype: Dtype::F32, elems: 2, zero: true, name: "after.err".into() },
+            Command::Free {
+                ids: vec![u64::MAX],
+            },
+            Command::Alloc {
+                dtype: Dtype::F32,
+                elems: 2,
+                zero: true,
+                name: "after.err".into(),
+            },
         ])
         .await
         .expect("批本体仍 Ok");
@@ -126,7 +156,10 @@ async fn handle_sugar_lands_on_same_throat() {
     let Some(c) = assemble() else { return };
     let mut dev = owl_iface::handle::DeviceHandle::new(c, None);
 
-    let b = dev.alloc(Dtype::F16, 16, "handle.alloc").await.expect("alloc 经命令面");
+    let b = dev
+        .alloc(Dtype::F16, 16, "handle.alloc")
+        .await
+        .expect("alloc 经命令面");
     assert_eq!((b.len, b.dtype), (16, Dtype::F16));
     dev.sync().await.expect("sync 经命令面");
     dev.free(&[b.id]).await.expect("free 经命令面");
@@ -156,7 +189,12 @@ impl ClientMut for owl_iface::handle::DeviceHandle<GpuClient> {
 const ADD_KERNEL: &str = "owl_add_f32";
 
 /// `owl_add_f32`(a+b→out)发射消息(与 gpu_server 门同款真资产核)
-fn add_msg(a: &owl_iface::contract::Bytes, b: &owl_iface::contract::Bytes, out: &owl_iface::contract::Bytes, n: usize) -> owl_iface::contract::LaunchMsg {
+fn add_msg(
+    a: &owl_iface::contract::Bytes,
+    b: &owl_iface::contract::Bytes,
+    out: &owl_iface::contract::Bytes,
+    n: usize,
+) -> owl_iface::contract::LaunchMsg {
     use owl_iface::contract::{Arg, KernelSource, LaunchMsg};
     LaunchMsg {
         kernel: KernelSource {
@@ -212,14 +250,24 @@ async fn queued_launches_flush_as_one_batch() {
         .expect("buf");
     // 输出块 = alloc(dtype/rank 未定形 ⇒ view 定形,与 gpu_server 门同律)
     let out1 = c
-        .exec(Command::Alloc { dtype: Dtype::F32, elems: N, zero: true, name: "q.o1".into() })
+        .exec(Command::Alloc {
+            dtype: Dtype::F32,
+            elems: N,
+            zero: true,
+            name: "q.o1".into(),
+        })
         .await
         .expect("alloc o1")
         .into_buf("o1")
         .expect("buf")
         .view(Dtype::F32, 1);
     let out2 = c
-        .exec(Command::Alloc { dtype: Dtype::F32, elems: N, zero: true, name: "q.o2".into() })
+        .exec(Command::Alloc {
+            dtype: Dtype::F32,
+            elems: N,
+            zero: true,
+            name: "q.o2".into(),
+        })
         .await
         .expect("alloc o2")
         .into_buf("o2")
@@ -227,8 +275,20 @@ async fn queued_launches_flush_as_one_batch() {
         .view(Dtype::F32, 1);
 
     // 两条发射**分两次 queue**(验证累积),按队列序执行:o1=a+b, o2=o1+a
-    assert_eq!(c.queue(Command::Launch { msg: add_msg(&a, &b, &out1, N) }).expect("queue 0"), 0);
-    assert_eq!(c.queue(Command::Launch { msg: add_msg(&out1, &a, &out2, N) }).expect("queue 1"), 1);
+    assert_eq!(
+        c.queue(Command::Launch {
+            msg: add_msg(&a, &b, &out1, N)
+        })
+        .expect("queue 0"),
+        0
+    );
+    assert_eq!(
+        c.queue(Command::Launch {
+            msg: add_msg(&out1, &a, &out2, N)
+        })
+        .expect("queue 1"),
+        1
+    );
 
     // 队列非空 ⇒ 单条命令响亮拒(不隐式多跑一次往返)
     let e = c.exec(Command::Sync).await.expect_err("队列非空必须拒");
@@ -241,7 +301,11 @@ async fn queued_launches_flush_as_one_batch() {
 
     // 收割:顺序正确 ⇒ o2 = 2a + b
     let got = c
-        .exec(Command::Dtoh { id: out2.id, off_bytes: 0, want_bytes: N * 4 })
+        .exec(Command::Dtoh {
+            id: out2.id,
+            off_bytes: 0,
+            want_bytes: N * 4,
+        })
         .await
         .expect("dtoh")
         .into_bytes("dtoh")
@@ -252,12 +316,18 @@ async fn queued_launches_flush_as_one_batch() {
         .collect();
     for i in 0..N {
         let want = 2.0 * av[i] + bv[i];
-        assert!((vals[i] - want).abs() < 1e-3, "i={i} 实得 {} 期望 {want}", vals[i]);
+        assert!(
+            (vals[i] - want).abs() < 1e-3,
+            "i={i} 实得 {} 期望 {want}",
+            vals[i]
+        );
     }
 
-    c.exec(Command::Free { ids: vec![a.id, b.id, out1.id, out2.id] })
-        .await
-        .expect("free");
+    c.exec(Command::Free {
+        ids: vec![a.id, b.id, out1.id, out2.id],
+    })
+    .await
+    .expect("free");
     c.close().await.ok();
 }
 
@@ -296,7 +366,12 @@ async fn batch_vs_single_round_trip_cost() {
         .into_buf("b")
         .expect("buf");
     let out = c
-        .exec(Command::Alloc { dtype: Dtype::F32, elems: N, zero: true, name: "bench.o".into() })
+        .exec(Command::Alloc {
+            dtype: Dtype::F32,
+            elems: N,
+            zero: true,
+            name: "bench.o".into(),
+        })
         .await
         .expect("alloc o")
         .into_buf("o")
@@ -306,7 +381,11 @@ async fn batch_vs_single_round_trip_cost() {
     // ① 逐条:每条一次 await(= 一次信箱往返)
     let t0 = std::time::Instant::now();
     for _ in 0..ROUNDS {
-        c.exec(Command::Launch { msg: add_msg(&a, &b, &out, N) }).await.expect("launch");
+        c.exec(Command::Launch {
+            msg: add_msg(&a, &b, &out, N),
+        })
+        .await
+        .expect("launch");
     }
     c.sync().await.expect("sync");
     let single = t0.elapsed();
@@ -314,7 +393,10 @@ async fn batch_vs_single_round_trip_cost() {
     // ② 累积:一次 flush
     let t0 = std::time::Instant::now();
     for _ in 0..ROUNDS {
-        c.queue(Command::Launch { msg: add_msg(&a, &b, &out, N) }).expect("queue");
+        c.queue(Command::Launch {
+            msg: add_msg(&a, &b, &out, N),
+        })
+        .expect("queue");
     }
     let r = c.flush().await.expect("flush");
     assert!(r.all_ok());
@@ -331,8 +413,15 @@ async fn batch_vs_single_round_trip_cost() {
         single.as_secs_f64() / batch.as_secs_f64().max(1e-9)
     );
     // 只做"批不得更慢"的软门(计时硬门留给同机 A/B)
-    assert!(batch.as_secs_f64() <= single.as_secs_f64() * 1.2, "批竟然更慢");
+    assert!(
+        batch.as_secs_f64() <= single.as_secs_f64() * 1.2,
+        "批竟然更慢"
+    );
 
-    c.exec(Command::Free { ids: vec![a.id, b.id, out.id] }).await.expect("free");
+    c.exec(Command::Free {
+        ids: vec![a.id, b.id, out.id],
+    })
+    .await
+    .expect("free");
     c.close().await.ok();
 }

@@ -19,8 +19,8 @@
 use crate::budget::{Admission, AdmissionVerdict, BudgetInputs, TurnFloor, VramBudget};
 use crate::disk::{AdoptReport, DiskEvictPlanOf, DiskTier, FillPlanOf, SpillPlanOf};
 use crate::error::{StoreError, StoreResult};
-use crate::host::{HostBlock, HostTier};
 use crate::host::SlotTable;
+use crate::host::{HostBlock, HostTier};
 use crate::id::{ChainHash, PrefixId, SnapKey};
 use crate::kv::{CacheUpdate, KvDiag, KvStats};
 use crate::leg::{BlockLeg, Carrier, ChainHit, InPlan, LegConfig, LegStats, PoolLayout, ReadPlan};
@@ -32,12 +32,12 @@ use crate::tier::{AssetKind, Tier, TierReport};
 use owl_iface::contract::{ConnSlot, SwapPiece};
 
 mod admin;
+mod boot;
 mod disk;
-mod state;
+mod index;
 mod kv;
 mod report;
-mod index;
-mod boot;
+mod state;
 
 /// KV 腿几何(boot 装配一次;`block_tokens` 本引擎恒 32 —— 设计卷 §3.6.2)。
 ///
@@ -423,7 +423,6 @@ impl Rel {
     pub fn set_evict_policy(&mut self, p: Box<dyn EvictPolicy>) {
         self.evict = p;
     }
-
 }
 
 #[cfg(test)]

@@ -25,8 +25,7 @@
 //! 那属预期(D5 裁决:v1 拒混插),不算本门失败。
 
 use owl_cuda::{
-    DeviceClient as _, DeviceSelector, Dtype, GpuClient, GpuServer, Shape,
-    PEER_ALLOC_HARD_CAP,
+    DeviceClient as _, DeviceSelector, Dtype, GpuClient, GpuServer, Shape, PEER_ALLOC_HARD_CAP,
 };
 
 // ============================================================================
@@ -55,10 +54,17 @@ fn dev(name: &str) -> Option<usize> {
 /// 抠 `"key":<digits>`(第一个匹配;键不存在 = 测试失败 —— 门要硬)
 fn json_u64(json: &str, key: &str) -> u64 {
     let pat = format!("\"{key}\":");
-    let i = json.find(&pat).unwrap_or_else(|| panic!("LedgerJson 缺键 {key}: {json}")) + pat.len();
+    let i = json
+        .find(&pat)
+        .unwrap_or_else(|| panic!("LedgerJson 缺键 {key}: {json}"))
+        + pat.len();
     let rest = &json[i..];
-    let end = rest.find(|c: char| !c.is_ascii_digit()).unwrap_or(rest.len());
-    rest[..end].parse().unwrap_or_else(|e| panic!("键 {key} 数值非法: {e}"))
+    let end = rest
+        .find(|c: char| !c.is_ascii_digit())
+        .unwrap_or(rest.len());
+    rest[..end]
+        .parse()
+        .unwrap_or_else(|e| panic!("键 {key} 数值非法: {e}"))
 }
 
 fn le_f32(v: &[f32]) -> Vec<u8> {
@@ -72,9 +78,7 @@ fn le_f32(v: &[f32]) -> Vec<u8> {
 #[tokio::test]
 async fn peer_shared_gate() {
     let (Some(oa), Some(ob)) = (dev("OWL_PEER_TEST_DEV_A"), dev("OWL_PEER_TEST_DEV_B")) else {
-        eprintln!(
-            "skip: 需 OWL_PEER_TEST_DEV_A / OWL_PEER_TEST_DEV_B(两张空闲卡的 CUDA ordinal)"
-        );
+        eprintln!("skip: 需 OWL_PEER_TEST_DEV_A / OWL_PEER_TEST_DEV_B(两张空闲卡的 CUDA ordinal)");
         return;
     };
     assert_ne!(oa, ob, "A/B 必须是两张不同卡");
@@ -100,7 +104,11 @@ async fn peer_shared_gate() {
         .await
         .expect("PeerAlloc 64MiB 应成功(≤cap)");
     let ja = a.ledger_json().await.expect("ledger_json(a) after alloc");
-    assert_eq!(json_u64(&ja, "shared_bytes"), STAGING as u64, "shared 账应 +64MiB");
+    assert_eq!(
+        json_u64(&ja, "shared_bytes"),
+        STAGING as u64,
+        "shared 账应 +64MiB"
+    );
     assert_eq!(json_u64(&ja, "mappings"), 1);
     assert_eq!(
         json_u64(&ja, "live_bytes"),
@@ -123,7 +131,11 @@ async fn peer_shared_gate() {
         "拒收消息须带数值(MiB 口径);实得: {msg}"
     );
     let ja2 = a.ledger_json().await.expect("ledger_json(a) after reject");
-    assert_eq!(json_u64(&ja2, "shared_bytes"), STAGING as u64, "拒收不得留半成品/漂移");
+    assert_eq!(
+        json_u64(&ja2, "shared_bytes"),
+        STAGING as u64,
+        "拒收不得留半成品/漂移"
+    );
     assert_eq!(json_u64(&ja2, "mappings"), 1, "拒收不得留下映射笔数");
 
     // ── G4c:坏凭据响亮拒(import 侧;不猜格式) ──────────────────────
@@ -139,13 +151,20 @@ async fn peer_shared_gate() {
     );
 
     // ── import 成功(记 live 基线于 import 之前) ────────────────────
-    let live_b_before = json_u64(&b.ledger_json().await.expect("ledger_json(b) pre"), "live_bytes");
+    let live_b_before = json_u64(
+        &b.ledger_json().await.expect("ledger_json(b) pre"),
+        "live_bytes",
+    );
     let alias = b
         .peer_import(cred, STAGING, "GPU-A(反查)", "gate:staging-b")
         .await
         .expect("PeerImport 应成功");
     let jb = b.ledger_json().await.expect("ledger_json(b) after import");
-    assert_eq!(json_u64(&jb, "alias_bytes"), STAGING as u64, "alias 账应 +64MiB");
+    assert_eq!(
+        json_u64(&jb, "alias_bytes"),
+        STAGING as u64,
+        "alias 账应 +64MiB"
+    );
     assert_eq!(json_u64(&jb, "mappings"), 1);
     assert_eq!(
         json_u64(&jb, "live_bytes"),
@@ -155,9 +174,14 @@ async fn peer_shared_gate() {
 
     // ── 映射可用性最小实证:A 写 → A sync → B 经别名读回 ────────────
     let payload: [f32; 4] = [1.5, -2.25, 3.125, 42.0];
-    let src = owl_iface::htod!(a, Dtype::F32, &Shape::from(vec![payload.len()]), &le_f32(&payload))
-        .await
-        .expect("htod src");
+    let src = owl_iface::htod!(
+        a,
+        Dtype::F32,
+        &Shape::from(vec![payload.len()]),
+        &le_f32(&payload)
+    )
+    .await
+    .expect("htod src");
     a.copy_block_at(&src, 0, &pb, 0, 16)
         .await
         .expect("设备内拷贝(src → peer 块)");
@@ -168,7 +192,9 @@ async fn peer_shared_gate() {
     a.free(&[src.id]).await.expect("free src");
 
     // ── 普通 Free 对 peer 块 = 响亮 no-op(不静默销毁) ──────────────
-    a.free(&[pb.id]).await.expect("free 对 peer 块:句柄语义仍 Ok");
+    a.free(&[pb.id])
+        .await
+        .expect("free 对 peer 块:句柄语义仍 Ok");
     let ja3 = a.ledger_json().await.expect("ledger_json(a) after free");
     assert_eq!(
         json_u64(&ja3, "shared_bytes"),
@@ -178,12 +204,18 @@ async fn peer_shared_gate() {
 
     // ── G5:释放闭合(双方;live 归位) ──────────────────────────────
     a.peer_release(vec![pb.id]).await.expect("a peer_release");
-    b.peer_release(vec![alias.id]).await.expect("b peer_release");
+    b.peer_release(vec![alias.id])
+        .await
+        .expect("b peer_release");
     let ja4 = a.ledger_json().await.expect("ledger_json(a) after release");
     let jb4 = b.ledger_json().await.expect("ledger_json(b) after release");
     assert_eq!(json_u64(&ja4, "shared_bytes"), 0);
     assert_eq!(json_u64(&ja4, "mappings"), 0);
-    assert_eq!(json_u64(&ja4, "live_bytes"), live0, "释放后引擎 live 账归位(无漂移)");
+    assert_eq!(
+        json_u64(&ja4, "live_bytes"),
+        live0,
+        "释放后引擎 live 账归位(无漂移)"
+    );
     assert_eq!(json_u64(&jb4, "alias_bytes"), 0);
     assert_eq!(json_u64(&jb4, "mappings"), 0);
 
@@ -192,7 +224,9 @@ async fn peer_shared_gate() {
         a.peer_release(vec![pb.id]).await.is_err(),
         "重复释放应响亮拒(DeadBlock),不许静默 Ok"
     );
-    let plain = owl_iface::client_alloc!(a, Dtype::F32, 4).await.expect("alloc plain");
+    let plain = owl_iface::client_alloc!(a, Dtype::F32, 4)
+        .await
+        .expect("alloc plain");
     let e_plain = a
         .peer_release(vec![plain.id])
         .await

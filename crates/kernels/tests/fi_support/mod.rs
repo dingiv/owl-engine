@@ -48,7 +48,14 @@ impl TestRes {
         // 生产侧把这条记为"坑 A",这里照抄 —— 探针必须与生产同姿态。
         unsafe { ctx.disable_event_tracking() };
         let stream = ctx.new_stream().expect("new_stream");
-        Self { dev_ordinal: dev as i32, ctx, stream, blocks: HashMap::new(), next_id: 1, capture_flag: false }
+        Self {
+            dev_ordinal: dev as i32,
+            ctx,
+            stream,
+            blocks: HashMap::new(),
+            next_id: 1,
+            capture_flag: false,
+        }
     }
     pub fn upload(&mut self, bytes: &[u8]) -> Bytes {
         let id = self.next_id;
@@ -69,7 +76,9 @@ impl TestRes {
     pub fn take_f32(&self, id: u64) -> Vec<f32> {
         let s = self.blocks.get(&id).expect("块在册");
         let host = self.stream.clone_dtoh(s).expect("dtoh");
-        host.chunks_exact(4).map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]])).collect()
+        host.chunks_exact(4)
+            .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+            .collect()
     }
 
     /// 设备地址(测试域直调 FFI 用;块在册即返回)。
@@ -82,7 +91,9 @@ impl TestRes {
     pub fn take_u16(&self, id: u64) -> Vec<u16> {
         let s = self.blocks.get(&id).expect("块在册");
         let host = self.stream.clone_dtoh(s).expect("dtoh");
-        host.chunks_exact(2).map(|c| u16::from_le_bytes([c[0], c[1]])).collect()
+        host.chunks_exact(2)
+            .map(|c| u16::from_le_bytes([c[0], c[1]]))
+            .collect()
     }
 
     /// 整块回读(u8;plan/workspace 取证面 —— 按尺寸找块见 `block_id_of_len`)
@@ -94,7 +105,10 @@ impl TestRes {
     /// 按**块字节数**找一个块 id(探针取证:FiRuntime 的 int_ws = 32MiB、
     /// float_ws = 64MiB,尺寸在测试面唯一可辨)
     pub fn block_id_of_len(&self, bytes: usize) -> Option<u64> {
-        self.blocks.iter().find(|(_, s)| s.len() == bytes).map(|(id, _)| *id)
+        self.blocks
+            .iter()
+            .find(|(_, s)| s.len() == bytes)
+            .map(|(id, _)| *id)
     }
 }
 
@@ -117,12 +131,15 @@ impl DeviceRes for TestRes {
             })
     }
     fn resolve_len(&self, id: u64) -> Result<usize, OpError> {
-        self.blocks.get(&id).map(|s| s.len()).ok_or_else(|| OpError::Contract {
-            op: "fi-probe".into(),
-            field: "resolve_len",
-            expect: "块在册".into(),
-            got: id.to_string(),
-        })
+        self.blocks
+            .get(&id)
+            .map(|s| s.len())
+            .ok_or_else(|| OpError::Contract {
+                op: "fi-probe".into(),
+                field: "resolve_len",
+                expect: "块在册".into(),
+                got: id.to_string(),
+            })
     }
     fn alloc(&mut self, bytes: usize, _tag: &str) -> Result<ScratchBuf, OpError> {
         let d = self.stream.alloc_zeros::<u8>(bytes.max(1)).expect("alloc");
@@ -136,12 +153,15 @@ impl DeviceRes for TestRes {
     }
     fn upload_block(&mut self, b: &Bytes, src: &[u8]) -> Result<(), OpError> {
         let stream = self.stream.clone();
-        let s = self.blocks.get_mut(&b.id).ok_or_else(|| OpError::Contract {
-            op: "fi-probe".into(),
-            field: "upload_block",
-            expect: "块在册".into(),
-            got: format!("id={}", b.id),
-        })?;
+        let s = self
+            .blocks
+            .get_mut(&b.id)
+            .ok_or_else(|| OpError::Contract {
+                op: "fi-probe".into(),
+                field: "upload_block",
+                expect: "块在册".into(),
+                got: format!("id={}", b.id),
+            })?;
         stream.memcpy_htod(src, s).map_err(|e| OpError::Contract {
             op: "fi-probe".into(),
             field: "upload_block",
@@ -240,7 +260,6 @@ impl DeviceRes for TestRes {
         }
     }
 }
-
 
 /// f16 → f32(探针读回口径)
 pub fn f16_to_f32(b: u16) -> f32 {

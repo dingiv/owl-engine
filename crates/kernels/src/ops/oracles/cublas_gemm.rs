@@ -11,8 +11,8 @@
 //!
 //! 参考 = host f32 三重循环;判据 = **相对偏差**(f16 输出舍入 + 累加序)。
 
-use crate::contract::{Arg, KernelSource, LaunchMsg, OpError};
 use crate::bootcheck::{BootCheck, CheckReport, CheckRunner};
+use crate::contract::{Arg, KernelSource, LaunchMsg, OpError};
 
 use super::{f16_bits, f16_to_f32, lcg_f16};
 
@@ -28,7 +28,10 @@ pub struct Case {
 }
 
 pub fn case() -> Case {
-    Case { a: lcg_f16(TT * K, 0xC1), b: lcg_f16(N_OUT * K, 0xC2) }
+    Case {
+        a: lcg_f16(TT * K, 0xC1),
+        b: lcg_f16(N_OUT * K, 0xC2),
+    }
 }
 
 /// host 参考:`out[t, o] = Σ_i a[t,i]·b[o,i]`(f32 累加)。
@@ -83,7 +86,10 @@ pub fn run_case(r: &mut dyn CheckRunner, c: &Case) -> Result<Vec<u16>, OpError> 
     r.sync()?;
     let mut raw = vec![0u8; TT * N_OUT * 2];
     r.download_block(&dout, &mut raw)?;
-    Ok(raw.chunks_exact(2).map(|x| u16::from_le_bytes([x[0], x[1]])).collect())
+    Ok(raw
+        .chunks_exact(2)
+        .map(|x| u16::from_le_bytes([x[0], x[1]]))
+        .collect())
 }
 
 /// 相对偏差

@@ -68,7 +68,10 @@ impl KernelTagIndex {
             for t in m.tags {
                 let i = t.index();
                 if i >= KERNEL_TAG_COUNT || KERNEL_TAGS[i].tag != *t {
-                    return Err(TagIndexError::UnknownTag { op: m.entry, tag: t.as_str() });
+                    return Err(TagIndexError::UnknownTag {
+                        op: m.entry,
+                        tag: t.as_str(),
+                    });
                 }
                 by_tag[i].push(m);
             }
@@ -138,7 +141,9 @@ mod tests {
         let shape_covers = |m: &crate::spec::KernelMeta, prefix: &str| {
             let mut any = false;
             for t in m.tags {
-                let Some(rest) = t.as_str().strip_prefix(prefix) else { continue };
+                let Some(rest) = t.as_str().strip_prefix(prefix) else {
+                    continue;
+                };
                 any = true;
                 let want = match rest {
                     "f16" => Some(crate::contract::Dtype::F16),
@@ -179,7 +184,10 @@ mod tests {
                 ));
             }
         }
-        assert!(bad.is_empty(), "kv.main/kv.draft tag 与 POOL/形状事实不一致: {bad:#?}");
+        assert!(
+            bad.is_empty(),
+            "kv.main/kv.draft tag 与 POOL/形状事实不一致: {bad:#?}"
+        );
     }
 
     #[test]
@@ -189,7 +197,11 @@ mod tests {
         for m in crate::ops::all() {
             let tag = m.has_tag(crate::spec::KernelTag::FEAT_GRAPH);
             let cap = m.capture == crate::spec::CaptureEvidence::NoHostWork;
-            assert_eq!(tag, cap, "{}: feat.graph={tag} 但 CAPTURE={:?}", m.entry, m.capture);
+            assert_eq!(
+                tag, cap,
+                "{}: feat.graph={tag} 但 CAPTURE={:?}",
+                m.entry, m.capture
+            );
         }
     }
 
@@ -210,7 +222,17 @@ mod tests {
                 untagged.push(m.entry);
             }
         }
-        eprintln!("[tag-index] 已打 tag {} / 总 {}（未打 {}）", idx.all().len() - untagged.len(), idx.all().len(), untagged.len());
-        assert!(untagged.is_empty(), "仍有 {} 个算子未打 tag: {:?}", untagged.len(), &untagged[..untagged.len().min(20)]);
+        eprintln!(
+            "[tag-index] 已打 tag {} / 总 {}（未打 {}）",
+            idx.all().len() - untagged.len(),
+            idx.all().len(),
+            untagged.len()
+        );
+        assert!(
+            untagged.is_empty(),
+            "仍有 {} 个算子未打 tag: {:?}",
+            untagged.len(),
+            &untagged[..untagged.len().min(20)]
+        );
     }
 }

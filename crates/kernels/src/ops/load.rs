@@ -1,8 +1,8 @@
 //! 装载域生产算子元数据(ct packed → marlin B 设备重排)。
 
-use owl_macros::kernel_tags;
 use crate::contract::{Dtype, Law};
 use crate::spec::{meta_of, CaptureEvidence, Determinism, KernelMeta, KernelSpec, Param};
+use owl_macros::kernel_tags;
 
 /// `owl_ct_repack_u32` —— AWQ 装载线的设备侧权重重排(**非轮内**;装载期一次)
 pub struct CtRepackU32;

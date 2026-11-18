@@ -369,23 +369,24 @@ async fn handle(
         }
         // **store 账查询面**(第 0 刀;`/debug/vram`):三层账 + **owner 维明细**。
         // 纯读账(零副作用、零搬运)—— 泄漏判据面:同一 owner 字节逐轮爬坡 = 漏。
-        ("GET", "/debug/vram") => {
-            match ctx.engine.client().diag().await {
-                Ok(rep) => http::respond_json(&mut stream, 200, &debug::vram_json(&rep)).await?,
-                Err(e) => {
-                    http::respond_json(
-                        &mut stream,
-                        503,
-                        &openai::error_json(format!("引擎连接中断({e})")),
-                    )
-                    .await?
-                }
+        ("GET", "/debug/vram") => match ctx.engine.client().diag().await {
+            Ok(rep) => http::respond_json(&mut stream, 200, &debug::vram_json(&rep)).await?,
+            Err(e) => {
+                http::respond_json(
+                    &mut stream,
+                    503,
+                    &openai::error_json(format!("引擎连接中断({e})")),
+                )
+                .await?
             }
-        }
+        },
         // **块账本投影**(判"同 id 两地址 / 两活块区间相交";与发射账互补:
         // 那张账 = 每次命令的块 id+地址,本投影 = 当前账本的权威快照)
         ("GET", "/debug/blocks") => match ctx.engine.client().diag().await {
-            Ok(snap) => http::respond_json(&mut stream, 200, &debug::blocks_ranks_json(&snap.blocks)).await?,
+            Ok(snap) => {
+                http::respond_json(&mut stream, 200, &debug::blocks_ranks_json(&snap.blocks))
+                    .await?
+            }
             Err(e) => {
                 http::respond_json(
                     &mut stream,

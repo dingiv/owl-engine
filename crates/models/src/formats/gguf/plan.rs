@@ -51,20 +51,28 @@ pub struct GgufPlan<'g> {
 
 impl<'g> GgufPlan<'g> {
     pub fn new(g: &'g Gguf) -> Self {
-        Self { g, tp: None, unresolved: Mutex::new(BTreeMap::new()) }
+        Self {
+            g,
+            tp: None,
+            unresolved: Mutex::new(BTreeMap::new()),
+        }
     }
 
     /// **TP 档计划表**(形状门按角色放大;`sel.world == 1` 等价 [`Self::new`])
     pub fn for_shard(g: &'g Gguf, dims: GgufDims, sel: ShardSel) -> Self {
         let tp = (sel.world > 1).then_some((dims, sel));
-        Self { g, tp, unresolved: Mutex::new(BTreeMap::new()) }
+        Self {
+            g,
+            tp,
+            unresolved: Mutex::new(BTreeMap::new()),
+        }
     }
 
     /// 声明维(分片)→ 文件维(全量):按角色把**被切的那一维**放大 `world` 倍
-    fn inflate(&self, key: &str, out_dim: usize, in_dim: usize)
-        -> Result<(usize, usize), String>
-    {
-        let Some((dims, sel)) = self.tp else { return Ok((out_dim, in_dim)) };
+    fn inflate(&self, key: &str, out_dim: usize, in_dim: usize) -> Result<(usize, usize), String> {
+        let Some((dims, sel)) = self.tp else {
+            return Ok((out_dim, in_dim));
+        };
         let role = role_of(key, &dims, sel.head_split).map_err(|e| e.to_string())?;
         let w = sel.world;
         Ok(match role {
@@ -110,7 +118,11 @@ impl PlanTable for GgufPlan<'_> {
                     t.rows(),
                     t.inner(),
                     t.ne,
-                    if self.tp.is_some() { "(声明维已按 TP 角色放大)" } else { "" }
+                    if self.tp.is_some() {
+                        "(声明维已按 TP 角色放大)"
+                    } else {
+                        ""
+                    }
                 ),
             );
             return QuantPlan::F16;
@@ -122,7 +134,10 @@ impl PlanTable for GgufPlan<'_> {
             // 解析得了 ≠ 跑得了;落 F16 只为"槽形态合法",**必然被拒**(unresolved)
             self.note(
                 full_key,
-                &format!("型 {} 未移植(内核族无入口;PORTED 见 family::gguf)", t.ty.name()),
+                &format!(
+                    "型 {} 未移植(内核族无入口;PORTED 见 family::gguf)",
+                    t.ty.name()
+                ),
             );
             return QuantPlan::F16;
         }
@@ -131,10 +146,7 @@ impl PlanTable for GgufPlan<'_> {
 
     fn take_unresolved(&self) -> Vec<String> {
         let mut m = self.unresolved.lock().unwrap_or_else(|e| e.into_inner());
-        let out: Vec<String> = m
-            .iter()
-            .map(|(k, why)| format!("{k} ({why})"))
-            .collect();
+        let out: Vec<String> = m.iter().map(|(k, why)| format!("{k} ({why})")).collect();
         m.clear();
         out
     }
@@ -207,7 +219,9 @@ mod tests {
             assert_eq!(total, g.tensors.len(), "[{key}] 直方图覆盖全部张量");
             eprintln!(
                 "[{key}] 型直方图:{:?}",
-                hist.iter().map(|(t, n)| format!("{}×{n}", t.name())).collect::<Vec<_>>()
+                hist.iter()
+                    .map(|(t, n)| format!("{}×{n}", t.name()))
+                    .collect::<Vec<_>>()
             );
         }
     }
@@ -228,7 +242,10 @@ mod tests {
         let keys = GgufConvention::new();
         let src = PlanSource::keyed(&plan, &keys, SourceFacts::GGUF);
         let model = Model::new(&spec, keys, src, src).expect("Model::new(计划表全覆盖)");
-        let ctx = LoaderCtx { dtype: Dtype::F16, ..Default::default() };
+        let ctx = LoaderCtx {
+            dtype: Dtype::F16,
+            ..Default::default()
+        };
         let ops = model.layout(&ctx);
         // 声明数(4B = 402 件)与计划表查询数同量级
         assert!(ops.wants().len() > 300, "声明太少:{}", ops.wants().len());

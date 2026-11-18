@@ -1030,9 +1030,12 @@ impl GpuServer {
             } => self.handle_peer_import(credential, bytes, peer_uuid, name, rw, ack),
             Command::PeerRelease { ids, ack } => self.handle_peer_release(ids, ack),
             Command::HostAlloc { bytes, name, ack } => self.handle_host_alloc(bytes, name, ack),
-            Command::HostAttach { host, bytes, name, ack } => {
-                self.handle_host_attach(host, bytes, name, ack)
-            }
+            Command::HostAttach {
+                host,
+                bytes,
+                name,
+                ack,
+            } => self.handle_host_attach(host, bytes, name, ack),
             Command::HostRelease { ids, ack } => self.handle_host_release(ids, ack),
             Command::Htod {
                 data,

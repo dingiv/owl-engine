@@ -122,7 +122,10 @@ pub fn plan_sync_msg(
 ) -> crate::contract::LaunchMsg {
     use crate::contract::{Arg, Dtype, KernelSource, LaunchMsg};
     LaunchMsg {
-        kernel: KernelSource { name: PLAN_SYNC_FI.to_string(), source: String::new() },
+        kernel: KernelSource {
+            name: PLAN_SYNC_FI.to_string(),
+            source: String::new(),
+        },
         args: vec![
             Arg::block(out.id, Dtype::F16, 1),
             Arg::U64(t as u64),
@@ -193,17 +196,13 @@ impl Default for FlashinferCfg {
 /// 图自携 plan restore(缺省 true = 图自带表)
 static PLAN_RESTORE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(true);
 /// 图档 plan 瓦(缺省 false = eager 定瓦)
-static CUDA_GRAPH: std::sync::atomic::AtomicBool =
-    std::sync::atomic::AtomicBool::new(false);
+static CUDA_GRAPH: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 /// prefill f16 影子(缺省 false)
-static PREFILL_SHADOW: std::sync::atomic::AtomicBool =
-    std::sync::atomic::AtomicBool::new(false);
+static PREFILL_SHADOW: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 /// 影子容量上限(token;0 = 未下发)
-static PREFILL_SHADOW_CAP: std::sync::atomic::AtomicUsize =
-    std::sync::atomic::AtomicUsize::new(0);
+static PREFILL_SHADOW_CAP: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 /// 40 系原生 FP8 MMA(引擎 boot 从 `Arch::Sm89` 投影)
-static FP8_NATIVE: std::sync::atomic::AtomicBool =
-    std::sync::atomic::AtomicBool::new(false);
+static FP8_NATIVE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
 /// **族装配参数唯一写点**(引擎装配期一次;boot 期,任何 plan/捕获之前)。
 ///
@@ -266,9 +265,12 @@ pub(crate) fn fp8_native() -> bool {
 extern "C" {
     /// host 侧调度规划(见 cu/flashinfer/owl_fi_attention.cu 契约)
     pub fn owl_fi_prefill_plan(
-        float_ws: *mut c_void, float_ws_size: usize,
-        int_ws: *mut c_void, int_ws_size: usize,
-        page_locked: *mut c_void, page_locked_size: usize,
+        float_ws: *mut c_void,
+        float_ws_size: usize,
+        int_ws: *mut c_void,
+        int_ws_size: usize,
+        page_locked: *mut c_void,
+        page_locked_size: usize,
         out_plan15: *mut i64,
         out_cta_tile_q: *mut i32,
         out_split_kv: *mut i32,
@@ -278,16 +280,21 @@ extern "C" {
         kv_indptr_h: *const i32,
         total_num_rows: i32,
         batch_size: i32,
-        num_qo_heads: i32, num_kv_heads: i32,
-        head_dim: i32, page_size: i32,
+        num_qo_heads: i32,
+        num_kv_heads: i32,
+        head_dim: i32,
+        page_size: i32,
         stream: *mut c_void,
     ) -> i32;
 
     /// **f16 shadow 专用 plan**(显式 `kv_bytes`;2 = f16,不读 env)
     pub fn owl_fi_prefill_plan2(
-        float_ws: *mut c_void, float_ws_size: usize,
-        int_ws: *mut c_void, int_ws_size: usize,
-        page_locked: *mut c_void, page_locked_size: usize,
+        float_ws: *mut c_void,
+        float_ws_size: usize,
+        int_ws: *mut c_void,
+        int_ws_size: usize,
+        page_locked: *mut c_void,
+        page_locked_size: usize,
         out_plan15: *mut i64,
         out_cta_tile_q: *mut i32,
         out_split_kv: *mut i32,
@@ -296,8 +303,10 @@ extern "C" {
         kv_indptr_h: *const i32,
         total_num_rows: i32,
         batch_size: i32,
-        num_qo_heads: i32, num_kv_heads: i32,
-        head_dim: i32, page_size: i32,
+        num_qo_heads: i32,
+        num_kv_heads: i32,
+        head_dim: i32,
+        page_size: i32,
         kv_bytes: i32,
         stream: *mut c_void,
     ) -> i32;
@@ -305,9 +314,12 @@ extern "C" {
     /// **40/50 系原生 FP8 MMA 专用 plan**（arch-sm89/120 构建；force CTA16，split 沿用上游）
     #[cfg(any(feature = "arch-sm89", feature = "arch-sm120"))]
     pub fn owl_fi_prefill_plan_fp8mma(
-        float_ws: *mut c_void, float_ws_size: usize,
-        int_ws: *mut c_void, int_ws_size: usize,
-        page_locked: *mut c_void, page_locked_size: usize,
+        float_ws: *mut c_void,
+        float_ws_size: usize,
+        int_ws: *mut c_void,
+        int_ws_size: usize,
+        page_locked: *mut c_void,
+        page_locked_size: usize,
         out_plan15: *mut i64,
         out_cta_tile_q: *mut i32,
         out_split_kv: *mut i32,
@@ -316,8 +328,10 @@ extern "C" {
         kv_indptr_h: *const i32,
         total_num_rows: i32,
         batch_size: i32,
-        num_qo_heads: i32, num_kv_heads: i32,
-        head_dim: i32, page_size: i32,
+        num_qo_heads: i32,
+        num_kv_heads: i32,
+        head_dim: i32,
+        page_size: i32,
         stream: *mut c_void,
     ) -> i32;
 
@@ -346,11 +360,15 @@ extern "C" {
         indptr: *mut i32,
         last_len: *mut i32,
         plan15: *const i64,
-        int_ws: *mut c_void, int_ws_size: usize,
-        float_ws: *mut c_void, float_ws_size: usize,
+        int_ws: *mut c_void,
+        int_ws_size: usize,
+        float_ws: *mut c_void,
+        float_ws_size: usize,
         batch_size: i32,
-        num_qo_heads: i32, num_kv_heads: i32,
-        head_dim: i32, page_size: i32,
+        num_qo_heads: i32,
+        num_kv_heads: i32,
+        head_dim: i32,
+        page_size: i32,
         total_num_rows: i32,
         sm_scale: f32,
         // 尾部 CTA 掩码(P-5;null = 不用掩码)。内容 `i < tiles` 由 Rust 侧
@@ -370,11 +388,15 @@ extern "C" {
         indptr: *mut i32,
         last_len: *mut i32,
         plan15: *const i64,
-        int_ws: *mut c_void, int_ws_size: usize,
-        float_ws: *mut c_void, float_ws_size: usize,
+        int_ws: *mut c_void,
+        int_ws_size: usize,
+        float_ws: *mut c_void,
+        float_ws_size: usize,
         batch_size: i32,
-        num_qo_heads: i32, num_kv_heads: i32,
-        head_dim: i32, page_size: i32,
+        num_qo_heads: i32,
+        num_kv_heads: i32,
+        head_dim: i32,
+        page_size: i32,
         total_num_rows: i32,
         sm_scale: f32,
         // 尾部 CTA 掩码(P-5;null = 不用掩码)。内容 `i < tiles` 由 Rust 侧
@@ -396,11 +418,15 @@ extern "C" {
         indptr: *mut i32,
         last_len: *mut i32,
         plan15: *const i64,
-        int_ws: *mut c_void, int_ws_size: usize,
-        float_ws: *mut c_void, float_ws_size: usize,
+        int_ws: *mut c_void,
+        int_ws_size: usize,
+        float_ws: *mut c_void,
+        float_ws_size: usize,
         batch_size: i32,
-        num_qo_heads: i32, num_kv_heads: i32,
-        head_dim: i32, page_size: i32,
+        num_qo_heads: i32,
+        num_kv_heads: i32,
+        head_dim: i32,
+        page_size: i32,
         total_num_rows: i32,
         sm_scale: f32,
         block_valid_mask: *const c_void,
@@ -492,9 +518,15 @@ mod cfg_tests {
     /// 红档不写任何状态(先判后写),故本测试不污染进程。
     #[test]
     fn 影子无容量响亮拒() {
-        let e = configure(FlashinferCfg { prefill_shadow: true, ..Default::default() })
-            .expect_err("cap = 0 时必须拒");
-        assert!(format!("{e}").contains("prefill_shadow_cap"), "错误要点名字段: {e}");
+        let e = configure(FlashinferCfg {
+            prefill_shadow: true,
+            ..Default::default()
+        })
+        .expect_err("cap = 0 时必须拒");
+        assert!(
+            format!("{e}").contains("prefill_shadow_cap"),
+            "错误要点名字段: {e}"
+        );
     }
 
     /// **一次落全字段**(写者唯一的可观测后果);跑完还原缺省,不留给兄弟测试。

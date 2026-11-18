@@ -31,12 +31,23 @@ async fn cpu_mock_engine_boots_loads_and_runs_a_turn() {
         device_ordinal: 0,
         max_context_length_tokens: 256,
         prefill_chunk: 32,
-        knobs: EngineKnobs { sampler_enabled: false, ..Default::default() },
+        knobs: EngineKnobs {
+            sampler_enabled: false,
+            ..Default::default()
+        },
     };
     // 空转档:账与搬运真、数值不算
-    let face = CpuFace::mock(MockLimits { null_kernels: true, graph_capture: true, ..Default::default() });
+    let face = CpuFace::mock(MockLimits {
+        null_kernels: true,
+        graph_capture: true,
+        ..Default::default()
+    });
     let mut engine = Engine::on(cfg, face).expect("构造(CPU face)");
-    let loaded = engine.loader().load_qwen35_0_8b(&asset_dir()).await.expect("装载");
+    let loaded = engine
+        .loader()
+        .load_qwen35_0_8b(&asset_dir())
+        .await
+        .expect("装载");
     let mut running = engine.run(loaded).await.expect("装配(warmup + 图捕获)");
     let text = running.generate("你好", 4).await.expect("生成");
     eprintln!("[cpu-mock] 空转档生成(数值无意义,只有流程意义): {text:?}");
@@ -55,10 +66,16 @@ async fn cpu_mock_vram_wall_rejects_boot_loudly() {
         device_ordinal: 0,
         max_context_length_tokens: 256,
         prefill_chunk: 32,
-        knobs: EngineKnobs { sampler_enabled: false, ..Default::default() },
+        knobs: EngineKnobs {
+            sampler_enabled: false,
+            ..Default::default()
+        },
     };
     // 1MiB "显存":连权重都装不下 ⇒ 拒启(而非静默降级/静默 OOM)
-    let face = CpuFace::mock(MockLimits { vram_bytes: 1 << 20, ..Default::default() });
+    let face = CpuFace::mock(MockLimits {
+        vram_bytes: 1 << 20,
+        ..Default::default()
+    });
     let mut engine = Engine::on(cfg, face).expect("构造");
     let err = match engine.loader().load_qwen35_0_8b(&asset_dir()).await {
         Ok(_) => panic!("容量墙内装载必须失败"),
@@ -83,24 +100,45 @@ async fn cpu_mock_load_cost_breakdown() {
         device_ordinal: 0,
         max_context_length_tokens: 256,
         prefill_chunk: 32,
-        knobs: EngineKnobs { sampler_enabled: false, ..Default::default() },
+        knobs: EngineKnobs {
+            sampler_enabled: false,
+            ..Default::default()
+        },
     };
-    let face = CpuFace::mock(MockLimits { null_kernels: true, graph_capture: true, ..Default::default() });
+    let face = CpuFace::mock(MockLimits {
+        null_kernels: true,
+        graph_capture: true,
+        ..Default::default()
+    });
     let mut engine = Engine::on(cfg, face).expect("构造");
     owl_cpu::mock_stats_reset();
     let t = std::time::Instant::now();
-    let loaded = engine.loader().load_qwen35_0_8b(&asset_dir()).await.expect("装载");
+    let loaded = engine
+        .loader()
+        .load_qwen35_0_8b(&asset_dir())
+        .await
+        .expect("装载");
     let wall = t.elapsed().as_secs_f64();
-    let names = ["alloc", "htod", "upload_pinned", "upload_and_launch", "copy_block_at", "launch"];
+    let names = [
+        "alloc",
+        "htod",
+        "upload_pinned",
+        "upload_and_launch",
+        "copy_block_at",
+        "launch",
+    ];
     let st = owl_cpu::mock_stats();
     eprintln!("[cpu-mock] 装载墙钟 {wall:.2}s;契约面累计:");
     let mut acc = 0.0f64;
     for (i, (calls, ns)) in st.iter().enumerate() {
-        eprintln!("[cpu-mock]   {:<18} calls={:<8} cum={:>8.2}s", names[i], calls, *ns as f64 / 1e9);
+        eprintln!(
+            "[cpu-mock]   {:<18} calls={:<8} cum={:>8.2}s",
+            names[i],
+            calls,
+            *ns as f64 / 1e9
+        );
         acc += *ns as f64 / 1e9;
     }
     eprintln!("[cpu-mock]   契约面合计 {acc:.2}s(其余 = 装载器 host 侧:repack/读盘/校验)");
     drop(loaded);
 }
-
-

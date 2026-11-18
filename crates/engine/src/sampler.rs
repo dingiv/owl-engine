@@ -71,7 +71,12 @@ pub struct SamplerCfg {
 impl Default for SamplerCfg {
     /// 缺省 = generation_config 同款三维,**不做重复惩罚**(rep_penalty = 1.0)
     fn default() -> Self {
-        SamplerCfg { temp: 1.0, topk: 20, topp: 0.95, rep_penalty: 1.0 }
+        SamplerCfg {
+            temp: 1.0,
+            topk: 20,
+            topp: 0.95,
+            rep_penalty: 1.0,
+        }
     }
 }
 
@@ -79,11 +84,14 @@ impl SamplerCfg {
     /// **入口侧组装器**:自全量配置 sampling module 显式搬运
     /// (引擎内部经 EngineKnobs.sampler 携带,热路径零 env 读取)
     pub fn from_sampling(s: &owl_shared::config::SamplingCfg) -> Self {
-        SamplerCfg { temp: s.temp, topk: s.topk, topp: s.topp, rep_penalty: s.rep_penalty }
+        SamplerCfg {
+            temp: s.temp,
+            topk: s.topk,
+            topp: s.topp,
+            rep_penalty: s.rep_penalty,
+        }
     }
 }
-
-
 
 /// xorshift64* 步进(返回 64 位;调用方持有 state)
 fn xorshift(state: &mut u64) -> u64 {
@@ -120,7 +128,11 @@ pub fn distribution(logits: &mut [f32], cfg: &SamplerCfg, history: &[u32]) -> Ve
             let t = t as usize;
             if t < n {
                 let v = logits[t];
-                logits[t] = if v > 0.0 { v / cfg.rep_penalty } else { v * cfg.rep_penalty };
+                logits[t] = if v > 0.0 {
+                    v / cfg.rep_penalty
+                } else {
+                    v * cfg.rep_penalty
+                };
             }
         }
     }
@@ -167,7 +179,10 @@ pub fn distribution(logits: &mut [f32], cfg: &SamplerCfg, history: &[u32]) -> Ve
     // "两半 top-K 并集"路径的集合相同 ⇒ 采样**逐位相同**。
     cand.sort_by(|a, b| b.0.total_cmp(&a.0).then(a.1.cmp(&b.1)));
     // ── softmax(temperature;减 max 稳定化)──
-    let mx = cand.iter().map(|(v, _)| *v).fold(f32::NEG_INFINITY, f32::max);
+    let mx = cand
+        .iter()
+        .map(|(v, _)| *v)
+        .fold(f32::NEG_INFINITY, f32::max);
     let mut sum = 0f32;
     for (v, _) in cand.iter_mut() {
         *v = ((*v - mx) / cfg.temp).exp();
@@ -223,7 +238,9 @@ pub fn sample_from_candidates(union: &[(f32, u32)], cfg: &SamplerCfg, rng: &mut 
             return union[*pos as usize].1;
         }
     }
-    keep.last().map(|(pos, _)| union[*pos as usize].1).unwrap_or(0)
+    keep.last()
+        .map(|(pos, _)| union[*pos as usize].1)
+        .unwrap_or(0)
 }
 
 /// **已算好的稀疏分布 → 多项式抽样**(2026-10-31;与 [`sample`] 的 RNG 用法**逐字一致**
@@ -283,12 +300,7 @@ mod candidate_tests {
         let n = logits.len();
         // 全表 top-32(值降,索引升)= 两半并集的上界
         let mut order: Vec<usize> = (0..n).collect();
-        order.sort_by(|&a, &b| {
-            logits[b]
-                .partial_cmp(&logits[a])
-                .unwrap()
-                .then(a.cmp(&b))
-        });
+        order.sort_by(|&a, &b| logits[b].partial_cmp(&logits[a]).unwrap().then(a.cmp(&b)));
         let mut union: Vec<(f32, u32)> = order[..k.min(n)]
             .iter()
             .map(|&i| (logits[i], i as u32))
@@ -314,7 +326,12 @@ mod candidate_tests {
             s = s.wrapping_mul(6364136223846793005).wrapping_add(1);
             *v = ((s >> 40) as f32 / (1u64 << 24) as f32) * 8.0 - 4.0;
         }
-        let cfg = SamplerCfg { temp: 0.9, topk: 20, topp: 0.92, rep_penalty: 1.0 };
+        let cfg = SamplerCfg {
+            temp: 0.9,
+            topk: 20,
+            topp: 0.92,
+            rep_penalty: 1.0,
+        };
         check(&x, &cfg, 32, 500);
     }
 
@@ -323,7 +340,12 @@ mod candidate_tests {
         // 大量同值:候选边界全是平局 —— 最考"取最小索引"语义
         let n = 512usize;
         let x: Vec<f32> = (0..n).map(|i| ((i % 7) as f32) * 0.5).collect();
-        let cfg = SamplerCfg { temp: 1.0, topk: 20, topp: 0.95, rep_penalty: 1.0 };
+        let cfg = SamplerCfg {
+            temp: 1.0,
+            topk: 20,
+            topp: 0.95,
+            rep_penalty: 1.0,
+        };
         check(&x, &cfg, 32, 500);
     }
 
@@ -331,8 +353,28 @@ mod candidate_tests {
     fn candidates_equal_full_table_k1_and_topp1() {
         let n = 1024usize;
         let x: Vec<f32> = (0..n).map(|i| ((i * 37 % 101) as f32) * 0.1).collect();
-        check(&x, &SamplerCfg { temp: 1.3, topk: 1, topp: 0.95, rep_penalty: 1.0 }, 32, 200);
-        check(&x, &SamplerCfg { temp: 0.7, topk: 20, topp: 1.0, rep_penalty: 1.0 }, 32, 200);
+        check(
+            &x,
+            &SamplerCfg {
+                temp: 1.3,
+                topk: 1,
+                topp: 0.95,
+                rep_penalty: 1.0,
+            },
+            32,
+            200,
+        );
+        check(
+            &x,
+            &SamplerCfg {
+                temp: 0.7,
+                topk: 20,
+                topp: 1.0,
+                rep_penalty: 1.0,
+            },
+            32,
+            200,
+        );
     }
 }
 
@@ -359,7 +401,10 @@ mod tests {
 
     #[test]
     fn penalty_history_is_recent_dedup_sorted_with_sentinel() {
-        assert_eq!(penalty_history(&[], &[]), vec![REP_HISTORY_SENTINEL; REP_HISTORY_WINDOW]);
+        assert_eq!(
+            penalty_history(&[], &[]),
+            vec![REP_HISTORY_SENTINEL; REP_HISTORY_WINDOW]
+        );
 
         let h = penalty_history(&[9, 3, 9, 7], &[3, 5]);
         // 最近窗口 = prompt ++ generated,去重升序,尾部哨兵
@@ -395,7 +440,12 @@ mod tests {
         }
         // 让历史命中若干真实高概率 token,并带重复项
         let history: Vec<u32> = (20..70).chain(20..40).collect();
-        let cfg = SamplerCfg { temp: 0.8, topk: 20, topp: 0.92, rep_penalty: 1.3 };
+        let cfg = SamplerCfg {
+            temp: 0.8,
+            topk: 20,
+            topp: 0.92,
+            rep_penalty: 1.3,
+        };
 
         let mut penalized = x.clone();
         apply_rep(&mut penalized, cfg.rep_penalty, &history);
@@ -426,7 +476,12 @@ mod tests {
     #[test]
     fn greedy_arm_and_temp_zero() {
         let mut logits = vec![-1.0, 3.0, 2.0, 0.5];
-        let g = SamplerCfg { temp: 0.0, topk: 20, topp: 0.95, rep_penalty: 1.0 };
+        let g = SamplerCfg {
+            temp: 0.0,
+            topk: 20,
+            topp: 0.95,
+            rep_penalty: 1.0,
+        };
         assert_eq!(sample(&mut logits, &g, &mut 1, &[]), 1, "temp=0 → argmax");
     }
 
@@ -436,7 +491,12 @@ mod tests {
         let mut logits = vec![-10f32; 1000];
         logits[7] = 1.0; // P≈0.55
         logits[100] = 0.8; // P≈0.45(其余 exp(-10)≈0)
-        let cfg = SamplerCfg { temp: 1.0, topk: 20, topp: 0.95, rep_penalty: 1.0 };
+        let cfg = SamplerCfg {
+            temp: 1.0,
+            topk: 20,
+            topp: 0.95,
+            rep_penalty: 1.0,
+        };
         let mut rng = 42u64;
         let (h7, h100) = (0..400).fold((0, 0), |(a, b), _| {
             match sample(&mut logits, &cfg, &mut rng, &[]) {
@@ -452,10 +512,19 @@ mod tests {
     #[test]
     fn deterministic_same_seed() {
         let mut logits: Vec<f32> = (0..5000).map(|i| ((i * 37) % 97) as f32 / 10.0).collect();
-        let cfg = SamplerCfg { temp: 1.0, topk: 20, topp: 0.95, rep_penalty: 1.0 };
+        let cfg = SamplerCfg {
+            temp: 1.0,
+            topk: 20,
+            topp: 0.95,
+            rep_penalty: 1.0,
+        };
         let (mut a, mut b) = (12345u64, 12345u64);
-        let seq_a: Vec<u32> = (0..50).map(|_| sample(&mut logits, &cfg, &mut a, &[])).collect();
-        let seq_b: Vec<u32> = (0..50).map(|_| sample(&mut logits, &cfg, &mut b, &[])).collect();
+        let seq_a: Vec<u32> = (0..50)
+            .map(|_| sample(&mut logits, &cfg, &mut a, &[]))
+            .collect();
+        let seq_b: Vec<u32> = (0..50)
+            .map(|_| sample(&mut logits, &cfg, &mut b, &[]))
+            .collect();
         assert_eq!(seq_a, seq_b, "同 seed 必同序列(测试可复现契约)");
     }
 
@@ -464,7 +533,12 @@ mod tests {
         let mut logits = vec![-1f32; 100];
         logits[3] = f32::NAN;
         logits[50] = 2.0; // 真 max
-        let cfg = SamplerCfg { temp: 1.0, topk: 20, topp: 0.95, rep_penalty: 1.0 };
+        let cfg = SamplerCfg {
+            temp: 1.0,
+            topk: 20,
+            topp: 0.95,
+            rep_penalty: 1.0,
+        };
         let mut rng = 7u64;
         for _ in 0..100 {
             let t = sample(&mut logits, &cfg, &mut rng, &[]);
@@ -478,7 +552,12 @@ mod tests {
         let mut logits = vec![-3f32; 500];
         logits[5] = 8.0;
         logits[10] = 6.5; // P(5) ≈ 0.82,top-p 后必高概率中
-        let cfg = SamplerCfg { temp: 1.0, topk: 20, topp: 0.95, rep_penalty: 1.3 };
+        let cfg = SamplerCfg {
+            temp: 1.0,
+            topk: 20,
+            topp: 0.95,
+            rep_penalty: 1.3,
+        };
         let mut rng = 11u64;
         let no_pen = (0..200)
             .map(|_| sample(&mut logits.clone(), &cfg, &mut rng, &[]))
@@ -496,7 +575,12 @@ mod tests {
     /// **去重律**:同一 token 出现 k 次只罚一次(回归门;原实现 = 1.15^k 累积)
     #[test]
     fn rep_penalty_once_per_distinct_token() {
-        let cfg = SamplerCfg { temp: 0.0, topk: 20, topp: 0.95, rep_penalty: 1.5 };
+        let cfg = SamplerCfg {
+            temp: 0.0,
+            topk: 20,
+            topp: 0.95,
+            rep_penalty: 1.5,
+        };
         let base = || {
             let mut v = vec![-3f32; 64];
             v[5] = 8.0;
@@ -521,9 +605,17 @@ mod tests {
             sample(&mut l, &cfg, &mut 7, &[5, 6]);
             l
         };
-        assert!((two[5] - 5.3333).abs() < 1e-3 && (two[6] - 4.6667).abs() < 1e-3, "{:?} {:?}", two[5], two[6]);
+        assert!(
+            (two[5] - 5.3333).abs() < 1e-3 && (two[6] - 4.6667).abs() < 1e-3,
+            "{:?} {:?}",
+            two[5],
+            two[6]
+        );
         // 1.0 = 关
-        let off = SamplerCfg { rep_penalty: 1.0, ..cfg };
+        let off = SamplerCfg {
+            rep_penalty: 1.0,
+            ..cfg
+        };
         let mut l = base();
         sample(&mut l, &off, &mut 7, &[5, 5, 5]);
         assert_eq!(l[5], 8.0, "rep_penalty=1.0 不得改动 logits");
@@ -537,7 +629,12 @@ mod tests {
         for (i, v) in logits.iter_mut().enumerate().take(5) {
             *v = 3.0 - i as f32 * 0.5;
         }
-        let cfg = SamplerCfg { temp: 1.0, topk: 20, topp: 0.95, rep_penalty: 1.0 };
+        let cfg = SamplerCfg {
+            temp: 1.0,
+            topk: 20,
+            topp: 0.95,
+            rep_penalty: 1.0,
+        };
         let mut rng = 99u64;
         let head_hits = (0..300)
             .filter(|_| {

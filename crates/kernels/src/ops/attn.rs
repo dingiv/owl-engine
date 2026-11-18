@@ -2,9 +2,12 @@
 //!
 //! 参数名/序/类型 = `.cu` 签名的逐字抄录(机器互证见 `tests/op_tables.rs`)。
 
-use owl_macros::kernel_tags;
 use crate::contract::{Dtype, Law};
-use crate::spec::{meta_of, pools, CaptureEvidence, Determinism, KernelMeta, KernelSpec, LayoutTag, Param, PoolAccess};
+use crate::spec::{
+    meta_of, pools, CaptureEvidence, Determinism, KernelMeta, KernelSpec, LayoutTag, Param,
+    PoolAccess,
+};
+use owl_macros::kernel_tags;
 
 // ============================================================================
 // 草稿非因果块注意力(DFlash2 propose 的 NC 核 v2;2026-10-13 ③ 转正)
@@ -22,7 +25,14 @@ use crate::spec::{meta_of, pools, CaptureEvidence, Determinism, KernelMeta, Kern
 /// 结构门:驱动件要求 `nwarp ≥ group` 且整除(否则回落旧核);核内 `__trap()` 兜底。
 pub struct NcAttnBf16V2;
 
-#[kernel_tags("dom.attn", "role.attn", "feat.dflash", "feat.spec", "phase.propose", "kv.draft.bf16")]
+#[kernel_tags(
+    "dom.attn",
+    "role.attn",
+    "feat.dflash",
+    "feat.spec",
+    "phase.propose",
+    "kv.draft.bf16"
+)]
 impl KernelSpec for NcAttnBf16V2 {
     const ENTRY: &'static str = "owl_naive_attn_nc_bf16_v2";
     const SRC: &'static str = "cu/attn/naive_attn_nc.cu";
@@ -43,7 +53,11 @@ impl KernelSpec for NcAttnBf16V2 {
         Param::i32("ring_cap"),
         Param::t_out("out", Dtype::BF16, 2),
     ];
-    const POOL: &'static [PoolAccess] = &[PoolAccess::read(pools::KV_DRAFT, LayoutTag::Classic, Dtype::BF16)];
+    const POOL: &'static [PoolAccess] = &[PoolAccess::read(
+        pools::KV_DRAFT,
+        LayoutTag::Classic,
+        Dtype::BF16,
+    )];
     const SELFCHECK: Option<&'static dyn crate::bootcheck::BootCheck> =
         Some(&crate::ops::oracles::nc_bf16_v2::NcBf16V2Oracle);
     const LAWS: &'static [Law] = &[Law::OutputFinite];
@@ -74,30 +88,30 @@ pub struct PagedAttnV2Fp8KnhdHd256Bs32;
 /// paged v2 主核参数表 —— **fp8 池臂**(18 参;f16/fp8 × classic/kNHD 同 ABI,
 /// 池句柄视图不同 ⇒ 2026-10-15 拆两表)
 const PAGED_V2_FP8_KNHD_PARAMS: &[Param] = &[
-        Param::t_in("q", Dtype::F16, 2),
-        // fp8 主池句柄:引擎叶子 = U32 扁平字节账(`bytes/4` 字;池的 e4m3
-        // 字节语义由 `POOL` 的 `Dtype::F8E4M3` 承担)。旧声明 U8x4 描述的是核内
-        // kNHD 字节视图,与喂进来的句柄不是同一层(2026-10-15 事实面对齐)
-        Param::t_in("k_cache", Dtype::U32, 1),
-        Param::t_in("v_cache", Dtype::U32, 1),
-        Param::t_in("block_tables", Dtype::F32, 2),
-        // 每序列 KV 长:视图随臂变(计划输入槽 rank1 / 会话表 rank2)⇒ 显式阶数无关
-        Param::t_in("context_lens", Dtype::F32, 0),
-        // 哑槽(use_alibi=0 不解引用):喂 K0 哑输出 = 本族激活 dtype(f16)
-        Param::t_in("alibi_slopes", Dtype::F16, 0),
-        Param::t_in("exp_sums", Dtype::F32, 2),
-        Param::t_in("max_logits", Dtype::F32, 2),
-        Param::i32("num_kv_heads"),
-        Param::f32("scale"),
-        Param::i32("max_num_blocks_per_seq"),
-        Param::i32("q_stride"),
-        Param::i32("kv_block_stride"),
-        Param::i32("kv_head_stride"),
-        Param::f32("softscapping"),
-        Param::i32("sliding_window"),
-        Param::i32("use_alibi"),
-        // 引擎 scratch 叶子 = 扁平 `[hq·nparts·hd]`(rank1)
-        Param::t_out("tmp_out", Dtype::F16, 1),
+    Param::t_in("q", Dtype::F16, 2),
+    // fp8 主池句柄:引擎叶子 = U32 扁平字节账(`bytes/4` 字;池的 e4m3
+    // 字节语义由 `POOL` 的 `Dtype::F8E4M3` 承担)。旧声明 U8x4 描述的是核内
+    // kNHD 字节视图,与喂进来的句柄不是同一层(2026-10-15 事实面对齐)
+    Param::t_in("k_cache", Dtype::U32, 1),
+    Param::t_in("v_cache", Dtype::U32, 1),
+    Param::t_in("block_tables", Dtype::F32, 2),
+    // 每序列 KV 长:视图随臂变(计划输入槽 rank1 / 会话表 rank2)⇒ 显式阶数无关
+    Param::t_in("context_lens", Dtype::F32, 0),
+    // 哑槽(use_alibi=0 不解引用):喂 K0 哑输出 = 本族激活 dtype(f16)
+    Param::t_in("alibi_slopes", Dtype::F16, 0),
+    Param::t_in("exp_sums", Dtype::F32, 2),
+    Param::t_in("max_logits", Dtype::F32, 2),
+    Param::i32("num_kv_heads"),
+    Param::f32("scale"),
+    Param::i32("max_num_blocks_per_seq"),
+    Param::i32("q_stride"),
+    Param::i32("kv_block_stride"),
+    Param::i32("kv_head_stride"),
+    Param::f32("softscapping"),
+    Param::i32("sliding_window"),
+    Param::i32("use_alibi"),
+    // 引擎 scratch 叶子 = 扁平 `[hq·nparts·hd]`(rank1)
+    Param::t_out("tmp_out", Dtype::F16, 1),
 ];
 
 #[kernel_tags("dom.attn", "role.attn", "role.kv_read", "phase.decode", "kv.main.fp8")]
@@ -115,7 +129,11 @@ impl KernelSpec for PagedAttnV2Fp8KnhdHd256Bs32 {
         grp: None,
         tile: None,
     };
-    const POOL: &'static [PoolAccess] = &[PoolAccess::read(pools::KV_MAIN, LayoutTag::Knhd, Dtype::F8E4M3)];
+    const POOL: &'static [PoolAccess] = &[PoolAccess::read(
+        pools::KV_MAIN,
+        LayoutTag::Knhd,
+        Dtype::F8E4M3,
+    )];
 }
 
 /// `vllm_paged_attention_v2_reduce_f16_hd256` —— 分区 partial 归并
@@ -150,7 +168,13 @@ impl KernelSpec for PagedAttnV2ReduceF16Hd256 {
 /// (B6.3 全零案:E10)。
 pub struct K0WriteFp8Knhd;
 
-#[kernel_tags("dom.attn", "role.attn", "role.kv_write", "phase.prefill", "kv.main.fp8")]
+#[kernel_tags(
+    "dom.attn",
+    "role.attn",
+    "role.kv_write",
+    "phase.prefill",
+    "kv.main.fp8"
+)]
 impl KernelSpec for K0WriteFp8Knhd {
     const ENTRY: &'static str = "owl_reshape_and_cache_fp8kv_knhd";
     const SRC: &'static str = "cu/attn/reshape_and_cache_fp8kv.cu";
@@ -170,7 +194,11 @@ impl KernelSpec for K0WriteFp8Knhd {
         // 假输出(ABI 需要末位输出块;内核不写内容)
         Param::t_out("out", Dtype::F16, 1),
     ];
-    const POOL: &'static [PoolAccess] = &[PoolAccess::write(pools::KV_MAIN, LayoutTag::Knhd, Dtype::F8E4M3)];
+    const POOL: &'static [PoolAccess] = &[PoolAccess::write(
+        pools::KV_MAIN,
+        LayoutTag::Knhd,
+        Dtype::F8E4M3,
+    )];
     const SELFCHECK: Option<&'static dyn crate::bootcheck::BootCheck> =
         Some(&crate::ops::oracles::k0_fp8_knhd::K0Fp8KnhdOracle);
     const LAWS: &'static [Law] = &[Law::OutputFinite];
@@ -719,7 +747,11 @@ impl KernelSpec for ChunkedPrefillFp8KnhdHd256 {
         Param::i32("use_sinks_flag"),
         Param::t_out("out", Dtype::F16, 2),
     ];
-    const POOL: &'static [PoolAccess] = &[PoolAccess::read(pools::KV_MAIN, LayoutTag::Knhd, Dtype::F8E4M3)];
+    const POOL: &'static [PoolAccess] = &[PoolAccess::read(
+        pools::KV_MAIN,
+        LayoutTag::Knhd,
+        Dtype::F8E4M3,
+    )];
     const LAWS: &'static [Law] = &[Law::OutputFinite];
     const CAPTURE: CaptureEvidence = CaptureEvidence::NoHostWork;
     const DETERMINISM: Determinism = Determinism::Deterministic;
@@ -738,7 +770,13 @@ impl KernelSpec for ChunkedPrefillFp8KnhdHd256 {
 /// 测试面保留,不再同时声明为主池写者(E14 双寻址)。
 pub struct K0WriteFp8Classic;
 
-#[kernel_tags("dom.attn", "role.attn", "role.kv_write", "phase.prefill", "kv.draft.fp8")]
+#[kernel_tags(
+    "dom.attn",
+    "role.attn",
+    "role.kv_write",
+    "phase.prefill",
+    "kv.draft.fp8"
+)]
 impl KernelSpec for K0WriteFp8Classic {
     const ENTRY: &'static str = "owl_reshape_and_cache_fp8kv";
     const SRC: &'static str = "cu/attn/reshape_and_cache_fp8kv.cu";
@@ -781,7 +819,13 @@ const K0_PARAMS: &[Param] = &[
 /// DFlash2 草稿池的权威写者;漏声明 = 草稿池静默全零(E10 同类)。
 pub struct K0WriteBf16;
 
-#[kernel_tags("dom.attn", "role.attn", "role.kv_write", "phase.prefill", "kv.draft.bf16")]
+#[kernel_tags(
+    "dom.attn",
+    "role.attn",
+    "role.kv_write",
+    "phase.prefill",
+    "kv.draft.bf16"
+)]
 impl KernelSpec for K0WriteBf16 {
     const ENTRY: &'static str = "vllm_reshape_and_cache_bf16";
     const SRC: &'static str = "cu/attn/reshape_and_cache.cu";
@@ -799,7 +843,11 @@ impl KernelSpec for K0WriteBf16 {
         Param::i32("x"),
         Param::t_out("out", Dtype::BF16, 1),
     ];
-    const POOL: &'static [PoolAccess] = &[PoolAccess::write(pools::KV_DRAFT, LayoutTag::Classic, Dtype::BF16)];
+    const POOL: &'static [PoolAccess] = &[PoolAccess::write(
+        pools::KV_DRAFT,
+        LayoutTag::Classic,
+        Dtype::BF16,
+    )];
     const LAWS: &'static [Law] = &[Law::OutputFinite];
     const CAPTURE: CaptureEvidence = CaptureEvidence::NoHostWork;
     const DETERMINISM: Determinism = Determinism::Deterministic;
@@ -816,7 +864,14 @@ impl KernelSpec for K0WriteBf16 {
 /// 自块直读保持 bf16)。fp8 草稿池档的生产读核。
 pub struct NcAttnFp8kvBf16;
 
-#[kernel_tags("dom.attn", "role.attn", "feat.dflash", "feat.spec", "phase.propose", "kv.draft.fp8")]
+#[kernel_tags(
+    "dom.attn",
+    "role.attn",
+    "feat.dflash",
+    "feat.spec",
+    "phase.propose",
+    "kv.draft.fp8"
+)]
 impl KernelSpec for NcAttnFp8kvBf16 {
     const ENTRY: &'static str = "owl_naive_attn_nc_fp8kv_bf16";
     const SRC: &'static str = "cu/attn/naive_attn_nc.cu";
@@ -835,7 +890,11 @@ impl KernelSpec for NcAttnFp8kvBf16 {
         Param::i32("ring_cap"),
         Param::t_out("out", Dtype::BF16, 2),
     ];
-    const POOL: &'static [PoolAccess] = &[PoolAccess::read(pools::KV_DRAFT, LayoutTag::Classic, Dtype::F8E4M3)];
+    const POOL: &'static [PoolAccess] = &[PoolAccess::read(
+        pools::KV_DRAFT,
+        LayoutTag::Classic,
+        Dtype::F8E4M3,
+    )];
     const LAWS: &'static [Law] = &[Law::OutputFinite];
     const CAPTURE: CaptureEvidence = CaptureEvidence::NoHostWork;
     const DETERMINISM: Determinism = Determinism::Deterministic;
@@ -1027,26 +1086,26 @@ pub static NORM_ROPE_BF16: KernelMeta = meta_of::<NormRopeBf16>();
 
 /// paged v2 主核参数表 —— **f16 池臂**(池句柄 = kNHD 分页视图)
 const PAGED_V2_F16_KNHD_PARAMS: &[Param] = &[
-        Param::t_in("q", Dtype::F16, 2),
-        // f16 主池:引擎叶子 = [nb, hkv, hd/x, page, x](k)/[nb, hkv, hd, page](v)
-        Param::t_in("k_cache", Dtype::F16, 5),
-        Param::t_in("v_cache", Dtype::F16, 4),
-        Param::t_in("block_tables", Dtype::F32, 2),
-        // 每序列 KV 长:视图随臂变(计划输入槽 rank1 / 会话表 rank2)⇒ 显式阶数无关
-        Param::t_in("context_lens", Dtype::F32, 0),
-        Param::t_in("alibi_slopes", Dtype::F16, 0),
-        Param::t_in("exp_sums", Dtype::F32, 2),
-        Param::t_in("max_logits", Dtype::F32, 2),
-        Param::i32("num_kv_heads"),
-        Param::f32("scale"),
-        Param::i32("max_num_blocks_per_seq"),
-        Param::i32("q_stride"),
-        Param::i32("kv_block_stride"),
-        Param::i32("kv_head_stride"),
-        Param::f32("softscapping"),
-        Param::i32("sliding_window"),
-        Param::i32("use_alibi"),
-        Param::t_out("tmp_out", Dtype::F16, 1),
+    Param::t_in("q", Dtype::F16, 2),
+    // f16 主池:引擎叶子 = [nb, hkv, hd/x, page, x](k)/[nb, hkv, hd, page](v)
+    Param::t_in("k_cache", Dtype::F16, 5),
+    Param::t_in("v_cache", Dtype::F16, 4),
+    Param::t_in("block_tables", Dtype::F32, 2),
+    // 每序列 KV 长:视图随臂变(计划输入槽 rank1 / 会话表 rank2)⇒ 显式阶数无关
+    Param::t_in("context_lens", Dtype::F32, 0),
+    Param::t_in("alibi_slopes", Dtype::F16, 0),
+    Param::t_in("exp_sums", Dtype::F32, 2),
+    Param::t_in("max_logits", Dtype::F32, 2),
+    Param::i32("num_kv_heads"),
+    Param::f32("scale"),
+    Param::i32("max_num_blocks_per_seq"),
+    Param::i32("q_stride"),
+    Param::i32("kv_block_stride"),
+    Param::i32("kv_head_stride"),
+    Param::f32("softscapping"),
+    Param::i32("sliding_window"),
+    Param::i32("use_alibi"),
+    Param::t_out("tmp_out", Dtype::F16, 1),
 ];
 /// reduce 参数表(6 参;hd128/hd256 同 ABI)
 const PAGED_V2_REDUCE_PARAMS: &[Param] = &[
@@ -1054,7 +1113,7 @@ const PAGED_V2_REDUCE_PARAMS: &[Param] = &[
     Param::t_in("max_logits", Dtype::F32, 2),
     Param::t_in("tmp_out", Dtype::F16, 1),
     // 每序列 KV 长:视图随臂变(计划输入槽 rank1 / 会话表 rank2)⇒ 显式阶数无关
-        Param::t_in("context_lens", Dtype::F32, 0),
+    Param::t_in("context_lens", Dtype::F32, 0),
     Param::i32("max_num_partitions"),
     Param::t_out("out", Dtype::F16, 2),
 ];
@@ -1090,19 +1149,123 @@ macro_rules! paged_v2_variant {
     };
 }
 
-paged_v2_variant!(PagedV2F16Hd128Bs32, "vllm_paged_attention_v2_f16_hd128bs32", Dtype::F16, 128, &[32], &[128], "kv.main.f16");
-paged_v2_variant!(PagedV2F16Hd256Bs32, "vllm_paged_attention_v2_f16_hd256bs32", Dtype::F16, 256, &[32], &[256], "kv.main.f16");
-paged_v2_variant!(PagedV2F16KnhdHd128Bs32, "vllm_paged_attention_v2_f16_knhd_hd128bs32", Dtype::F16, 128, &[32], &[128], "kv.main.f16");
-paged_v2_variant!(PagedV2F16KnhdHd256Bs32, "vllm_paged_attention_v2_f16_knhd_hd256bs32", Dtype::F16, 256, &[32], &[256], "kv.main.f16");
-paged_v2_variant!(PagedV2F16KnhdHd128, "vllm_paged_attention_v2_f16_knhd_hd128", Dtype::F16, 128, &[16], &[128], "kv.main.f16");
-paged_v2_variant!(PagedV2F16KnhdHd256, "vllm_paged_attention_v2_f16_knhd_hd256", Dtype::F16, 256, &[16], &[256], "kv.main.f16");
-paged_v2_variant!(PagedV2Fp8Hd128, "vllm_paged_attention_v2_fp8_hd128", Dtype::F8E4M3, 128, &[16], &[128], "kv.main.fp8");
-paged_v2_variant!(PagedV2Fp8Hd256, "vllm_paged_attention_v2_fp8_hd256", Dtype::F8E4M3, 256, &[16], &[256], "kv.main.fp8");
-paged_v2_variant!(PagedV2Fp8Hd128Bs32, "vllm_paged_attention_v2_fp8_hd128bs32", Dtype::F8E4M3, 128, &[32], &[128], "kv.main.fp8");
-paged_v2_variant!(PagedV2Fp8Hd256Bs32, "vllm_paged_attention_v2_fp8_hd256bs32", Dtype::F8E4M3, 256, &[32], &[256], "kv.main.fp8");
-paged_v2_variant!(PagedV2Fp8KnhdHd128Bs32, "vllm_paged_attention_v2_fp8_knhd_hd128bs32", Dtype::F8E4M3, 128, &[32], &[128], "kv.main.fp8");
-paged_v2_variant!(PagedV2Fp8KnhdHd256, "vllm_paged_attention_v2_fp8_knhd_hd256", Dtype::F8E4M3, 256, &[16], &[256], "kv.main.fp8");
-paged_v2_variant!(PagedV2Fp8KnhdHd128, "vllm_paged_attention_v2_fp8_knhd_hd128", Dtype::F8E4M3, 128, &[16], &[128], "kv.main.fp8");
+paged_v2_variant!(
+    PagedV2F16Hd128Bs32,
+    "vllm_paged_attention_v2_f16_hd128bs32",
+    Dtype::F16,
+    128,
+    &[32],
+    &[128],
+    "kv.main.f16"
+);
+paged_v2_variant!(
+    PagedV2F16Hd256Bs32,
+    "vllm_paged_attention_v2_f16_hd256bs32",
+    Dtype::F16,
+    256,
+    &[32],
+    &[256],
+    "kv.main.f16"
+);
+paged_v2_variant!(
+    PagedV2F16KnhdHd128Bs32,
+    "vllm_paged_attention_v2_f16_knhd_hd128bs32",
+    Dtype::F16,
+    128,
+    &[32],
+    &[128],
+    "kv.main.f16"
+);
+paged_v2_variant!(
+    PagedV2F16KnhdHd256Bs32,
+    "vllm_paged_attention_v2_f16_knhd_hd256bs32",
+    Dtype::F16,
+    256,
+    &[32],
+    &[256],
+    "kv.main.f16"
+);
+paged_v2_variant!(
+    PagedV2F16KnhdHd128,
+    "vllm_paged_attention_v2_f16_knhd_hd128",
+    Dtype::F16,
+    128,
+    &[16],
+    &[128],
+    "kv.main.f16"
+);
+paged_v2_variant!(
+    PagedV2F16KnhdHd256,
+    "vllm_paged_attention_v2_f16_knhd_hd256",
+    Dtype::F16,
+    256,
+    &[16],
+    &[256],
+    "kv.main.f16"
+);
+paged_v2_variant!(
+    PagedV2Fp8Hd128,
+    "vllm_paged_attention_v2_fp8_hd128",
+    Dtype::F8E4M3,
+    128,
+    &[16],
+    &[128],
+    "kv.main.fp8"
+);
+paged_v2_variant!(
+    PagedV2Fp8Hd256,
+    "vllm_paged_attention_v2_fp8_hd256",
+    Dtype::F8E4M3,
+    256,
+    &[16],
+    &[256],
+    "kv.main.fp8"
+);
+paged_v2_variant!(
+    PagedV2Fp8Hd128Bs32,
+    "vllm_paged_attention_v2_fp8_hd128bs32",
+    Dtype::F8E4M3,
+    128,
+    &[32],
+    &[128],
+    "kv.main.fp8"
+);
+paged_v2_variant!(
+    PagedV2Fp8Hd256Bs32,
+    "vllm_paged_attention_v2_fp8_hd256bs32",
+    Dtype::F8E4M3,
+    256,
+    &[32],
+    &[256],
+    "kv.main.fp8"
+);
+paged_v2_variant!(
+    PagedV2Fp8KnhdHd128Bs32,
+    "vllm_paged_attention_v2_fp8_knhd_hd128bs32",
+    Dtype::F8E4M3,
+    128,
+    &[32],
+    &[128],
+    "kv.main.fp8"
+);
+paged_v2_variant!(
+    PagedV2Fp8KnhdHd256,
+    "vllm_paged_attention_v2_fp8_knhd_hd256",
+    Dtype::F8E4M3,
+    256,
+    &[16],
+    &[256],
+    "kv.main.fp8"
+);
+paged_v2_variant!(
+    PagedV2Fp8KnhdHd128,
+    "vllm_paged_attention_v2_fp8_knhd_hd128",
+    Dtype::F8E4M3,
+    128,
+    &[16],
+    &[128],
+    "kv.main.fp8"
+);
 
 /// `vllm_paged_attention_v2_reduce_f16_hd128` —— 分区归并(hd128 变体)
 pub struct PagedV2ReduceF16Hd128;
@@ -1163,9 +1326,17 @@ impl KernelSpec for NaiveDecodeAttnF16 {
         Param::sz("d_dim"),
         Param::t_out("out", Dtype::F16, 2),
     ];
-    const POOL: &'static [PoolAccess] = &[PoolAccess::read(pools::KV_MAIN, LayoutTag::Classic, Dtype::F16)];
+    const POOL: &'static [PoolAccess] = &[PoolAccess::read(
+        pools::KV_MAIN,
+        LayoutTag::Classic,
+        Dtype::F16,
+    )];
     const SHAPE: crate::spec::ShapeFamily = crate::spec::ShapeFamily {
-        kv_dtype: Some(Dtype::F16), head_dim: &[128], page: &[16, 32, 64, 128], grp: None, tile: None,
+        kv_dtype: Some(Dtype::F16),
+        head_dim: &[128],
+        page: &[16, 32, 64, 128],
+        grp: None,
+        tile: None,
     };
     const LAWS: &'static [Law] = &[Law::OutputFinite];
     const CAPTURE: CaptureEvidence = CaptureEvidence::NoHostWork;
@@ -1198,7 +1369,11 @@ impl KernelSpec for NaiveDecodeAttnF32 {
         Param::t_out("out", Dtype::F32, 2),
     ];
     const SHAPE: crate::spec::ShapeFamily = crate::spec::ShapeFamily {
-        kv_dtype: Some(Dtype::F16), head_dim: &[128], page: &[16, 32, 64, 128], grp: None, tile: None,
+        kv_dtype: Some(Dtype::F16),
+        head_dim: &[128],
+        page: &[16, 32, 64, 128],
+        grp: None,
+        tile: None,
     };
     const LAWS: &'static [Law] = &[Law::OutputFinite];
     const CAPTURE: CaptureEvidence = CaptureEvidence::NoHostWork;
@@ -1208,7 +1383,14 @@ impl KernelSpec for NaiveDecodeAttnF32 {
 /// `owl_naive_attn_nc_f16` —— naive_attn_nc.cu(R1 补表;池声明见 POOL)
 pub struct NaiveAttnNcF16;
 
-#[kernel_tags("dom.attn", "role.attn", "feat.dflash", "feat.spec", "phase.propose", "kv.draft.f16")]
+#[kernel_tags(
+    "dom.attn",
+    "role.attn",
+    "feat.dflash",
+    "feat.spec",
+    "phase.propose",
+    "kv.draft.f16"
+)]
 impl KernelSpec for NaiveAttnNcF16 {
     const ENTRY: &'static str = "owl_naive_attn_nc_f16";
     const SRC: &'static str = "cu/attn/naive_attn_nc.cu";
@@ -1227,9 +1409,17 @@ impl KernelSpec for NaiveAttnNcF16 {
         Param::i32("ring_cap"),
         Param::t_out("out", Dtype::F16, 2),
     ];
-    const POOL: &'static [PoolAccess] = &[PoolAccess::read(pools::KV_DRAFT, LayoutTag::Classic, Dtype::F16)];
+    const POOL: &'static [PoolAccess] = &[PoolAccess::read(
+        pools::KV_DRAFT,
+        LayoutTag::Classic,
+        Dtype::F16,
+    )];
     const SHAPE: crate::spec::ShapeFamily = crate::spec::ShapeFamily {
-        kv_dtype: Some(Dtype::F16), head_dim: &[128], page: &[16, 32, 64, 128], grp: None, tile: None,
+        kv_dtype: Some(Dtype::F16),
+        head_dim: &[128],
+        page: &[16, 32, 64, 128],
+        grp: None,
+        tile: None,
     };
     const LAWS: &'static [Law] = &[Law::OutputFinite];
     const CAPTURE: CaptureEvidence = CaptureEvidence::NoHostWork;
@@ -1239,7 +1429,14 @@ impl KernelSpec for NaiveAttnNcF16 {
 /// `owl_naive_attn_nc_bf16` —— naive_attn_nc.cu(R1 补表;池声明见 POOL)
 pub struct NaiveAttnNcBf16;
 
-#[kernel_tags("dom.attn", "role.attn", "feat.dflash", "feat.spec", "phase.propose", "kv.draft.bf16")]
+#[kernel_tags(
+    "dom.attn",
+    "role.attn",
+    "feat.dflash",
+    "feat.spec",
+    "phase.propose",
+    "kv.draft.bf16"
+)]
 impl KernelSpec for NaiveAttnNcBf16 {
     const ENTRY: &'static str = "owl_naive_attn_nc_bf16";
     const SRC: &'static str = "cu/attn/naive_attn_nc.cu";
@@ -1258,9 +1455,17 @@ impl KernelSpec for NaiveAttnNcBf16 {
         Param::i32("ring_cap"),
         Param::t_out("out", Dtype::BF16, 2),
     ];
-    const POOL: &'static [PoolAccess] = &[PoolAccess::read(pools::KV_DRAFT, LayoutTag::Classic, Dtype::BF16)];
+    const POOL: &'static [PoolAccess] = &[PoolAccess::read(
+        pools::KV_DRAFT,
+        LayoutTag::Classic,
+        Dtype::BF16,
+    )];
     const SHAPE: crate::spec::ShapeFamily = crate::spec::ShapeFamily {
-        kv_dtype: Some(Dtype::BF16), head_dim: &[128], page: &[16, 32, 64, 128], grp: None, tile: None,
+        kv_dtype: Some(Dtype::BF16),
+        head_dim: &[128],
+        page: &[16, 32, 64, 128],
+        grp: None,
+        tile: None,
     };
     const LAWS: &'static [Law] = &[Law::OutputFinite];
     const CAPTURE: CaptureEvidence = CaptureEvidence::NoHostWork;
@@ -1270,7 +1475,14 @@ impl KernelSpec for NaiveAttnNcBf16 {
 /// `owl_naive_attn_nc_fp8kv_f16` —— naive_attn_nc.cu(R1 补表;池声明见 POOL)
 pub struct NaiveAttnNcFp8KvF16;
 
-#[kernel_tags("dom.attn", "role.attn", "feat.dflash", "feat.spec", "phase.propose", "kv.draft.fp8")]
+#[kernel_tags(
+    "dom.attn",
+    "role.attn",
+    "feat.dflash",
+    "feat.spec",
+    "phase.propose",
+    "kv.draft.fp8"
+)]
 impl KernelSpec for NaiveAttnNcFp8KvF16 {
     const ENTRY: &'static str = "owl_naive_attn_nc_fp8kv_f16";
     const SRC: &'static str = "cu/attn/naive_attn_nc.cu";
@@ -1289,9 +1501,17 @@ impl KernelSpec for NaiveAttnNcFp8KvF16 {
         Param::i32("ring_cap"),
         Param::t_out("out", Dtype::F16, 2),
     ];
-    const POOL: &'static [PoolAccess] = &[PoolAccess::read(pools::KV_DRAFT, LayoutTag::Classic, Dtype::F8E4M3)];
+    const POOL: &'static [PoolAccess] = &[PoolAccess::read(
+        pools::KV_DRAFT,
+        LayoutTag::Classic,
+        Dtype::F8E4M3,
+    )];
     const SHAPE: crate::spec::ShapeFamily = crate::spec::ShapeFamily {
-        kv_dtype: Some(Dtype::F8E4M3), head_dim: &[128], page: &[16, 32, 64, 128], grp: None, tile: None,
+        kv_dtype: Some(Dtype::F8E4M3),
+        head_dim: &[128],
+        page: &[16, 32, 64, 128],
+        grp: None,
+        tile: None,
     };
     const LAWS: &'static [Law] = &[Law::OutputFinite];
     const CAPTURE: CaptureEvidence = CaptureEvidence::NoHostWork;
@@ -1309,7 +1529,14 @@ macro_rules! nc_tiled_spec {
         #[doc = $doc]
         pub struct $ty;
 
-        #[kernel_tags("dom.attn", "role.attn", "feat.dflash", "feat.spec", "phase.propose", $tag)]
+        #[kernel_tags(
+            "dom.attn",
+            "role.attn",
+            "feat.dflash",
+            "feat.spec",
+            "phase.propose",
+            $tag
+        )]
         impl KernelSpec for $ty {
             const ENTRY: &'static str = $entry;
             const SRC: &'static str = "cu/attn/naive_attn_nc.cu";
@@ -1329,8 +1556,11 @@ macro_rules! nc_tiled_spec {
                 Param::i32("ring_cap"),
                 Param::t_out("out", Dtype::$dt, 2),
             ];
-            const POOL: &'static [PoolAccess] =
-                &[PoolAccess::read(pools::KV_DRAFT, LayoutTag::Classic, Dtype::$kvpool)];
+            const POOL: &'static [PoolAccess] = &[PoolAccess::read(
+                pools::KV_DRAFT,
+                LayoutTag::Classic,
+                Dtype::$kvpool,
+            )];
             const LAWS: &'static [Law] = &[Law::OutputFinite];
             const CAPTURE: CaptureEvidence = CaptureEvidence::NoHostWork;
             const DETERMINISM: Determinism = Determinism::Deterministic;
@@ -1395,7 +1625,13 @@ nc_tiled_spec!(
 /// `vllm_reshape_and_cache_f16` —— reshape_and_cache.cu(R1 补表;池声明见 POOL)
 pub struct VllmReshapeAndCacheF16;
 
-#[kernel_tags("dom.attn", "role.attn", "role.kv_write", "phase.prefill", "kv.draft.f16")]
+#[kernel_tags(
+    "dom.attn",
+    "role.attn",
+    "role.kv_write",
+    "phase.prefill",
+    "kv.draft.f16"
+)]
 impl KernelSpec for VllmReshapeAndCacheF16 {
     const ENTRY: &'static str = "vllm_reshape_and_cache_f16";
     const SRC: &'static str = "cu/attn/reshape_and_cache.cu";
@@ -1413,9 +1649,17 @@ impl KernelSpec for VllmReshapeAndCacheF16 {
         Param::i32("x"),
         Param::t_out("out", Dtype::F16, 1),
     ];
-    const POOL: &'static [PoolAccess] = &[PoolAccess::write(pools::KV_DRAFT, LayoutTag::Classic, Dtype::F16)];
+    const POOL: &'static [PoolAccess] = &[PoolAccess::write(
+        pools::KV_DRAFT,
+        LayoutTag::Classic,
+        Dtype::F16,
+    )];
     const SHAPE: crate::spec::ShapeFamily = crate::spec::ShapeFamily {
-        kv_dtype: Some(Dtype::F16), head_dim: &[128, 256], page: &[16, 32, 64, 128], grp: None, tile: None,
+        kv_dtype: Some(Dtype::F16),
+        head_dim: &[128, 256],
+        page: &[16, 32, 64, 128],
+        grp: None,
+        tile: None,
     };
     const LAWS: &'static [Law] = &[Law::OutputFinite];
     const CAPTURE: CaptureEvidence = CaptureEvidence::NoHostWork;
@@ -1425,7 +1669,13 @@ impl KernelSpec for VllmReshapeAndCacheF16 {
 /// `vllm_reshape_and_cache_f16_knhd` —— reshape_and_cache.cu(R1 补表;池声明见 POOL)
 pub struct VllmReshapeAndCacheF16Knhd;
 
-#[kernel_tags("dom.attn", "role.attn", "role.kv_write", "phase.prefill", "kv.main.f16")]
+#[kernel_tags(
+    "dom.attn",
+    "role.attn",
+    "role.kv_write",
+    "phase.prefill",
+    "kv.main.f16"
+)]
 impl KernelSpec for VllmReshapeAndCacheF16Knhd {
     const ENTRY: &'static str = "vllm_reshape_and_cache_f16_knhd";
     const SRC: &'static str = "cu/attn/reshape_and_cache.cu";
@@ -1443,9 +1693,17 @@ impl KernelSpec for VllmReshapeAndCacheF16Knhd {
         Param::i32("x"),
         Param::t_out("out", Dtype::F16, 1),
     ];
-    const POOL: &'static [PoolAccess] = &[PoolAccess::write(pools::KV_MAIN, LayoutTag::Knhd, Dtype::F16)];
+    const POOL: &'static [PoolAccess] = &[PoolAccess::write(
+        pools::KV_MAIN,
+        LayoutTag::Knhd,
+        Dtype::F16,
+    )];
     const SHAPE: crate::spec::ShapeFamily = crate::spec::ShapeFamily {
-        kv_dtype: Some(Dtype::F16), head_dim: &[128, 256], page: &[16, 32, 64, 128], grp: None, tile: None,
+        kv_dtype: Some(Dtype::F16),
+        head_dim: &[128, 256],
+        page: &[16, 32, 64, 128],
+        grp: None,
+        tile: None,
     };
     const LAWS: &'static [Law] = &[Law::OutputFinite];
     const CAPTURE: CaptureEvidence = CaptureEvidence::NoHostWork;
@@ -1455,7 +1713,13 @@ impl KernelSpec for VllmReshapeAndCacheF16Knhd {
 /// `vllm_reshape_and_cache_bf16_knhd` —— reshape_and_cache.cu(R1 补表;池声明见 POOL)
 pub struct VllmReshapeAndCacheBf16Knhd;
 
-#[kernel_tags("dom.attn", "role.attn", "role.kv_write", "phase.prefill", "kv.main.bf16")]
+#[kernel_tags(
+    "dom.attn",
+    "role.attn",
+    "role.kv_write",
+    "phase.prefill",
+    "kv.main.bf16"
+)]
 impl KernelSpec for VllmReshapeAndCacheBf16Knhd {
     const ENTRY: &'static str = "vllm_reshape_and_cache_bf16_knhd";
     const SRC: &'static str = "cu/attn/reshape_and_cache.cu";
@@ -1473,9 +1737,17 @@ impl KernelSpec for VllmReshapeAndCacheBf16Knhd {
         Param::i32("x"),
         Param::t_out("out", Dtype::BF16, 1),
     ];
-    const POOL: &'static [PoolAccess] = &[PoolAccess::write(pools::KV_MAIN, LayoutTag::Knhd, Dtype::BF16)];
+    const POOL: &'static [PoolAccess] = &[PoolAccess::write(
+        pools::KV_MAIN,
+        LayoutTag::Knhd,
+        Dtype::BF16,
+    )];
     const SHAPE: crate::spec::ShapeFamily = crate::spec::ShapeFamily {
-        kv_dtype: Some(Dtype::BF16), head_dim: &[128, 256], page: &[16, 32, 64, 128], grp: None, tile: None,
+        kv_dtype: Some(Dtype::BF16),
+        head_dim: &[128, 256],
+        page: &[16, 32, 64, 128],
+        grp: None,
+        tile: None,
     };
     const LAWS: &'static [Law] = &[Law::OutputFinite];
     const CAPTURE: CaptureEvidence = CaptureEvidence::NoHostWork;
@@ -1485,7 +1757,13 @@ impl KernelSpec for VllmReshapeAndCacheBf16Knhd {
 /// `owl_reshape_and_cache_fp8kv_bf16` —— reshape_and_cache_fp8kv.cu(R1 补表;池声明见 POOL)
 pub struct ReshapeAndCacheFp8KvBf16;
 
-#[kernel_tags("dom.attn", "role.attn", "role.kv_write", "phase.prefill", "kv.draft.fp8")]
+#[kernel_tags(
+    "dom.attn",
+    "role.attn",
+    "role.kv_write",
+    "phase.prefill",
+    "kv.draft.fp8"
+)]
 impl KernelSpec for ReshapeAndCacheFp8KvBf16 {
     const ENTRY: &'static str = "owl_reshape_and_cache_fp8kv_bf16";
     const SRC: &'static str = "cu/attn/reshape_and_cache_fp8kv.cu";
@@ -1503,9 +1781,17 @@ impl KernelSpec for ReshapeAndCacheFp8KvBf16 {
         Param::i32("x"),
         Param::t_out("out", Dtype::BF16, 1),
     ];
-    const POOL: &'static [PoolAccess] = &[PoolAccess::write(pools::KV_DRAFT, LayoutTag::Classic, Dtype::F8E4M3)];
+    const POOL: &'static [PoolAccess] = &[PoolAccess::write(
+        pools::KV_DRAFT,
+        LayoutTag::Classic,
+        Dtype::F8E4M3,
+    )];
     const SHAPE: crate::spec::ShapeFamily = crate::spec::ShapeFamily {
-        kv_dtype: Some(Dtype::F8E4M3), head_dim: &[128, 256], page: &[16, 32, 64, 128], grp: None, tile: None,
+        kv_dtype: Some(Dtype::F8E4M3),
+        head_dim: &[128, 256],
+        page: &[16, 32, 64, 128],
+        grp: None,
+        tile: None,
     };
     const LAWS: &'static [Law] = &[Law::OutputFinite];
     const CAPTURE: CaptureEvidence = CaptureEvidence::NoHostWork;
@@ -1515,7 +1801,13 @@ impl KernelSpec for ReshapeAndCacheFp8KvBf16 {
 /// `owl_reshape_and_cache_fp8kv_bf16_knhd` —— reshape_and_cache_fp8kv.cu(R1 补表;池声明见 POOL)
 pub struct ReshapeAndCacheFp8KvBf16Knhd;
 
-#[kernel_tags("dom.attn", "role.attn", "role.kv_write", "phase.prefill", "kv.main.fp8")]
+#[kernel_tags(
+    "dom.attn",
+    "role.attn",
+    "role.kv_write",
+    "phase.prefill",
+    "kv.main.fp8"
+)]
 impl KernelSpec for ReshapeAndCacheFp8KvBf16Knhd {
     const ENTRY: &'static str = "owl_reshape_and_cache_fp8kv_bf16_knhd";
     const SRC: &'static str = "cu/attn/reshape_and_cache_fp8kv.cu";
@@ -1533,9 +1825,17 @@ impl KernelSpec for ReshapeAndCacheFp8KvBf16Knhd {
         Param::i32("x"),
         Param::t_out("out", Dtype::BF16, 1),
     ];
-    const POOL: &'static [PoolAccess] = &[PoolAccess::write(pools::KV_MAIN, LayoutTag::Knhd, Dtype::F8E4M3)];
+    const POOL: &'static [PoolAccess] = &[PoolAccess::write(
+        pools::KV_MAIN,
+        LayoutTag::Knhd,
+        Dtype::F8E4M3,
+    )];
     const SHAPE: crate::spec::ShapeFamily = crate::spec::ShapeFamily {
-        kv_dtype: Some(Dtype::F8E4M3), head_dim: &[128, 256], page: &[16, 32, 64, 128], grp: None, tile: None,
+        kv_dtype: Some(Dtype::F8E4M3),
+        head_dim: &[128, 256],
+        page: &[16, 32, 64, 128],
+        grp: None,
+        tile: None,
     };
     const LAWS: &'static [Law] = &[Law::OutputFinite];
     const CAPTURE: CaptureEvidence = CaptureEvidence::NoHostWork;
@@ -1567,9 +1867,17 @@ impl KernelSpec for VllmPagedAttentionV1F16Hd128 {
         Param::i32("use_alibi"),
         Param::t_out("out", Dtype::F16, 2),
     ];
-    const POOL: &'static [PoolAccess] = &[PoolAccess::read(pools::KV_MAIN, LayoutTag::Classic, Dtype::F16)];
+    const POOL: &'static [PoolAccess] = &[PoolAccess::read(
+        pools::KV_MAIN,
+        LayoutTag::Classic,
+        Dtype::F16,
+    )];
     const SHAPE: crate::spec::ShapeFamily = crate::spec::ShapeFamily {
-        kv_dtype: Some(Dtype::F16), head_dim: &[128], page: &[16, 32, 64, 128], grp: None, tile: None,
+        kv_dtype: Some(Dtype::F16),
+        head_dim: &[128],
+        page: &[16, 32, 64, 128],
+        grp: None,
+        tile: None,
     };
     const LAWS: &'static [Law] = &[Law::OutputFinite];
     const CAPTURE: CaptureEvidence = CaptureEvidence::NoHostWork;
@@ -1601,9 +1909,17 @@ impl KernelSpec for VllmPagedAttentionV1F16Hd128bs32 {
         Param::i32("use_alibi"),
         Param::t_out("out", Dtype::F16, 2),
     ];
-    const POOL: &'static [PoolAccess] = &[PoolAccess::read(pools::KV_MAIN, LayoutTag::Classic, Dtype::F16)];
+    const POOL: &'static [PoolAccess] = &[PoolAccess::read(
+        pools::KV_MAIN,
+        LayoutTag::Classic,
+        Dtype::F16,
+    )];
     const SHAPE: crate::spec::ShapeFamily = crate::spec::ShapeFamily {
-        kv_dtype: Some(Dtype::F16), head_dim: &[128], page: &[16, 32, 64, 128], grp: None, tile: None,
+        kv_dtype: Some(Dtype::F16),
+        head_dim: &[128],
+        page: &[16, 32, 64, 128],
+        grp: None,
+        tile: None,
     };
     const LAWS: &'static [Law] = &[Law::OutputFinite];
     const CAPTURE: CaptureEvidence = CaptureEvidence::NoHostWork;
@@ -1635,9 +1951,17 @@ impl KernelSpec for VllmPagedAttentionV1F16Hd256 {
         Param::i32("use_alibi"),
         Param::t_out("out", Dtype::F16, 2),
     ];
-    const POOL: &'static [PoolAccess] = &[PoolAccess::read(pools::KV_MAIN, LayoutTag::Classic, Dtype::F16)];
+    const POOL: &'static [PoolAccess] = &[PoolAccess::read(
+        pools::KV_MAIN,
+        LayoutTag::Classic,
+        Dtype::F16,
+    )];
     const SHAPE: crate::spec::ShapeFamily = crate::spec::ShapeFamily {
-        kv_dtype: Some(Dtype::F16), head_dim: &[256], page: &[16, 32, 64, 128], grp: None, tile: None,
+        kv_dtype: Some(Dtype::F16),
+        head_dim: &[256],
+        page: &[16, 32, 64, 128],
+        grp: None,
+        tile: None,
     };
     const LAWS: &'static [Law] = &[Law::OutputFinite];
     const CAPTURE: CaptureEvidence = CaptureEvidence::NoHostWork;
@@ -1669,9 +1993,17 @@ impl KernelSpec for VllmPagedAttentionV1F16Hd256bs32 {
         Param::i32("use_alibi"),
         Param::t_out("out", Dtype::F16, 2),
     ];
-    const POOL: &'static [PoolAccess] = &[PoolAccess::read(pools::KV_MAIN, LayoutTag::Classic, Dtype::F16)];
+    const POOL: &'static [PoolAccess] = &[PoolAccess::read(
+        pools::KV_MAIN,
+        LayoutTag::Classic,
+        Dtype::F16,
+    )];
     const SHAPE: crate::spec::ShapeFamily = crate::spec::ShapeFamily {
-        kv_dtype: Some(Dtype::F16), head_dim: &[256], page: &[16, 32, 64, 128], grp: None, tile: None,
+        kv_dtype: Some(Dtype::F16),
+        head_dim: &[256],
+        page: &[16, 32, 64, 128],
+        grp: None,
+        tile: None,
     };
     const LAWS: &'static [Law] = &[Law::OutputFinite];
     const CAPTURE: CaptureEvidence = CaptureEvidence::NoHostWork;
@@ -1710,9 +2042,17 @@ impl KernelSpec for VllmChunkedPrefillPagedAttnOptF16Hd128 {
         Param::i32("use_sinks_flag"),
         Param::t_out("out", Dtype::F16, 2),
     ];
-    const POOL: &'static [PoolAccess] = &[PoolAccess::read(pools::KV_MAIN, LayoutTag::Classic, Dtype::F16)];
+    const POOL: &'static [PoolAccess] = &[PoolAccess::read(
+        pools::KV_MAIN,
+        LayoutTag::Classic,
+        Dtype::F16,
+    )];
     const SHAPE: crate::spec::ShapeFamily = crate::spec::ShapeFamily {
-        kv_dtype: Some(Dtype::F16), head_dim: &[128], page: &[16, 32, 64, 128], grp: None, tile: None,
+        kv_dtype: Some(Dtype::F16),
+        head_dim: &[128],
+        page: &[16, 32, 64, 128],
+        grp: None,
+        tile: None,
     };
     const LAWS: &'static [Law] = &[Law::OutputFinite];
     const CAPTURE: CaptureEvidence = CaptureEvidence::NoHostWork;
@@ -1751,9 +2091,17 @@ impl KernelSpec for VllmChunkedPrefillPagedAttnOptF16Hd256 {
         Param::i32("use_sinks_flag"),
         Param::t_out("out", Dtype::F16, 2),
     ];
-    const POOL: &'static [PoolAccess] = &[PoolAccess::read(pools::KV_MAIN, LayoutTag::Classic, Dtype::F16)];
+    const POOL: &'static [PoolAccess] = &[PoolAccess::read(
+        pools::KV_MAIN,
+        LayoutTag::Classic,
+        Dtype::F16,
+    )];
     const SHAPE: crate::spec::ShapeFamily = crate::spec::ShapeFamily {
-        kv_dtype: Some(Dtype::F16), head_dim: &[256], page: &[16, 32, 64, 128], grp: None, tile: None,
+        kv_dtype: Some(Dtype::F16),
+        head_dim: &[256],
+        page: &[16, 32, 64, 128],
+        grp: None,
+        tile: None,
     };
     const LAWS: &'static [Law] = &[Law::OutputFinite];
     const CAPTURE: CaptureEvidence = CaptureEvidence::NoHostWork;
@@ -1792,9 +2140,17 @@ impl KernelSpec for VllmChunkedPrefillPagedAttnOptF16KnhdHd128 {
         Param::i32("use_sinks_flag"),
         Param::t_out("out", Dtype::F16, 2),
     ];
-    const POOL: &'static [PoolAccess] = &[PoolAccess::read(pools::KV_MAIN, LayoutTag::Knhd, Dtype::F16)];
+    const POOL: &'static [PoolAccess] = &[PoolAccess::read(
+        pools::KV_MAIN,
+        LayoutTag::Knhd,
+        Dtype::F16,
+    )];
     const SHAPE: crate::spec::ShapeFamily = crate::spec::ShapeFamily {
-        kv_dtype: Some(Dtype::F16), head_dim: &[128], page: &[16, 32, 64, 128], grp: None, tile: None,
+        kv_dtype: Some(Dtype::F16),
+        head_dim: &[128],
+        page: &[16, 32, 64, 128],
+        grp: None,
+        tile: None,
     };
     const LAWS: &'static [Law] = &[Law::OutputFinite];
     const CAPTURE: CaptureEvidence = CaptureEvidence::NoHostWork;
@@ -1833,9 +2189,17 @@ impl KernelSpec for VllmChunkedPrefillPagedAttnOptF16KnhdHd256 {
         Param::i32("use_sinks_flag"),
         Param::t_out("out", Dtype::F16, 2),
     ];
-    const POOL: &'static [PoolAccess] = &[PoolAccess::read(pools::KV_MAIN, LayoutTag::Knhd, Dtype::F16)];
+    const POOL: &'static [PoolAccess] = &[PoolAccess::read(
+        pools::KV_MAIN,
+        LayoutTag::Knhd,
+        Dtype::F16,
+    )];
     const SHAPE: crate::spec::ShapeFamily = crate::spec::ShapeFamily {
-        kv_dtype: Some(Dtype::F16), head_dim: &[256], page: &[16, 32, 64, 128], grp: None, tile: None,
+        kv_dtype: Some(Dtype::F16),
+        head_dim: &[256],
+        page: &[16, 32, 64, 128],
+        grp: None,
+        tile: None,
     };
     const LAWS: &'static [Law] = &[Law::OutputFinite];
     const CAPTURE: CaptureEvidence = CaptureEvidence::NoHostWork;
@@ -1874,9 +2238,17 @@ impl KernelSpec for VllmChunkedPrefillPagedAttnOptFp8Hd128 {
         Param::i32("use_sinks_flag"),
         Param::t_out("out", Dtype::F16, 2),
     ];
-    const POOL: &'static [PoolAccess] = &[PoolAccess::read(pools::KV_MAIN, LayoutTag::Classic, Dtype::F8E4M3)];
+    const POOL: &'static [PoolAccess] = &[PoolAccess::read(
+        pools::KV_MAIN,
+        LayoutTag::Classic,
+        Dtype::F8E4M3,
+    )];
     const SHAPE: crate::spec::ShapeFamily = crate::spec::ShapeFamily {
-        kv_dtype: Some(Dtype::F8E4M3), head_dim: &[128], page: &[16, 32, 64, 128], grp: None, tile: None,
+        kv_dtype: Some(Dtype::F8E4M3),
+        head_dim: &[128],
+        page: &[16, 32, 64, 128],
+        grp: None,
+        tile: None,
     };
     const LAWS: &'static [Law] = &[Law::OutputFinite];
     const CAPTURE: CaptureEvidence = CaptureEvidence::NoHostWork;
@@ -1915,9 +2287,17 @@ impl KernelSpec for VllmChunkedPrefillPagedAttnOptFp8Hd256 {
         Param::i32("use_sinks_flag"),
         Param::t_out("out", Dtype::F16, 2),
     ];
-    const POOL: &'static [PoolAccess] = &[PoolAccess::read(pools::KV_MAIN, LayoutTag::Classic, Dtype::F8E4M3)];
+    const POOL: &'static [PoolAccess] = &[PoolAccess::read(
+        pools::KV_MAIN,
+        LayoutTag::Classic,
+        Dtype::F8E4M3,
+    )];
     const SHAPE: crate::spec::ShapeFamily = crate::spec::ShapeFamily {
-        kv_dtype: Some(Dtype::F8E4M3), head_dim: &[256], page: &[16, 32, 64, 128], grp: None, tile: None,
+        kv_dtype: Some(Dtype::F8E4M3),
+        head_dim: &[256],
+        page: &[16, 32, 64, 128],
+        grp: None,
+        tile: None,
     };
     const LAWS: &'static [Law] = &[Law::OutputFinite];
     const CAPTURE: CaptureEvidence = CaptureEvidence::NoHostWork;
@@ -1956,9 +2336,17 @@ impl KernelSpec for VllmChunkedPrefillPagedAttnOptFp8KnhdHd128 {
         Param::i32("use_sinks_flag"),
         Param::t_out("out", Dtype::F16, 2),
     ];
-    const POOL: &'static [PoolAccess] = &[PoolAccess::read(pools::KV_MAIN, LayoutTag::Knhd, Dtype::F8E4M3)];
+    const POOL: &'static [PoolAccess] = &[PoolAccess::read(
+        pools::KV_MAIN,
+        LayoutTag::Knhd,
+        Dtype::F8E4M3,
+    )];
     const SHAPE: crate::spec::ShapeFamily = crate::spec::ShapeFamily {
-        kv_dtype: Some(Dtype::F8E4M3), head_dim: &[128], page: &[16, 32, 64, 128], grp: None, tile: None,
+        kv_dtype: Some(Dtype::F8E4M3),
+        head_dim: &[128],
+        page: &[16, 32, 64, 128],
+        grp: None,
+        tile: None,
     };
     const LAWS: &'static [Law] = &[Law::OutputFinite];
     const CAPTURE: CaptureEvidence = CaptureEvidence::NoHostWork;
@@ -1979,7 +2367,7 @@ impl KernelSpec for PrefillSplitF16Hd256 {
         Param::t_in("block_tables", Dtype::F32, 2),
         Param::t_in("scr_out", Dtype::F16, 2),
         Param::t_in("scr_stat", Dtype::F32, 2),
-        Param::t_in("k0_alibi", Dtype::F16, 0),  // 调用方传 K0 写输出(out r1)⇒ 不约束 rank(2026-10-15 B6)
+        Param::t_in("k0_alibi", Dtype::F16, 0), // 调用方传 K0 写输出(out r1)⇒ 不约束 rank(2026-10-15 B6)
         Param::f32("scale"),
         Param::i32("hkv"),
         Param::i32("T"),
@@ -1989,11 +2377,19 @@ impl KernelSpec for PrefillSplitF16Hd256 {
         Param::i32("kv_head_stride"),
         Param::i32("page"),
         Param::i32("hq"),
-        Param::t_out("dummy", Dtype::F16, 0),  // 哨兵槽:调用方传 K0 写输出(r1)⇒ 不约束(2026-10-15 B6)
+        Param::t_out("dummy", Dtype::F16, 0), // 哨兵槽:调用方传 K0 写输出(r1)⇒ 不约束(2026-10-15 B6)
     ];
-    const POOL: &'static [PoolAccess] = &[PoolAccess::read(pools::KV_MAIN, LayoutTag::Classic, Dtype::F16)];
+    const POOL: &'static [PoolAccess] = &[PoolAccess::read(
+        pools::KV_MAIN,
+        LayoutTag::Classic,
+        Dtype::F16,
+    )];
     const SHAPE: crate::spec::ShapeFamily = crate::spec::ShapeFamily {
-        kv_dtype: Some(Dtype::F16), head_dim: &[256], page: &[16, 32, 64, 128], grp: None, tile: None,
+        kv_dtype: Some(Dtype::F16),
+        head_dim: &[256],
+        page: &[16, 32, 64, 128],
+        grp: None,
+        tile: None,
     };
     const LAWS: &'static [Law] = &[Law::OutputFinite];
     const CAPTURE: CaptureEvidence = CaptureEvidence::NoHostWork;
@@ -2014,7 +2410,7 @@ impl KernelSpec for PrefillSplitFp8KvHd256 {
         Param::t_in("block_tables", Dtype::F32, 2),
         Param::t_in("scr_out", Dtype::F16, 2),
         Param::t_in("scr_stat", Dtype::F32, 2),
-        Param::t_in("k0_alibi", Dtype::F16, 0),  // 调用方传 K0 写输出(out r1)⇒ 不约束 rank(2026-10-15 B6)
+        Param::t_in("k0_alibi", Dtype::F16, 0), // 调用方传 K0 写输出(out r1)⇒ 不约束 rank(2026-10-15 B6)
         Param::f32("scale"),
         Param::i32("hkv"),
         Param::i32("T"),
@@ -2024,11 +2420,19 @@ impl KernelSpec for PrefillSplitFp8KvHd256 {
         Param::i32("kv_head_stride"),
         Param::i32("page"),
         Param::i32("hq"),
-        Param::t_out("dummy", Dtype::F16, 0),  // 哨兵槽:调用方传 K0 写输出(r1)⇒ 不约束(2026-10-15 B6)
+        Param::t_out("dummy", Dtype::F16, 0), // 哨兵槽:调用方传 K0 写输出(r1)⇒ 不约束(2026-10-15 B6)
     ];
-    const POOL: &'static [PoolAccess] = &[PoolAccess::read(pools::KV_MAIN, LayoutTag::Classic, Dtype::F8E4M3)];
+    const POOL: &'static [PoolAccess] = &[PoolAccess::read(
+        pools::KV_MAIN,
+        LayoutTag::Classic,
+        Dtype::F8E4M3,
+    )];
     const SHAPE: crate::spec::ShapeFamily = crate::spec::ShapeFamily {
-        kv_dtype: Some(Dtype::F8E4M3), head_dim: &[256], page: &[16, 32, 64, 128], grp: None, tile: None,
+        kv_dtype: Some(Dtype::F8E4M3),
+        head_dim: &[256],
+        page: &[16, 32, 64, 128],
+        grp: None,
+        tile: None,
     };
     const LAWS: &'static [Law] = &[Law::OutputFinite];
     const CAPTURE: CaptureEvidence = CaptureEvidence::NoHostWork;
@@ -2049,7 +2453,7 @@ impl KernelSpec for PrefillSplitF16KnhdHd256 {
         Param::t_in("block_tables", Dtype::F32, 2),
         Param::t_in("scr_out", Dtype::F16, 2),
         Param::t_in("scr_stat", Dtype::F32, 2),
-        Param::t_in("k0_alibi", Dtype::F16, 0),  // 调用方传 K0 写输出(out r1)⇒ 不约束 rank(2026-10-15 B6)
+        Param::t_in("k0_alibi", Dtype::F16, 0), // 调用方传 K0 写输出(out r1)⇒ 不约束 rank(2026-10-15 B6)
         Param::f32("scale"),
         Param::i32("hkv"),
         Param::i32("T"),
@@ -2059,11 +2463,19 @@ impl KernelSpec for PrefillSplitF16KnhdHd256 {
         Param::i32("kv_head_stride"),
         Param::i32("page"),
         Param::i32("hq"),
-        Param::t_out("dummy", Dtype::F16, 0),  // 哨兵槽:调用方传 K0 写输出(r1)⇒ 不约束(2026-10-15 B6)
+        Param::t_out("dummy", Dtype::F16, 0), // 哨兵槽:调用方传 K0 写输出(r1)⇒ 不约束(2026-10-15 B6)
     ];
-    const POOL: &'static [PoolAccess] = &[PoolAccess::read(pools::KV_MAIN, LayoutTag::Knhd, Dtype::F16)];
+    const POOL: &'static [PoolAccess] = &[PoolAccess::read(
+        pools::KV_MAIN,
+        LayoutTag::Knhd,
+        Dtype::F16,
+    )];
     const SHAPE: crate::spec::ShapeFamily = crate::spec::ShapeFamily {
-        kv_dtype: Some(Dtype::F16), head_dim: &[256], page: &[16, 32, 64, 128], grp: None, tile: None,
+        kv_dtype: Some(Dtype::F16),
+        head_dim: &[256],
+        page: &[16, 32, 64, 128],
+        grp: None,
+        tile: None,
     };
     const LAWS: &'static [Law] = &[Law::OutputFinite];
     const CAPTURE: CaptureEvidence = CaptureEvidence::NoHostWork;
@@ -2084,7 +2496,7 @@ impl KernelSpec for PrefillSplitFp8KvKnhdHd256 {
         Param::t_in("block_tables", Dtype::F32, 2),
         Param::t_in("scr_out", Dtype::F16, 2),
         Param::t_in("scr_stat", Dtype::F32, 2),
-        Param::t_in("k0_alibi", Dtype::F16, 0),  // 调用方传 K0 写输出(out r1)⇒ 不约束 rank(2026-10-15 B6)
+        Param::t_in("k0_alibi", Dtype::F16, 0), // 调用方传 K0 写输出(out r1)⇒ 不约束 rank(2026-10-15 B6)
         Param::f32("scale"),
         Param::i32("hkv"),
         Param::i32("T"),
@@ -2094,11 +2506,19 @@ impl KernelSpec for PrefillSplitFp8KvKnhdHd256 {
         Param::i32("kv_head_stride"),
         Param::i32("page"),
         Param::i32("hq"),
-        Param::t_out("dummy", Dtype::F16, 0),  // 哨兵槽:调用方传 K0 写输出(r1)⇒ 不约束(2026-10-15 B6)
+        Param::t_out("dummy", Dtype::F16, 0), // 哨兵槽:调用方传 K0 写输出(r1)⇒ 不约束(2026-10-15 B6)
     ];
-    const POOL: &'static [PoolAccess] = &[PoolAccess::read(pools::KV_MAIN, LayoutTag::Knhd, Dtype::F8E4M3)];
+    const POOL: &'static [PoolAccess] = &[PoolAccess::read(
+        pools::KV_MAIN,
+        LayoutTag::Knhd,
+        Dtype::F8E4M3,
+    )];
     const SHAPE: crate::spec::ShapeFamily = crate::spec::ShapeFamily {
-        kv_dtype: Some(Dtype::F8E4M3), head_dim: &[256], page: &[16, 32, 64, 128], grp: None, tile: None,
+        kv_dtype: Some(Dtype::F8E4M3),
+        head_dim: &[256],
+        page: &[16, 32, 64, 128],
+        grp: None,
+        tile: None,
     };
     const LAWS: &'static [Law] = &[Law::OutputFinite];
     const CAPTURE: CaptureEvidence = CaptureEvidence::NoHostWork;
@@ -2113,7 +2533,7 @@ impl KernelSpec for PrefillSplitReduceF16Hd256 {
     const ENTRY: &'static str = "owl_prefill_split_reduce_f16_hd256";
     const SRC: &'static str = "cu/attn/prefill_split_f16.cu";
     const PARAMS: &'static [Param] = &[
-        Param::t_in("split_alibi", Dtype::F16, 0),  // 哨兵槽(=K0 写输出 r1)⇒ 不约束(2026-10-15 B6)
+        Param::t_in("split_alibi", Dtype::F16, 0), // 哨兵槽(=K0 写输出 r1)⇒ 不约束(2026-10-15 B6)
         Param::t_in("scr_out", Dtype::F16, 2),
         Param::t_in("scr_stat", Dtype::F32, 2),
         Param::i32("nparts"),
@@ -2123,7 +2543,11 @@ impl KernelSpec for PrefillSplitReduceF16Hd256 {
         Param::t_out("out", Dtype::F16, 2),
     ];
     const SHAPE: crate::spec::ShapeFamily = crate::spec::ShapeFamily {
-        kv_dtype: Some(Dtype::F16), head_dim: &[256], page: &[16, 32, 64, 128], grp: None, tile: None,
+        kv_dtype: Some(Dtype::F16),
+        head_dim: &[256],
+        page: &[16, 32, 64, 128],
+        grp: None,
+        tile: None,
     };
     const LAWS: &'static [Law] = &[Law::OutputFinite];
     const CAPTURE: CaptureEvidence = CaptureEvidence::NoHostWork;
@@ -2139,18 +2563,30 @@ pub static VLLM_RESHAPE_AND_CACHE_F16: KernelMeta = meta_of::<VllmReshapeAndCach
 pub static VLLM_RESHAPE_AND_CACHE_F16_KNHD: KernelMeta = meta_of::<VllmReshapeAndCacheF16Knhd>();
 pub static VLLM_RESHAPE_AND_CACHE_BF16_KNHD: KernelMeta = meta_of::<VllmReshapeAndCacheBf16Knhd>();
 pub static OWL_RESHAPE_AND_CACHE_FP8KV_BF16: KernelMeta = meta_of::<ReshapeAndCacheFp8KvBf16>();
-pub static OWL_RESHAPE_AND_CACHE_FP8KV_BF16_KNHD: KernelMeta = meta_of::<ReshapeAndCacheFp8KvBf16Knhd>();
-pub static VLLM_PAGED_ATTENTION_V1_F16_HD128: KernelMeta = meta_of::<VllmPagedAttentionV1F16Hd128>();
-pub static VLLM_PAGED_ATTENTION_V1_F16_HD128BS32: KernelMeta = meta_of::<VllmPagedAttentionV1F16Hd128bs32>();
-pub static VLLM_PAGED_ATTENTION_V1_F16_HD256: KernelMeta = meta_of::<VllmPagedAttentionV1F16Hd256>();
-pub static VLLM_PAGED_ATTENTION_V1_F16_HD256BS32: KernelMeta = meta_of::<VllmPagedAttentionV1F16Hd256bs32>();
-pub static VLLM_CHUNKED_PREFILL_PAGED_ATTN_OPT_F16_HD128: KernelMeta = meta_of::<VllmChunkedPrefillPagedAttnOptF16Hd128>();
-pub static VLLM_CHUNKED_PREFILL_PAGED_ATTN_OPT_F16_HD256: KernelMeta = meta_of::<VllmChunkedPrefillPagedAttnOptF16Hd256>();
-pub static VLLM_CHUNKED_PREFILL_PAGED_ATTN_OPT_F16_KNHD_HD128: KernelMeta = meta_of::<VllmChunkedPrefillPagedAttnOptF16KnhdHd128>();
-pub static VLLM_CHUNKED_PREFILL_PAGED_ATTN_OPT_F16_KNHD_HD256: KernelMeta = meta_of::<VllmChunkedPrefillPagedAttnOptF16KnhdHd256>();
-pub static VLLM_CHUNKED_PREFILL_PAGED_ATTN_OPT_FP8_HD128: KernelMeta = meta_of::<VllmChunkedPrefillPagedAttnOptFp8Hd128>();
-pub static VLLM_CHUNKED_PREFILL_PAGED_ATTN_OPT_FP8_HD256: KernelMeta = meta_of::<VllmChunkedPrefillPagedAttnOptFp8Hd256>();
-pub static VLLM_CHUNKED_PREFILL_PAGED_ATTN_OPT_FP8_KNHD_HD128: KernelMeta = meta_of::<VllmChunkedPrefillPagedAttnOptFp8KnhdHd128>();
+pub static OWL_RESHAPE_AND_CACHE_FP8KV_BF16_KNHD: KernelMeta =
+    meta_of::<ReshapeAndCacheFp8KvBf16Knhd>();
+pub static VLLM_PAGED_ATTENTION_V1_F16_HD128: KernelMeta =
+    meta_of::<VllmPagedAttentionV1F16Hd128>();
+pub static VLLM_PAGED_ATTENTION_V1_F16_HD128BS32: KernelMeta =
+    meta_of::<VllmPagedAttentionV1F16Hd128bs32>();
+pub static VLLM_PAGED_ATTENTION_V1_F16_HD256: KernelMeta =
+    meta_of::<VllmPagedAttentionV1F16Hd256>();
+pub static VLLM_PAGED_ATTENTION_V1_F16_HD256BS32: KernelMeta =
+    meta_of::<VllmPagedAttentionV1F16Hd256bs32>();
+pub static VLLM_CHUNKED_PREFILL_PAGED_ATTN_OPT_F16_HD128: KernelMeta =
+    meta_of::<VllmChunkedPrefillPagedAttnOptF16Hd128>();
+pub static VLLM_CHUNKED_PREFILL_PAGED_ATTN_OPT_F16_HD256: KernelMeta =
+    meta_of::<VllmChunkedPrefillPagedAttnOptF16Hd256>();
+pub static VLLM_CHUNKED_PREFILL_PAGED_ATTN_OPT_F16_KNHD_HD128: KernelMeta =
+    meta_of::<VllmChunkedPrefillPagedAttnOptF16KnhdHd128>();
+pub static VLLM_CHUNKED_PREFILL_PAGED_ATTN_OPT_F16_KNHD_HD256: KernelMeta =
+    meta_of::<VllmChunkedPrefillPagedAttnOptF16KnhdHd256>();
+pub static VLLM_CHUNKED_PREFILL_PAGED_ATTN_OPT_FP8_HD128: KernelMeta =
+    meta_of::<VllmChunkedPrefillPagedAttnOptFp8Hd128>();
+pub static VLLM_CHUNKED_PREFILL_PAGED_ATTN_OPT_FP8_HD256: KernelMeta =
+    meta_of::<VllmChunkedPrefillPagedAttnOptFp8Hd256>();
+pub static VLLM_CHUNKED_PREFILL_PAGED_ATTN_OPT_FP8_KNHD_HD128: KernelMeta =
+    meta_of::<VllmChunkedPrefillPagedAttnOptFp8KnhdHd128>();
 pub static OWL_PREFILL_SPLIT_F16_HD256: KernelMeta = meta_of::<PrefillSplitF16Hd256>();
 pub static OWL_PREFILL_SPLIT_FP8KV_HD256: KernelMeta = meta_of::<PrefillSplitFp8KvHd256>();
 pub static OWL_PREFILL_SPLIT_F16_KNHD_HD256: KernelMeta = meta_of::<PrefillSplitF16KnhdHd256>();
@@ -2186,9 +2622,17 @@ impl KernelSpec for VllmPagedAttentionV2F16Hd128 {
         Param::i32("use_alibi"),
         Param::t_out("tmp_out", Dtype::F16, 2),
     ];
-    const POOL: &'static [PoolAccess] = &[PoolAccess::read(pools::KV_MAIN, LayoutTag::Classic, Dtype::F16)];
+    const POOL: &'static [PoolAccess] = &[PoolAccess::read(
+        pools::KV_MAIN,
+        LayoutTag::Classic,
+        Dtype::F16,
+    )];
     const SHAPE: crate::spec::ShapeFamily = crate::spec::ShapeFamily {
-        kv_dtype: Some(Dtype::F16), head_dim: &[128], page: &[16], grp: None, tile: None,
+        kv_dtype: Some(Dtype::F16),
+        head_dim: &[128],
+        page: &[16],
+        grp: None,
+        tile: None,
     };
     const LAWS: &'static [Law] = &[Law::OutputFinite];
     const CAPTURE: CaptureEvidence = CaptureEvidence::NoHostWork;
@@ -2224,9 +2668,17 @@ impl KernelSpec for VllmPagedAttentionV2F16Hd256 {
         Param::i32("use_alibi"),
         Param::t_out("tmp_out", Dtype::F16, 2),
     ];
-    const POOL: &'static [PoolAccess] = &[PoolAccess::read(pools::KV_MAIN, LayoutTag::Classic, Dtype::F16)];
+    const POOL: &'static [PoolAccess] = &[PoolAccess::read(
+        pools::KV_MAIN,
+        LayoutTag::Classic,
+        Dtype::F16,
+    )];
     const SHAPE: crate::spec::ShapeFamily = crate::spec::ShapeFamily {
-        kv_dtype: Some(Dtype::F16), head_dim: &[256], page: &[16], grp: None, tile: None,
+        kv_dtype: Some(Dtype::F16),
+        head_dim: &[256],
+        page: &[16],
+        grp: None,
+        tile: None,
     };
     const LAWS: &'static [Law] = &[Law::OutputFinite];
     const CAPTURE: CaptureEvidence = CaptureEvidence::NoHostWork;
@@ -2240,7 +2692,14 @@ impl KernelSpec for VllmPagedAttentionV2F16Hd256 {
 /// 草稿池走 classic 变体 + `vllm_reshape_and_cache_bf16/f16`。
 pub struct NaiveAttnNcF16Knhd;
 
-#[kernel_tags("dom.attn", "role.attn", "feat.dflash", "feat.spec", "phase.propose", "kv.main.f16")]
+#[kernel_tags(
+    "dom.attn",
+    "role.attn",
+    "feat.dflash",
+    "feat.spec",
+    "phase.propose",
+    "kv.main.f16"
+)]
 impl KernelSpec for NaiveAttnNcF16Knhd {
     const ENTRY: &'static str = "owl_naive_attn_nc_f16_knhd";
     const SRC: &'static str = "cu/attn/naive_attn_nc.cu";
@@ -2259,9 +2718,17 @@ impl KernelSpec for NaiveAttnNcF16Knhd {
         Param::i32("ring_cap"),
         Param::t_out("out", Dtype::F16, 2),
     ];
-    const POOL: &'static [PoolAccess] = &[PoolAccess::read(pools::KV_MAIN, LayoutTag::Knhd, Dtype::F16)];
+    const POOL: &'static [PoolAccess] = &[PoolAccess::read(
+        pools::KV_MAIN,
+        LayoutTag::Knhd,
+        Dtype::F16,
+    )];
     const SHAPE: crate::spec::ShapeFamily = crate::spec::ShapeFamily {
-        kv_dtype: Some(Dtype::F16), head_dim: &[128], page: &[32], grp: None, tile: None,
+        kv_dtype: Some(Dtype::F16),
+        head_dim: &[128],
+        page: &[32],
+        grp: None,
+        tile: None,
     };
     const LAWS: &'static [Law] = &[Law::OutputFinite];
     const CAPTURE: CaptureEvidence = CaptureEvidence::NoHostWork;
@@ -2273,7 +2740,14 @@ impl KernelSpec for NaiveAttnNcF16Knhd {
 /// 同上
 pub struct NaiveAttnNcBf16Knhd;
 
-#[kernel_tags("dom.attn", "role.attn", "feat.dflash", "feat.spec", "phase.propose", "kv.main.bf16")]
+#[kernel_tags(
+    "dom.attn",
+    "role.attn",
+    "feat.dflash",
+    "feat.spec",
+    "phase.propose",
+    "kv.main.bf16"
+)]
 impl KernelSpec for NaiveAttnNcBf16Knhd {
     const ENTRY: &'static str = "owl_naive_attn_nc_bf16_knhd";
     const SRC: &'static str = "cu/attn/naive_attn_nc.cu";
@@ -2292,9 +2766,17 @@ impl KernelSpec for NaiveAttnNcBf16Knhd {
         Param::i32("ring_cap"),
         Param::t_out("out", Dtype::BF16, 2),
     ];
-    const POOL: &'static [PoolAccess] = &[PoolAccess::read(pools::KV_MAIN, LayoutTag::Knhd, Dtype::BF16)];
+    const POOL: &'static [PoolAccess] = &[PoolAccess::read(
+        pools::KV_MAIN,
+        LayoutTag::Knhd,
+        Dtype::BF16,
+    )];
     const SHAPE: crate::spec::ShapeFamily = crate::spec::ShapeFamily {
-        kv_dtype: Some(Dtype::BF16), head_dim: &[128], page: &[32], grp: None, tile: None,
+        kv_dtype: Some(Dtype::BF16),
+        head_dim: &[128],
+        page: &[32],
+        grp: None,
+        tile: None,
     };
     const LAWS: &'static [Law] = &[Law::OutputFinite];
     const CAPTURE: CaptureEvidence = CaptureEvidence::NoHostWork;
@@ -2306,7 +2788,14 @@ impl KernelSpec for NaiveAttnNcBf16Knhd {
 /// 同上
 pub struct NaiveAttnNcFp8KvF16Knhd;
 
-#[kernel_tags("dom.attn", "role.attn", "feat.dflash", "feat.spec", "phase.propose", "kv.main.fp8")]
+#[kernel_tags(
+    "dom.attn",
+    "role.attn",
+    "feat.dflash",
+    "feat.spec",
+    "phase.propose",
+    "kv.main.fp8"
+)]
 impl KernelSpec for NaiveAttnNcFp8KvF16Knhd {
     const ENTRY: &'static str = "owl_naive_attn_nc_fp8kv_f16_knhd";
     const SRC: &'static str = "cu/attn/naive_attn_nc.cu";
@@ -2325,9 +2814,17 @@ impl KernelSpec for NaiveAttnNcFp8KvF16Knhd {
         Param::i32("ring_cap"),
         Param::t_out("out", Dtype::F16, 2),
     ];
-    const POOL: &'static [PoolAccess] = &[PoolAccess::read(pools::KV_MAIN, LayoutTag::Knhd, Dtype::F8E4M3)];
+    const POOL: &'static [PoolAccess] = &[PoolAccess::read(
+        pools::KV_MAIN,
+        LayoutTag::Knhd,
+        Dtype::F8E4M3,
+    )];
     const SHAPE: crate::spec::ShapeFamily = crate::spec::ShapeFamily {
-        kv_dtype: Some(Dtype::F8E4M3), head_dim: &[128], page: &[32], grp: None, tile: None,
+        kv_dtype: Some(Dtype::F8E4M3),
+        head_dim: &[128],
+        page: &[32],
+        grp: None,
+        tile: None,
     };
     const LAWS: &'static [Law] = &[Law::OutputFinite];
     const CAPTURE: CaptureEvidence = CaptureEvidence::NoHostWork;
@@ -2339,7 +2836,14 @@ impl KernelSpec for NaiveAttnNcFp8KvF16Knhd {
 /// 同上
 pub struct NaiveAttnNcFp8KvBf16Knhd;
 
-#[kernel_tags("dom.attn", "role.attn", "feat.dflash", "feat.spec", "phase.propose", "kv.main.fp8")]
+#[kernel_tags(
+    "dom.attn",
+    "role.attn",
+    "feat.dflash",
+    "feat.spec",
+    "phase.propose",
+    "kv.main.fp8"
+)]
 impl KernelSpec for NaiveAttnNcFp8KvBf16Knhd {
     const ENTRY: &'static str = "owl_naive_attn_nc_fp8kv_bf16_knhd";
     const SRC: &'static str = "cu/attn/naive_attn_nc.cu";
@@ -2358,31 +2862,40 @@ impl KernelSpec for NaiveAttnNcFp8KvBf16Knhd {
         Param::i32("ring_cap"),
         Param::t_out("out", Dtype::BF16, 2),
     ];
-    const POOL: &'static [PoolAccess] = &[PoolAccess::read(pools::KV_MAIN, LayoutTag::Knhd, Dtype::F8E4M3)];
+    const POOL: &'static [PoolAccess] = &[PoolAccess::read(
+        pools::KV_MAIN,
+        LayoutTag::Knhd,
+        Dtype::F8E4M3,
+    )];
     const SHAPE: crate::spec::ShapeFamily = crate::spec::ShapeFamily {
-        kv_dtype: Some(Dtype::F8E4M3), head_dim: &[128], page: &[32], grp: None, tile: None,
+        kv_dtype: Some(Dtype::F8E4M3),
+        head_dim: &[128],
+        page: &[32],
+        grp: None,
+        tile: None,
     };
     const LAWS: &'static [Law] = &[Law::OutputFinite];
     const CAPTURE: CaptureEvidence = CaptureEvidence::NoHostWork;
     const DETERMINISM: Determinism = Determinism::Deterministic;
 }
 
-pub static VLLM_PAGED_ATTENTION_V2_F16_HD128: KernelMeta = meta_of::<VllmPagedAttentionV2F16Hd128>();
-pub static VLLM_PAGED_ATTENTION_V2_F16_HD256: KernelMeta = meta_of::<VllmPagedAttentionV2F16Hd256>();
+pub static VLLM_PAGED_ATTENTION_V2_F16_HD128: KernelMeta =
+    meta_of::<VllmPagedAttentionV2F16Hd128>();
+pub static VLLM_PAGED_ATTENTION_V2_F16_HD256: KernelMeta =
+    meta_of::<VllmPagedAttentionV2F16Hd256>();
 pub static NAIVE_ATTN_NC_F16_KNHD: KernelMeta = meta_of::<NaiveAttnNcF16Knhd>();
 pub static NAIVE_ATTN_NC_BF16_KNHD: KernelMeta = meta_of::<NaiveAttnNcBf16Knhd>();
 pub static NAIVE_ATTN_NC_FP8_KV_F16_KNHD: KernelMeta = meta_of::<NaiveAttnNcFp8KvF16Knhd>();
 pub static NAIVE_ATTN_NC_FP8_KV_BF16_KNHD: KernelMeta = meta_of::<NaiveAttnNcFp8KvBf16Knhd>();
-
 
 /// **谓词 ⇔ 声明一致性**(P4:收编 driver 谓词 —— 页配对律此前只住
 /// `driver::attn::paged_decode_ok`,现在与算子表的 `ShapeFamily` 声明互证:
 /// 谓词说"可跑"的 (hd,page) 必须被声明接受;反之亦然)。
 #[cfg(test)]
 mod predicate_lock {
+    use super::PagedAttnV2Fp8KnhdHd256Bs32;
     use crate::driver;
     use crate::spec::{meta_of, ShapeQuery};
-    use super::PagedAttnV2Fp8KnhdHd256Bs32;
 
     #[test]
     fn paged_decode_predicate_agrees_with_declaration() {
@@ -2392,7 +2905,12 @@ mod predicate_lock {
                 let ok = driver::attn::paged_decode_ok(hd, page);
                 let accepted = m
                     .shape
-                    .accepts(&ShapeQuery { head_dim: hd, page, grp: 0, tile: 0 })
+                    .accepts(&ShapeQuery {
+                        head_dim: hd,
+                        page,
+                        grp: 0,
+                        tile: 0,
+                    })
                     .is_ok();
                 // 本表只声明 hd256/page32 ⇒ 谓词为真但表不接受 = 该 (hd,page)
                 // 走的是**别的变体**(未建表),不算矛盾;谓词为假却表接受才是雷

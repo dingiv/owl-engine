@@ -150,24 +150,52 @@ pub fn apply(value: &mut Value, origins: &mut Origins) -> Result<Option<ResolveM
     });
     match intent.goal {
         Goal::MaxContext => {
-            b.set("runtime.prefill_chunk", 512i64.into(), "goal=max-context:桶上界 1024");
+            b.set(
+                "runtime.prefill_chunk",
+                512i64.into(),
+                "goal=max-context:桶上界 1024",
+            );
             b.set("store.vram_budget", 0.99f64.into(), "goal=max-context:贴顶");
-            b.set("store.vram_activation_reserve", 714i64.into(), "goal=max-context:总预留(含图/warmup/碎片)");
+            b.set(
+                "store.vram_activation_reserve",
+                714i64.into(),
+                "goal=max-context:总预留(含图/warmup/碎片)",
+            );
         }
         Goal::MaxSpeed => {
-            b.set("runtime.prefill_chunk", 1024i64.into(), "goal=max-speed:大块摊薄固定税");
+            b.set(
+                "runtime.prefill_chunk",
+                1024i64.into(),
+                "goal=max-speed:大块摊薄固定税",
+            );
             b.set("store.vram_budget", 0.99f64.into(), "goal=max-speed:贴顶");
-            b.set("store.vram_activation_reserve", 970i64.into(), "goal=max-speed:总预留(含图/warmup/碎片)");
+            b.set(
+                "store.vram_activation_reserve",
+                970i64.into(),
+                "goal=max-speed:总预留(含图/warmup/碎片)",
+            );
         }
         Goal::Balanced => {
             b.set("runtime.prefill_chunk", 512i64.into(), "goal=balanced");
             b.set("store.vram_budget", 0.97f64.into(), "goal=balanced");
-            b.set("store.vram_activation_reserve", 970i64.into(), "goal=balanced:总预留");
+            b.set(
+                "store.vram_activation_reserve",
+                970i64.into(),
+                "goal=balanced:总预留",
+            );
         }
         Goal::LowMemory => {
-            b.set("runtime.prefill_chunk", 512i64.into(), "goal=low-memory:小激活面");
+            b.set(
+                "runtime.prefill_chunk",
+                512i64.into(),
+                "goal=low-memory:小激活面",
+            );
             b.set("store.vram_budget", 0.99f64.into(), "goal=low-memory");
-            b.set("store.vram_activation_reserve", 970i64.into(), "goal=low-memory:总预留");
+            b.set(
+                "store.vram_activation_reserve",
+                970i64.into(),
+                "goal=low-memory:总预留",
+            );
         }
     }
 
@@ -194,14 +222,22 @@ pub fn apply(value: &mut Value, origins: &mut Origins) -> Result<Option<ResolveM
     }
     // 并发唯一真源 = `runtime.max_concurrency`；gdn_slots / max_batch 在
     // OwlConfig::bind_derived 里派生。
-    b.set("runtime.max_concurrency", (c as i64).into(), "intent.concurrency → 并发唯一真源");
+    b.set(
+        "runtime.max_concurrency",
+        (c as i64).into(),
+        "intent.concurrency → 并发唯一真源",
+    );
 
     match intent.spec {
         SpecIntent::Off => {
             b.set("spec.depth", 0i64.into(), "intent.spec = off");
         }
         SpecIntent::Dflash => {
-            b.set("spec.depth", 7i64.into(), "intent.spec = dflash → depth 7(生产形状)");
+            b.set(
+                "spec.depth",
+                7i64.into(),
+                "intent.spec = dflash → depth 7(生产形状)",
+            );
             if value
                 .get("model")
                 .and_then(|m| m.get("dflash2_dir"))
@@ -241,8 +277,11 @@ pub fn apply(value: &mut Value, origins: &mut Origins) -> Result<Option<ResolveM
             }
             b.set("kvmem.pool_overcommit", false.into(), "intent.kvmem = off");
             b.set("store.ram_pool_size", 0i64.into(), "kvmem=off:无宿主 KV 腿");
-            b.set("store.disk_pool_size", 0i64.into(), "kvmem=off:无磁盘 KV 腿");
-            b.set("store.snap_disk_mb", 0i64.into(), "kvmem=off:无磁盘状态腿");
+            b.set(
+                "store.disk_pool_size",
+                0i64.into(),
+                "kvmem=off:无磁盘 KV 腿",
+            );
         }
         KvmemIntent::Overcommit => {
             for k in ["select_decode", "select_partial", "index"] {
@@ -252,18 +291,37 @@ pub fn apply(value: &mut Value, origins: &mut Origins) -> Result<Option<ResolveM
                     "intent.kvmem = overcommit(虚拟化两扇门 + 索引)",
                 );
             }
-            b.set("kvmem.pool_overcommit", true.into(), "intent.kvmem = overcommit");
-            b.set("kvmem.workspace_per_req", 1024i64.into(), "kvmem=overcommit:每 turn 工作集");
-            b.set("store.ram_pool_size", 4096i64.into(), "kvmem=overcommit:宿主 KV 腿");
-            b.set("store.snap_host_mb", 2048i64.into(), "kvmem=overcommit:宿主状态腿");
+            b.set(
+                "kvmem.pool_overcommit",
+                true.into(),
+                "intent.kvmem = overcommit",
+            );
+            b.set(
+                "kvmem.workspace_per_req",
+                1024i64.into(),
+                "kvmem=overcommit:每 turn 工作集",
+            );
+            b.set(
+                "store.ram_pool_size",
+                6144i64.into(),
+                "kvmem=overcommit:宿主总池(KV+快照)",
+            );
         }
     }
 
     // 图臂(自动降级必须打印原因)
     match intent.graphs {
         GraphIntent::Off => {
-            b.set("cuda.graph", false.into(), "intent.graphs = off(eager 直发)");
-            b.set("cuda.graph", false.into(), "intent.graphs = off(eager 直发)");
+            b.set(
+                "cuda.graph",
+                false.into(),
+                "intent.graphs = off(eager 直发)",
+            );
+            b.set(
+                "cuda.graph",
+                false.into(),
+                "intent.graphs = off(eager 直发)",
+            );
             b.set("kernel.fi_cuda_graph", false.into(), "intent.graphs = off");
             b.set("kernel.fi_plan", "host-sync".into(), "intent.graphs = off");
             b.set("kernel.decode_arm", "v2".into(), "intent.graphs = off");
@@ -285,25 +343,53 @@ pub fn apply(value: &mut Value, origins: &mut Origins) -> Result<Option<ResolveM
                     warnings.push(format!(
                         "graphs=auto 已降级为 eager/piecewise:{reason}(仍保留 decode 普通图)"
                     ));
-                    b.set("cuda.graph", true.into(), "graphs=auto(降级:保留普通 decode 图)");
-                    b.set("cuda.graph", true.into(), "graphs=auto(降级:保留普通 decode 图)");
+                    b.set(
+                        "cuda.graph",
+                        true.into(),
+                        "graphs=auto(降级:保留普通 decode 图)",
+                    );
+                    b.set(
+                        "cuda.graph",
+                        true.into(),
+                        "graphs=auto(降级:保留普通 decode 图)",
+                    );
                     b.set("kernel.fi_cuda_graph", false.into(), "graphs=auto 降级");
                     b.set("kernel.fi_plan", "host-sync".into(), "graphs=auto 降级");
                     b.set("kernel.decode_arm", "v2".into(), "graphs=auto 降级");
-                    b.set("kernel.verify_arm", "v2".into(), "graphs=auto 降级:verify 回 v2");
+                    b.set(
+                        "kernel.verify_arm",
+                        "v2".into(),
+                        "graphs=auto 降级:verify 回 v2",
+                    );
                     false
                 }
                 None => {
                     b.set("cuda.graph", true.into(), "graphs=auto");
                     b.set("cuda.graph", true.into(), "graphs=auto");
                     // **单键臂**(2026-10-21):"v2" = 分页 v2 主核;prefill 桶已退役
-                    b.set("kernel.decode_arm", "fi".into(), "graphs=auto:decode FI 单图");
+                    b.set(
+                        "kernel.decode_arm",
+                        "fi".into(),
+                        "graphs=auto:decode FI 单图",
+                    );
                     if intent.spec == SpecIntent::Dflash {
-                        b.set("kernel.verify_arm", "fi".into(), "graphs=auto:verify 走 FI(有投机时)");
+                        b.set(
+                            "kernel.verify_arm",
+                            "fi".into(),
+                            "graphs=auto:verify 走 FI(有投机时)",
+                        );
                     } else {
-                        b.set("kernel.verify_arm", "v2".into(), "graphs=auto:无投机 ⇒ verify 臂不影响,留 v2");
+                        b.set(
+                            "kernel.verify_arm",
+                            "v2".into(),
+                            "graphs=auto:无投机 ⇒ verify 臂不影响,留 v2",
+                        );
                     }
-                    b.set("kernel.fi_cuda_graph", true.into(), "graphs=auto:图档瓦(plan 形状恒定)");
+                    b.set(
+                        "kernel.fi_cuda_graph",
+                        true.into(),
+                        "graphs=auto:图档瓦(plan 形状恒定)",
+                    );
                     b.set("kernel.fi_plan", "baked".into(), "graphs=auto:烘 plan 进图(上界 = max_context_length) + 表由窗外 flashinfer_fi_plan_sync 刷");
                     true
                 }
@@ -313,37 +399,64 @@ pub fn apply(value: &mut Value, origins: &mut Origins) -> Result<Option<ResolveM
 
     // 复用(快照/前缀缓存);虚拟化档强制前缀缓存
     let reuse = if overcommit && reuse == ReuseIntent::Off {
-        warnings.push("kvmem=overcommit 需要 prefix_cache=true —— reuse=off 已被提升为 session".into());
+        warnings
+            .push("kvmem=overcommit 需要 prefix_cache=true —— reuse=off 已被提升为 session".into());
         ReuseIntent::Session
     } else {
         reuse
     };
     match reuse {
         ReuseIntent::Off => {
-            b.set("store.prefix_cache", false.into(), "reuse=off:单会话最大上下文档");
+            b.set(
+                "store.prefix_cache",
+                false.into(),
+                "reuse=off:单会话最大上下文档",
+            );
             b.set("store.gdn.snap_max", 0i64.into(), "reuse=off:无消费方");
-            b.set("store.snap_host_mb", 0i64.into(), "reuse=off");
             b.set("store.ram_pool_size", 0i64.into(), "reuse=off");
         }
         ReuseIntent::Session => {
             b.set("store.prefix_cache", true.into(), "reuse=session");
-            b.set("store.gdn.snap_max", 1i64.into(), "reuse=session:1 条边界快照");
-                        b.set("store.snap_host_mb", 1024i64.into(), "reuse=session:状态腿下沉");
+            b.set(
+                "store.gdn.snap_max",
+                1i64.into(),
+                "reuse=session:1 条边界快照",
+            );
+            b.set(
+                "store.ram_pool_size",
+                1024i64.into(),
+                "reuse=session:宿主总池",
+            );
         }
         ReuseIntent::Global => {
             b.set("store.prefix_cache", true.into(), "reuse=global");
-            b.set("store.gdn.snap_max", 4i64.into(), "reuse=global:4 条快照(跨会话)");
-                        b.set("store.snap_host_mb", 3072i64.into(), "reuse=global:状态腿下沉");
-            b.set("store.ram_pool_size", 4096i64.into(), "reuse=global:KV 宿主腿");
+            b.set(
+                "store.gdn.snap_max",
+                4i64.into(),
+                "reuse=global:4 条快照(跨会话)",
+            );
+            b.set(
+                "store.ram_pool_size",
+                7168i64.into(),
+                "reuse=global:宿主总池(KV+快照)",
+            );
         }
     }
     // 超卖档强制前缀缓存(否则 select_* 永远不出洞 ⇒ 池装不下就 Exhausted)
     if overcommit {
         if !get_bool(value, "store.prefix_cache").unwrap_or(false) {
-            b.set("store.prefix_cache", true.into(), "kvmem=overcommit:虚拟化前提");
+            b.set(
+                "store.prefix_cache",
+                true.into(),
+                "kvmem=overcommit:虚拟化前提",
+            );
         }
         if get_usize(value, "store.gdn.snap_max").unwrap_or(0) == 0 {
-            b.set("store.gdn.snap_max", 1i64.into(), "kvmem=overcommit:前缀复用需要快照");
+            b.set(
+                "store.gdn.snap_max",
+                1i64.into(),
+                "kvmem=overcommit:前缀复用需要快照",
+            );
         }
     }
 
@@ -360,14 +473,13 @@ pub fn apply(value: &mut Value, origins: &mut Origins) -> Result<Option<ResolveM
     // ── ⑥ context 求解(显式 max_context_length 优先;池不含在配置里) ──
 
     // 尾块合并 = 引擎定值 0（2026-11-16：`runtime.prefill_tail_merge` 已删）
-    let (act, act_note) = memory::activation_for(
-        get_usize(&out, "runtime.prefill_chunk").unwrap_or(512),
-        0,
-    );
+    let (act, act_note) =
+        memory::activation_for(get_usize(&out, "runtime.prefill_chunk").unwrap_or(512), 0);
     let inp = MemoryInputs {
         total_bytes: hw.total_bytes,
         vram_budget: get_f64(&out, "store.vram_budget").unwrap_or(0.97),
-        reserve_bytes: (get_usize(&out, "store.vram_activation_reserve").unwrap_or(714) as u64) << 20,
+        reserve_bytes: (get_usize(&out, "store.vram_activation_reserve").unwrap_or(714) as u64)
+            << 20,
         model,
         spec_dflash: intent.spec == SpecIntent::Dflash,
         // 内存模型只关心"每元素几字节"——直接给字节数,不再用布尔表达格式。
@@ -443,8 +555,15 @@ pub fn apply(value: &mut Value, origins: &mut Origins) -> Result<Option<ResolveM
         memory::CONTEXT_ROUND_TOKENS,
     );
     if !origins.contains_key("runtime.max_context_length") {
-        set_path(&mut out, "runtime.max_context_length", Value::Integer(ctx as i64));
-        origins.insert("runtime.max_context_length".into(), Origin::Derived(ctx_rule));
+        set_path(
+            &mut out,
+            "runtime.max_context_length",
+            Value::Integer(ctx as i64),
+        );
+        origins.insert(
+            "runtime.max_context_length".into(),
+            Origin::Derived(ctx_rule),
+        );
     }
     if tp {
         warnings.push(
@@ -488,7 +607,10 @@ struct Builder {
 
 impl Default for Builder {
     fn default() -> Self {
-        Self { v: Value::Table(Default::default()), rules: BTreeMap::new() }
+        Self {
+            v: Value::Table(Default::default()),
+            rules: BTreeMap::new(),
+        }
     }
 }
 
@@ -538,10 +660,7 @@ fn apply_site(value: &mut Value, origins: &mut Origins) -> Result<(), String> {
 
 /// 显式 `[model]` 三键必须与 intent.model **同值**(同值 = 无害的显式复述;
 /// 不同值 = 两个真源,拒)
-fn check_explicit_model(
-    v: &Value,
-    p: &intent::ModelProfile,
-) -> Result<(), String> {
+fn check_explicit_model(v: &Value, p: &intent::ModelProfile) -> Result<(), String> {
     let Some(m) = v.get("model").and_then(|x| x.as_table()) else {
         return Ok(());
     };
@@ -552,7 +671,10 @@ fn check_explicit_model(
     ] {
         let Some(val) = m.get(key) else { continue };
         let got = val.as_str().ok_or_else(|| {
-            format!("[model].{key} 必须是字符串(得到 {})", super::toml_type_name(val))
+            format!(
+                "[model].{key} 必须是字符串(得到 {})",
+                super::toml_type_name(val)
+            )
         })?;
         if got != want {
             return Err(format!(
@@ -603,7 +725,9 @@ pub(crate) fn get<'a>(v: &'a Value, path: &str) -> Option<&'a Value> {
 }
 
 pub(crate) fn get_usize(v: &Value, path: &str) -> Option<usize> {
-    get(v, path).and_then(|x| x.as_integer()).and_then(|n| usize::try_from(n).ok())
+    get(v, path)
+        .and_then(|x| x.as_integer())
+        .and_then(|n| usize::try_from(n).ok())
 }
 
 pub(crate) fn get_bool(v: &Value, path: &str) -> Option<bool> {
@@ -693,7 +817,10 @@ mode = "greedy"
         assert_eq!(c.model.quant, crate::config::QuantScheme::W4a16);
 
         // 上下文/并发/预填充
-        assert_eq!(c.runtime.max_context_length, 143_360, "context=max ⇒ 合并预留后的模型上限");
+        assert_eq!(
+            c.runtime.max_context_length, 143_360,
+            "context=max ⇒ 合并预留后的模型上限"
+        );
         assert_eq!(c.store.gdn.gdn_slots, 1, "并发唯一真源 = gdn_slots");
         assert_eq!(c.runtime.max_batch, 1);
         assert_eq!(c.runtime.prefill_chunk, 512);
@@ -701,7 +828,6 @@ mode = "greedy"
         // 复用关(reuse=off ⇒ 快照/宿主/前缀缓存全零)
         assert_eq!(c.store.gdn.snap_max, 0, "reuse=off ⇒ 快照池关");
         assert_eq!(c.store.ram_pool_size, 0, "reuse=off ⇒ KV 宿主层关");
-        assert_eq!(c.store.snap_host_mb, 0, "reuse=off ⇒ 快照宿主层关");
         assert!(!c.store.prefix_cache, "reuse=off ⇒ 前缀缓存关");
         assert_eq!(c.store.gdn.gdn_slots, 1);
         assert_eq!(c.store.kv.kv_dtype, super::super::KvDtype::Fp8, "kv=fp8");
@@ -732,13 +858,26 @@ mode = "greedy"
     fn profile_estimate_matches_boot_ledger() {
         let mut v: Value = toml::from_str(INTENT_AWQ_3090_MAX).expect("toml");
         let mut origins = Origins::new();
-        let meta = super::apply(&mut v, &mut origins).expect("resolve").expect("intent");
+        let meta = super::apply(&mut v, &mut origins)
+            .expect("resolve")
+            .expect("intent");
         let e = meta.estimate.expect("estimate");
         assert_eq!(e.context_tokens, 143_360);
-        assert_eq!(e.pool_tokens, e.context_tokens, "逻辑池 = 上下文(物理池自动)");
+        assert_eq!(
+            e.pool_tokens, e.context_tokens,
+            "逻辑池 = 上下文(物理池自动)"
+        );
         assert_eq!(e.pool_bytes, 143_360 * 32768);
-        assert_eq!(e.fixed_bytes, (148 << 20) + (1 << 19), "fixed 只剩 GDN 真实分配");
-        assert!((e.budget_bytes as f64 / GB - 6.26).abs() < 0.02, "budget={:?}", e.budget_bytes);
+        assert_eq!(
+            e.fixed_bytes,
+            (148 << 20) + (1 << 19),
+            "fixed 只剩 GDN 真实分配"
+        );
+        assert!(
+            (e.budget_bytes as f64 / GB - 6.26).abs() < 0.02,
+            "budget={:?}",
+            e.budget_bytes
+        );
         assert_eq!(e.stability_margin_bytes, STABILITY_MARGIN_BYTES);
         assert!(e.slack_bytes >= 0, "导出的 128k 应有正余量:{e:?}");
     }
@@ -759,8 +898,14 @@ bind = "127.0.0.1:8140"
 device = { bdf = "42:00.0" }
 "#,
         );
-        assert_eq!(get(&v, "model.path").and_then(|x| x.as_str()), Some("/models/27b"));
-        assert_eq!(get(&v, "server.bind").and_then(|x| x.as_str()), Some("127.0.0.1:8140"));
+        assert_eq!(
+            get(&v, "model.path").and_then(|x| x.as_str()),
+            Some("/models/27b")
+        );
+        assert_eq!(
+            get(&v, "server.bind").and_then(|x| x.as_str()),
+            Some("127.0.0.1:8140")
+        );
         assert!(matches!(origins.get("server.bind"), Some(Origin::Site(_))));
         let mut bad: Value = toml::from_str("[site]\nmodel_dirz = \"x\"\n").expect("toml");
         let e = super::apply(&mut bad, &mut Origins::new()).expect_err("未知 site 键拒");
@@ -844,8 +989,14 @@ graphs = "auto"
 "#,
         );
         assert_eq!(get_bool(&v, "kernel.fi_cuda_graph"), Some(false));
-        assert_eq!(get(&v, "kernel.decode_arm").and_then(|x| x.as_str()), Some("v2"));
-        assert!(get(&v, "graph.prefill_bucket").is_none(), "prefill 桶已退役");
+        assert_eq!(
+            get(&v, "kernel.decode_arm").and_then(|x| x.as_str()),
+            Some("v2")
+        );
+        assert!(
+            get(&v, "graph.prefill_bucket").is_none(),
+            "prefill 桶已退役"
+        );
     }
 
     /// 旧档(无 intent)零变化:apply 返回 None 且不增删键
@@ -879,6 +1030,9 @@ kvmem = "overcommit"
         assert_eq!(get_bool(&v, "kvmem.select_decode"), Some(true));
         assert_eq!(get_bool(&v, "kvmem.pool_overcommit"), Some(true));
         // 选择层档不得建 FI 桶图
-        assert!(get(&v, "graph.prefill_bucket").is_none(), "prefill 桶已退役");
+        assert!(
+            get(&v, "graph.prefill_bucket").is_none(),
+            "prefill 桶已退役"
+        );
     }
 }

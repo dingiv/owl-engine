@@ -13,8 +13,9 @@ pub use super::BlockRef;
 pub use crate::family::nvfp4::{GEMM, PACK_WEIGHT};
 
 /// `parse_gemm` 取用的槽名(声明序)
-pub const PARSE_SLOTS: &[&str] =
-    &["a", "bq", "bsf", "out", "aq", "asf", "dg", "m", "k", "n", "gb"];
+pub const PARSE_SLOTS: &[&str] = &[
+    "a", "bq", "bsf", "out", "aq", "asf", "dg", "m", "k", "n", "gb",
+];
 
 /// `parse_pack` 取用的槽名(声明序;见表 `ops::nvfp4::PACK_WEIGHT`)
 pub const PARSE_SLOTS_PACK: &[&str] = &["src", "q", "sf", "g", "n", "k", "src_bf16"];

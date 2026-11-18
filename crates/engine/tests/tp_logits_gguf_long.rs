@@ -26,17 +26,25 @@ use owl_iface::contract::ModelError;
 use owl_shared::testkit::{resource, resource_ok};
 
 fn cfg_of(ordinal: usize, max_context_length: usize, chunk: usize) -> EngineConfig {
-    let mut knobs = EngineKnobs { sampler_enabled: false, raw_completion: true, ..Default::default() };
+    let mut knobs = EngineKnobs {
+        sampler_enabled: false,
+        raw_completion: true,
+        ..Default::default()
+    };
     if let Ok(mb) = std::env::var("OWL_GGUF_TP_RESERVE_MB").map(|s| s.parse::<u64>()) {
         knobs.vram_activation_reserve = mb.expect("OWL_GGUF_TP_RESERVE_MB 非数字");
     }
     knobs.pool_tokens = Some(max_context_length);
     knobs.gdn_slots = 1;
     knobs.ram_pool_size = 32;
-    knobs.snap_host_mb = 0;
     knobs.snap_max = 0;
     knobs.prefix_cache = false;
-    EngineConfig { device_ordinal: ordinal, max_context_length_tokens: max_context_length, prefill_chunk: chunk, knobs }
+    EngineConfig {
+        device_ordinal: ordinal,
+        max_context_length_tokens: max_context_length,
+        prefill_chunk: chunk,
+        knobs,
+    }
 }
 
 fn dev(name: &str) -> Option<usize> {
@@ -49,16 +57,18 @@ fn dev(name: &str) -> Option<usize> {
 /// 长 prompt(词级拼装;`words` 约 = 1.28 × tok)
 fn long_prompt(words: usize) -> String {
     let pool = [
-        "apple", "river", "stone", "cloud", "mountain", "garden", "window", "silver",
-        "forest", "island", "letter", "market", "number", "object", "paper", "quiet",
-        "reason", "signal", "table", "united", "village", "winter", "yellow", "zebra",
-        "fabric", "gentle", "hunter", "ivory", "jacket", "kernel", "ladder", "meadow",
+        "apple", "river", "stone", "cloud", "mountain", "garden", "window", "silver", "forest",
+        "island", "letter", "market", "number", "object", "paper", "quiet", "reason", "signal",
+        "table", "united", "village", "winter", "yellow", "zebra", "fabric", "gentle", "hunter",
+        "ivory", "jacket", "kernel", "ladder", "meadow",
     ];
     let half = words / 2;
     let mut s = String::with_capacity(words * 8 + 160);
     for i in 0..words {
         if i == half {
-            s.push_str(" IMPORTANT FACT: the secret passcode is PASSCODE-8842. Remember it exactly. ");
+            s.push_str(
+                " IMPORTANT FACT: the secret passcode is PASSCODE-8842. Remember it exactly. ",
+            );
         }
         s.push_str(pool[i % pool.len()]);
         s.push(' ');
@@ -99,13 +109,23 @@ async fn first_step_logits(
         }
     }
     let toks = running.session_token_ids(sid).unwrap_or_default();
-    let gen = if toks.len() > prompt_len { toks[prompt_len..].to_vec() } else { Vec::new() };
+    let gen = if toks.len() > prompt_len {
+        toks[prompt_len..].to_vec()
+    } else {
+        Vec::new()
+    };
     let l = logits.ok_or_else(|| ModelError::Msg("首步读不到 logits 槽".into()))?;
     Ok((l, gen, peer_logits))
 }
 
 fn argmax(v: &[f32]) -> usize {
-    v.iter().enumerate().fold((0, f32::MIN), |a, (i, x)| if *x > a.1 { (i, *x) } else { a }).0
+    v.iter()
+        .enumerate()
+        .fold(
+            (0, f32::MIN),
+            |a, (i, x)| if *x > a.1 { (i, *x) } else { a },
+        )
+        .0
 }
 
 fn topn(v: &[f32], n: usize) -> Vec<usize> {
@@ -158,9 +178,15 @@ fn stats(a: &[f32], b: &[f32]) -> Stats {
             dmax_ref = *x;
             dmax_tp = *y;
         }
-        if d > 0.01 { gt_001 += 1; }
-        if d > 0.1 { gt_01 += 1; }
-        if d > 1.0 { gt_1 += 1; }
+        if d > 0.01 {
+            gt_001 += 1;
+        }
+        if d > 0.1 {
+            gt_01 += 1;
+        }
+        if d > 1.0 {
+            gt_1 += 1;
+        }
         max_ref = max_ref.max(*x);
         max_tp = max_tp.max(*y);
         dot += (*x as f64) * (*y as f64);
@@ -196,7 +222,9 @@ fn stats(a: &[f32], b: &[f32]) -> Stats {
 #[ignore = "诊断仪(cos/生成段不是 TP1↔TP2 的判据;见文件头与设计 §23.8)"]
 fn tp_logits_gguf_long() {
     let (Some(oa), Some(ob)) = (dev("OWL_GGUF_TP_DEV_A"), dev("OWL_GGUF_TP_DEV_B")) else {
-        owl_shared::testkit::report::skip("需 OWL_GGUF_TP_DEV_A / OWL_GGUF_TP_DEV_B(两张空闲卡的 BDF)");
+        owl_shared::testkit::report::skip(
+            "需 OWL_GGUF_TP_DEV_A / OWL_GGUF_TP_DEV_B(两张空闲卡的 BDF)",
+        );
         return;
     };
     assert_ne!(oa, ob, "TP2 需要两张不同的卡");
@@ -207,10 +235,19 @@ fn tp_logits_gguf_long() {
         owl_shared::testkit::report::skip(&format!("资源清单缺 \"{res}\""));
         return;
     }
-    let words: usize = std::env::var("OWL_GGUF_TP_WORDS").ok().and_then(|s| s.parse().ok()).unwrap_or(900);
-    let chunk: usize = std::env::var("OWL_GGUF_TP_CHUNK").ok().and_then(|s| s.parse().ok()).unwrap_or(512);
+    let words: usize = std::env::var("OWL_GGUF_TP_WORDS")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(900);
+    let chunk: usize = std::env::var("OWL_GGUF_TP_CHUNK")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(512);
     // 20G 卡跑单卡参考时 4096 池会超预算；诊断档允许压到刚够 1.3k prompt。
-    let max_context_length: usize = std::env::var("OWL_GGUF_TP_MAX_SEQ").ok().and_then(|s| s.parse().ok()).unwrap_or(4096);
+    let max_context_length: usize = std::env::var("OWL_GGUF_TP_MAX_SEQ")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(4096);
     std::thread::Builder::new()
         .stack_size(64 << 20)
         .spawn(move || {
@@ -224,14 +261,23 @@ fn tp_logits_gguf_long() {
         .expect("门失败");
 }
 
-async fn body(oa: usize, ob: usize, words: usize, chunk: usize, max_context_length: usize, res: &str) {
+async fn body(
+    oa: usize,
+    ob: usize,
+    words: usize,
+    chunk: usize,
+    max_context_length: usize,
+    res: &str,
+) {
     let path = std::path::PathBuf::from(resource(res).expect("列了就有"));
     let prompt = long_prompt(words);
     eprintln!("[gguf-tp-long] {res} · chunk={chunk} · 词 {words} · max_context_length={max_context_length} · 设备 A={oa} B={ob}");
 
     let skip_ref = std::env::var_os("OWL_GGUF_TP_SKIP_REF").is_some();
     // ── ① 单卡参考(最后一词 logits)──
-    let (ref_logits, ref_gen) = if skip_ref { (Vec::new(), Vec::new()) } else {
+    let (ref_logits, ref_gen) = if skip_ref {
+        (Vec::new(), Vec::new())
+    } else {
         let mut e = Engine::new(cfg_of(oa, max_context_length, chunk)).expect("engine(单卡参考)");
         let loaded = e.loader().load_gguf(&path).await.expect("单卡装载");
         let mut r = e.run(loaded).await.expect("单卡装配");
@@ -244,10 +290,24 @@ async fn body(oa: usize, ob: usize, words: usize, chunk: usize, max_context_leng
 
     // ── ② TP2(同 prompt)──
     let mut e0 = Engine::new(cfg_of(oa, max_context_length, chunk)).expect("engine(r0)");
-    let m0 = e0.loader().slice(0, 2).load_gguf(&path).await.expect("rank0 分片装载");
-    let mut e1 = Engine::new_with_ledger(cfg_of(ob, max_context_length, chunk), e0.ledger_cell(), 1).expect("engine(r1)");
-    let m1 = e1.loader().slice(1, 2).load_gguf(&path).await.expect("rank1 分片装载");
-    let tp = TpEngine::assemble(vec![e0, e1], vec![m0, m1]).await.expect("TP2 装配");
+    let m0 = e0
+        .loader()
+        .slice(0, 2)
+        .load_gguf(&path)
+        .await
+        .expect("rank0 分片装载");
+    let mut e1 =
+        Engine::new_with_ledger(cfg_of(ob, max_context_length, chunk), e0.ledger_cell(), 1)
+            .expect("engine(r1)");
+    let m1 = e1
+        .loader()
+        .slice(1, 2)
+        .load_gguf(&path)
+        .await
+        .expect("rank1 分片装载");
+    let tp = TpEngine::assemble(vec![e0, e1], vec![m0, m1])
+        .await
+        .expect("TP2 装配");
     let mut r = tp.run().expect("TP2 进执行态");
     let (tp_logits, tp_gen, peer) = first_step_logits(&mut r, &prompt, 16, true)
         .await
@@ -255,7 +315,10 @@ async fn body(oa: usize, ob: usize, words: usize, chunk: usize, max_context_leng
     let _ = r.shutdown_tp().await;
     let first_div = ref_gen.iter().zip(tp_gen.iter()).position(|(a, b)| a != b);
     eprintln!("[gguf-tp-long] 单卡 gen = {ref_gen:?}");
-    eprintln!("[gguf-tp-long] TP2  gen = {tp_gen:?}(首分歧 {:?})", first_div);
+    eprintln!(
+        "[gguf-tp-long] TP2  gen = {tp_gen:?}(首分歧 {:?})",
+        first_div
+    );
     let st = stats(&ref_logits, &tp_logits);
     let (t1a, t1b) = (argmax(&ref_logits), argmax(&tp_logits));
     let (top_a, top_b) = (topn(&ref_logits, 10), topn(&tp_logits, 10));
@@ -270,7 +333,11 @@ async fn body(oa: usize, ob: usize, words: usize, chunk: usize, max_context_leng
     );
     if let Some(p) = peer {
         let ps = stats(&tp_logits, &p);
-        let nbit = p.iter().zip(tp_logits.iter()).filter(|(a, b)| a.to_bits() != b.to_bits()).count();
+        let nbit = p
+            .iter()
+            .zip(tp_logits.iter())
+            .filter(|(a, b)| a.to_bits() != b.to_bits())
+            .count();
         eprintln!(
             "[gguf-tp-long] peer-vs-rank0: {nbit} 项不同 · max|Δ|={:.4} · mean={:.5} · p99={:.5} · cos={:.8}",
             ps.dmax, ps.mean, ps.p99, ps.cos
@@ -280,8 +347,16 @@ async fn body(oa: usize, ob: usize, words: usize, chunk: usize, max_context_leng
         assert_eq!(first_div, None, "生成段与单卡在超步 {:?} 分叉", first_div);
         // 已知 AWQ TP2 vs TP1 首步 max|Δ| = 10.83（tests_gguf 的既有对照）；
         // 这里 5.76 属同量级，不能再用 cos>0.99 当硬门。
-        assert!(st.dmax < 12.0, "max|Δ| = {:.4} 超出既有 TP2 噪声量级 12", st.dmax);
-        assert!(st.cos > 0.95, "cos = {:.6} < 0.95 —— 信息面已明显偏", st.cos);
+        assert!(
+            st.dmax < 12.0,
+            "max|Δ| = {:.4} 超出既有 TP2 噪声量级 12",
+            st.dmax
+        );
+        assert!(
+            st.cos > 0.95,
+            "cos = {:.6} < 0.95 —— 信息面已明显偏",
+            st.cos
+        );
         assert_eq!(t1a, t1b, "top1 不同 —— TP2 长上下文分片/AR 有实质错");
     }
 }

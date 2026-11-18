@@ -9,8 +9,8 @@
 //! OWL_TEST_DEVICE=41:00.0 \
 //!   cargo test -p owl-engine --test dflash2_concurrent_gate -- --nocapture
 //! ```
-use owl_engine::{Engine, EngineConfig, EngineKnobs, RunningEngine, TurnEvent};
 use owl_engine::turn::TurnStats;
+use owl_engine::{Engine, EngineConfig, EngineKnobs, RunningEngine, TurnEvent};
 
 const MAX_SEQ: usize = 512;
 const MAX_NEW: usize = 16;
@@ -131,13 +131,30 @@ fn dflash2_two_sessions_match_serial() {
         let cst2 = cst2.expect("c2 stats");
         let c1 = r.session_token_ids(sid1).expect("c1 账")[plen1..].to_vec();
         let c2 = r.session_token_ids(sid2).expect("c2 账")[plen2..].to_vec();
-        let al = |st: &TurnStats| if st.spec_rounds == 0 { 0.0 } else { st.spec_accepted as f64 / st.spec_rounds as f64 };
+        let al = |st: &TurnStats| {
+            if st.spec_rounds == 0 {
+                0.0
+            } else {
+                st.spec_accepted as f64 / st.spec_rounds as f64
+            }
+        };
         eprintln!("[dflash2-conc] serial A={s1:?}\n[dflash2-conc] conc   A={c1:?}");
         eprintln!("[dflash2-conc] serial B={s2:?}\n[dflash2-conc] conc   B={c2:?}");
-        eprintln!("[dflash2-conc] serial AL A={:.2} B={:.2}; conc AL A={:.2} B={:.2}",
-                  al(&st1), al(&st2), al(&cst1), al(&cst2));
-        assert_eq!(s1, c1, "会话 A：并发与串行逐 token 不一致（目标 KV/GDN 串了？）");
-        assert_eq!(s2, c2, "会话 B：并发与串行逐 token 不一致（目标 KV/GDN 串了？）");
+        eprintln!(
+            "[dflash2-conc] serial AL A={:.2} B={:.2}; conc AL A={:.2} B={:.2}",
+            al(&st1),
+            al(&st2),
+            al(&cst1),
+            al(&cst2)
+        );
+        assert_eq!(
+            s1, c1,
+            "会话 A：并发与串行逐 token 不一致（目标 KV/GDN 串了？）"
+        );
+        assert_eq!(
+            s2, c2,
+            "会话 B：并发与串行逐 token 不一致（目标 KV/GDN 串了？）"
+        );
         eprintln!("[dflash2-conc] ✅ 两会话并发逐 token 一致（DFlash2 ring0/ring1）");
     });
 }

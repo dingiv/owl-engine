@@ -106,29 +106,54 @@ async fn m1_multistream_capture_orders_and_replays() {
     const N: usize = 8192;
 
     // 输入:两条链各自的源(A 链与 B 链是**独立**的 —— 微批并行的形状)
-    let a_src = owl_iface::htod!(c, Dtype::F32, &Shape::from(vec![N]), &le_f32(&vec![1.0f32; N]))
+    let a_src = owl_iface::htod!(
+        c,
+        Dtype::F32,
+        &Shape::from(vec![N]),
+        &le_f32(&vec![1.0f32; N])
+    )
+    .await
+    .expect("htod a_src")
+    .view(Dtype::F32, 1);
+    let b_src = owl_iface::htod!(
+        c,
+        Dtype::F32,
+        &Shape::from(vec![N]),
+        &le_f32(&vec![2.0f32; N])
+    )
+    .await
+    .expect("htod b_src")
+    .view(Dtype::F32, 1);
+    let a_mid = owl_iface::alloc_uninit!(c, Dtype::F32, N)
         .await
-        .expect("htod a_src")
+        .expect("a_mid")
         .view(Dtype::F32, 1);
-    let b_src = owl_iface::htod!(c, Dtype::F32, &Shape::from(vec![N]), &le_f32(&vec![2.0f32; N]))
+    let b_mid = owl_iface::alloc_uninit!(c, Dtype::F32, N)
         .await
-        .expect("htod b_src")
+        .expect("b_mid")
         .view(Dtype::F32, 1);
-    let a_mid = owl_iface::alloc_uninit!(c, Dtype::F32, N).await.expect("a_mid").view(Dtype::F32, 1);
-    let b_mid = owl_iface::alloc_uninit!(c, Dtype::F32, N).await.expect("b_mid").view(Dtype::F32, 1);
-    let out = owl_iface::alloc_uninit!(c, Dtype::F32, N).await.expect("out").view(Dtype::F32, 1);
+    let out = owl_iface::alloc_uninit!(c, Dtype::F32, N)
+        .await
+        .expect("out")
+        .view(Dtype::F32, 1);
     c.sync().await.expect("sync setup");
 
     // ── 捕获窗:COMPUTE 链 + fork 到 AUX 的第二条链 + join 回来 ──────
     c.graph_begin().await.expect("graph_begin");
-    c.launch(add_msg(&a_src, &a_src, &a_mid, N)).await.expect("A 链 k1(COMPUTE)");
+    c.launch(add_msg(&a_src, &a_src, &a_mid, N))
+        .await
+        .expect("A 链 k1(COMPUTE)");
     c.capture_route_to(STREAM_COMPUTE_AUX as u8)
         .await
         .expect("fork 到 AUX(该口只在捕获期合法)");
-    c.launch(add_msg(&b_src, &b_src, &b_mid, N)).await.expect("B 链 k2(AUX):b_mid = 2·b_src");
+    c.launch(add_msg(&b_src, &b_src, &b_mid, N))
+        .await
+        .expect("B 链 k2(AUX):b_mid = 2·b_src");
     c.capture_join().await.expect("join 回 COMPUTE(主链等支链)");
     // k3 读**两条链**的结果 —— 没有 join 边这里就会读到未写的 b_mid
-    c.launch(add_msg(&a_mid, &b_mid, &out, N)).await.expect("k3(COMPUTE,读两链)");
+    c.launch(add_msg(&a_mid, &b_mid, &out, N))
+        .await
+        .expect("k3(COMPUTE,读两链)");
     let gid = c.graph_end().await.expect("graph_end");
 
     // ── M1+M2:回放 → a_mid=2.0, b_mid=102.0, out=104.0 ────────────
@@ -142,11 +167,18 @@ async fn m1_multistream_capture_orders_and_replays() {
     );
 
     // ── M3:改 AUX 链的输入 → 再回放 → 数值必须跟着变(回放真执行两条链)──
-    let b_src2 = owl_iface::htod!(c, Dtype::F32, &Shape::from(vec![N]), &le_f32(&vec![5.0f32; N]))
+    let b_src2 = owl_iface::htod!(
+        c,
+        Dtype::F32,
+        &Shape::from(vec![N]),
+        &le_f32(&vec![5.0f32; N])
+    )
+    .await
+    .expect("htod b_src2")
+    .view(Dtype::F32, 1);
+    c.copy_block_at(&b_src2, 0, &b_src, 0, N * 4)
         .await
-        .expect("htod b_src2")
-        .view(Dtype::F32, 1);
-    c.copy_block_at(&b_src2, 0, &b_src, 0, N * 4).await.expect("改写 b_src");
+        .expect("改写 b_src");
     c.sync().await.expect("sync 改写");
     c.graph_launch(gid).await.expect("replay#2");
     let g2 = read_f32(&mut c, &out, 1).await;
@@ -161,7 +193,9 @@ async fn m1_multistream_capture_orders_and_replays() {
     c.free(&[a_src.id, b_src.id, b_src2.id, a_mid.id, b_mid.id, out.id])
         .await
         .expect("free");
-    eprintln!("[multistream] M1/M2/M3 绿(dev={d}, N={N}):fork 卷入 ✓ join 保序 ✓ 回放真执行两条链 ✓");
+    eprintln!(
+        "[multistream] M1/M2/M3 绿(dev={d}, N={N}):fork 卷入 ✓ join 保序 ✓ 回放真执行两条链 ✓"
+    );
 }
 
 // ============================================================================
@@ -202,29 +236,48 @@ async fn m5_dual_stream_throughput() {
         .ok()
         .and_then(|v| v.parse().ok())
         .unwrap_or(512);
-    let dual = std::env::var("OWL_MS_DUAL").map(|v| v != "0" && !v.is_empty()).unwrap_or(false);
-    let k: u32 = std::env::var("OWL_MS_K").ok().and_then(|v| v.parse().ok()).unwrap_or(20);
+    let dual = std::env::var("OWL_MS_DUAL")
+        .map(|v| v != "0" && !v.is_empty())
+        .unwrap_or(false);
+    let k: u32 = std::env::var("OWL_MS_K")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(20);
     let mut c = assemble(d, "m5");
     const N: usize = 1 << 18; // 1 MiB f32/链
-    let one = owl_iface::htod!(c, Dtype::F32, &Shape::from(vec![N]), &le_f32(&vec![1.0f32; N]))
+    let one = owl_iface::htod!(
+        c,
+        Dtype::F32,
+        &Shape::from(vec![N]),
+        &le_f32(&vec![1.0f32; N])
+    )
+    .await
+    .expect("htod base")
+    .view(Dtype::F32, 1);
+    let sink = owl_iface::alloc_uninit!(c, Dtype::F32, N)
         .await
-        .expect("htod base")
+        .expect("sink")
         .view(Dtype::F32, 1);
-    let sink = owl_iface::alloc_uninit!(c, Dtype::F32, N).await.expect("sink").view(Dtype::F32, 1);
     c.sync().await.expect("sync setup");
 
     c.graph_begin().await.expect("graph_begin");
     // ★ **fork 必须在链的起点**(2026-10-18 M5 教训):边记在链尾 = 把两条链拴成串行。
     if dual {
-        c.capture_route_to(STREAM_COMPUTE_AUX as u8).await.expect("fork→AUX(链起点)");
+        c.capture_route_to(STREAM_COMPUTE_AUX as u8)
+            .await
+            .expect("fork→AUX(链起点)");
         for _ in 0..chain {
-            c.launch(add_msg(&one, &one, &sink, N)).await.expect("AUX 链");
+            c.launch(add_msg(&one, &one, &sink, N))
+                .await
+                .expect("AUX 链");
         }
         // 切回 origin = **纯切换(不建边)** —— 建边就会让 COMPUTE 链等 AUX 链
         c.capture_route_to(1u8).await.expect("切回 COMPUTE");
     }
     for _ in 0..chain {
-        c.launch(add_msg(&one, &one, &sink, N)).await.expect("COMPUTE 链");
+        c.launch(add_msg(&one, &one, &sink, N))
+            .await
+            .expect("COMPUTE 链");
     }
     // ★ **末尾 join**(2026-10-18 §39):fork 出去的支流**必须有工作就要 join**,
     // 否则驱动以 UNJOINED 整窗拒。必须在**两条链都发完之后**记 ——
@@ -246,10 +299,7 @@ async fn m5_dual_stream_throughput() {
     let ms = t0.elapsed().as_secs_f64() * 1e3 / f64::from(k);
     let mut got = vec![0u8; 16];
     c.dtoh(&sink, &mut got).await.expect("dtoh");
-    assert_eq!(
-        de_f32(&got)[0], 2.0,
-        "数值自证:链没跑(1.0 + 1.0 应为 2.0)"
-    );
+    assert_eq!(de_f32(&got)[0], 2.0, "数值自证:链没跑(1.0 + 1.0 应为 2.0)");
     eprintln!(
         "[multistream] M5: chain={chain} dual={dual} ⇒ **{ms:.3} ms/回放**\
          (single vs dual 的比 = 并行度;≈1.0 真并行 / ≈2.0 串行)"
@@ -296,14 +346,25 @@ async fn m5_dual_stream_throughput() {
 #[tokio::test]
 async fn m6_capture_join_semantics() {
     let d = dev();
-    let k: u32 = std::env::var("OWL_MS6_K").ok().and_then(|v| v.parse().ok()).unwrap_or(8);
+    let k: u32 = std::env::var("OWL_MS6_K")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(8);
     let mut c = assemble(d, "m6");
     const N: usize = 1 << 16; // 256 KiB
-    let src = owl_iface::htod!(c, Dtype::F32, &Shape::from(vec![N]), &le_f32(&vec![1.0f32; N]))
+    let src = owl_iface::htod!(
+        c,
+        Dtype::F32,
+        &Shape::from(vec![N]),
+        &le_f32(&vec![1.0f32; N])
+    )
+    .await
+    .expect("htod")
+    .view(Dtype::F32, 1);
+    let dst = owl_iface::alloc_uninit!(c, Dtype::F32, N)
         .await
-        .expect("htod")
+        .expect("dst")
         .view(Dtype::F32, 1);
-    let dst = owl_iface::alloc_uninit!(c, Dtype::F32, N).await.expect("dst").view(Dtype::F32, 1);
     c.sync().await.expect("sync");
 
     // 一形状 = 捕一张图;返回 Ok/Err(不 panic —— 本档就是来分类错误的)
@@ -320,25 +381,39 @@ async fn m6_capture_join_semantics() {
         comp_kernel: bool,
         join_on_aux: bool,
     ) -> Result<(), String> {
-        c.graph_begin().await.map_err(|e| format!("graph_begin: {e}"))?;
-        c.capture_route_to(STREAM_COMPUTE_AUX as u8).await.map_err(|e| format!("fork: {e}"))?;
+        c.graph_begin()
+            .await
+            .map_err(|e| format!("graph_begin: {e}"))?;
+        c.capture_route_to(STREAM_COMPUTE_AUX as u8)
+            .await
+            .map_err(|e| format!("fork: {e}"))?;
         for _ in 0..k {
             if aux_copy {
-                c.copy_block_at(src, 0, dst, 0, n * 4).await.map_err(|e| format!("AUX copy: {e}"))?;
+                c.copy_block_at(src, 0, dst, 0, n * 4)
+                    .await
+                    .map_err(|e| format!("AUX copy: {e}"))?;
             }
             if aux_kernel {
-                c.launch(add_msg(src, src, dst, n)).await.map_err(|e| format!("AUX kern: {e}"))?;
+                c.launch(add_msg(src, src, dst, n))
+                    .await
+                    .map_err(|e| format!("AUX kern: {e}"))?;
             }
         }
         if join_on_aux {
             // ★ **在 AUX 上 join**(切回 origin 之前)⇒ 边真的建起来
-            c.capture_join().await.map_err(|e| format!("join(AUX): {e}"))?;
+            c.capture_join()
+                .await
+                .map_err(|e| format!("join(AUX): {e}"))?;
         } else {
-            c.capture_route_to(1u8).await.map_err(|e| format!("switch: {e}"))?;
+            c.capture_route_to(1u8)
+                .await
+                .map_err(|e| format!("switch: {e}"))?;
         }
         for _ in 0..k {
             if comp_kernel {
-                c.launch(add_msg(src, src, dst, n)).await.map_err(|e| format!("COMP: {e}"))?;
+                c.launch(add_msg(src, src, dst, n))
+                    .await
+                    .map_err(|e| format!("COMP: {e}"))?;
             }
         }
         // ⚠️ **不补 join**:切回 origin 之后 `capture_join()` 已按纪律改成**响亮拒**
@@ -372,7 +447,9 @@ async fn m6_capture_join_semantics() {
         c.graph_begin().await.expect("graph_begin(E)");
         c.launch(add_msg(&src, &src, &dst, N)).await.expect("E 链");
         match c.capture_join().await {
-            Ok(()) => eprintln!("[multistream] M6 E  在 origin 上 join        ⇒ **✗ 静默 no-op(应当拒)**"),
+            Ok(()) => {
+                eprintln!("[multistream] M6 E  在 origin 上 join        ⇒ **✗ 静默 no-op(应当拒)**")
+            }
             Err(e) => eprintln!("[multistream] M6 E  在 origin 上 join        ⇒ **✓ 响亮拒**:{e}"),
         }
         c.graph_end().await.expect("graph_end(E)");

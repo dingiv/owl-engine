@@ -31,14 +31,22 @@ pub struct CheckBuf {
 pub trait CheckRunner {
     fn alloc(&mut self, bytes: usize, tag: &'static str) -> Result<CheckBuf, OpError>;
     /// **账本块分配**(foreign 算子自检必需:它们的参数是块句柄,不是 scratch)
-    fn alloc_block(&mut self, bytes: usize, tag: &'static str) -> Result<crate::contract::Bytes, OpError>;
+    fn alloc_block(
+        &mut self,
+        bytes: usize,
+        tag: &'static str,
+    ) -> Result<crate::contract::Bytes, OpError>;
     /// 按块句柄上传(等价于 `resolve` + `upload`)
     fn upload_block(&mut self, b: &crate::contract::Bytes, src: &[u8]) -> Result<(), OpError>;
     /// 按块句柄回读(等价于 `resolve` + `download`)
-    fn download_block(&mut self, b: &crate::contract::Bytes, dst: &mut [u8]) -> Result<(), OpError>;
+    fn download_block(&mut self, b: &crate::contract::Bytes, dst: &mut [u8])
+        -> Result<(), OpError>;
     /// **经注册表发射**(与生产同一路径:`OpRegistry::execute`)—— foreign
     /// 算子(FFI/家族 runtime)只能这样跑;native 用 [`launch_aot`](Self::launch_aot)。
-    fn dispatch(&mut self, msg: crate::contract::LaunchMsg) -> Result<crate::contract::Bytes, OpError>;
+    fn dispatch(
+        &mut self,
+        msg: crate::contract::LaunchMsg,
+    ) -> Result<crate::contract::Bytes, OpError>;
     fn upload(&mut self, dst: CheckBuf, src: &[u8]) -> Result<(), OpError>;
     /// 设备 → host 回读(**独立参考比对的唯一入口**)
     fn download(&mut self, src: CheckBuf, dst: &mut [u8]) -> Result<(), OpError>;
@@ -81,7 +89,13 @@ pub struct CheckReport {
 impl CheckReport {
     /// 纯数值型报告(无数值越界 = `first_bad: None`)
     pub fn numeric(op: &'static str, worst_abs_err: f32, tolerance: f32) -> Self {
-        Self { op, worst_abs_err, first_bad: None, tolerance, poison_untouched: None }
+        Self {
+            op,
+            worst_abs_err,
+            first_bad: None,
+            tolerance,
+            poison_untouched: None,
+        }
     }
 }
 

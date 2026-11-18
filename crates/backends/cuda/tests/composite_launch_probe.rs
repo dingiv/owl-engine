@@ -86,7 +86,11 @@ async fn composites_hold_stream_order_and_closed_set_validation() {
     let out_b = c
         .upload_and_launch(
             &b,
-            vec![owl_cuda::UpChunk { offset_bytes: 0, len_bytes: n * 4, lease }],
+            vec![owl_cuda::UpChunk {
+                offset_bytes: 0,
+                len_bytes: n * 4,
+                lease,
+            }],
             add_msg(&a, &b, &out1, n),
         )
         .await
@@ -152,9 +156,14 @@ async fn composites_are_rejected_during_capture() {
     }
     let mut c = assemble();
     let n = 256usize;
-    let a = owl_iface::htod!(c, Dtype::F32, &Shape::from(vec![n]), &le_f32(&vec![1.0f32; n]))
-        .await
-        .expect("htod A");
+    let a = owl_iface::htod!(
+        c,
+        Dtype::F32,
+        &Shape::from(vec![n]),
+        &le_f32(&vec![1.0f32; n])
+    )
+    .await
+    .expect("htod A");
     let b = owl_iface::client_alloc!(c, Dtype::F32, n)
         .await
         .expect("alloc B")
@@ -171,7 +180,11 @@ async fn composites_are_rejected_during_capture() {
     let e1 = c
         .upload_and_launch(
             &b,
-            vec![owl_cuda::UpChunk { offset_bytes: 0, len_bytes: n * 4, lease }],
+            vec![owl_cuda::UpChunk {
+                offset_bytes: 0,
+                len_bytes: n * 4,
+                lease,
+            }],
             add_msg(&a, &b, &out, n),
         )
         .await
@@ -208,10 +221,18 @@ async fn block_ledger_is_clean() {
     let mut c = assemble();
     let n = 4096usize;
     // 造一批块(不同尺寸 ⇒ 尽量压到不同尺寸类/复用面)
-    let a = owl_iface::htod!(c, Dtype::F32, &Shape::from(vec![n]), &le_f32(&vec![1.0f32; n]))
+    let a = owl_iface::htod!(
+        c,
+        Dtype::F32,
+        &Shape::from(vec![n]),
+        &le_f32(&vec![1.0f32; n])
+    )
+    .await
+    .expect("htod");
+    let b = owl_iface::client_alloc!(c, Dtype::F32, n)
         .await
-        .expect("htod");
-    let b = owl_iface::client_alloc!(c, Dtype::F32, n).await.expect("alloc").view(Dtype::F32, 1);
+        .expect("alloc")
+        .view(Dtype::F32, 1);
     let big = owl_iface::client_alloc!(c, Dtype::F32, n * 64)
         .await
         .expect("alloc big")
@@ -222,7 +243,11 @@ async fn block_ledger_is_clean() {
     assert!(!rows.is_empty(), "账本不应为空");
     let mut ids: Vec<u64> = rows.iter().map(|r| r.id).collect();
     ids.sort_unstable();
-    let dups: Vec<u64> = ids.windows(2).filter(|w| w[0] == w[1]).map(|w| w[0]).collect();
+    let dups: Vec<u64> = ids
+        .windows(2)
+        .filter(|w| w[0] == w[1])
+        .map(|w| w[0])
+        .collect();
     assert!(dups.is_empty(), "同 id 两条目(账本被顶掉/复用): {dups:?}");
 
     let mut by_addr: Vec<(u64, usize, u64)> =

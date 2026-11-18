@@ -112,12 +112,27 @@ impl DraftSpec {
         let block = kv.usize(&p("block_size")).map_err(&m)?;
         let rank = kv.usize(&p("selector_rank")).map_err(&m)?;
         let top_k = kv.usize(&p("selector_top_k")).map_err(&m)?;
-        let conv_taps = kv.opt_usize(&p("conv_kernel_size")).map_err(&m)?.unwrap_or_else(|| Self::family_fallback(TAPS, "conv_kernel_size"));
-        let conv_group = kv.opt_usize(&p("conv_group_size")).map_err(&m)?.unwrap_or_else(|| Self::family_fallback(GROUP, "conv_group_size"));
-        let causal = kv.opt_bool(&p("attention.causal")).map_err(&m)?.unwrap_or(false);
+        let conv_taps = kv
+            .opt_usize(&p("conv_kernel_size"))
+            .map_err(&m)?
+            .unwrap_or_else(|| Self::family_fallback(TAPS, "conv_kernel_size"));
+        let conv_group = kv
+            .opt_usize(&p("conv_group_size"))
+            .map_err(&m)?
+            .unwrap_or_else(|| Self::family_fallback(GROUP, "conv_group_size"));
+        let causal = kv
+            .opt_bool(&p("attention.causal"))
+            .map_err(&m)?
+            .unwrap_or(false);
         let sliding_window = kv.opt_usize(&p("attention.sliding_window")).map_err(&m)?;
-        let rope_max_pos = kv.opt_usize(&p("context_length")).map_err(&m)?.unwrap_or(262_144);
-        let rope_theta = kv.opt_f32(&p("rope.freq_base")).map_err(&m)?.unwrap_or(1.0e7);
+        let rope_max_pos = kv
+            .opt_usize(&p("context_length"))
+            .map_err(&m)?
+            .unwrap_or(262_144);
+        let rope_theta = kv
+            .opt_f32(&p("rope.freq_base"))
+            .map_err(&m)?
+            .unwrap_or(1.0e7);
         let mask_token = match kv.opt_u32("dflash.mask_token_id").map_err(&m)? {
             Some(v) => v,
             None => Self::FAMILY_27B_MASK_TOKEN,
@@ -131,10 +146,14 @@ impl DraftSpec {
             )));
         }
         if hd != vd {
-            return Err(m(format!("key_length {hd} ≠ value_length {vd}(草稿注意力两者必须同宽)")));
+            return Err(m(format!(
+                "key_length {hd} ≠ value_length {vd}(草稿注意力两者必须同宽)"
+            )));
         }
         if layers == 0 || hkv == 0 || hq % hkv != 0 {
-            return Err(m(format!("头/层几何不成立:layers {layers} · hq {hq} · hkv {hkv}")));
+            return Err(m(format!(
+                "头/层几何不成立:layers {layers} · hq {hq} · hkv {hkv}"
+            )));
         }
         if block != BLOCK {
             return Err(m(format!(
@@ -145,16 +164,20 @@ impl DraftSpec {
             owl_shared::log_info!("dflash", "草稿注意力 = 非因果块(causal=false;ENCODER_ONLY)");
         } else {
             return Err(m(
-                "`dflash.attention.causal = true`:草稿线只支持非因果块注意力(sglang 同构)"
-                    .into(),
+                "`dflash.attention.causal = true`:草稿线只支持非因果块注意力(sglang 同构)".into(),
             ));
         }
 
         // ---- taps:**1-based → 0-based**(最高危的一条) ----
-        let raw = kv.opt_u32s(&p("target_layers")).map_err(&m)?.ok_or_else(|| {
-            m("缺键 `dflash.target_layers`(草稿的 taps 声明,无它无法对齐 target 层)"
-                .to_string())
-        })?;
+        let raw = kv
+            .opt_u32s(&p("target_layers"))
+            .map_err(&m)?
+            .ok_or_else(|| {
+                m(
+                    "缺键 `dflash.target_layers`(草稿的 taps 声明,无它无法对齐 target 层)"
+                        .to_string(),
+                )
+            })?;
         if raw.is_empty() {
             return Err(m("`dflash.target_layers` 为空".into()));
         }

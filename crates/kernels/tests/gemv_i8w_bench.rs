@@ -28,7 +28,6 @@ use owl_kernels::device::{DevPtr, DeviceRes, Exec, LaunchNote, ScratchBuf};
 // §1 测试资源面(最小实现;与 ln_elems_bench.rs 同款 —— 勿改语义)
 // ============================================================================
 
-
 struct TestRes {
     ctx: Arc<CudaContext>,
     stream: Arc<CudaStream>,
@@ -44,7 +43,12 @@ impl TestRes {
         let ctx = CudaContext::new(ordinal).expect("ctx");
         ctx.bind_to_thread().expect("bind");
         let stream = ctx.default_stream();
-        Some(Self { ctx, stream, blocks: HashMap::new(), next: 1 })
+        Some(Self {
+            ctx,
+            stream,
+            blocks: HashMap::new(),
+            next: 1,
+        })
     }
     fn blk(&mut self, nbytes: usize, tag: &str) -> u64 {
         match self.alloc_block(nbytes, tag) {
@@ -80,7 +84,8 @@ impl TestRes {
         }
     }
     fn ptr(&self, id: u64) -> u64 {
-        self.resolve(id).unwrap_or_else(|e| panic!("resolve(id={id}): {e:?}"))
+        self.resolve(id)
+            .unwrap_or_else(|e| panic!("resolve(id={id}): {e:?}"))
     }
     fn sync(&self) {
         self.stream.synchronize().expect("sync");
@@ -95,28 +100,35 @@ impl DeviceRes for TestRes {
         Ok(self.stream.clone())
     }
     fn resolve(&self, id: u64) -> Result<DevPtr, OpError> {
-        self.blocks.get(&id).map(|s| s.device_ptr(&self.stream).0).ok_or_else(|| OpError::Contract {
-            op: "bench".into(),
-            field: "resolve",
-            expect: "块在册".into(),
-            got: format!("id={id}"),
-        })
+        self.blocks
+            .get(&id)
+            .map(|s| s.device_ptr(&self.stream).0)
+            .ok_or_else(|| OpError::Contract {
+                op: "bench".into(),
+                field: "resolve",
+                expect: "块在册".into(),
+                got: format!("id={id}"),
+            })
     }
     fn resolve_len(&self, id: u64) -> Result<usize, OpError> {
-        self.blocks.get(&id).map(|s| s.len()).ok_or_else(|| OpError::Contract {
-            op: "bench".into(),
-            field: "resolve_len",
-            expect: "块在册".into(),
-            got: format!("id={id}"),
-        })
+        self.blocks
+            .get(&id)
+            .map(|s| s.len())
+            .ok_or_else(|| OpError::Contract {
+                op: "bench".into(),
+                field: "resolve_len",
+                expect: "块在册".into(),
+                got: format!("id={id}"),
+            })
     }
     fn alloc(&mut self, bytes: usize, _tag: &str) -> Result<ScratchBuf, OpError> {
-        let s = unsafe { self.stream.alloc::<u8>(bytes.max(1)) }.map_err(|e| OpError::Contract {
-            op: "bench".into(),
-            field: "alloc",
-            expect: "设备分配".into(),
-            got: format!("{e:?}"),
-        })?;
+        let s =
+            unsafe { self.stream.alloc::<u8>(bytes.max(1)) }.map_err(|e| OpError::Contract {
+                op: "bench".into(),
+                field: "alloc",
+                expect: "设备分配".into(),
+                got: format!("{e:?}"),
+            })?;
         let ptr = s.device_ptr(&self.stream).0;
         Ok(ScratchBuf { ptr, bytes })
     }
@@ -138,31 +150,37 @@ impl DeviceRes for TestRes {
         Ok(self.ctx.ordinal() as i32)
     }
     fn alloc_block(&mut self, bytes: usize, _tag: &str) -> Result<Bytes, OpError> {
-        let s = unsafe { self.stream.alloc::<u8>(bytes.max(1)) }.map_err(|e| OpError::Contract {
-            op: "bench".into(),
-            field: "alloc_block",
-            expect: "设备分配".into(),
-            got: format!("{e:?}"),
-        })?;
+        let s =
+            unsafe { self.stream.alloc::<u8>(bytes.max(1)) }.map_err(|e| OpError::Contract {
+                op: "bench".into(),
+                field: "alloc_block",
+                expect: "设备分配".into(),
+                got: format!("{e:?}"),
+            })?;
         let id = self.next;
         self.next += 1;
         self.blocks.insert(id, s);
         Ok(Bytes::new(id, bytes, Dtype::U8, 0))
     }
     fn upload_block(&mut self, b: &Bytes, src: &[u8]) -> Result<(), OpError> {
-        let s = self.blocks.get_mut(&b.id).ok_or_else(|| OpError::Contract {
-            op: "bench".into(),
-            field: "upload_block",
-            expect: "块在册".into(),
-            got: format!("id={}", b.id),
-        })?;
+        let s = self
+            .blocks
+            .get_mut(&b.id)
+            .ok_or_else(|| OpError::Contract {
+                op: "bench".into(),
+                field: "upload_block",
+                expect: "块在册".into(),
+                got: format!("id={}", b.id),
+            })?;
         let n = src.len().min(s.len());
-        self.stream.memcpy_htod(&src[..n], &mut *s).map_err(|e| OpError::Contract {
-            op: "bench".into(),
-            field: "upload_block",
-            expect: "htod".into(),
-            got: format!("{e:?}"),
-        })
+        self.stream
+            .memcpy_htod(&src[..n], &mut *s)
+            .map_err(|e| OpError::Contract {
+                op: "bench".into(),
+                field: "upload_block",
+                expect: "htod".into(),
+                got: format!("{e:?}"),
+            })
     }
     fn download(&mut self, src: DevPtr, dst: &mut [u8]) -> Result<(), OpError> {
         let id = self
@@ -178,17 +196,18 @@ impl DeviceRes for TestRes {
             })?;
         let s = self.blocks.get(&id).expect("刚找到");
         let mut tmp = vec![0u8; s.len()];
-        self.stream.memcpy_dtoh(s, &mut tmp).map_err(|e| OpError::Contract {
-            op: "bench".into(),
-            field: "download",
-            expect: "dtoh".into(),
-            got: format!("{e:?}"),
-        })?;
+        self.stream
+            .memcpy_dtoh(s, &mut tmp)
+            .map_err(|e| OpError::Contract {
+                op: "bench".into(),
+                field: "download",
+                expect: "dtoh".into(),
+                got: format!("{e:?}"),
+            })?;
         dst.copy_from_slice(&tmp[..dst.len()]);
         Ok(())
     }
 }
-
 
 // ============================================================================
 // §2 台
@@ -206,8 +225,16 @@ fn fire(
     smem: u32,
     vals: &[LaunchVal],
 ) {
-    if let Err(e) = exec.launch(res, OpId(owl_kernels::spec::NATIVE), f, entry, grid, block, smem, vals)
-    {
+    if let Err(e) = exec.launch(
+        res,
+        OpId(owl_kernels::spec::NATIVE),
+        f,
+        entry,
+        grid,
+        block,
+        smem,
+        vals,
+    ) {
         panic!("launch({entry}) grid={grid:?} block={block:?}: {e:?}");
     }
 }
@@ -253,12 +280,14 @@ fn rnd(seed: u32, i: usize) -> f32 {
 #[allow(clippy::needless_range_loop)]
 fn bench_one(res: &mut TestRes, entry: &'static str, src: &'static str, rows: usize, cols: usize) {
     let mut exec = Exec::new();
-    let f = exec.load_aot(res, src, entry, OpId(owl_kernels::spec::NATIVE)).expect("资产");
+    let f = exec
+        .load_aot(res, src, entry, OpId(owl_kernels::spec::NATIVE))
+        .expect("资产");
 
     // 权重:~N(0, 0.02) 截断后 per-row 对称量化(与装载器同一式)
     let mut wq = vec![0i8; rows * cols];
     let mut sc = vec![0f32; rows];
-    let mut wf = vec![0f32; rows * cols];   // host 参考用(反量化后的权重)
+    let mut wf = vec![0f32; rows * cols]; // host 参考用(反量化后的权重)
     for r in 0..rows {
         let mut mx = 0.0f32;
         let mut row = vec![0f32; cols];
@@ -277,13 +306,17 @@ fn bench_one(res: &mut TestRes, entry: &'static str, src: &'static str, rows: us
             wf[r * cols + k] = q * s;
         }
     }
-    let x: Vec<u16> = (0..cols).map(|k| f16::from_f32((rnd(0x72, k) - 0.5) * 0.1).to_bits()).collect();
+    let x: Vec<u16> = (0..cols)
+        .map(|k| f16::from_f32((rnd(0x72, k) - 0.5) * 0.1).to_bits())
+        .collect();
 
     // host f32 参考(逐行,顺序累加 —— 与核的 fp32 累加同域,容差只看量化误差)
     let xf: Vec<f32> = x.iter().map(|b| f16::from_bits(*b).to_f32()).collect();
     let mut want = vec![0f32; rows];
     for r in 0..rows {
-        let z: f64 = (0..cols).map(|k| wf[r * cols + k] as f64 * xf[k] as f64).sum();
+        let z: f64 = (0..cols)
+            .map(|k| wf[r * cols + k] as f64 * xf[k] as f64)
+            .sum();
         want[r] = z as f32;
     }
 
@@ -292,8 +325,14 @@ fn bench_one(res: &mut TestRes, entry: &'static str, src: &'static str, rows: us
     let bx = res.blk(cols * 2, "x");
     let by = res.blk(rows * 2, "y");
     res.up(bw, &wq.iter().map(|v| *v as u8).collect::<Vec<u8>>());
-    res.up(bs, &sc.iter().flat_map(|v| v.to_le_bytes()).collect::<Vec<u8>>());
-    res.up(bx, &x.iter().flat_map(|v| v.to_le_bytes()).collect::<Vec<u8>>());
+    res.up(
+        bs,
+        &sc.iter().flat_map(|v| v.to_le_bytes()).collect::<Vec<u8>>(),
+    );
+    res.up(
+        bx,
+        &x.iter().flat_map(|v| v.to_le_bytes()).collect::<Vec<u8>>(),
+    );
     let (pw, ps, px, py) = (res.ptr(bw), res.ptr(bs), res.ptr(bx), res.ptr(by));
 
     let prod = owl_kernels::driver::elems::gemv_i8w(rows, cols, 1);
@@ -342,7 +381,12 @@ fn bench_mt(res: &mut TestRes, rows: usize, cols: usize, tokens: usize) {
     let mut exec = Exec::new();
     let src = <owl_kernels::ops::elems::GemvI8wF16 as owl_kernels::spec::KernelSpec>::SRC;
     let f_old = exec
-        .load_aot(res, src, "owl_gemv_i8w_f16", OpId(owl_kernels::spec::NATIVE))
+        .load_aot(
+            res,
+            src,
+            "owl_gemv_i8w_f16",
+            OpId(owl_kernels::spec::NATIVE),
+        )
         .expect("old 资产");
     let prod = owl_kernels::driver::elems::gemv_i8w(rows, cols, tokens);
     let f_new = exec
@@ -377,9 +421,21 @@ fn bench_mt(res: &mut TestRes, rows: usize, cols: usize, tokens: usize) {
     let byo = res.blk(tokens * rows * 2, "y_old");
     let byn = res.blk(tokens * rows * 2, "y_new");
     res.up(bw, &wq.iter().map(|v| *v as u8).collect::<Vec<u8>>());
-    res.up(bs, &sc.iter().flat_map(|v| v.to_le_bytes()).collect::<Vec<u8>>());
-    res.up(bx, &x.iter().flat_map(|v| v.to_le_bytes()).collect::<Vec<u8>>());
-    let (pw, ps, px, pyo, pyn) = (res.ptr(bw), res.ptr(bs), res.ptr(bx), res.ptr(byo), res.ptr(byn));
+    res.up(
+        bs,
+        &sc.iter().flat_map(|v| v.to_le_bytes()).collect::<Vec<u8>>(),
+    );
+    res.up(
+        bx,
+        &x.iter().flat_map(|v| v.to_le_bytes()).collect::<Vec<u8>>(),
+    );
+    let (pw, ps, px, pyo, pyn) = (
+        res.ptr(bw),
+        res.ptr(bs),
+        res.ptr(bx),
+        res.ptr(byo),
+        res.ptr(byn),
+    );
 
     // 旧核:grid.y = tokens,每个 token 各读一遍权重
     let old_grid = (rows.div_ceil(8) as u32, tokens as u32, 1);
@@ -393,7 +449,16 @@ fn bench_mt(res: &mut TestRes, rows: usize, cols: usize, tokens: usize) {
         LaunchVal::I32(cols as i32),
         LaunchVal::Ptr(pyo),
     ];
-    fire(res, &mut exec, &f_old, "owl_gemv_i8w_f16", old_grid, old_block, old_smem, &old_vals);
+    fire(
+        res,
+        &mut exec,
+        &f_old,
+        "owl_gemv_i8w_f16",
+        old_grid,
+        old_block,
+        old_smem,
+        &old_vals,
+    );
 
     // 新核:driver 在 tokens=7 时选 mt7,其余 >1 选 mt8
     let (new_grid, new_block, new_smem) = (prod.shape.grid, prod.shape.block, prod.shape.smem);
@@ -406,7 +471,9 @@ fn bench_mt(res: &mut TestRes, rows: usize, cols: usize, tokens: usize) {
         LaunchVal::I32(tokens as i32),
         LaunchVal::Ptr(pyn),
     ];
-    fire(res, &mut exec, &f_new, prod.name, new_grid, new_block, new_smem, &new_vals);
+    fire(
+        res, &mut exec, &f_new, prod.name, new_grid, new_block, new_smem, &new_vals,
+    );
     res.sync();
 
     let mut yo = vec![0u8; tokens * rows * 2];
@@ -417,9 +484,11 @@ fn bench_mt(res: &mut TestRes, rows: usize, cols: usize, tokens: usize) {
     let mut max_ref = 0.0f32;
     let mut diff = 0usize;
     for v in 0..tokens * rows {
-        let o = f16::from_bits(u16::from_le_bytes([yo[v*2], yo[v*2+1]])).to_f32();
-        let n = f16::from_bits(u16::from_le_bytes([yn[v*2], yn[v*2+1]])).to_f32();
-        if yo[v*2] != yn[v*2] || yo[v*2+1] != yn[v*2+1] { diff += 1; }
+        let o = f16::from_bits(u16::from_le_bytes([yo[v * 2], yo[v * 2 + 1]])).to_f32();
+        let n = f16::from_bits(u16::from_le_bytes([yn[v * 2], yn[v * 2 + 1]])).to_f32();
+        if yo[v * 2] != yn[v * 2] || yo[v * 2 + 1] != yn[v * 2 + 1] {
+            diff += 1;
+        }
         max_abs = max_abs.max((o - n).abs());
         max_ref = max_ref.max(o.abs());
     }
@@ -427,8 +496,21 @@ fn bench_mt(res: &mut TestRes, rows: usize, cols: usize, tokens: usize) {
         max_abs <= (max_ref * 1e-3).max(1e-6),
         "多 token 快路与旧核偏差过大:max|Δ|={max_abs} / max|ref|={max_ref}(diff {diff})"
     );
-    let us_old = time_us(res, &mut exec, &f_old, "owl_gemv_i8w_f16", old_grid, old_block, old_smem, &old_vals, 10, 1);
-    let us_new = time_us(res, &mut exec, &f_new, prod.name, new_grid, new_block, new_smem, &new_vals, 30, 1);
+    let us_old = time_us(
+        res,
+        &mut exec,
+        &f_old,
+        "owl_gemv_i8w_f16",
+        old_grid,
+        old_block,
+        old_smem,
+        &old_vals,
+        10,
+        1,
+    );
+    let us_new = time_us(
+        res, &mut exec, &f_new, prod.name, new_grid, new_block, new_smem, &new_vals, 30, 1,
+    );
     let wbytes = (rows * cols) as f64;
     println!(
         "  rows={rows:<7} cols={cols:<5} tokens={tokens}  old {us_old:>8.1} µs({:>6.1} GB/s) · \
@@ -474,14 +556,29 @@ fn gemv_i8w_mt_bench() {
 fn bench_a8(res: &mut TestRes, rows: usize, cols: usize, tokens: usize) {
     let mut exec = Exec::new();
     let fscale = exec
-        .load_aot(res, "cu/elems/quant_i8_act.cu", "owl_quant_i8_act_scale_f16", OpId(owl_kernels::spec::NATIVE))
+        .load_aot(
+            res,
+            "cu/elems/quant_i8_act.cu",
+            "owl_quant_i8_act_scale_f16",
+            OpId(owl_kernels::spec::NATIVE),
+        )
         .expect("a8 scale 资产");
     let fq = exec
-        .load_aot(res, "cu/elems/quant_i8_act.cu", "owl_quant_i8_act_q_f16", OpId(owl_kernels::spec::NATIVE))
+        .load_aot(
+            res,
+            "cu/elems/quant_i8_act.cu",
+            "owl_quant_i8_act_q_f16",
+            OpId(owl_kernels::spec::NATIVE),
+        )
         .expect("a8 q 资产");
     let prod = owl_kernels::driver::elems::gemv_i8w_a8_f16(rows, cols, tokens);
     let fg = exec
-        .load_aot(res, "cu/elems/gemv_i8w_a8.cu", prod.name, OpId(owl_kernels::spec::NATIVE))
+        .load_aot(
+            res,
+            "cu/elems/gemv_i8w_a8.cu",
+            prod.name,
+            OpId(owl_kernels::spec::NATIVE),
+        )
         .expect("a8 gemv 资产");
 
     // 权重:与 W8A16 台同分布
@@ -517,7 +614,9 @@ fn bench_a8(res: &mut TestRes, rows: usize, cols: usize, tokens: usize) {
         let s = if mx > 0.0 { mx / 127.0 } else { 1.0 };
         sx[t] = s;
         for k in 0..cols {
-            qh[t * cols + k] = (xf[t * cols + k] / s).round_ties_even().clamp(-127.0, 127.0) as i8;
+            qh[t * cols + k] = (xf[t * cols + k] / s)
+                .round_ties_even()
+                .clamp(-127.0, 127.0) as i8;
         }
     }
 
@@ -528,10 +627,21 @@ fn bench_a8(res: &mut TestRes, rows: usize, cols: usize, tokens: usize) {
     let bsx = res.blk(tokens * 4, "sx");
     let by = res.blk(tokens * rows * 2, "y");
     res.up(bw, &wq.iter().map(|v| *v as u8).collect::<Vec<u8>>());
-    res.up(bsw, &sw.iter().flat_map(|v| v.to_le_bytes()).collect::<Vec<u8>>());
-    res.up(bx, &x.iter().flat_map(|v| v.to_le_bytes()).collect::<Vec<u8>>());
+    res.up(
+        bsw,
+        &sw.iter().flat_map(|v| v.to_le_bytes()).collect::<Vec<u8>>(),
+    );
+    res.up(
+        bx,
+        &x.iter().flat_map(|v| v.to_le_bytes()).collect::<Vec<u8>>(),
+    );
     let (pw, psw, px, pq, psx, py) = (
-        res.ptr(bw), res.ptr(bsw), res.ptr(bx), res.ptr(bq), res.ptr(bsx), res.ptr(by),
+        res.ptr(bw),
+        res.ptr(bsw),
+        res.ptr(bx),
+        res.ptr(bq),
+        res.ptr(bsx),
+        res.ptr(by),
     );
 
     let scale_vals = [
@@ -559,9 +669,36 @@ fn bench_a8(res: &mut TestRes, rows: usize, cols: usize, tokens: usize) {
     ];
     let scale_grid = (tokens as u32, 1, 1);
     let q_grid = (tokens as u32, 1, 1);
-    fire(res, &mut exec, &fscale, "owl_quant_i8_act_scale_f16", scale_grid, (256,1,1), 0, &scale_vals);
-    fire(res, &mut exec, &fq, "owl_quant_i8_act_q_f16", q_grid, (256,1,1), 0, &q_vals);
-    fire(res, &mut exec, &fg, prod.name, prod.shape.grid, prod.shape.block, prod.shape.smem, &g_vals);
+    fire(
+        res,
+        &mut exec,
+        &fscale,
+        "owl_quant_i8_act_scale_f16",
+        scale_grid,
+        (256, 1, 1),
+        0,
+        &scale_vals,
+    );
+    fire(
+        res,
+        &mut exec,
+        &fq,
+        "owl_quant_i8_act_q_f16",
+        q_grid,
+        (256, 1, 1),
+        0,
+        &q_vals,
+    );
+    fire(
+        res,
+        &mut exec,
+        &fg,
+        prod.name,
+        prod.shape.grid,
+        prod.shape.block,
+        prod.shape.smem,
+        &g_vals,
+    );
     res.sync();
 
     // 小形状:与 host 整数点积对拍(权重/激活都是同一份 int8)
@@ -577,18 +714,61 @@ fn bench_a8(res: &mut TestRes, rows: usize, cols: usize, tokens: usize) {
                     acc += (wq[r * cols + k] as i64) * (qh[t * cols + k] as i64);
                 }
                 let want = acc as f32 * (sw[r] * sx[t]);
-                let got = f16::from_bits(u16::from_le_bytes([got[(t * rows + r) * 2], got[(t * rows + r) * 2 + 1]])).to_f32();
+                let got = f16::from_bits(u16::from_le_bytes([
+                    got[(t * rows + r) * 2],
+                    got[(t * rows + r) * 2 + 1],
+                ]))
+                .to_f32();
                 max_abs = max_abs.max((got - want).abs());
                 max_ref = max_ref.max(want.abs());
             }
         }
-        assert!(max_abs <= (max_ref * 1e-3).max(1e-5), "W8A8 host 对拍:max|Δ|={max_abs}/max|ref|={max_ref}");
-        eprintln!("  W8A8 host 对拍 rows={rows} cols={cols}: max|Δ|/max|ref| = {:.2e}", max_abs / max_ref.max(1e-6));
+        assert!(
+            max_abs <= (max_ref * 1e-3).max(1e-5),
+            "W8A8 host 对拍:max|Δ|={max_abs}/max|ref|={max_ref}"
+        );
+        eprintln!(
+            "  W8A8 host 对拍 rows={rows} cols={cols}: max|Δ|/max|ref| = {:.2e}",
+            max_abs / max_ref.max(1e-6)
+        );
     }
 
-    let us_scale = time_us(res, &mut exec, &fscale, "owl_quant_i8_act_scale_f16", scale_grid, (256,1,1), 0, &scale_vals, 20, 1);
-    let us_q = time_us(res, &mut exec, &fq, "owl_quant_i8_act_q_f16", q_grid, (256,1,1), 0, &q_vals, 20, 1);
-    let us_g = time_us(res, &mut exec, &fg, prod.name, prod.shape.grid, prod.shape.block, prod.shape.smem, &g_vals, 20, 1);
+    let us_scale = time_us(
+        res,
+        &mut exec,
+        &fscale,
+        "owl_quant_i8_act_scale_f16",
+        scale_grid,
+        (256, 1, 1),
+        0,
+        &scale_vals,
+        20,
+        1,
+    );
+    let us_q = time_us(
+        res,
+        &mut exec,
+        &fq,
+        "owl_quant_i8_act_q_f16",
+        q_grid,
+        (256, 1, 1),
+        0,
+        &q_vals,
+        20,
+        1,
+    );
+    let us_g = time_us(
+        res,
+        &mut exec,
+        &fg,
+        prod.name,
+        prod.shape.grid,
+        prod.shape.block,
+        prod.shape.smem,
+        &g_vals,
+        20,
+        1,
+    );
     println!(
         "  W8A8 rows={rows:<7} cols={cols:<5} tokens={tokens}  scale {us_scale:>7.1} µs · q {us_q:>7.1} µs · gemv {us_g:>7.1} µs · total {:.1} µs",
         us_scale + us_q + us_g
@@ -597,7 +777,9 @@ fn bench_a8(res: &mut TestRes, rows: usize, cols: usize, tokens: usize) {
 
 #[test]
 fn gemv_i8w_a8_bench() {
-    let Some(mut res) = TestRes::new() else { return; };
+    let Some(mut res) = TestRes::new() else {
+        return;
+    };
     println!("\n═══ W8A8 head(per-token int8 激活 + dp4a)");
     bench_a8(&mut res, 64, 128, 8); // host 对拍
     let rows = owl_shared::env_reader::parse_or("OWL_A8_ROWS", 124160usize);
@@ -655,7 +837,9 @@ fn bench_tc(res: &mut TestRes, rows: usize, cols: usize, tokens: usize, parity: 
         let s = if mx > 0.0 { mx / 127.0 } else { 1.0 };
         sx[t] = s;
         for k in 0..cols {
-            qh[t * cols + k] = (xf[t * cols + k] / s).round_ties_even().clamp(-127.0, 127.0) as i8;
+            qh[t * cols + k] = (xf[t * cols + k] / s)
+                .round_ties_even()
+                .clamp(-127.0, 127.0) as i8;
         }
     }
 
@@ -665,11 +849,21 @@ fn bench_tc(res: &mut TestRes, rows: usize, cols: usize, tokens: usize, parity: 
     let bsx = res.blk(tokens * 4, "tc.sx");
     let by = res.blk(tokens * rows * 2, "tc.y");
     res.up(bw, &wq.iter().map(|v| *v as u8).collect::<Vec<u8>>());
-    res.up(bsw, &sw.iter().flat_map(|v| v.to_le_bytes()).collect::<Vec<u8>>());
+    res.up(
+        bsw,
+        &sw.iter().flat_map(|v| v.to_le_bytes()).collect::<Vec<u8>>(),
+    );
     res.up(bq, &qh.iter().map(|v| *v as u8).collect::<Vec<u8>>());
-    res.up(bsx, &sx.iter().flat_map(|v| v.to_le_bytes()).collect::<Vec<u8>>());
+    res.up(
+        bsx,
+        &sx.iter().flat_map(|v| v.to_le_bytes()).collect::<Vec<u8>>(),
+    );
     let (pw, psw, pq, psx, py) = (
-        res.ptr(bw), res.ptr(bsw), res.ptr(bq), res.ptr(bsx), res.ptr(by),
+        res.ptr(bw),
+        res.ptr(bsw),
+        res.ptr(bq),
+        res.ptr(bsx),
+        res.ptr(by),
     );
     let vals = [
         LaunchVal::Ptr(pw),
@@ -704,12 +898,11 @@ fn bench_tc(res: &mut TestRes, rows: usize, cols: usize, tokens: usize, parity: 
                     acc += (wq[r * cols + k] as i64) * (qh[t * cols + k] as i64);
                 }
                 let want = f16::from_f32(acc as f32 * (sw[r] * sx[t])).to_bits();
-                let hit = u16::from_le_bytes([got[(t * rows + r) * 2], got[(t * rows + r) * 2 + 1]]);
+                let hit =
+                    u16::from_le_bytes([got[(t * rows + r) * 2], got[(t * rows + r) * 2 + 1]]);
                 if want != hit {
                     if bad < 5 {
-                        eprintln!(
-                            "  TC bad t{t} r{r}: want {want:04x} got {hit:04x}"
-                        );
+                        eprintln!("  TC bad t{t} r{r}: want {want:04x} got {hit:04x}");
                     }
                     bad += 1;
                 }
@@ -795,8 +988,14 @@ fn bench_a16_tc(res: &mut TestRes, rows: usize, cols: usize, tokens: usize, pari
     let bx = res.blk(tokens * cols * 2, "a16.x");
     let by = res.blk(tokens * rows * 2, "a16.y");
     res.up(bw, &wq.iter().map(|v| *v as u8).collect::<Vec<u8>>());
-    res.up(bsw, &sw.iter().flat_map(|v| v.to_le_bytes()).collect::<Vec<u8>>());
-    res.up(bx, &x.iter().flat_map(|v| v.to_le_bytes()).collect::<Vec<u8>>());
+    res.up(
+        bsw,
+        &sw.iter().flat_map(|v| v.to_le_bytes()).collect::<Vec<u8>>(),
+    );
+    res.up(
+        bx,
+        &x.iter().flat_map(|v| v.to_le_bytes()).collect::<Vec<u8>>(),
+    );
     let (pw, psw, px, py) = (res.ptr(bw), res.ptr(bsw), res.ptr(bx), res.ptr(by));
     let vals = [
         LaunchVal::Ptr(pw),
@@ -832,7 +1031,11 @@ fn bench_a16_tc(res: &mut TestRes, rows: usize, cols: usize, tokens: usize, pari
                     acc += xv * (wq[r * cols + k] as f32);
                 }
                 let want = acc * sw[r];
-                let got = f16::from_bits(u16::from_le_bytes([got[(t * rows + r) * 2], got[(t * rows + r) * 2 + 1]])).to_f32();
+                let got = f16::from_bits(u16::from_le_bytes([
+                    got[(t * rows + r) * 2],
+                    got[(t * rows + r) * 2 + 1],
+                ]))
+                .to_f32();
                 max_abs = max_abs.max((got - want).abs());
                 max_ref = max_ref.max(want.abs());
             }

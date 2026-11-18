@@ -35,7 +35,10 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
                     let (from, to) = self.bank.parts().rel.plan_rekey_snap_disk(*old, *new)?;
                     match crate::disk_io::rename_block(from, to).await {
                         Ok(()) => {
-                            self.bank.parts_mut().rel.commit_rekey_snap_disk(*old, *new)?;
+                            self.bank
+                                .parts_mut()
+                                .rel
+                                .commit_rekey_snap_disk(*old, *new)?;
                             rekeyed += 1;
                         }
                         Err(e) => {
@@ -46,11 +49,7 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
                 }
             }
         }
-        owl_shared::log_info!(
-            "img-evict",
-            "盘层快照收尾:重挂 {} 条",
-            rekeyed
-        );
+        owl_shared::log_info!("img-evict", "盘层快照收尾:重挂 {} 条", rekeyed);
         Ok(())
     }
 }

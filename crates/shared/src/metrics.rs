@@ -340,12 +340,20 @@ impl MetricsStore {
     }
 
     pub fn with_cap(cap_per_tag: usize) -> Self {
-        Self { inner: Mutex::new(Inner::default()), cap_per_tag, level: AtomicU8::new(level::HOST) }
+        Self {
+            inner: Mutex::new(Inner::default()),
+            cap_per_tag,
+            level: AtomicU8::new(level::HOST),
+        }
     }
 
     /// 带分级的显式构造(测试/基准域;隔离级别的唯一安全形态)
     pub fn with_cap_level(cap_per_tag: usize, l: u8) -> Self {
-        Self { inner: Mutex::new(Inner::default()), cap_per_tag, level: AtomicU8::new(l.min(level::GPU)) }
+        Self {
+            inner: Mutex::new(Inner::default()),
+            cap_per_tag,
+            level: AtomicU8::new(l.min(level::GPU)),
+        }
     }
 
     /// 本 store 的运行期分级
@@ -385,10 +393,18 @@ impl MetricsStore {
         let stack = inner.open.entry(t).or_default();
         if stack.len() >= MAX_OPEN_PER_THREAD {
             #[cfg(any(debug_assertions, feature = "perf"))]
-            crate::log_debug!("metrics", "同线程开栈超限(>{MAX_OPEN_PER_THREAD}),start 被拒: {tag}");
+            crate::log_debug!(
+                "metrics",
+                "同线程开栈超限(>{MAX_OPEN_PER_THREAD}),start 被拒: {tag}"
+            );
             return;
         }
-        stack.push(OpenSpan { tag: tag.to_string(), start: Instant::now(), file, line });
+        stack.push(OpenSpan {
+            tag: tag.to_string(),
+            start: Instant::now(),
+            file,
+            line,
+        });
     }
 
     /// timer_end 实现:弹栈配对 → 样本落库(**附父 tag = 调用树边**)
@@ -396,10 +412,7 @@ impl MetricsStore {
     /// `file`/`line` 只在"无配对 start"的**诊断日志**里用(该日志本身受
     /// `debug_assertions ∨ feature="perf"` 门控)⇒ 非 perf 档它们未被读:
     /// 显式 `allow`(2026-10-17 审查清告警),不动签名(macro 面契约不变)。
-    #[cfg_attr(
-        not(any(debug_assertions, feature = "perf")),
-        allow(unused_variables)
-    )]
+    #[cfg_attr(not(any(debug_assertions, feature = "perf")), allow(unused_variables))]
     pub fn timer_end(&self, tag: &str, file: &'static str, line: u32) -> Result<(), MetricsError> {
         if !self.armed(level::HOST) {
             return Ok(());
@@ -418,8 +431,11 @@ impl MetricsStore {
         };
         let disorder = pos + 1 != stack.len();
         let open = stack.remove(pos);
-        let parent =
-            if pos > 0 { Some(stack[pos - 1].tag.clone().into_boxed_str()) } else { None };
+        let parent = if pos > 0 {
+            Some(stack[pos - 1].tag.clone().into_boxed_str())
+        } else {
+            None
+        };
         if disorder {
             *inner.out_of_order.entry(tag.to_string()).or_default() += 1;
         }
@@ -449,7 +465,11 @@ impl MetricsStore {
         if evict {
             *inner.dropped.entry(tag.to_string()).or_default() += 1;
         }
-        inner.samples.entry(tag.to_string()).or_default().push_back(sample);
+        inner
+            .samples
+            .entry(tag.to_string())
+            .or_default()
+            .push_back(sample);
     }
 
     /// 手动记录一次耗时(等价一对 start/end 的样本;无父:平铺计入)
@@ -459,8 +479,14 @@ impl MetricsStore {
         }
         let mut inner = self.inner.lock().unwrap_or_else(|p| p.into_inner());
         let t = self.thread_no(&mut inner);
-        let sample =
-            Sample { dur, at: SystemTime::now(), file, line, thread: t, parent: None };
+        let sample = Sample {
+            dur,
+            at: SystemTime::now(),
+            file,
+            line,
+            thread: t,
+            parent: None,
+        };
         self.push_sample(&mut inner, tag, sample);
     }
 
@@ -475,7 +501,10 @@ impl MetricsStore {
             return;
         }
         let mut inner = self.inner.lock().unwrap_or_else(|p| p.into_inner());
-        let e = inner.counters.entry(tag.to_string()).or_insert((0, file, line));
+        let e = inner
+            .counters
+            .entry(tag.to_string())
+            .or_insert((0, file, line));
         e.0 += n;
         e.1 = file;
         e.2 = line;
@@ -488,7 +517,10 @@ impl MetricsStore {
             return;
         }
         let mut inner = self.inner.lock().unwrap_or_else(|p| p.into_inner());
-        let e = inner.counters.entry(tag.to_string()).or_insert((0, file, line));
+        let e = inner
+            .counters
+            .entry(tag.to_string())
+            .or_insert((0, file, line));
         e.0 = v;
         e.1 = file;
         e.2 = line;
@@ -526,15 +558,17 @@ impl MetricsStore {
                 Some(m) => r.count >= m,
                 None => true,
             })
-            .filter(|r| match (
-                filter.tag.as_deref(),
-                filter.tag_prefix.as_deref(),
-                filter.tag_contains.as_deref(),
-            ) {
-                (Some(t), _, _) => r.tag == t,
-                (_, Some(p), _) => r.tag.starts_with(p),
-                (_, _, Some(c)) => r.tag.contains(c),
-                _ => true,
+            .filter(|r| {
+                match (
+                    filter.tag.as_deref(),
+                    filter.tag_prefix.as_deref(),
+                    filter.tag_contains.as_deref(),
+                ) {
+                    (Some(t), _, _) => r.tag == t,
+                    (_, Some(p), _) => r.tag.starts_with(p),
+                    (_, _, Some(c)) => r.tag.contains(c),
+                    _ => true,
+                }
             })
             .collect();
         match filter.sort {
@@ -558,7 +592,10 @@ impl MetricsStore {
         filter: &MetricsFilter,
         child_sum: &HashMap<&str, Duration>,
     ) -> TagReport {
-        let mut r = TagReport { tag: tag.to_string(), ..Default::default() };
+        let mut r = TagReport {
+            tag: tag.to_string(),
+            ..Default::default()
+        };
         if let Some(dq) = inner.samples.get(tag) {
             let mut durs: Vec<Duration> = dq
                 .iter()
@@ -581,7 +618,9 @@ impl MetricsStore {
                 r.last_line = s.line;
             }
             // 排他时间:扣掉直接子样本(since 窗口下的近似 —— 子样本未必同窗)
-            r.self_total = r.total.saturating_sub(child_sum.get(tag).copied().unwrap_or(Duration::ZERO));
+            r.self_total = r
+                .total
+                .saturating_sub(child_sum.get(tag).copied().unwrap_or(Duration::ZERO));
         }
         if let Some((c, f, l)) = inner.counters.get(tag) {
             r.counter = *c;
@@ -690,7 +729,11 @@ impl MetricsStore {
 
     /// 落盘(CSV + 同名 .json;经 [`crate::file_loader`] 统一 I/O 口)。
     /// 每轮覆写 —— 进程被 kill 也不丢账。
-    pub fn dump(&self, base: impl AsRef<std::path::Path>, filter: &MetricsFilter) -> std::io::Result<()> {
+    pub fn dump(
+        &self,
+        base: impl AsRef<std::path::Path>,
+        filter: &MetricsFilter,
+    ) -> std::io::Result<()> {
         let base = base.as_ref();
         crate::file_loader::write(base, self.export_csv(filter))?;
         let json_path = base.with_extension("json");
@@ -737,16 +780,37 @@ pub fn collect_metrics(filter: &MetricsFilter) -> Vec<TagReport> {
 pub fn query_metrics(filter: &MetricsFilter) -> Vec<TagReport> {
     let reports = collect_metrics(filter);
     if reports.is_empty() {
-        crate::log_debug!("metrics", "无匹配记录(filter: tag={:?} prefix={:?} contains={:?})",
-            filter.tag, filter.tag_prefix, filter.tag_contains);
+        crate::log_debug!(
+            "metrics",
+            "无匹配记录(filter: tag={:?} prefix={:?} contains={:?})",
+            filter.tag,
+            filter.tag_prefix,
+            filter.tag_contains
+        );
         return reports;
     }
-    crate::log_debug!("metrics", "{:<32} {:>7} {:>11} {:>10} {:>10} {:>10} {:>10} {:>5} {:>6} {:>6}  last@",
-        "tag", "count", "total", "avg", "p50", "p99", "max", "open", "orph", "drop"
+    crate::log_debug!(
+        "metrics",
+        "{:<32} {:>7} {:>11} {:>10} {:>10} {:>10} {:>10} {:>5} {:>6} {:>6}  last@",
+        "tag",
+        "count",
+        "total",
+        "avg",
+        "p50",
+        "p99",
+        "max",
+        "open",
+        "orph",
+        "drop"
     );
     for r in &reports {
-        let (f, l) = (r.last_file.rsplit('/').next().unwrap_or(r.last_file), r.last_line);
-        crate::log_debug!("metrics", "{:<32} {:>7} {:>11} {:>10} {:>10} {:>10} {:>10} {:>5} {:>6} {:>6}  {}:{}",
+        let (f, l) = (
+            r.last_file.rsplit('/').next().unwrap_or(r.last_file),
+            r.last_line,
+        );
+        crate::log_debug!(
+            "metrics",
+            "{:<32} {:>7} {:>11} {:>10} {:>10} {:>10} {:>10} {:>5} {:>6} {:>6}  {}:{}",
             truncate32(&r.tag),
             r.count,
             fmt_dur(r.total),
@@ -786,7 +850,10 @@ pub fn set_level(l: u8) {
 
 /// 当前全局分级(store 未 init 时读缺省级)
 pub fn level() -> u8 {
-    STORE.get().map(|s| s.level()).unwrap_or_else(|| DEFAULT_LEVEL.load(Ordering::Relaxed))
+    STORE
+        .get()
+        .map(|s| s.level())
+        .unwrap_or_else(|| DEFAULT_LEVEL.load(Ordering::Relaxed))
 }
 
 /// 当前分级名(`off`/`counters`/`host`/`gpu`)
@@ -798,22 +865,34 @@ pub fn level_name() -> &'static str {
 
 /// 打 epoch 标记(「只看这一轮」起点);沿用 store 既有 since 过滤面
 pub fn mark_epoch() -> SystemTime {
-    STORE.get().map(|s| s.mark_epoch()).unwrap_or_else(SystemTime::now)
+    STORE
+        .get()
+        .map(|s| s.mark_epoch())
+        .unwrap_or_else(SystemTime::now)
 }
 
 /// 按 epoch 过滤收集
 pub fn collect_since_epoch(filter: MetricsFilter) -> Vec<TagReport> {
-    STORE.get().map(|s| s.collect_since_epoch(filter)).unwrap_or_default()
+    STORE
+        .get()
+        .map(|s| s.collect_since_epoch(filter))
+        .unwrap_or_default()
 }
 
 /// CSV 导出(全局)
 pub fn export_csv(filter: &MetricsFilter) -> String {
-    STORE.get().map(|s| s.export_csv(filter)).unwrap_or_default()
+    STORE
+        .get()
+        .map(|s| s.export_csv(filter))
+        .unwrap_or_default()
 }
 
 /// JSON 导出(全局)
 pub fn export_json(filter: &MetricsFilter) -> String {
-    STORE.get().map(|s| s.export_json(filter)).unwrap_or_default()
+    STORE
+        .get()
+        .map(|s| s.export_json(filter))
+        .unwrap_or_default()
 }
 
 /// 落盘(全局;CSV + JSON 双份)
@@ -938,8 +1017,16 @@ fn subtree(n: &Node) -> (u64, Duration, Duration) {
 pub fn rollup(reports: &[TagReport], depth: usize) -> Vec<TagReport> {
     let mut m: std::collections::BTreeMap<String, TagReport> = Default::default();
     for r in reports {
-        let key: String = r.tag.split('.').take(depth.max(1)).collect::<Vec<_>>().join(".");
-        let e = m.entry(key.clone()).or_insert_with(|| TagReport { tag: key, ..Default::default() });
+        let key: String = r
+            .tag
+            .split('.')
+            .take(depth.max(1))
+            .collect::<Vec<_>>()
+            .join(".");
+        let e = m.entry(key.clone()).or_insert_with(|| TagReport {
+            tag: key,
+            ..Default::default()
+        });
         e.count += r.count;
         e.total += r.total;
         e.self_total += r.self_total;
@@ -956,14 +1043,22 @@ pub fn rollup(reports: &[TagReport], depth: usize) -> Vec<TagReport> {
 }
 
 fn truncate32(s: &str) -> String {
-    if s.chars().count() <= 32 { s.to_string() } else { format!("{}…", s.chars().take(31).collect::<String>()) }
+    if s.chars().count() <= 32 {
+        s.to_string()
+    } else {
+        format!("{}…", s.chars().take(31).collect::<String>())
+    }
 }
 
 fn fmt_dur(d: Duration) -> String {
     let us = d.as_nanos() as f64 / 1e3;
-    if us < 1_000.0 { format!("{us:.1}µs") }
-    else if us < 1e6 { format!("{:.2}ms", us / 1e3) }
-    else { format!("{:.2}s", us / 1e6) }
+    if us < 1_000.0 {
+        format!("{us:.1}µs")
+    } else if us < 1e6 {
+        format!("{:.2}ms", us / 1e3)
+    } else {
+        format!("{:.2}s", us / 1e6)
+    }
 }
 
 // ============================================================================
@@ -985,7 +1080,12 @@ impl Span {
         if !STORE.get().map(|s| s.armed(level::HOST)).unwrap_or(false) {
             return None;
         }
-        Some(Self { tag, start: Instant::now(), file, line })
+        Some(Self {
+            tag,
+            start: Instant::now(),
+            file,
+            line,
+        })
     }
 
     /// 当前 span 的 tag(诊断面)
@@ -1174,7 +1274,10 @@ mod tests {
         let _ = init_metrics(MetricsStore::new());
         assert!(metrics_ready());
         // 幂等断言:再 init 必 AlreadyInit(任何测试顺序下都成立)
-        assert_eq!(init_metrics(MetricsStore::new()), Err(MetricsError::AlreadyInit));
+        assert_eq!(
+            init_metrics(MetricsStore::new()),
+            Err(MetricsError::AlreadyInit)
+        );
     }
 
     fn dur_ms(d: Duration) -> f64 {
@@ -1253,7 +1356,10 @@ mod tests {
         // LIFO:后入先出 → 先 end 的是内层(2ms),后 end 的外层 ≥ 内层 + 1ms
         let dq_samples = &s.inner.lock().unwrap().samples["t.nest"];
         let (outer, inner_d) = (dur_ms(dq_samples[1].dur), dur_ms(dq_samples[0].dur));
-        assert!(outer >= inner_d + 0.8, "外层应包住内层: {outer} vs {inner_d}");
+        assert!(
+            outer >= inner_d + 0.8,
+            "外层应包住内层: {outer} vs {inner_d}"
+        );
     }
 
     #[test]
@@ -1292,16 +1398,31 @@ mod tests {
         let all_f = s.collect(&MetricsFilter::new().tag_prefix("f."));
         assert_eq!(all_f.len(), 3, "f.a.total/f.b.total/f.a.count");
         // 包含
-        assert_eq!(s.collect(&MetricsFilter::new().tag_contains(".b.")).len(), 1);
+        assert_eq!(
+            s.collect(&MetricsFilter::new().tag_contains(".b.")).len(),
+            1
+        );
         // min_count(timer 样本数)
-        assert_eq!(s.collect(&MetricsFilter::new().min_count(2)).len(), 1, "仅 f.a.total 有 2 样本");
+        assert_eq!(
+            s.collect(&MetricsFilter::new().min_count(2)).len(),
+            1,
+            "仅 f.a.total 有 2 样本"
+        );
         // 排序:TotalDesc → f.a.total(30ms)第一
-        let sorted = s.collect(&MetricsFilter::new().tag_prefix("f.").sort(MetricsSort::TotalDesc));
+        let sorted = s.collect(
+            &MetricsFilter::new()
+                .tag_prefix("f.")
+                .sort(MetricsSort::TotalDesc),
+        );
         assert_eq!(sorted[0].tag, "f.a.total");
         assert_eq!(dur_ms(sorted[0].total), 30.0);
         assert_eq!(dur_ms(sorted[0].p50), 20.0, "两样本 p50 = 偏大者");
         // limit
-        assert_eq!(s.collect(&MetricsFilter::new().tag_prefix("f.").limit(2)).len(), 2);
+        assert_eq!(
+            s.collect(&MetricsFilter::new().tag_prefix("f.").limit(2))
+                .len(),
+            2
+        );
     }
 
     #[test]
@@ -1344,7 +1465,13 @@ mod tests {
         let scoped = timer_scope!("t.macro.scope", 40 + 2);
         assert_eq!(scoped, 42, "scope 保留块值");
         let reps = collect_metrics(&MetricsFilter::new().tag_prefix("t.macro."));
-        crate::log_debug!("dbg", "reps = {:?}", reps.iter().map(|r| (r.tag.clone(), r.count, r.counter)).collect::<Vec<_>>());
+        crate::log_debug!(
+            "dbg",
+            "reps = {:?}",
+            reps.iter()
+                .map(|r| (r.tag.clone(), r.count, r.counter))
+                .collect::<Vec<_>>()
+        );
         assert!(reps.len() >= 4, "route/cnt/evt/rec/scope 至少四类");
         let route = collect_metrics(&MetricsFilter::new().tag("t.macro.route"));
         assert_eq!(route[0].count, 1);
@@ -1371,8 +1498,13 @@ mod tests {
         s.timer_record("lvl.t", Duration::from_millis(1), file!(), line!());
         s.counter_add("lvl.c", 1, file!(), line!());
         s.timer_begin("lvl.s", file!(), line!());
-        s.timer_end("lvl.s", file!(), line!()).expect("off 下 end 不报 orphan");
-        assert!(s.collect(&MetricsFilter::new().tag_prefix("lvl.")).is_empty(), "OFF = 全关");
+        s.timer_end("lvl.s", file!(), line!())
+            .expect("off 下 end 不报 orphan");
+        assert!(
+            s.collect(&MetricsFilter::new().tag_prefix("lvl."))
+                .is_empty(),
+            "OFF = 全关"
+        );
 
         s.set_level(level::COUNTERS);
         s.timer_record("lvl.t", Duration::from_millis(1), file!(), line!());
@@ -1384,7 +1516,11 @@ mod tests {
 
         s.set_level(level::HOST);
         s.timer_record("lvl.t", Duration::from_millis(1), file!(), line!());
-        assert_eq!(s.collect(&MetricsFilter::new().tag("lvl.t"))[0].count, 1, "HOST 收计时");
+        assert_eq!(
+            s.collect(&MetricsFilter::new().tag("lvl.t"))[0].count,
+            1,
+            "HOST 收计时"
+        );
     }
 
     /// 父指针 + 排他时间:嵌套 A⊃B 时 B 的父 = A;A.self = A.total − B.total
@@ -1406,10 +1542,18 @@ mod tests {
         assert_eq!(bs[0].parent.as_deref(), Some("tr.A"));
         // B.total ≈ B.self(无子);A.self < A.total(扣掉 B)
         assert_eq!(b.self_total, b.total, "叶子 self == total");
-        assert!(a.self_total < a.total, "A 应扣掉子 B:{:?} vs {:?}", a.self_total, a.total);
+        assert!(
+            a.self_total < a.total,
+            "A 应扣掉子 B:{:?} vs {:?}",
+            a.self_total,
+            a.total
+        );
         let diff = a.total - a.self_total;
         let diff_ms = diff.as_nanos() as f64 / 1e6;
-        assert!((2.5..4.0).contains(&diff_ms), "扣除量应≈B 时长 3ms,实得 {diff_ms}");
+        assert!(
+            (2.5..4.0).contains(&diff_ms),
+            "扣除量应≈B 时长 3ms,实得 {diff_ms}"
+        );
     }
 
     /// 乱序配对:end 与栈顶不符但向下找到匹配 → 计数 out_of_order,不报 orphan
@@ -1430,15 +1574,29 @@ mod tests {
     fn tree_rollup_export_and_epoch() {
         let s = MetricsStore::new();
         s.timer_begin("perf.phase.prefill", file!(), line!());
-        s.timer_record("interp.host.node.marlin_gemm", Duration::from_millis(9), file!(), line!());
-        s.timer_record("interp.host.node.owl_gdn_conv_fwd_f16", Duration::from_millis(3), file!(), line!());
+        s.timer_record(
+            "interp.host.node.marlin_gemm",
+            Duration::from_millis(9),
+            file!(),
+            line!(),
+        );
+        s.timer_record(
+            "interp.host.node.owl_gdn_conv_fwd_f16",
+            Duration::from_millis(3),
+            file!(),
+            line!(),
+        );
         s.counter_add("interp.count.node", 12, file!(), line!());
-        s.timer_end("perf.phase.prefill", file!(), line!()).expect("prefill 配对");
+        s.timer_end("perf.phase.prefill", file!(), line!())
+            .expect("prefill 配对");
         let reps = s.collect(&MetricsFilter::new());
         let tree = render_tree(&reps, Duration::from_millis(12));
         assert!(tree.contains("marlin_gemm"), "树应含叶子:\n{tree}");
         let roll = rollup(&reps, 3);
-        assert!(roll.iter().any(|r| r.tag == "interp.host.node"), "rollup 到第 3 段");
+        assert!(
+            roll.iter().any(|r| r.tag == "interp.host.node"),
+            "rollup 到第 3 段"
+        );
         let csv = s.export_csv(&MetricsFilter::new().tag_prefix("interp."));
         assert!(csv.starts_with("tag,count,counter"));
         assert!(csv.lines().count() >= 3, "表头 + ≥2 行");
@@ -1448,9 +1606,17 @@ mod tests {
         std::thread::sleep(Duration::from_millis(2));
         s.mark_epoch();
         std::thread::sleep(Duration::from_millis(2));
-        s.timer_record("interp.host.node.marlin_gemm", Duration::from_millis(1), file!(), line!());
+        s.timer_record(
+            "interp.host.node.marlin_gemm",
+            Duration::from_millis(1),
+            file!(),
+            line!(),
+        );
         let ep = s.collect_since_epoch(MetricsFilter::new().tag_prefix("interp."));
-        let m = ep.iter().find(|r| r.tag.ends_with("marlin_gemm")).expect("epoch 内有账");
+        let m = ep
+            .iter()
+            .find(|r| r.tag.ends_with("marlin_gemm"))
+            .expect("epoch 内有账");
         assert_eq!(m.count, 1, "epoch 只看标记之后的样本");
     }
 }

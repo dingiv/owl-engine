@@ -20,9 +20,7 @@ impl Value {
 
     pub(crate) fn zero(dtype: Dtype, shape: &Shape) -> Result<Self, ModelError> {
         if dtype != Dtype::F32 {
-            return Err(ModelError::Msg(format!(
-                "CPU 后端仅 F32(S1),得 {dtype:?}"
-            )));
+            return Err(ModelError::Msg(format!("CPU 后端仅 F32(S1),得 {dtype:?}")));
         }
         Ok(Value {
             f32: vec![0.0; owl_iface::contract::numel(shape)],
@@ -30,7 +28,11 @@ impl Value {
         })
     }
 
-    pub(crate) fn from_bytes(dtype: Dtype, shape: &Shape, bytes: &[u8]) -> Result<Self, ModelError> {
+    pub(crate) fn from_bytes(
+        dtype: Dtype,
+        shape: &Shape,
+        bytes: &[u8],
+    ) -> Result<Self, ModelError> {
         // f16 基线(F5):CPU 面存储仍 f32,f16 字节解码入账(装载冒烟用;
         // 执行面照旧仅 F32 —— CPU 先不搞,用户裁决)。其余 dtype 拒。
         if dtype == Dtype::BF16 {
@@ -71,7 +73,9 @@ impl Value {
             });
         }
         if dtype != Dtype::F32 {
-            return Err(ModelError::Msg("CPU 后端仅 F32/F16-h 工装载;执行仅 F32".into()));
+            return Err(ModelError::Msg(
+                "CPU 后端仅 F32/F16-h 工装载;执行仅 F32".into(),
+            ));
         }
         let n = owl_iface::contract::numel(shape);
         if bytes.len() != n * 4 {

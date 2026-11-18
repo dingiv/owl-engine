@@ -47,7 +47,9 @@ const BANNED: &[&str] = &[
 
 /// 递归收集 `*.rs`(跳过 `tests/`、`examples/`、`benches/`、`target/`)
 fn collect(dir: &Path, out: &mut Vec<PathBuf>) {
-    let Ok(rd) = std::fs::read_dir(dir) else { return };
+    let Ok(rd) = std::fs::read_dir(dir) else {
+        return;
+    };
     for e in rd.flatten() {
         let p = e.path();
         let name = p.file_name().and_then(|s| s.to_str()).unwrap_or("");
@@ -86,11 +88,17 @@ fn production_paths_never_compile_cuda_at_runtime() {
     for r in ROOTS {
         collect(&root.join(r), &mut files);
     }
-    assert!(files.len() > 50, "扫描面异常小({} 个 .rs)—— 路径推导错了?", files.len());
+    assert!(
+        files.len() > 50,
+        "扫描面异常小({} 个 .rs)—— 路径推导错了?",
+        files.len()
+    );
 
     let mut hits: Vec<String> = Vec::new();
     for f in &files {
-        let Ok(text) = std::fs::read_to_string(f) else { continue };
+        let Ok(text) = std::fs::read_to_string(f) else {
+            continue;
+        };
         // 同文件 `#[cfg(test)]` 段:豁免(测试域允许自己编译源做对拍)
         let prod = match text.find("#[cfg(test)]") {
             Some(i) => &text[..i],
@@ -115,11 +123,23 @@ fn production_paths_never_compile_cuda_at_runtime() {
 /// 反证面:门的**判据本身**要能抓到违规(防"扫描器坏了 ⇒ 永远绿")
 #[test]
 fn banned_matcher_is_sensitive() {
-    assert_eq!(banned("let ptx = compile_ptx_with_opts(src, opts)?;"), Some("compile_ptx"));
-    assert_eq!(banned("let _ = nvrtcCreateProgram(&mut p, src, ..);"), Some("nvrtcCreateProgram"));
-    assert_eq!(banned("cudarc::nvrtc::CompileOptions::default()"), Some("CompileOptions"));
+    assert_eq!(
+        banned("let ptx = compile_ptx_with_opts(src, opts)?;"),
+        Some("compile_ptx")
+    );
+    assert_eq!(
+        banned("let _ = nvrtcCreateProgram(&mut p, src, ..);"),
+        Some("nvrtcCreateProgram")
+    );
+    assert_eq!(
+        banned("cudarc::nvrtc::CompileOptions::default()"),
+        Some("CompileOptions")
+    );
     // 合法用法不得误伤
-    assert_eq!(banned("ctx.load_module(Ptx::from_binary(bytes.to_vec()))"), None);
+    assert_eq!(
+        banned("ctx.load_module(Ptx::from_binary(bytes.to_vec()))"),
+        None
+    );
     assert_eq!(banned("// cubin 载入走 driver API,零编译"), None);
     // **混合行必报**(旧白名单短路的绕过口;2026-10-15 审查定谳)
     assert_eq!(
@@ -216,7 +236,9 @@ fn gguf_kernels_never_allocate_or_query_device() {
     );
     let mut hits: Vec<String> = Vec::new();
     for f in &files {
-        let Ok(text) = std::fs::read_to_string(f) else { continue };
+        let Ok(text) = std::fs::read_to_string(f) else {
+            continue;
+        };
         let code = strip_c_comments(&text);
         for (ln, line) in code.lines().enumerate() {
             for pat in GGUF_BANNED {
@@ -233,12 +255,17 @@ fn gguf_kernels_never_allocate_or_query_device() {
          A5.2 一切分配过账本 + 热路径禁 host 查询):\n  {}",
         hits.join("\n  ")
     );
-    eprintln!("[I-4] GGUF 族 {} 个源文件零 cudaMalloc*/Free/Memset*/GetDeviceProperties ✓", files.len());
+    eprintln!(
+        "[I-4] GGUF 族 {} 个源文件零 cudaMalloc*/Free/Memset*/GetDeviceProperties ✓",
+        files.len()
+    );
 }
 
 /// 递归收集 `.cu`/`.cuh`(与 [`collect`] 同律的姊妹;源码门专用)
 fn collect_cu(dir: &Path, out: &mut Vec<PathBuf>) {
-    let Ok(rd) = std::fs::read_dir(dir) else { return };
+    let Ok(rd) = std::fs::read_dir(dir) else {
+        return;
+    };
     for e in rd.flatten() {
         let p = e.path();
         if p.is_dir() {
@@ -256,7 +283,8 @@ fn gguf_i4_matcher_is_sensitive() {
     let code = strip_c_comments(viol);
     assert!(GGUF_BANNED.iter().any(|p| code.contains(p)), "禁词匹配失灵");
     // 引文(注释里提到禁词)必须**不算违规** —— 否则头注的 H1/H2 条目会误红
-    let doc = "// 上游 gguf_gemm() 用 cudaGetDeviceProperties 查 CC\n/* cudaMallocAsync 装中间缓冲 */\n";
+    let doc =
+        "// 上游 gguf_gemm() 用 cudaGetDeviceProperties 查 CC\n/* cudaMallocAsync 装中间缓冲 */\n";
     let code = strip_c_comments(doc);
     assert!(
         !GGUF_BANNED.iter().any(|p| code.contains(p)),

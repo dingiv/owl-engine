@@ -38,9 +38,7 @@ async fn ledger_captures_load_pool_and_graph_phases() {
     // 内部造的同一形状,只是为了能在外面读账。
     let cell = owl_store::shared_ledger(owl_store::tier_budget_of(
         cfg.knobs.ram_pool_size,
-        cfg.knobs.snap_host_mb,
         cfg.knobs.disk_pool_size,
-        cfg.knobs.snap_disk_mb,
     ));
     let face = CpuFace::mock(MockLimits {
         null_kernels: true,
@@ -49,7 +47,11 @@ async fn ledger_captures_load_pool_and_graph_phases() {
     });
     let mut engine =
         Engine::on_with_ledger(cfg, face, cell.clone()).expect("构造(CPU face + 预置账本)");
-    let loaded = engine.loader().load_qwen35_0_8b(&asset_dir()).await.expect("装载");
+    let loaded = engine
+        .loader()
+        .load_qwen35_0_8b(&asset_dir())
+        .await
+        .expect("装载");
     {
         // 装载完:权重类必须有账(相位上下文 = Weight)
         let b = owl_store::book_lock(&cell);
@@ -59,7 +61,12 @@ async fn ledger_captures_load_pool_and_graph_phases() {
             .filter(|r| r.kind == owl_store::AssetKind::Weight)
             .map(|r| r.bytes)
             .sum();
-        eprintln!("[ledger] 装载后 open={} 条 / {}B;weight 类 {}B", b.open_count(), b.open_total_bytes(), weight);
+        eprintln!(
+            "[ledger] 装载后 open={} 条 / {}B;weight 类 {}B",
+            b.open_count(),
+            b.open_total_bytes(),
+            weight
+        );
         assert!(weight > 0, "装载期必须有 weight 类账:{rows:?}");
         assert_eq!(b.hook_fail(), 0, "装载期不许有未入账事件");
     }
@@ -67,9 +74,23 @@ async fn ledger_captures_load_pool_and_graph_phases() {
     {
         let b = owl_store::book_lock(&cell);
         let rows = b.open_rows();
-        let pool: usize = rows.iter().filter(|r| r.kind == owl_store::AssetKind::Pool).map(|r| r.bytes).sum();
-        let graph: usize = rows.iter().filter(|r| r.kind == owl_store::AssetKind::Graph).map(|r| r.bytes).sum();
-        eprintln!("[ledger] 装配后 open={} 条 / {}B;pool {}B;graph {}B", b.open_count(), b.open_total_bytes(), pool, graph);
+        let pool: usize = rows
+            .iter()
+            .filter(|r| r.kind == owl_store::AssetKind::Pool)
+            .map(|r| r.bytes)
+            .sum();
+        let graph: usize = rows
+            .iter()
+            .filter(|r| r.kind == owl_store::AssetKind::Graph)
+            .map(|r| r.bytes)
+            .sum();
+        eprintln!(
+            "[ledger] 装配后 open={} 条 / {}B;pool {}B;graph {}B",
+            b.open_count(),
+            b.open_total_bytes(),
+            pool,
+            graph
+        );
         for r in &rows {
             eprintln!(
                 "[ledger]   rank{} {:?} {:?} {:?} {}B n={}",
@@ -85,7 +106,10 @@ async fn ledger_captures_load_pool_and_graph_phases() {
     eprintln!("[ledger] 空转档生成(数值无意义): {text:?}");
     let (hf, wu, owb) = running.handle_probe();
     let b = owl_store::book_lock(&cell);
-    eprintln!("[ledger] turn 后 open={} 条;hook_fail={hf} window_unclosed={wu} 窗内块={owb}", b.open_count());
+    eprintln!(
+        "[ledger] turn 后 open={} 条;hook_fail={hf} window_unclosed={wu} 窗内块={owb}",
+        b.open_count()
+    );
     assert_eq!(hf, 0, "全程不许有未入账事件");
     assert_eq!(wu, 0, "没有窗失败 ⇒ 不该有未收窗");
     assert!(b.open_count() > 0, "账必须有内容(否则记了个寂寞)");
@@ -99,8 +123,12 @@ async fn ledger_captures_load_pool_and_graph_phases() {
 fn ledger_budget_mismatch_is_rejected() {
     // store 侧已有单测覆盖(rel.rs `open_rejects_unmeasured_budget_and_geometry`);
     // 这里只钉住引擎侧**同一个算式**(tier_budget_of)是唯一产地。
-    let a = owl_store::tier_budget_of(512, 512, 0, 0);
-    assert_eq!(a.host_bytes, 1024 << 20, "host 总量 = 两块之和");
+    let a = owl_store::tier_budget_of(512, 0);
+    assert_eq!(
+        a.host_bytes,
+        512 << 20,
+        "host 总量 = ram_pool_size（共享池）"
+    );
     assert_eq!(a.disk_bytes, 0, "盘层二期(恒 0)");
     let _ = AssetClass::Weight; // 词表在引擎侧可见(公共面)
 }

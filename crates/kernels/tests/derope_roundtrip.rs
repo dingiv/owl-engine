@@ -85,8 +85,16 @@ fn host_rope(x: &[f32], c: &[f32], s: &[f32], pos: &[f32], inverse: bool) -> Vec
                 let a = x[base + i];
                 let b = x[base + i + HALF];
                 let (ci, si) = (c[p * HALF + i], s[p * HALF + i]);
-                out[base + i] = if inverse { a * ci + b * si } else { a * ci - b * si };
-                out[base + i + HALF] = if inverse { b * ci - a * si } else { b * ci + a * si };
+                out[base + i] = if inverse {
+                    a * ci + b * si
+                } else {
+                    a * ci - b * si
+                };
+                out[base + i + HALF] = if inverse {
+                    b * ci - a * si
+                } else {
+                    b * ci + a * si
+                };
             }
             // partial 直通(2*HALF..HEAD_DIM 必须非空 —— 见文件头 HALF 注)
             out[base + ROTARY_DIM..base + HEAD_DIM]
@@ -126,7 +134,9 @@ macro_rules! roundtrip_case {
             if $f16 {
                 // f16 走 u16 位型（`half::f16` 不实现 `DeviceRepr`）
                 let h = |v: &[f32]| {
-                    v.iter().map(|x| half::f16::from_f32(*x).to_bits()).collect::<Vec<u16>>()
+                    v.iter()
+                        .map(|x| half::f16::from_f32(*x).to_bits())
+                        .collect::<Vec<u16>>()
                 };
                 let d_x = stream.clone_htod(&h(&k)).unwrap();
                 let d_c = stream.clone_htod(&h(&c)).unwrap();
@@ -141,16 +151,21 @@ macro_rules! roundtrip_case {
                         d_p.device_ptr(&stream).0,
                         d_o.device_ptr(&stream).0,
                     );
-                    let (heads_i, hd_i, half_i) =
-                        (HEADS as u64, HEAD_DIM as u64, HALF as u64);
+                    let (heads_i, hd_i, half_i) = (HEADS as u64, HEAD_DIM as u64, HALF as u64);
                     let cfg = LaunchConfig {
                         grid_dim: (TOKENS as u32, 1, 1),
                         block_dim: (128, 1, 1),
                         shared_mem_bytes: 0,
                     };
                     let mut b = stream.launch_builder(&f);
-                    b.arg(&xp).arg(&cp).arg(&sp).arg(&pp)
-                        .arg(&heads_i).arg(&hd_i).arg(&half_i).arg(&op);
+                    b.arg(&xp)
+                        .arg(&cp)
+                        .arg(&sp)
+                        .arg(&pp)
+                        .arg(&heads_i)
+                        .arg(&hd_i)
+                        .arg(&half_i)
+                        .arg(&op);
                     unsafe { b.launch(cfg) }.expect("launch");
                     stream.synchronize().expect("sync");
                 }
@@ -197,16 +212,21 @@ macro_rules! roundtrip_case {
                         d_p.device_ptr(&stream).0,
                         d_o.device_ptr(&stream).0,
                     );
-                    let (heads_i, hd_i, half_i) =
-                        (HEADS as u64, HEAD_DIM as u64, HALF as u64);
+                    let (heads_i, hd_i, half_i) = (HEADS as u64, HEAD_DIM as u64, HALF as u64);
                     let cfg = LaunchConfig {
                         grid_dim: (TOKENS as u32, 1, 1),
                         block_dim: (128, 1, 1),
                         shared_mem_bytes: 0,
                     };
                     let mut b = stream.launch_builder(&f);
-                    b.arg(&xp).arg(&cp).arg(&sp).arg(&pp)
-                        .arg(&heads_i).arg(&hd_i).arg(&half_i).arg(&op);
+                    b.arg(&xp)
+                        .arg(&cp)
+                        .arg(&sp)
+                        .arg(&pp)
+                        .arg(&heads_i)
+                        .arg(&hd_i)
+                        .arg(&half_i)
+                        .arg(&op);
                     unsafe { b.launch(cfg) }.expect("launch");
                     stream.synchronize().expect("sync");
                 }
@@ -223,12 +243,36 @@ macro_rules! roundtrip_case {
 }
 
 // 正向 rope 核的正确性（已有核，这里顺带作对照基线）
-roundtrip_case!(rope_f32_matches_host, "owl_rope_half_partial_f32", false, 1e-6, false);
-roundtrip_case!(rope_f16_matches_host, "owl_rope_half_partial_f16", true, 6e-2, false);
+roundtrip_case!(
+    rope_f32_matches_host,
+    "owl_rope_half_partial_f32",
+    false,
+    1e-6,
+    false
+);
+roundtrip_case!(
+    rope_f16_matches_host,
+    "owl_rope_half_partial_f16",
+    true,
+    6e-2,
+    false
+);
 
 // derope = 逆：与 host 逆向（inverse=true）逐元素对齐
-roundtrip_case!(derope_f32_matches_host, "owl_derope_half_partial_f32", false, 1e-6, true);
-roundtrip_case!(derope_f16_matches_host, "owl_derope_half_partial_f16", true, 6e-2, true);
+roundtrip_case!(
+    derope_f32_matches_host,
+    "owl_derope_half_partial_f32",
+    false,
+    1e-6,
+    true
+);
+roundtrip_case!(
+    derope_f16_matches_host,
+    "owl_derope_half_partial_f16",
+    true,
+    6e-2,
+    true
+);
 
 /// 纯 host 往返：raw → rope(p) → derope(p) 应回到 raw（f32，无量化）
 #[test]
@@ -253,13 +297,21 @@ fn host_repeat_roundtrip_drift_f16() {
     let (c, s) = tables(true);
     let pos = pos_vec();
     let k = make_k();
-    let q = |v: &[f32]| v.iter().map(|x| half::f16::from_f32(*x).to_f32()).collect::<Vec<_>>();
+    let q = |v: &[f32]| {
+        v.iter()
+            .map(|x| half::f16::from_f32(*x).to_f32())
+            .collect::<Vec<_>>()
+    };
     let mut cur = q(&k); // 模拟 GPU 页上的 f16 K
     println!("f16 反复 re-RoPE（同一位置）漂移：");
     for round in 1..=8 {
         let raw = q(&host_rope(&cur, &c, &s, &pos, true));
         cur = q(&host_rope(&raw, &c, &s, &pos, false));
-        let worst = k.iter().zip(cur.iter()).map(|(a, b)| (a - b).abs()).fold(0f32, f32::max);
+        let worst = k
+            .iter()
+            .zip(cur.iter())
+            .map(|(a, b)| (a - b).abs())
+            .fold(0f32, f32::max);
         println!("  round {round}: worst |Δ| vs 原始 = {worst:e}");
     }
 }

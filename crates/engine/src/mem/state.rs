@@ -19,9 +19,7 @@ use owl_iface::contract::{Bytes, DeviceClient, Dtype, ModelError, VramSnapshot};
 use owl_models::interpreters::eval_ops;
 use owl_models::module::kv_paged_policy;
 use owl_models::TensorOps;
-use owl_store::{
-    auto_pool_tokens, PoolFixedInputs, PoolFixedTerms, PoolTokenTerms, SnapKey,
-};
+use owl_store::{auto_pool_tokens, PoolFixedInputs, PoolFixedTerms, PoolTokenTerms, SnapKey};
 
 use crate::exec::mtp_ring::MtpRingPlan;
 
@@ -420,13 +418,7 @@ impl KvBank {
             &format!("{tag}.max_logits"),
         )
         .await?;
-        let to = zero_block_dt(
-            face,
-            tmp_elems,
-            tmp_dtype,
-            &format!("{tag}.tmp_out"),
-        )
-        .await?;
+        let to = zero_block_dt(face, tmp_elems, tmp_dtype, &format!("{tag}.tmp_out")).await?;
         Ok(owl_models::module::AttnV2Scratch {
             exp_sums: block_leaf(&es.0, vec![seqs, dims.hq * nparts]),
             max_logits: block_leaf(&ml.0, vec![seqs, dims.hq * nparts]),
@@ -526,8 +518,13 @@ impl KvBank {
         // 若写在 H2D 流，前一 chunk 仍在 COMPUTE 上跑的 GDN 核会读到被本次
         // 覆写的表（2026-11-04 “INT8 末块丢 `M`” 的真根因：当时用末块前全设备
         // sync 遮住了这条跨流竞态；2026-11-16 改为同流写，删掉 sync）。
-        face.write_block_f32_on(owl_iface::contract::UpStream::Compute, &gt.table, 0, &f32bits)
-            .await?;
+        face.write_block_f32_on(
+            owl_iface::contract::UpStream::Compute,
+            &gt.table,
+            0,
+            &f32bits,
+        )
+        .await?;
         Ok(Some(GdnTableSlotOwned {
             leaf: TensorOps::of_block(
                 gt.table.id,
@@ -682,9 +679,7 @@ fn per_tok_terms(
         n_full * 2 * dims.hkv * dims.hd * kv_elem,
         draft_elem.map(|e| geom.per_tok_bytes(e)).unwrap_or(0),
         // MTP 链 = **1 层 × full 几何 × (k+v)**;elem 由 `[spec] draft_kv_fp8` 定
-        mtp_kv_elem
-            .map(|e| 2 * dims.hkv * dims.hd * e)
-            .unwrap_or(0),
+        mtp_kv_elem.map(|e| 2 * dims.hkv * dims.hd * e).unwrap_or(0),
     )
 }
 
@@ -1089,10 +1084,7 @@ impl StatePool {
     /// 物理池 = `rings × ring_nb` 页；这里按 `ring` 切一段**连续视图**，
     /// 内核仍按 `p % ring_slots` 映射（ring_cap = 每份槽数）。视图隔离后
     /// 两个会话的同位置窗口行不再互相覆盖。
-    pub(crate) fn dflash_kv_leaves(
-        &self,
-        ring: usize,
-    ) -> Option<Vec<(TensorOps, TensorOps)>> {
+    pub(crate) fn dflash_kv_leaves(&self, ring: usize) -> Option<Vec<(TensorOps, TensorOps)>> {
         let ks = self.draft.dflash_kvs.as_ref()?;
         if ring >= self.draft.rings.max(1) {
             return None;
@@ -1137,13 +1129,12 @@ impl StatePool {
                             vec![ring_nb, dkv, dhd / self.geom.x, page, self.geom.x],
                             self.draft.dt,
                         )
-                        .slice_view(off, vec![ring_nb, dkv, dhd / self.geom.x, page, self.geom.x]),
-                        block_leaf_dt(
-                            &kb.v_cache.0,
-                            vec![ring_nb, dkv, dhd, page],
-                            self.draft.dt,
-                        )
-                        .slice_view(off, vec![ring_nb, dkv, dhd, page]),
+                        .slice_view(
+                            off,
+                            vec![ring_nb, dkv, dhd / self.geom.x, page, self.geom.x],
+                        ),
+                        block_leaf_dt(&kb.v_cache.0, vec![ring_nb, dkv, dhd, page], self.draft.dt)
+                            .slice_view(off, vec![ring_nb, dkv, dhd, page]),
                     )
                 })
                 .collect(),
@@ -2186,9 +2177,8 @@ impl<'a> AllocCtx<'a> {
                             plan.seq_tokens as f64 / pool as f64
                         );
                     } else if plan.pool_sessions > 1 {
-                        let transient_tok = (((transient_mb as usize) << 20)
-                            / per_tok.total().max(1))
-                            .max(1);
+                        let transient_tok =
+                            (((transient_mb as usize) << 20) / per_tok.total().max(1)).max(1);
                         owl_shared::log_info!(
                             "pool",
                             "**并发自动池**:max_context_length={} × {} = {} tok，\
@@ -2205,9 +2195,7 @@ impl<'a> AllocCtx<'a> {
                     }
                     pool
                 }
-                None => plan
-                    .seq_tokens
-                    .saturating_mul(plan.pool_sessions.max(1)),
+                None => plan.seq_tokens.saturating_mul(plan.pool_sessions.max(1)),
             }
         } else {
             match pool_cap {
@@ -2529,10 +2517,7 @@ impl KvBank {
         let nparts = (nb * page).div_ceil(V2_PARTITION_TOKENS);
         let max_batch = plan.max_batch.max(1);
         let attn_v2 = if paged {
-            Some(
-                Self::alloc_attn_v2(face, dims, nparts, 1, "attn2", dims.dtype, dims.hd)
-                    .await?,
-            )
+            Some(Self::alloc_attn_v2(face, dims, nparts, 1, "attn2", dims.dtype, dims.hd).await?)
         } else {
             None
         };
@@ -2563,16 +2548,8 @@ impl KvBank {
         };
         let batch_attn_v2 = if paged && max_batch > 1 {
             Some(
-                Self::alloc_attn_v2(
-                    face,
-                    dims,
-                    nparts,
-                    max_batch,
-                    "battn2",
-                    dims.dtype,
-                    dims.hd,
-                )
-                .await?,
+                Self::alloc_attn_v2(face, dims, nparts, max_batch, "battn2", dims.dtype, dims.hd)
+                    .await?,
             )
         } else {
             None
@@ -2763,9 +2740,7 @@ impl DraftBank {
         // ⇒ 每 token 4 KiB → 2 KiB。读核由 `draft_env.kv.quant` 同步成 e4m3。
         let mtp_elem_b = plan.draft_kv.size_bytes();
         let mtp_ring = plan.mtp_ring;
-        let mtp_pages = mtp_ring
-            .map(|r| r.capacity_pages())
-            .unwrap_or(nb);
+        let mtp_pages = mtp_ring.map(|r| r.capacity_pages()).unwrap_or(nb);
         let mtp_elems = mtp_pages * dims.hkv * dims.hd * page;
         let (mtp_e, mtp_dt) = if mtp_elem_b == 1 {
             (mtp_elems / 4, Dtype::U32)
@@ -3094,13 +3069,11 @@ mod vram_budget_tests {
         // 27B/3080 档实测账：cap ≈ 380,746（不含 scratch），per_tok 17,536。
         let cap = 380_746usize;
         let per_tok = 17_536usize;
-        let (one, over) =
-            auto_pool_tokens(262_144, 1, cap, per_tok, 1024, false).expect("单会话");
+        let (one, over) = auto_pool_tokens(262_144, 1, cap, per_tok, 1024, false).expect("单会话");
         assert_eq!(one, 262_144, "单会话逐字节旧行为");
         assert!(!over);
 
-        let (two, over) =
-            auto_pool_tokens(262_144, 2, cap, per_tok, 1024, false).expect("双并发");
+        let (two, over) = auto_pool_tokens(262_144, 2, cap, per_tok, 1024, false).expect("双并发");
         assert!(!over);
         // 瞬态 1 GiB ≈ 61.2k tok ⇒ 池 ≈ 319k；必须覆盖 2×(100k+32k)=264k。
         assert!(two > 264_000, "并发池 {two} 必须装下 2×132k");

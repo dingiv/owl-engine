@@ -38,8 +38,8 @@ use std::future::Future;
 use std::sync::{Arc, Mutex, MutexGuard};
 
 use crate::contract::{
-    BlockLedgerRow, Bytes, Connector, DeviceClient, Dtype, GraphId, LaunchMsg,
-    ModelError, PinnedRegion, Shape, SwapDir, SwapPiece, SwapWaiter, UpChunk, UpStream,
+    BlockLedgerRow, Bytes, Connector, DeviceClient, Dtype, GraphId, LaunchMsg, ModelError,
+    PinnedRegion, Shape, SwapDir, SwapPiece, SwapWaiter, UpChunk, UpStream,
 };
 // 输出口(值语义 fn 指针包;未注入 = 全部静默)。本 crate 不能依赖 owl-shared
 // (`owl-shared → owl-iface`),故类型住 `owl-kernels::sink`(依赖倒置口),
@@ -225,7 +225,6 @@ pub trait AllocLedger: Send {
         false
     }
 
-
     /// **账本身份令牌**(TP 两 rank 合流判据):同一个"书"必须给**同一个非零值**;
     /// `0` = 不表态(无身份的实现 —— 一律按"另一本书"处理)。
     ///
@@ -331,7 +330,12 @@ impl Command {
 
     /// 构造糖(宏用):清零分配。
     pub fn alloc(class: AssetClass, dtype: Dtype, elems: usize, name: &str) -> Self {
-        Command::Alloc { class, dtype, elems, name: name.to_string() }
+        Command::Alloc {
+            class,
+            dtype,
+            elems,
+            name: name.to_string(),
+        }
     }
 
     /// 构造糖(宏用):归还。
@@ -507,7 +511,10 @@ fn swap_moves(dir: SwapDir, pieces: &[SwapPiece]) -> Vec<MoveEvent> {
         SwapDir::Out => MoveDir::Out,
         SwapDir::In => MoveDir::In,
     };
-    by_block.into_iter().map(|(id, bytes)| MoveEvent { id, bytes, dir: d }).collect()
+    by_block
+        .into_iter()
+        .map(|(id, bytes)| MoveEvent { id, bytes, dir: d })
+        .collect()
 }
 
 /// **换层事件的无句柄落账口**(2026-10-27;分离式 swap 专用)。
@@ -568,7 +575,12 @@ pub struct DeviceHandle<D: DeviceClient> {
 impl<D: DeviceClient> DeviceHandle<D> {
     /// 构造(唯一入口)。`ledger = None` = 纯转发(迁移态);`sink` 缺省静默。
     pub fn new(inner: D, ledger: Option<LedgerCell>) -> Self {
-        Self { inner, ledger, ctx: Arc::new(Mutex::new(Ctx::new())), sink: LogSink::none() }
+        Self {
+            inner,
+            ledger,
+            ctx: Arc::new(Mutex::new(Ctx::new())),
+            sink: LogSink::none(),
+        }
     }
 
     /// **注入输出口**(engine 构造期一次;缺省静默已足以跑测试)。
@@ -631,8 +643,14 @@ impl<D: DeviceClient> DeviceHandle<D> {
                 true
             } else {
                 // 中毒 = 有 panic 发生在持账期间:取回内层数据续用(与 `ctx` 同律)
-                let a = match cur.lock() { Ok(g) => g, Err(p) => p.into_inner() };
-                let b = match ledger.lock() { Ok(g) => g, Err(p) => p.into_inner() };
+                let a = match cur.lock() {
+                    Ok(g) => g,
+                    Err(p) => p.into_inner(),
+                };
+                let b = match ledger.lock() {
+                    Ok(g) => g,
+                    Err(p) => p.into_inner(),
+                };
                 let t = a.book_token();
                 t != 0 && t == b.book_token()
             };
@@ -660,7 +678,11 @@ impl<D: DeviceClient> DeviceHandle<D> {
             c.class = class;
             saved
         };
-        CtxScope { ctx: Some(self.ctx.clone()), saved, sink: self.sink }
+        CtxScope {
+            ctx: Some(self.ctx.clone()),
+            saved,
+            sink: self.sink,
+        }
     }
 
     /// 记账失败计数(诊断面;非零 = 有钩子调用失败过)。
@@ -710,7 +732,9 @@ impl<D: DeviceClient> DeviceHandle<D> {
         // 单条语义:把批的错误就地展开(不静默)
         match out.outcomes.pop() {
             Some(r) => r,
-            None => Err(ModelError::Msg("DeviceHandle::exec: 批为空(内部错误)".into())),
+            None => Err(ModelError::Msg(
+                "DeviceHandle::exec: 批为空(内部错误)".into(),
+            )),
         }
     }
 
@@ -730,7 +754,8 @@ impl<D: DeviceClient> DeviceHandle<D> {
         let mut events: Vec<AllocEvent> = Vec::new();
         let mut frees: Vec<FreeEvent> = Vec::new();
         let mut moves: Vec<MoveEvent> = Vec::new();
-        for (i, cmd) in cmds.into_iter().enumerate() { // FIXME: 这里没有达到批处理的目的，你要知道。这个Command，它是要让后端实现去感知的，你懂吧？为什么要搞批处理？搞批处理是为了省掉这个线程间同步开销啊。对吧？这一来一回，走这个线程间同步啊，那么就让这个每一个命令时间拖长了。
+        for (i, cmd) in cmds.into_iter().enumerate() {
+            // FIXME: 这里没有达到批处理的目的，你要知道。这个Command，它是要让后端实现去感知的，你懂吧？为什么要搞批处理？搞批处理是为了省掉这个线程间同步开销啊。对吧？这一来一回，走这个线程间同步啊，那么就让这个每一个命令时间拖长了。
             segments += 1;
             let r = self.run_one(cmd, &mut events, &mut frees, &mut moves).await;
             if r.is_err() && first_err.is_none() {
@@ -740,7 +765,11 @@ impl<D: DeviceClient> DeviceHandle<D> {
         }
         // 收口:入账(失败条已在上方被拦 ⇒ 这里全是成功事件)
         self.send_events(&events, &frees, &moves);
-        Ok(BatchOutcome { outcomes, first_err, segments })
+        Ok(BatchOutcome {
+            outcomes,
+            first_err,
+            segments,
+        })
     }
 
     /// 单条执行(内部;把事件塞进本批的缓冲)。
@@ -752,12 +781,22 @@ impl<D: DeviceClient> DeviceHandle<D> {
         _moves: &mut Vec<MoveEvent>, // 命令面无换层命令(swap 走 DeviceClient 转发)
     ) -> Result<Outcome, ModelError> {
         match cmd {
-            Command::Alloc { class, dtype, elems, name } => {
+            Command::Alloc {
+                class,
+                dtype,
+                elems,
+                name,
+            } => {
                 let b = self.inner.alloc(dtype, elems, &name).await?;
                 self.note_birth(&b, elems * dtype.size_bytes(), class, &name, events);
                 Ok(Outcome::Buf(b))
             }
-            Command::AllocUninit { class, dtype, elems, name } => {
+            Command::AllocUninit {
+                class,
+                dtype,
+                elems,
+                name,
+            } => {
                 let b = self.inner.alloc_uninit(dtype, elems, &name).await?;
                 self.note_birth(&b, elems * dtype.size_bytes(), class, &name, events);
                 Ok(Outcome::Buf(b))
@@ -838,7 +877,14 @@ impl<D: DeviceClient> DeviceHandle<D> {
         // **窗内出生 ⇒ Graph 类**(服务端捕获期恒走 `carve_block`,块随图存活;
         // 这不是猜测而是机制事实 —— 窗内不可能出 Owned 块)。
         let class = if in_window { AssetClass::Graph } else { class };
-        sink.push(AllocEvent { id: b.id, bytes, name: name.to_string(), class, owner, rank });
+        sink.push(AllocEvent {
+            id: b.id,
+            bytes,
+            name: name.to_string(),
+            class,
+            owner,
+            rank,
+        });
         let mut c = self.ctx();
         if let Some(w) = c.windows.last_mut() {
             w.ids.push(b.id);
@@ -894,7 +940,9 @@ impl<D: DeviceClient> DeviceHandle<D> {
     /// 复用已下沉 GPU server 的 cudaMallocAsync 默认池:校验通过后调用方
     /// **全部真归还**,store 不再持有/复用块。
     fn validate_free_ids(&self, ids: &[u64]) -> Result<(), ModelError> {
-        let Some(cell) = self.ledger.as_ref() else { return Ok(()) };
+        let Some(cell) = self.ledger.as_ref() else {
+            return Ok(());
+        };
         let my_rank = self.ctx().dev_rank;
         let mut g = match cell.lock() {
             Ok(g) => g,
@@ -943,7 +991,9 @@ impl<D: DeviceClient> DeviceHandle<D> {
         if births.is_empty() && frees.is_empty() && moves.is_empty() {
             return;
         }
-        let Some(cell) = self.ledger.as_ref() else { return }; // 纯转发态
+        let Some(cell) = self.ledger.as_ref() else {
+            return;
+        }; // 纯转发态
         let poisoned = cell.is_poisoned();
         {
             // 借用范围收在块内 ⇒ 绝不跨 await(本函数同步)
@@ -966,7 +1016,11 @@ impl<D: DeviceClient> DeviceHandle<D> {
             let mut c = self.ctx();
             c.events_sent = c.events_sent.saturating_add(n);
             if poisoned {
-                c.bump(self.sink, "ledger-lock", "事件入口锁中毒(已续用内部数据)".into());
+                c.bump(
+                    self.sink,
+                    "ledger-lock",
+                    "事件入口锁中毒(已续用内部数据)".into(),
+                );
             }
         }
     }
@@ -976,10 +1030,12 @@ impl<D: DeviceClient> DeviceHandle<D> {
         if ids.is_empty() {
             return;
         }
-        let frees: Vec<FreeEvent> = ids.iter().map(|id| FreeEvent { id: *id, bytes: 0 }).collect();
+        let frees: Vec<FreeEvent> = ids
+            .iter()
+            .map(|id| FreeEvent { id: *id, bytes: 0 })
+            .collect();
         self.send_events(&[], &frees, &[]);
     }
-
 }
 
 // ============================================================================
@@ -1024,8 +1080,7 @@ impl<D: DeviceClient> DeviceClient for DeviceHandle<D> {
         use crate::command::Command as C;
         if matches!(cmd, C::Alloc { .. } | C::Free { .. } | C::Htod { .. }) {
             return Err(ModelError::Msg(
-                "DeviceHandle::queue: 分配/归还/装载命令必须走具名方法(记账不可绕过)"
-                    .into(),
+                "DeviceHandle::queue: 分配/归还/装载命令必须走具名方法(记账不可绕过)".into(),
             ));
         }
         self.inner.queue(cmd)
@@ -1152,7 +1207,10 @@ impl<D: DeviceClient> DeviceClient for DeviceHandle<D> {
         }
     }
 
-    fn graph_launch(&mut self, graph: GraphId) -> impl Future<Output = Result<(), ModelError>> + Send {
+    fn graph_launch(
+        &mut self,
+        graph: GraphId,
+    ) -> impl Future<Output = Result<(), ModelError>> + Send {
         self.note_node();
         self.inner.graph_launch(graph)
     }
@@ -1230,7 +1288,9 @@ impl<D: DeviceClient> DeviceClient for DeviceHandle<D> {
                         self.sink.logf(
                             LVL_INFO,
                             "device-handle",
-                            format_args!("分配遇 PoolExhausted ⇒ GPU mem pool trim {trimmed} B 后重试"),
+                            format_args!(
+                                "分配遇 PoolExhausted ⇒ GPU mem pool trim {trimmed} B 后重试"
+                            ),
                         );
                         self.inner.alloc(dtype, elems, name).await?
                     } else {
@@ -1265,7 +1325,9 @@ impl<D: DeviceClient> DeviceClient for DeviceHandle<D> {
                         self.sink.logf(
                             LVL_INFO,
                             "device-handle",
-                            format_args!("分配遇 PoolExhausted ⇒ GPU mem pool trim {trimmed} B 后重试"),
+                            format_args!(
+                                "分配遇 PoolExhausted ⇒ GPU mem pool trim {trimmed} B 后重试"
+                            ),
                         );
                         self.inner.alloc_uninit(dtype, elems, name).await?
                     } else {
@@ -1323,7 +1385,11 @@ impl<D: DeviceClient> DeviceClient for DeviceHandle<D> {
         }
     }
 
-    fn dtoh(&mut self, b: &Bytes, out: &mut [u8]) -> impl Future<Output = Result<(), ModelError>> + Send {
+    fn dtoh(
+        &mut self,
+        b: &Bytes,
+        out: &mut [u8],
+    ) -> impl Future<Output = Result<(), ModelError>> + Send {
         self.inner.dtoh(b, out)
     }
 
@@ -1427,8 +1493,10 @@ impl<D: DeviceClient> DeviceClient for DeviceHandle<D> {
             // 幽灵/双 free/跨 rank 校验，然后**全部**真归还驱动。
             self.validate_free_ids(ids)?;
             self.inner.free(ids).await?;
-            let frees: Vec<FreeEvent> =
-                ids.iter().map(|id| FreeEvent { id: *id, bytes: 0 }).collect();
+            let frees: Vec<FreeEvent> = ids
+                .iter()
+                .map(|id| FreeEvent { id: *id, bytes: 0 })
+                .collect();
             self.send_events(&[], &frees, &[]);
             for id in ids {
                 self.untrack(*id);
@@ -1479,7 +1547,8 @@ impl<D: DeviceClient> DeviceClient for DeviceHandle<D> {
         offset_bytes: usize,
         len_bytes: usize,
     ) -> impl Future<Output = Result<(), ModelError>> + Send {
-        self.inner.upload_pinned_on(stream, buf, dst, offset_bytes, len_bytes)
+        self.inner
+            .upload_pinned_on(stream, buf, dst, offset_bytes, len_bytes)
     }
 
     fn upload_pinned(
@@ -1508,7 +1577,8 @@ impl<D: DeviceClient> DeviceClient for DeviceHandle<D> {
         offset_elems: usize,
         data: &[f32],
     ) -> impl Future<Output = Result<(), ModelError>> + Send {
-        self.inner.write_block_f32_on(stream, dst, offset_elems, data)
+        self.inner
+            .write_block_f32_on(stream, dst, offset_elems, data)
     }
 
     fn write_blocks_f32_on(
@@ -1556,7 +1626,9 @@ impl<D: DeviceClient> DeviceClient for DeviceHandle<D> {
         self.inner.launch_and_harvest(msg, id, want_bytes)
     }
 
-    fn block_ledger_dump(&mut self) -> impl Future<Output = Result<Vec<BlockLedgerRow>, ModelError>> + Send {
+    fn block_ledger_dump(
+        &mut self,
+    ) -> impl Future<Output = Result<Vec<BlockLedgerRow>, ModelError>> + Send {
         self.inner.block_ledger_dump()
     }
 
@@ -1570,9 +1642,7 @@ impl<D: DeviceClient> DeviceClient for DeviceHandle<D> {
         self.inner.mem_pool_stats()
     }
 
-    fn mem_info(
-        &mut self,
-    ) -> impl Future<Output = Result<(u64, u64), ModelError>> + Send {
+    fn mem_info(&mut self) -> impl Future<Output = Result<(u64, u64), ModelError>> + Send {
         self.inner.mem_info()
     }
 
@@ -1585,7 +1655,8 @@ impl<D: DeviceClient> DeviceClient for DeviceHandle<D> {
         len_bytes: usize,
     ) -> impl Future<Output = Result<(), ModelError>> + Send {
         self.note_node();
-        self.inner.copy_block_at(src, src_off_bytes, dst, dst_off_bytes, len_bytes)
+        self.inner
+            .copy_block_at(src, src_off_bytes, dst, dst_off_bytes, len_bytes)
     }
 
     fn face_clone(&self) -> Option<Self> {
@@ -1653,7 +1724,8 @@ impl<D: DeviceClient> DeviceClient for DeviceHandle<D> {
 #[macro_export]
 macro_rules! alloc {
     ($dev:expr, $cls:expr, $dtype:expr, $elems:expr, $name:expr) => {
-        $dev.exec($crate::handle::Command::alloc($cls, $dtype, $elems, $name)).await
+        $dev.exec($crate::handle::Command::alloc($cls, $dtype, $elems, $name))
+            .await
     };
 }
 
@@ -1673,21 +1745,29 @@ mod tests {
     #[test]
     fn command_builder_is_chainable() {
         let msg = LaunchMsg {
-            kernel: crate::contract::KernelSource { name: "k".into(), source: String::new() },
+            kernel: crate::contract::KernelSource {
+                name: "k".into(),
+                source: String::new(),
+            },
             args: vec![],
             grid: (1, 1, 1),
             block: (1, 1, 1),
             shared_mem: 0,
             out_elems: 0,
         };
-        let cmd = Command::Launch { msg, name: "k0".into() }
-            .grid((8, 1, 1))
-            .block((128, 1, 1))
-            .shared_mem(4096)
-            .args(vec![])
-            .name("k1");
+        let cmd = Command::Launch {
+            msg,
+            name: "k0".into(),
+        }
+        .grid((8, 1, 1))
+        .block((128, 1, 1))
+        .shared_mem(4096)
+        .args(vec![])
+        .name("k1");
         assert_eq!(cmd.kind(), "launch");
-        let Command::Launch { msg, name } = cmd else { panic!("应是 Launch") };
+        let Command::Launch { msg, name } = cmd else {
+            panic!("应是 Launch")
+        };
         assert_eq!(msg.grid, (8, 1, 1));
         assert_eq!(msg.block, (128, 1, 1));
         assert_eq!(msg.shared_mem, 4096);
@@ -1697,11 +1777,19 @@ mod tests {
     /// 骨架门 ②:构造糖 + `kind()`(打点/排障面)
     #[test]
     fn command_constructors_and_kind() {
-        assert_eq!(Command::alloc(AssetClass::Temp, Dtype::F16, 8, "x").kind(), "alloc");
+        assert_eq!(
+            Command::alloc(AssetClass::Temp, Dtype::F16, 8, "x").kind(),
+            "alloc"
+        );
         assert_eq!(Command::free(3).kind(), "free");
         assert_eq!(Command::Sync.kind(), "sync");
         assert_eq!(
-            Command::Htod { id: 1, off: 0, bytes: 8 }.kind(),
+            Command::Htod {
+                id: 1,
+                off: 0,
+                bytes: 8
+            }
+            .kind(),
             "htod",
             "未接线命令也要能报名字"
         );
@@ -1770,7 +1858,9 @@ mod tests {
         use std::sync::Mutex as StdMutex;
         static SEEN: StdMutex<Vec<String>> = StdMutex::new(Vec::new());
         fn rec(_l: u8, tag: &str, msg: &str) {
-            SEEN.lock().unwrap_or_else(|p| p.into_inner()).push(format!("{tag}:{msg}"));
+            SEEN.lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .push(format!("{tag}:{msg}"));
         }
         fn yes(_l: u8, _t: &str) -> bool {
             true
@@ -1781,7 +1871,10 @@ mod tests {
         assert_eq!(c.hook_fail, 1, "计数与日志同进");
         let seen = SEEN.lock().unwrap_or_else(|p| p.into_inner());
         assert_eq!(seen.len(), 1);
-        assert!(seen[0].starts_with("device-handle:ctx-lock:锁中毒"), "{seen:?}");
+        assert!(
+            seen[0].starts_with("device-handle:ctx-lock:锁中毒"),
+            "{seen:?}"
+        );
         drop(seen);
         // 未注入 = 静默,但计数照记(静默不等于丢账)
         c.bump(LogSink::none(), "x", "y".into());

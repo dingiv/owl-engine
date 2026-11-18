@@ -189,8 +189,12 @@ impl ReservationLedger {
             return Err(StoreError::Budget(format!(
                 "grant {id:?} 额度不足:要 {slots} 槽/{bytes}B,剩 {} 槽/{}B\
                  (票:turn {} {:?};分配面 {} 槽/{}B,已消费 {used_slots} 槽/{used_bytes}B)",
-                e.remaining_slots, e.remaining_bytes, e.grant.turn, e.grant.kind,
-                e.grant.alloc_slots, e.grant.alloc_bytes
+                e.remaining_slots,
+                e.remaining_bytes,
+                e.grant.turn,
+                e.grant.kind,
+                e.grant.alloc_slots,
+                e.grant.alloc_bytes
             )));
         }
         e.remaining_slots -= slots;

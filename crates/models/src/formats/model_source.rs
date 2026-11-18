@@ -455,7 +455,12 @@ impl ModelSource for HfDirSource {
         max_context_length: usize,
         pos_cap: usize,
     ) -> Result<Rope, ModelError> {
-        build_hf_rope(self.rope, self.facts.spec.full_heads.2, max_context_length, pos_cap)
+        build_hf_rope(
+            self.rope,
+            self.facts.spec.full_heads.2,
+            max_context_length,
+            pos_cap,
+        )
     }
 
     fn vision(&self) -> Option<VisionSource<'_>> {
@@ -698,7 +703,13 @@ impl ModelSource for GgufFileSource {
         max_context_length: usize,
         pos_cap: usize,
     ) -> Result<Rope, ModelError> {
-        build_gguf_rope(&self.facts.rf, cfg, max_context_length, pos_cap, self.spec.full_heads.2)
+        build_gguf_rope(
+            &self.facts.rf,
+            cfg,
+            max_context_length,
+            pos_cap,
+            self.spec.full_heads.2,
+        )
     }
 
     fn vision(&self) -> Option<VisionSource<'_>> {
@@ -795,7 +806,12 @@ fn build_hf_rope(
     }
     // 表长 = max(模型原生, 位置容量)：`pos_cap` 里的多出来的位置是图片 gap
     // 预留（只允许 leave-gap 会话消费；正常会话 pos_hi ≤ max_context_length）。
-    Rope::new(facts.max_pos.max(pos_cap), head_dim, facts.rotary_dim, facts.theta)
+    Rope::new(
+        facts.max_pos.max(pos_cap),
+        head_dim,
+        facts.rotary_dim,
+        facts.theta,
+    )
 }
 
 /// **形状分片换算**(唯一产地;`shard = 1` 恒等)。
@@ -896,7 +912,11 @@ fn build_gguf_rope(
         ));
     }
     let scaled = (original as f64 * cfg.yarn_factor).round() as usize;
-    let table = rf.max_pos.max(scaled).max(max_context_length.max(1)).max(pos_cap);
+    let table = rf
+        .max_pos
+        .max(scaled)
+        .max(max_context_length.max(1))
+        .max(pos_cap);
     let yarn = crate::layers::rope::YarnCfg {
         factor: cfg.yarn_factor as f32,
         original_max: original,
@@ -992,7 +1012,10 @@ mod tests {
             rotary_dim: 64,
             theta: 1.0e7,
         };
-        assert!(build_hf_rope(f, 128, 1024, 1024).is_ok(), "恰好等于表长应放行");
+        assert!(
+            build_hf_rope(f, 128, 1024, 1024).is_ok(),
+            "恰好等于表长应放行"
+        );
         assert!(build_hf_rope(f, 128, 0, 0).is_ok(), "0 = 未定预算应放行");
         let e = match build_hf_rope(f, 128, 1025, 1025) {
             Ok(_) => panic!("越表必须拒"),

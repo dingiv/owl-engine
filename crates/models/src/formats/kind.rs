@@ -79,7 +79,9 @@ pub fn detect(path: &Path) -> Result<Detection, ModelError> {
         return detect_gguf_file(path);
     }
     if !path.is_dir() {
-        return Err(ModelError::Msg(format!("detect: {path:?} 既不是目录也不是文件")));
+        return Err(ModelError::Msg(format!(
+            "detect: {path:?} 既不是目录也不是文件"
+        )));
     }
     // 文件清单(与 open_raw_index 同口径:字典序;分片键天然互斥)
     let files: Vec<PathBuf> = owl_shared::file_loader::read_dir(path)
@@ -95,7 +97,10 @@ pub fn detect(path: &Path) -> Result<Detection, ModelError> {
         .collect();
     ggufs.sort();
     if !ggufs.is_empty() {
-        let n_st = files.iter().filter(|p| p.extension().is_some_and(|x| x == "safetensors")).count();
+        let n_st = files
+            .iter()
+            .filter(|p| p.extension().is_some_and(|x| x == "safetensors"))
+            .count();
         if n_st > 0 {
             return Err(ModelError::Msg(format!(
                 "detect: {path:?} 同时含 .gguf 与 .safetensors(起点格式歧义;不许猜)"
@@ -156,7 +161,9 @@ pub fn detect(path: &Path) -> Result<Detection, ModelError> {
                 .filter(|(_, e)| {
                     !matches!(
                         e.dtype,
-                        safetensors::Dtype::F32 | safetensors::Dtype::BF16 | safetensors::Dtype::F16
+                        safetensors::Dtype::F32
+                            | safetensors::Dtype::BF16
+                            | safetensors::Dtype::F16
                     )
                 })
                 .map(|(k, _)| k)
@@ -169,7 +176,12 @@ pub fn detect(path: &Path) -> Result<Detection, ModelError> {
             CheckpointKind::SafeTensors
         }
     };
-    Ok(Detection { kind, files, entries, dtypes: counts })
+    Ok(Detection {
+        kind,
+        files,
+        entries,
+        dtypes: counts,
+    })
 }
 
 /// **GGUF 单文件探测**(magic 权威;扩展名只作提示)
@@ -183,7 +195,12 @@ fn detect_gguf_file(file: &Path) -> Result<Detection, ModelError> {
         }
     }
     counts.sort_by(|a, b| a.0.cmp(&b.0));
-    Ok(Detection { kind: CheckpointKind::Gguf, files: vec![file.to_path_buf()], entries: g.tensors.len(), dtypes: counts })
+    Ok(Detection {
+        kind: CheckpointKind::Gguf,
+        files: vec![file.to_path_buf()],
+        entries: g.tensors.len(),
+        dtypes: counts,
+    })
 }
 
 #[cfg(test)]
@@ -200,11 +217,25 @@ mod tests {
     #[test]
     fn detects_safetensors_family() {
         for (env, default, entries) in [
-            ("ckpt:0.8b", concat!(env!("CARGO_MANIFEST_DIR"), "/../../models/Qwen/Qwen3.5-0.8B"), 488),
-            ("ckpt:qwen35-4b", concat!(env!("CARGO_MANIFEST_DIR"), "/../../models/Qwen/Qwen3.5-4B"), 738),
+            (
+                "ckpt:0.8b",
+                concat!(
+                    env!("CARGO_MANIFEST_DIR"),
+                    "/../../models/Qwen/Qwen3.5-0.8B"
+                ),
+                488,
+            ),
+            (
+                "ckpt:qwen35-4b",
+                concat!(env!("CARGO_MANIFEST_DIR"), "/../../models/Qwen/Qwen3.5-4B"),
+                738,
+            ),
             (
                 "ckpt:dflash2-bf16",
-                concat!(env!("CARGO_MANIFEST_DIR"), "/../../models/z-lab/Qwen3.8-27B-DFlash2"),
+                concat!(
+                    env!("CARGO_MANIFEST_DIR"),
+                    "/../../models/z-lab/Qwen3.8-27B-DFlash2"
+                ),
                 81,
             ),
         ] {
@@ -224,7 +255,10 @@ mod tests {
     fn detects_pack_quantized_family() {
         let Some(d) = dir(
             "ckpt:27b-awq",
-            concat!(env!("CARGO_MANIFEST_DIR"), "/../../models/cyankiwi/Qwen3.8-27B-AWQ-INT4"),
+            concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/../../models/cyankiwi/Qwen3.8-27B-AWQ-INT4"
+            ),
         ) else {
             owl_shared::testkit::report::skip("资源 ckpt:27b-awq 不在(testdata/resources.toml)");
             return;
@@ -232,7 +266,10 @@ mod tests {
         let det = detect(&d).expect("detect");
         assert_eq!(det.kind, CheckpointKind::PackQuantized);
         assert_eq!(det.entries, 2396);
-        assert!(det.single_dtype().is_none(), "混存 dtype(实测 I32/I64/BF16)");
+        assert!(
+            det.single_dtype().is_none(),
+            "混存 dtype(实测 I32/I64/BF16)"
+        );
     }
 
     /// 响亮拒:空目录 / 不存在的路径
@@ -252,13 +289,19 @@ mod tests {
             // 不留"默认路径不存在 ⇒ 静默 skip"的空档)
             (
                 "gguf:4b",
-                concat!(env!("CARGO_MANIFEST_DIR"), "/../../models/bartowski/Qwen_Qwen3.5-4B-GGUF/Qwen_Qwen3.5-4B-Q4_K_M.gguf"),
+                concat!(
+                    env!("CARGO_MANIFEST_DIR"),
+                    "/../../models/bartowski/Qwen_Qwen3.5-4B-GGUF/Qwen_Qwen3.5-4B-Q4_K_M.gguf"
+                ),
                 441,
                 ["F32", "Q4_K", "Q5_K", "Q6_K", "Q8_0"].as_slice(),
             ),
             (
                 "gguf:27b",
-                concat!(env!("CARGO_MANIFEST_DIR"), "/../../models/ggml-org/Qwen3.8-27B-GGUF/Qwen3.8-27B-Q4_K_M.gguf"),
+                concat!(
+                    env!("CARGO_MANIFEST_DIR"),
+                    "/../../models/ggml-org/Qwen3.8-27B-GGUF/Qwen3.8-27B-Q4_K_M.gguf"
+                ),
                 851,
                 ["F32", "Q4_K", "Q6_K", "Q8_0"].as_slice(),
             ),

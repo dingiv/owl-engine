@@ -19,8 +19,23 @@ pub use super::fi_sig::{scale_bits, SIG};
 /// `parse_prefill` 取用的槽名(声明序;两臂同名 —— F3 成对律,
 /// `client::tests::parse_slots_are_exactly_declared` 逐字锁死)。
 pub const PARSE_SLOTS: &[&str] = &[
-    "q", "k_cache", "v_cache", "q_cu", "indices", "indptr", "last_len", "wr", "out",
-    "total_rows", "ctx_total", "t", "hq", "hkv", "hd", "page", "sm_scale_bits",
+    "q",
+    "k_cache",
+    "v_cache",
+    "q_cu",
+    "indices",
+    "indptr",
+    "last_len",
+    "wr",
+    "out",
+    "total_rows",
+    "ctx_total",
+    "t",
+    "hq",
+    "hkv",
+    "hd",
+    "page",
+    "sm_scale_bits",
 ];
 
 #[derive(Clone, Debug)]
@@ -72,7 +87,10 @@ pub fn parse_prefill(msg: &LaunchMsg) -> Result<FiPrefillCall, OpError> {
         hd: s.u64("hd")? as usize,
         page: s.u64("page")? as usize,
         sm_scale: f32::from_bits(s.u64("sm_scale_bits")? as u32),
-        fp8kv: matches!(msg.kernel.name.as_str(), PREFILL_FI_FP8KV | PREFILL_FI_FP8MMA),
+        fp8kv: matches!(
+            msg.kernel.name.as_str(),
+            PREFILL_FI_FP8KV | PREFILL_FI_FP8MMA
+        ),
         fp8mma: msg.kernel.name == PREFILL_FI_FP8MMA,
     })
 }
@@ -84,8 +102,18 @@ pub fn parse_prefill(msg: &LaunchMsg) -> Result<FiPrefillCall, OpError> {
 pub const ATTN_RAGGED_F16: &str = crate::family::flashinfer::ATTN_RAGGED_F16;
 
 /// 取用槽名(声明序;`vis::AttnFull` 的 PARAMS 同名同序 ⇒ F3 成对律可查)
-pub const ATTN_RAGGED_SLOTS: &[&str] =
-    &["q", "k", "v", "cu_seqlens", "out", "rows", "heads", "head_dim", "n_seq", "scale"];
+pub const ATTN_RAGGED_SLOTS: &[&str] = &[
+    "q",
+    "k",
+    "v",
+    "cu_seqlens",
+    "out",
+    "rows",
+    "heads",
+    "head_dim",
+    "n_seq",
+    "scale",
+];
 
 #[derive(Clone, Debug)]
 pub struct FiAttnRaggedCall {
@@ -113,8 +141,7 @@ pub fn parse_attn_ragged(msg: &LaunchMsg) -> Result<FiAttnRaggedCall, OpError> {
         rows: s.u64("rows")? as usize,
         heads: s.u64("heads")? as usize,
         head_dim: s.u64("head_dim")? as usize,
-        n_seq: s.i32("n_seq")? as usize,  // i32 槽(与 native `vis.attn_full` 同声明)
+        n_seq: s.i32("n_seq")? as usize, // i32 槽(与 native `vis.attn_full` 同声明)
         scale: s.f32("scale")?,
     })
 }
-

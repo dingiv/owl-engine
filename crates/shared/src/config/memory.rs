@@ -107,7 +107,10 @@ pub struct MemoryEstimate {
 impl MemoryEstimate {
     /// 估算使用的总占用(含 activation/margin)
     pub fn used_bytes(&self) -> u64 {
-        self.weights_bytes + self.fixed_bytes + self.pool_bytes + self.activation_bytes
+        self.weights_bytes
+            + self.fixed_bytes
+            + self.pool_bytes
+            + self.activation_bytes
             + self.stability_margin_bytes
     }
 }
@@ -135,7 +138,10 @@ pub fn activation_for(chunk: usize, tail_merge: usize) -> (u64, &'static str) {
     let upper = chunk.saturating_add(tail_merge);
     let block = chunk.max(tail_merge);
     if upper > 1024 {
-        (1_700 << 20, "chunk+tail>1024(无对应桶 ⇒ eager;激活约 1.6–1.8G)")
+        (
+            1_700 << 20,
+            "chunk+tail>1024(无对应桶 ⇒ eager;激活约 1.6–1.8G)",
+        )
     } else if block > 512 {
         (1_050 << 20, "最大块≤1024(1024 桶档;激活约 0.8–1.2G)")
     } else {
@@ -162,14 +168,23 @@ pub fn weights_bytes(inp: &MemoryInputs) -> u64 {
     } else {
         0
     };
-    base + draft + if inp.vision { p.vision_weights_bytes } else { 0 }
+    base + draft
+        + if inp.vision {
+            p.vision_weights_bytes
+        } else {
+            0
+        }
 }
 
 /// 本档每卡每 token KV(主池 + 草稿池都按 world 摊)
 pub fn per_tok_bytes(inp: &MemoryInputs) -> u64 {
     let world = inp.tp_world.max(1) as u64;
     (inp.model.kv_bytes_per_token(inp.kv_bytes_per_elem)
-        + if inp.spec_dflash { inp.model.draft_bytes_per_token() } else { 0 })
+        + if inp.spec_dflash {
+            inp.model.draft_bytes_per_token()
+        } else {
+            0
+        })
         / world
 }
 
@@ -193,7 +208,11 @@ pub fn budget_parts(inp: &MemoryInputs) -> (FixedParts, u64, u64, usize) {
 ///
 /// 返回 `(context_tokens, pool_tokens, cap_tokens)`。
 /// 求解失败(预算装不下一个 4k 块)⇒ Err 带完整账目。
-pub fn solve_max(inp: &MemoryInputs, model_max: usize, overcommit: bool) -> Result<(usize, usize, usize), String> {
+pub fn solve_max(
+    inp: &MemoryInputs,
+    model_max: usize,
+    overcommit: bool,
+) -> Result<(usize, usize, usize), String> {
     let (fixed, _target_total, budget, cap) = budget_parts(inp);
     let reserve_for_pool = inp.activation_bytes + inp.stability_margin_bytes;
     if budget <= reserve_for_pool {
@@ -263,7 +282,10 @@ pub fn estimate(
             "上下文 {} tok 超过治理器池上限 {} tok(预算 {:.2}G / 每 token {}B)\n\
              —— 非超卖档池必须装得下整条上下文;请降 context / 减小 prefill_chunk / 关 reuse,\n\
              或改用 `[intent].kvmem = \"overcommit\"`(池小于上下文,需宿主腿)",
-            context_tokens, cap, budget as f64 / GB, per_tok
+            context_tokens,
+            cap,
+            budget as f64 / GB,
+            per_tok
         ));
     }
     // ② 逻辑池(上下文×并发)超过 cap:物理池会被夹到 cap;超卖档属预期
@@ -275,7 +297,9 @@ pub fn estimate(
         ));
     }
     // ③ 稳定裕度不足(144k 实测可跑,但长跑泄漏可能撞 reserve;响亮告警)
-    let slack = budget as i64 - inp.activation_bytes as i64 - inp.stability_margin_bytes as i64
+    let slack = budget as i64
+        - inp.activation_bytes as i64
+        - inp.stability_margin_bytes as i64
         - pool_bytes as i64;
     if slack < 0 {
         notes.push(format!(
@@ -323,7 +347,7 @@ const GB: f64 = 1073741824.0;
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::intent::{RTX_3090TI_24G, QWEN38_27B_AWQ};
+    use crate::config::intent::{QWEN38_27B_AWQ, RTX_3090TI_24G};
 
     fn inputs(kv_1byte: bool, chunk: usize, tail: usize, snap_max: usize) -> MemoryInputs {
         let (act, note) = activation_for(chunk, tail);
@@ -353,7 +377,11 @@ mod tests {
         let inp = inputs(true, 512, 512, 0);
         let (fixed, _target, budget, cap) = budget_parts(&inp);
         // fixed 只剩真实 GDN 分配;图/warmup 在 reserve(714MiB)内。
-        assert_eq!(fixed.total(), (148 << 20) + (1 << 19), "fixed = GDN 格+快照 148.5 MiB");
+        assert_eq!(
+            fixed.total(),
+            (148 << 20) + (1 << 19),
+            "fixed = GDN 格+快照 148.5 MiB"
+        );
         assert!(
             (budget as f64 / GB - 6.26).abs() < 0.02,
             "budget={:.3}G 应 ≈6.26G(2026-11-16 合并预留后)",
@@ -372,7 +400,11 @@ mod tests {
         let inp = inputs(true, 512, 512, 0);
         let e = estimate(&inp, 163_840, 163_840, true).expect("显式覆盖不拒");
         assert!(e.slack_bytes < 0, "160k 应余量不足:{e:?}");
-        assert!(e.notes.iter().any(|n| n.contains("稳定裕度")), "{:?}", e.notes);
+        assert!(
+            e.notes.iter().any(|n| n.contains("稳定裕度")),
+            "{:?}",
+            e.notes
+        );
         assert_eq!(e.pool_bytes, 163_840 * 32768);
     }
 

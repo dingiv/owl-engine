@@ -24,17 +24,47 @@ pub const SIG_W4A8: &str = "T,T,O,T,T,T,T,T,sz,sz,sz,sz";
 
 /// `parse_gemm`(f16/bf16 臂)取用的槽名(声明序) —— F3 成对律;
 /// `client::tests::parse_slots_are_exactly_declared` 逐字锁死。
-pub const PARSE_SLOTS: &[&str] =
-    &["a", "b", "out", "scales", "ws", "c_tmp", "m", "k", "n", "groupsize"];
+pub const PARSE_SLOTS: &[&str] = &[
+    "a",
+    "b",
+    "out",
+    "scales",
+    "ws",
+    "c_tmp",
+    "m",
+    "k",
+    "n",
+    "groupsize",
+];
 
 /// `parse_gemm_awq` 取用的槽名 —— 同律(AWQ 臂比上面多 `zeros`)。
 pub const PARSE_SLOTS_AWQ: &[&str] = &[
-    "a", "b", "out", "scales", "zeros", "ws", "c_tmp", "m", "k", "n", "groupsize",
+    "a",
+    "b",
+    "out",
+    "scales",
+    "zeros",
+    "ws",
+    "c_tmp",
+    "m",
+    "k",
+    "n",
+    "groupsize",
 ];
 
 /// `parse_gemm_w4a8_awq` 取用的槽名 —— 同律(W4A8 臂再插 `a_scales`)。
 pub const PARSE_SLOTS_W4A8: &[&str] = &[
-    "a", "b", "out", "scales", "zeros", "a_scales", "ws", "c_tmp", "m", "k", "n",
+    "a",
+    "b",
+    "out",
+    "scales",
+    "zeros",
+    "a_scales",
+    "ws",
+    "c_tmp",
+    "m",
+    "k",
+    "n",
     "groupsize",
 ];
 
@@ -171,9 +201,19 @@ mod tests {
     #[test]
     fn ffi_mnk_reorders_slots_to_c_params() {
         let call = MarlinCall {
-            a: blk(1), b: blk(2), out: blk(3), scales: blk(4),
-            zeros: None, a_scales: None, ws: blk(5), c_tmp: blk(6),
-            m: 8, k: 64, n: 256, groupsize: 32, bf16: false,
+            a: blk(1),
+            b: blk(2),
+            out: blk(3),
+            scales: blk(4),
+            zeros: None,
+            a_scales: None,
+            ws: blk(5),
+            c_tmp: blk(6),
+            m: 8,
+            k: 64,
+            n: 256,
+            groupsize: 32,
+            bf16: false,
         };
         assert_eq!(
             call.ffi_mnk(),

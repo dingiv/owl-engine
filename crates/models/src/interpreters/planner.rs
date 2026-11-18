@@ -236,10 +236,18 @@ mod tests {
         let st = p.stats();
         assert_eq!(st.miss, 3, "只有首层落 server:得 {}", st.miss);
         assert_eq!(st.hit, ((LAYERS - 1) * SHAPES.len()) as u64);
-        assert!(st.hit_rate() > 0.97, "命中率 {:.4}(只有首层落 server)", st.hit_rate());
+        assert!(
+            st.hit_rate() > 0.97,
+            "命中率 {:.4}(只有首层落 server)",
+            st.hit_rate()
+        );
         assert!(p.cached_bytes() <= 128 << 20);
         let drained = p.drain();
-        assert_eq!(drained.len(), SHAPES.len(), "收尾只 1 条批量 free 的 3 个块");
+        assert_eq!(
+            drained.len(),
+            SHAPES.len(),
+            "收尾只 1 条批量 free 的 3 个块"
+        );
         assert_eq!(p.cached_bytes(), 0);
     }
 }

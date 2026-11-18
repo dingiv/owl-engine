@@ -131,9 +131,9 @@ fn e5m2_decode(b: u8) -> f32 {
     let e = ((b >> 2) & 0x1F) as i32;
     let m = (b & 0x03) as f32;
     match e {
-        0 => s * m * 2f32.powi(-16),          // 次正规(尾数 × 2^-14 / 4)
-        0x1F if m != 0.0 => f32::NAN,         // 指数全 1 + 尾数非零 = NaN
-        0x1F => s * f32::INFINITY,            // 指数全 1 + 尾数零 = inf
+        0 => s * m * 2f32.powi(-16),  // 次正规(尾数 × 2^-14 / 4)
+        0x1F if m != 0.0 => f32::NAN, // 指数全 1 + 尾数非零 = NaN
+        0x1F => s * f32::INFINITY,    // 指数全 1 + 尾数零 = inf
         _ => s * (1.0 + m / 4.0) * 2f32.powi(e - 15),
     }
 }

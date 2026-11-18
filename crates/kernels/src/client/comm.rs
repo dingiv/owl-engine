@@ -100,9 +100,25 @@ fn barrier_entry_dt(dt: Dtype) -> &'static str {
 /// 2026-10-19 修复:上一轮只给 `ArStageCall` 加了 `data` 字段与 `parse`/`to_launch`,
 /// **漏了这张常量表** ⇒ `cargo test -p owl-kernels --lib` 两条槽序锁红(F3 铁律现场:
 /// 真源有两处就会漂 —— 两把锁存在的理由就是把这类漏跟当场抹出来)。
-pub const PARSE_SLOTS: &[&str] = &["local", "own", "peer", "data", "bytes", "slot_bytes", "slab_off"];
+pub const PARSE_SLOTS: &[&str] = &[
+    "local",
+    "own",
+    "peer",
+    "data",
+    "bytes",
+    "slot_bytes",
+    "slab_off",
+];
 /// reduce 的 parse 槽名(声明序;push 档同律 —— 第 4 槽 = `data`)
-pub const PARSE_SLOTS_REDUCE: &[&str] = &["out", "own", "peer", "data", "bytes", "slot_bytes", "slab_off"];
+pub const PARSE_SLOTS_REDUCE: &[&str] = &[
+    "out",
+    "own",
+    "peer",
+    "data",
+    "bytes",
+    "slot_bytes",
+    "slab_off",
+];
 
 /// fused 臂的族名(server 路由 id;§11.2)
 pub const AR_FUSED: &str = crate::family::comm::COMM_AR_FUSED;
@@ -110,7 +126,14 @@ pub const AR_FUSED: &str = crate::family::comm::COMM_AR_FUSED;
 pub const SIG_FUSED: &str = "O,T,T,O,T,sz,sz,sz";
 /// fused 的 parse 槽名(声明序)
 pub const PARSE_SLOTS_FUSED: &[&str] = &[
-    "payload", "own", "peer", "data_w", "data_r", "bytes", "slot_bytes", "slab_off",
+    "payload",
+    "own",
+    "peer",
+    "data_w",
+    "data_r",
+    "bytes",
+    "slot_bytes",
+    "slab_off",
 ];
 
 /// stage 调用(解析/组装双向同型)。
@@ -143,7 +166,16 @@ impl ArStageCall {
         slot_bytes: u64,
         slab_off: u64,
     ) -> Self {
-        Self { local, own, peer, data, bytes, slot_bytes, slab_off, f8: false }
+        Self {
+            local,
+            own,
+            peer,
+            data,
+            bytes,
+            slot_bytes,
+            slab_off,
+            f8: false,
+        }
     }
 
     /// 切到 **fp8 载荷档**(§47 第二步;builder —— 存量调用点零改)
@@ -253,7 +285,17 @@ impl ArFusedCall {
         slot_bytes: u64,
         slab_off: u64,
     ) -> Self {
-        Self { payload, own, peer, data_w, data_r, bytes, slot_bytes, slab_off, barrier: false }
+        Self {
+            payload,
+            own,
+            peer,
+            data_w,
+            data_r,
+            bytes,
+            slot_bytes,
+            slab_off,
+            barrier: false,
+        }
     }
 
     /// 切到 barrier-only AR-2(同一线格式;只换发射名)。
@@ -367,7 +409,16 @@ impl ArReduceCall {
         slot_bytes: u64,
         slab_off: u64,
     ) -> Self {
-        Self { out, own, peer, data, bytes, slot_bytes, slab_off, f8: false }
+        Self {
+            out,
+            own,
+            peer,
+            data,
+            bytes,
+            slot_bytes,
+            slab_off,
+            f8: false,
+        }
     }
 
     /// 切到 **fp8 载荷档**(与 `ArStageCall::with_f8` 成对使用)
@@ -474,8 +525,22 @@ pub struct Ar1StageCall {
 }
 
 impl Ar1StageCall {
-    pub fn new(out: Bytes, src: Bytes, own: Bytes, peer: Bytes, peer_data: Bytes, bytes: u64) -> Self {
-        Self { out, src, own, peer, peer_data, bytes }
+    pub fn new(
+        out: Bytes,
+        src: Bytes,
+        own: Bytes,
+        peer: Bytes,
+        peer_data: Bytes,
+        bytes: u64,
+    ) -> Self {
+        Self {
+            out,
+            src,
+            own,
+            peer,
+            peer_data,
+            bytes,
+        }
     }
 
     pub fn parse(msg: &LaunchMsg) -> Result<(Self, Bytes), OpError> {

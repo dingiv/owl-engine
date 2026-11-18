@@ -103,7 +103,7 @@ Body documents are written in **Chinese**; this index and all meta documents
 - ⬜ [`devlog/spec/gguf-dflash2-survey.md`](devlog/spec/gguf-dflash2-survey.md) — DFlash2 speculative decoding on the GGUF line
 - ⬜ [`devlog/spec/gguf-dflash2-roadmap.md`](devlog/spec/gguf-dflash2-roadmap.md) — GGUF DFlash2 speedup roadmap
 - ⬜ [`devlog/spec/longctx-spec-survey.md`](devlog/spec/longctx-spec-survey.md) — Long-context spec-decode: our decay vs community approaches
-- ✅ [`devlog/spec/spec-degrade-hysteresis-2026-11-03.md`](devlog/spec/spec-degrade-hysteresis-2026-11-03.md) — 投机降级"降了不回头":降级态探测消费 8~64 步前的**陈旧草稿** ⇒ 53 次探测全灭(`undegrad=0`,turn 内永久裸 decode);修草稿账 + 确认制(两连续低窗才降 / 探测命中必恢复 / 探测封顶 64→32);同形状 83.4→116.8 t/s
+- ✅ [`devlog/spec/spec-degrade-hysteresis-2026-11-03.md`](devlog/spec/spec-degrade-hysteresis-2026-11-03.md) — 投机降级"降了不回头":降级态探测消费 8~64 步前的**陈旧草稿** ⇒ 53 次探测全灭(`undegrad=0`,turn 内永久裸 decode);修草稿账 + 确认制(两连续低窗才降 / 探测命中必恢复 / 探测封顶 64→32);同形状 83.4→116.8 t/s。**2026-11-18 回归**:同步节流把步进计数器锁在 1 ⇒ 降级永不探测(50 t/s),已修 + 真机复验
 - ✅ [`devlog/spec/spec-seed-stale-draft-2026-11-12.md`](devlog/spec/spec-seed-stale-draft-2026-11-12.md) — 冷启动 AL 损失:播种裸步不吃预产草稿账(错位一格必 m=0)+ 分母 ctx 重采门在短 ctx 下反复触发(48→62 即 +29%,首 turn 8 次裸步);修作废草稿 + 相对门/绝对下限(4096)/播种中不重采;冷 AL 6.50→7.91(热 7.97),输出 sha 不变
 
 ## G. Memory, KV and long context

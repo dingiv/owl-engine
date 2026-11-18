@@ -8,15 +8,23 @@
 //! - 发射 grid = (num_tokens,1,1) **显式**(核内 blockIdx.x = token_idx;
 //!   哨兵自动 1D 会越界读 slot_mapping,禁用 —— port 头注第 3 条)。
 
-use owl_macros::owl_test;
 use crate::contract::DeviceClient as _;
 use crate::ops::SemanticKernel;
-use crate::testkit::{f32b, gpu_client, gpu_enabled};
 use crate::tensor::Dtype;
+use crate::testkit::{f32b, gpu_client, gpu_enabled};
 use crate::TensorOps;
+use owl_macros::owl_test;
 
 /// 物理槽 → cache 下标(vLLM classic 布局 host 参照;与核内逐式同源)
-fn host_cache_idx(slot: i64, head: usize, d: usize, hkv: usize, hd: usize, p: usize, x: usize) -> (usize, usize) {
+fn host_cache_idx(
+    slot: i64,
+    head: usize,
+    d: usize,
+    hkv: usize,
+    hd: usize,
+    p: usize,
+    x: usize,
+) -> (usize, usize) {
     let block_idx = (slot / p as i64) as usize;
     let block_offset = (slot % p as i64) as usize;
     let key = block_idx * hkv * (hd / x) * p * x
@@ -37,7 +45,9 @@ async fn gpu_reshape_and_cache_f16_matches_host() {
     let x = 16usize / 2; // f16 → 8
     let t_len = 10usize;
     let halfb = |v: &[f32]| -> Vec<u8> {
-        v.iter().flat_map(|f| half::f16::from_f32(*f).to_le_bytes()).collect()
+        v.iter()
+            .flat_map(|f| half::f16::from_f32(*f).to_le_bytes())
+            .collect()
     };
 
     // 输入(确定性;过 f16 量化)
@@ -68,22 +78,45 @@ async fn gpu_reshape_and_cache_f16_matches_host() {
     .expect("vc 池");
 
     // 发射(显式 grid = T;契约 5 槽表 f32)
-    let decl = TensorOps::call(SemanticKernel::K0Write).aux(&[t_len])
-    .arg(&TensorOps::from_host(Dtype::F16, vec![t_len, hkv, hd], &halfb(&key)))
-    .arg(&TensorOps::from_host(Dtype::F16, vec![t_len, hkv, hd], &halfb(&value)))
-    .arg(&TensorOps::of_block(kc_b.id, Dtype::F16, vec![nb, hkv, hd / x, p, x]))
-    .arg(&TensorOps::of_block(vc_b.id, Dtype::F16, vec![nb, hkv, hd, p]))
-    .arg(&TensorOps::from_host(Dtype::F32, vec![t_len], &f32b(&slots)))
-    .arg_i32(hkv as i32 * hd as i32) // key_stride = 行密排 = H·D
-    .arg_i32(hkv as i32 * hd as i32)
-    .arg_i32(hkv as i32)
-    .arg_i32(hd as i32)
-    .arg_i32(p as i32)
-    .arg_i32(x as i32)
-    // 末位 T = 哑输出(契约 4;核不写,cache 双池经 ins 就地写);
-    // grid 已显式 = (T,1,1),out 元素数无意义
-    .with_shape(Dtype::F16, vec![1]);
-    crate::interpreters::eval_ops(decl.step(), &mut gpu).await.expect("eval");
+    let decl = TensorOps::call(SemanticKernel::K0Write)
+        .aux(&[t_len])
+        .arg(&TensorOps::from_host(
+            Dtype::F16,
+            vec![t_len, hkv, hd],
+            &halfb(&key),
+        ))
+        .arg(&TensorOps::from_host(
+            Dtype::F16,
+            vec![t_len, hkv, hd],
+            &halfb(&value),
+        ))
+        .arg(&TensorOps::of_block(
+            kc_b.id,
+            Dtype::F16,
+            vec![nb, hkv, hd / x, p, x],
+        ))
+        .arg(&TensorOps::of_block(
+            vc_b.id,
+            Dtype::F16,
+            vec![nb, hkv, hd, p],
+        ))
+        .arg(&TensorOps::from_host(
+            Dtype::F32,
+            vec![t_len],
+            &f32b(&slots),
+        ))
+        .arg_i32(hkv as i32 * hd as i32) // key_stride = 行密排 = H·D
+        .arg_i32(hkv as i32 * hd as i32)
+        .arg_i32(hkv as i32)
+        .arg_i32(hd as i32)
+        .arg_i32(p as i32)
+        .arg_i32(x as i32)
+        // 末位 T = 哑输出(契约 4;核不写,cache 双池经 ins 就地写);
+        // grid 已显式 = (T,1,1),out 元素数无意义
+        .with_shape(Dtype::F16, vec![1]);
+    crate::interpreters::eval_ops(decl.step(), &mut gpu)
+        .await
+        .expect("eval");
 
     // 读回双池
     let mut read = async |b: &crate::contract::Bytes, shape: Vec<usize>| -> Vec<f32> {
@@ -135,11 +168,24 @@ async fn gpu_reshape_and_cache_f16_matches_host() {
 /// (布局自洽),q = token0 key 行;返回(池句柄, 分页表, 序长表)。
 async fn setup_paged_fixture(
     gpu: &mut owl_cuda::GpuClient,
-    _hq: usize, hkv: usize, hd: usize, p: usize, nb: usize, t_ctx: usize,
-) -> (crate::contract::Bytes, crate::contract::Bytes, Vec<f32>, Vec<f32>, Vec<f32>) {
+    _hq: usize,
+    hkv: usize,
+    hd: usize,
+    p: usize,
+    nb: usize,
+    t_ctx: usize,
+) -> (
+    crate::contract::Bytes,
+    crate::contract::Bytes,
+    Vec<f32>,
+    Vec<f32>,
+    Vec<f32>,
+) {
     let x = 8usize;
     let halfb = |v: &[f32]| -> Vec<u8> {
-        v.iter().flat_map(|f| half::f16::from_f32(*f).to_le_bytes()).collect()
+        v.iter()
+            .flat_map(|f| half::f16::from_f32(*f).to_le_bytes())
+            .collect()
     };
     let q8 = |v: f32| half::f16::from_f32(v).to_f32();
     let pat = |t: usize, h: usize, d: usize, salt: f32| {
@@ -159,18 +205,45 @@ async fn setup_paged_fixture(
         .collect();
 
     let kc_b = crate::interpreters::eval_ops(
-        TensorOps::zeros(Dtype::F16, vec![nb, hkv, hd / x, p, x]).step(), gpu)
-        .await.expect("kc 池");
+        TensorOps::zeros(Dtype::F16, vec![nb, hkv, hd / x, p, x]).step(),
+        gpu,
+    )
+    .await
+    .expect("kc 池");
     let vc_b = crate::interpreters::eval_ops(
-        TensorOps::zeros(Dtype::F16, vec![nb, hkv, hd, p]).step(), gpu)
-        .await.expect("vc 池");
+        TensorOps::zeros(Dtype::F16, vec![nb, hkv, hd, p]).step(),
+        gpu,
+    )
+    .await
+    .expect("vc 池");
     let slots: Vec<f32> = (0..t_ctx).map(|t| t as f32).collect();
-    let wr = TensorOps::call(SemanticKernel::K0Write).aux(&[t_ctx])
-        .arg(&TensorOps::from_host(Dtype::F16, vec![t_ctx, hkv, hd], &halfb(&key)))
-        .arg(&TensorOps::from_host(Dtype::F16, vec![t_ctx, hkv, hd], &halfb(&value)))
-        .arg(&TensorOps::of_block(kc_b.id, Dtype::F16, vec![nb, hkv, hd / x, p, x]))
-        .arg(&TensorOps::of_block(vc_b.id, Dtype::F16, vec![nb, hkv, hd, p]))
-        .arg(&TensorOps::from_host(Dtype::F32, vec![t_ctx], &f32b(&slots)))
+    let wr = TensorOps::call(SemanticKernel::K0Write)
+        .aux(&[t_ctx])
+        .arg(&TensorOps::from_host(
+            Dtype::F16,
+            vec![t_ctx, hkv, hd],
+            &halfb(&key),
+        ))
+        .arg(&TensorOps::from_host(
+            Dtype::F16,
+            vec![t_ctx, hkv, hd],
+            &halfb(&value),
+        ))
+        .arg(&TensorOps::of_block(
+            kc_b.id,
+            Dtype::F16,
+            vec![nb, hkv, hd / x, p, x],
+        ))
+        .arg(&TensorOps::of_block(
+            vc_b.id,
+            Dtype::F16,
+            vec![nb, hkv, hd, p],
+        ))
+        .arg(&TensorOps::from_host(
+            Dtype::F32,
+            vec![t_ctx],
+            &f32b(&slots),
+        ))
         .arg_i32(hkv as i32 * hd as i32)
         .arg_i32(hkv as i32 * hd as i32)
         .arg_i32(hkv as i32)
@@ -178,7 +251,9 @@ async fn setup_paged_fixture(
         .arg_i32(p as i32)
         .arg_i32(x as i32)
         .with_shape(Dtype::F16, vec![1]);
-    crate::interpreters::eval_ops(wr.step(), gpu).await.expect("K0 写池");
+    crate::interpreters::eval_ops(wr.step(), gpu)
+        .await
+        .expect("K0 写池");
 
     let tables = vec![0.0f32, 1.0]; // 恒等块表 [1, 2]
     (kc_b, vc_b, key, value, tables)
@@ -187,8 +262,15 @@ async fn setup_paged_fixture(
 /// host 参照:token-major 语义注意力(f16 量化值;分页索引由核验)
 #[allow(clippy::too_many_arguments)]
 fn host_attn_ref(
-    q_row: &[f32], key: &[f32], value: &[f32], h: usize, kvh_map: &[usize],
-    hkv: usize, hd: usize, t_ctx: usize, scale: f32,
+    q_row: &[f32],
+    key: &[f32],
+    value: &[f32],
+    h: usize,
+    kvh_map: &[usize],
+    hkv: usize,
+    hd: usize,
+    t_ctx: usize,
+    scale: f32,
 ) -> Vec<f32> {
     let q8 = |v: f32| half::f16::from_f32(v).to_f32();
     let kvh = kvh_map[h];
@@ -250,32 +332,64 @@ async fn gpu_prefill_paged_attn_f16_hd256_impl(t_ctx: usize) {
     let scale = 1.0 / (hd as f32).sqrt();
     let _smem = (64 + 2 * hd * p * 2) as u32;
     let q8 = |v: f32| half::f16::from_f32(v).to_f32();
-    let qb = |v: &[f32]| v.iter().flat_map(|f| half::f16::from_f32(*f).to_le_bytes()).collect::<Vec<u8>>();
+    let qb = |v: &[f32]| {
+        v.iter()
+            .flat_map(|f| half::f16::from_f32(*f).to_le_bytes())
+            .collect::<Vec<u8>>()
+    };
 
-    let decl = TensorOps::call(SemanticKernel::PagedPrefill).aux(&[hd, hkv, hq, t_ctx])
-    .arg(&TensorOps::from_host(Dtype::F16, vec![t_ctx, hq * hd], &qb(&q)))
-    .arg(&TensorOps::of_block(kc_b.id, Dtype::F16, vec![nb, hkv, hd / 8, p, 8]))
-    .arg(&TensorOps::of_block(vc_b.id, Dtype::F16, vec![nb, hkv, hd, p]))
-    .arg(&TensorOps::from_host(Dtype::F32, vec![1, 1], &f32b(&[0.0])))
-    .arg(&TensorOps::from_host(Dtype::F32, vec![1], &f32b(&[t_ctx as f32])))
-    .arg(&TensorOps::from_host(Dtype::F32, vec![2], &f32b(&[0.0, t_ctx as f32])))
-    .arg(&TensorOps::from_host(Dtype::F16, vec![1], &[0.0f32].iter().flat_map(|f| half::f16::from_f32(*f).to_le_bytes()).collect::<Vec<u8>>()))  // alibi 哑块(契约 F16)
-    .arg(&TensorOps::from_host(Dtype::F32, vec![1], &f32b(&[0.0])))
-    .arg_i32(hkv as i32)
-    .arg_f32(scale)
-    .arg_i32(1)
-    .arg_i32(1)
-    .arg_i32(hq as i32)
-    .arg_i32(t_ctx as i32)
-    .arg_f32(1.0)
-    .arg_i32(hq as i32 * hd as i32)
-    .arg_i32(-1)
-    .arg_i32(nb as i32)
-    .arg_i32(hkv as i32 * hd as i32 * p as i32)
-    .arg_i32(hd as i32 * p as i32)
-    .arg_i32(0)
-    .arg_i32(0)
-    .with_shape(Dtype::F16, vec![t_ctx, hq * hd]);
+    let decl = TensorOps::call(SemanticKernel::PagedPrefill)
+        .aux(&[hd, hkv, hq, t_ctx])
+        .arg(&TensorOps::from_host(
+            Dtype::F16,
+            vec![t_ctx, hq * hd],
+            &qb(&q),
+        ))
+        .arg(&TensorOps::of_block(
+            kc_b.id,
+            Dtype::F16,
+            vec![nb, hkv, hd / 8, p, 8],
+        ))
+        .arg(&TensorOps::of_block(
+            vc_b.id,
+            Dtype::F16,
+            vec![nb, hkv, hd, p],
+        ))
+        .arg(&TensorOps::from_host(Dtype::F32, vec![1, 1], &f32b(&[0.0])))
+        .arg(&TensorOps::from_host(
+            Dtype::F32,
+            vec![1],
+            &f32b(&[t_ctx as f32]),
+        ))
+        .arg(&TensorOps::from_host(
+            Dtype::F32,
+            vec![2],
+            &f32b(&[0.0, t_ctx as f32]),
+        ))
+        .arg(&TensorOps::from_host(
+            Dtype::F16,
+            vec![1],
+            &[0.0f32]
+                .iter()
+                .flat_map(|f| half::f16::from_f32(*f).to_le_bytes())
+                .collect::<Vec<u8>>(),
+        )) // alibi 哑块(契约 F16)
+        .arg(&TensorOps::from_host(Dtype::F32, vec![1], &f32b(&[0.0])))
+        .arg_i32(hkv as i32)
+        .arg_f32(scale)
+        .arg_i32(1)
+        .arg_i32(1)
+        .arg_i32(hq as i32)
+        .arg_i32(t_ctx as i32)
+        .arg_f32(1.0)
+        .arg_i32(hq as i32 * hd as i32)
+        .arg_i32(-1)
+        .arg_i32(nb as i32)
+        .arg_i32(hkv as i32 * hd as i32 * p as i32)
+        .arg_i32(hd as i32 * p as i32)
+        .arg_i32(0)
+        .arg_i32(0)
+        .with_shape(Dtype::F16, vec![t_ctx, hq * hd]);
     let got = crate::testkit::harvest_f16(&mut gpu, &decl).await;
 
     for (t, h) in (0..t_ctx).flat_map(|t| (0..hq).map(move |h| (t, h))) {
@@ -330,31 +444,70 @@ async fn gpu_paged_attention_v1_f16_smoke() {
     let scale = 1.0 / (hd as f32).sqrt();
     let _shared = (t_ctx.div_ceil(p) * p * 4).max((4 / 2) * hd * 4) as u32; // NUM_WARPS=4
 
-    let decl = TensorOps::call(SemanticKernel::PagedDecode).aux(&[hd, hq, hkv, nb])
-        .arg(&TensorOps::from_host(Dtype::F16, vec![1, hq * hd],
-            &q.iter().flat_map(|f| half::f16::from_f32(*f).to_le_bytes()).collect::<Vec<u8>>()))
-        .arg(&TensorOps::of_block(kc_b.id, Dtype::F16, vec![nb, hkv, hd / 8, p, 8]))
-        .arg(&TensorOps::of_block(vc_b.id, Dtype::F16, vec![nb, hkv, hd, p]))
-        .arg(&TensorOps::from_host(Dtype::F32, vec![1, 2], &f32b(&tables)))
-        .arg(&TensorOps::from_host(Dtype::F32, vec![1, 1], &f32b(&[t_ctx as f32])))
-        .arg(&TensorOps::from_host(Dtype::F16, vec![1], &[0.0f32].iter().flat_map(|f| half::f16::from_f32(*f).to_le_bytes()).collect::<Vec<u8>>())) // alibi 哑块(旗标 0 不解引用)
+    let decl = TensorOps::call(SemanticKernel::PagedDecode)
+        .aux(&[hd, hq, hkv, nb])
+        .arg(&TensorOps::from_host(
+            Dtype::F16,
+            vec![1, hq * hd],
+            &q.iter()
+                .flat_map(|f| half::f16::from_f32(*f).to_le_bytes())
+                .collect::<Vec<u8>>(),
+        ))
+        .arg(&TensorOps::of_block(
+            kc_b.id,
+            Dtype::F16,
+            vec![nb, hkv, hd / 8, p, 8],
+        ))
+        .arg(&TensorOps::of_block(
+            vc_b.id,
+            Dtype::F16,
+            vec![nb, hkv, hd, p],
+        ))
+        .arg(&TensorOps::from_host(
+            Dtype::F32,
+            vec![1, 2],
+            &f32b(&tables),
+        ))
+        .arg(&TensorOps::from_host(
+            Dtype::F32,
+            vec![1, 1],
+            &f32b(&[t_ctx as f32]),
+        ))
+        .arg(&TensorOps::from_host(
+            Dtype::F16,
+            vec![1],
+            &[0.0f32]
+                .iter()
+                .flat_map(|f| half::f16::from_f32(*f).to_le_bytes())
+                .collect::<Vec<u8>>(),
+        )) // alibi 哑块(旗标 0 不解引用)
         .arg_i32(hkv as i32)
         .arg_f32(scale)
         .arg_i32(nb as i32)
-        .arg_i32(hq as i32 * hd as i32)              // q_stride
-        .arg_i32(hkv as i32 * hd as i32 * p as i32)  // kv_block_stride
-        .arg_i32(hd as i32 * p as i32)               // kv_head_stride
-        .arg_f32(1.0)                                 // softscapping 直通
-        .arg_i32(-1)                                  // sliding_window 关
-        .arg_i32(0)                                   // use_alibi 关
-        .with_shape(Dtype::F16, vec![1, hq * hd]);     // 末位 T = 新分配输出
+        .arg_i32(hq as i32 * hd as i32) // q_stride
+        .arg_i32(hkv as i32 * hd as i32 * p as i32) // kv_block_stride
+        .arg_i32(hd as i32 * p as i32) // kv_head_stride
+        .arg_f32(1.0) // softscapping 直通
+        .arg_i32(-1) // sliding_window 关
+        .arg_i32(0) // use_alibi 关
+        .with_shape(Dtype::F16, vec![1, hq * hd]); // 末位 T = 新分配输出
 
     // nvrtc 懒编译在此行发生:编译失败 = 整个扁平化路线回炉
     let got = crate::testkit::harvest_f16(&mut gpu, &decl).await;
 
     let mut ref_out = Vec::new();
     for h in 0..hq {
-        ref_out.extend(host_attn_ref(&q[h * hd..(h + 1) * hd], &key, &value, h, &kvh_map, hkv, hd, t_ctx, scale));
+        ref_out.extend(host_attn_ref(
+            &q[h * hd..(h + 1) * hd],
+            &key,
+            &value,
+            h,
+            &kvh_map,
+            hkv,
+            hd,
+            t_ctx,
+            scale,
+        ));
     }
     crate::testkit::assert_close(&got, &ref_out, 2e-2, "paged v1 f16");
     gpu.close().await.expect("关机");
@@ -377,25 +530,49 @@ async fn gpu_paged_attention_v1_f16_hd256_smoke() {
     }
     let scale = 1.0 / (hd as f32).sqrt();
     let _shared = (t_ctx.div_ceil(p) * p * 4).max((4 / 2) * hd * 4) as u32;
-    let qb = |v: &[f32]| v.iter().flat_map(|f| half::f16::from_f32(*f).to_le_bytes()).collect::<Vec<u8>>();
+    let qb = |v: &[f32]| {
+        v.iter()
+            .flat_map(|f| half::f16::from_f32(*f).to_le_bytes())
+            .collect::<Vec<u8>>()
+    };
 
-    let decl = TensorOps::call(SemanticKernel::PagedDecode).aux(&[hd, hq, hkv, nb])
-    .arg(&TensorOps::from_host(Dtype::F16, vec![1, hq * hd], &qb(&q)))
-    .arg(&TensorOps::of_block(kc_b.id, Dtype::F16, vec![nb, hkv, hd / 8, p, 8]))
-    .arg(&TensorOps::of_block(vc_b.id, Dtype::F16, vec![nb, hkv, hd, p]))
-    .arg(&TensorOps::from_host(Dtype::F32, vec![1, 1], &f32b(&[0.0])))
-    .arg(&TensorOps::from_host(Dtype::F32, vec![1, 1], &f32b(&[t_ctx as f32])))
-    .arg(&TensorOps::from_host(Dtype::F16, vec![1], &[0.0f32].iter().flat_map(|f| half::f16::from_f32(*f).to_le_bytes()).collect::<Vec<u8>>()))  // alibi 哑块(契约 F16)
-    .arg_i32(hkv as i32)
-    .arg_f32(scale)
-    .arg_i32(nb as i32)
-    .arg_i32(hq as i32 * hd as i32)
-    .arg_i32(hkv as i32 * hd as i32 * p as i32)
-    .arg_i32(hd as i32 * p as i32)
-    .arg_f32(1.0)
-    .arg_i32(-1)
-    .arg_i32(0)
-    .with_shape(Dtype::F16, vec![1, hq * hd]);
+    let decl = TensorOps::call(SemanticKernel::PagedDecode)
+        .aux(&[hd, hq, hkv, nb])
+        .arg(&TensorOps::from_host(Dtype::F16, vec![1, hq * hd], &qb(&q)))
+        .arg(&TensorOps::of_block(
+            kc_b.id,
+            Dtype::F16,
+            vec![nb, hkv, hd / 8, p, 8],
+        ))
+        .arg(&TensorOps::of_block(
+            vc_b.id,
+            Dtype::F16,
+            vec![nb, hkv, hd, p],
+        ))
+        .arg(&TensorOps::from_host(Dtype::F32, vec![1, 1], &f32b(&[0.0])))
+        .arg(&TensorOps::from_host(
+            Dtype::F32,
+            vec![1, 1],
+            &f32b(&[t_ctx as f32]),
+        ))
+        .arg(&TensorOps::from_host(
+            Dtype::F16,
+            vec![1],
+            &[0.0f32]
+                .iter()
+                .flat_map(|f| half::f16::from_f32(*f).to_le_bytes())
+                .collect::<Vec<u8>>(),
+        )) // alibi 哑块(契约 F16)
+        .arg_i32(hkv as i32)
+        .arg_f32(scale)
+        .arg_i32(nb as i32)
+        .arg_i32(hq as i32 * hd as i32)
+        .arg_i32(hkv as i32 * hd as i32 * p as i32)
+        .arg_i32(hd as i32 * p as i32)
+        .arg_f32(1.0)
+        .arg_i32(-1)
+        .arg_i32(0)
+        .with_shape(Dtype::F16, vec![1, hq * hd]);
     let got = crate::testkit::harvest_f16(&mut gpu, &decl).await;
 
     let mut ref_out = Vec::new();
@@ -421,7 +598,8 @@ async fn gpu_paged_attention_v1_f16_hd256_smoke() {
         for d in 0..hd {
             let mut acc = 0f32;
             for s in 0..t_ctx {
-                acc += scores[s] / denom * half::f16::from_f32(value[s * hkv * hd + kvh * hd + d]).to_f32();
+                acc += scores[s] / denom
+                    * half::f16::from_f32(value[s * hkv * hd + kvh * hd + d]).to_f32();
             }
             out[d] = acc;
         }
@@ -443,20 +621,56 @@ async fn gpu_paged_attention_v2_reduce_f16_smoke() {
     let q: Vec<f32> = key[..hd].iter().chain(key[..hd].iter()).cloned().collect();
     let scale = 1.0 / (hd as f32).sqrt();
     let _shared = (t_ctx.div_ceil(p) * p * 4).max((4 / 2) * hd * 4) as u32;
-    let qb = |v: &[f32]| v.iter().flat_map(|f| half::f16::from_f32(*f).to_le_bytes()).collect::<Vec<u8>>();
+    let qb = |v: &[f32]| {
+        v.iter()
+            .flat_map(|f| half::f16::from_f32(*f).to_le_bytes())
+            .collect::<Vec<u8>>()
+    };
 
     // v2:exp_sums/max_logits 为 ins 就地写,tmp_out = 末位新分配
     let es_b = crate::interpreters::eval_ops(
-        TensorOps::zeros(Dtype::F32, vec![1, hq, 1]).step(), &mut gpu).await.expect("es");
+        TensorOps::zeros(Dtype::F32, vec![1, hq, 1]).step(),
+        &mut gpu,
+    )
+    .await
+    .expect("es");
     let ml_b = crate::interpreters::eval_ops(
-        TensorOps::zeros(Dtype::F32, vec![1, hq, 1]).step(), &mut gpu).await.expect("ml");
-    let v2 = TensorOps::call(SemanticKernel::PagedDecodeV2).aux(&[hd, hq, hkv, nb, 1])
+        TensorOps::zeros(Dtype::F32, vec![1, hq, 1]).step(),
+        &mut gpu,
+    )
+    .await
+    .expect("ml");
+    let v2 = TensorOps::call(SemanticKernel::PagedDecodeV2)
+        .aux(&[hd, hq, hkv, nb, 1])
         .arg(&TensorOps::from_host(Dtype::F16, vec![1, hq * hd], &qb(&q)))
-        .arg(&TensorOps::of_block(kc_b.id, Dtype::F16, vec![nb, hkv, hd / 8, p, 8]))
-        .arg(&TensorOps::of_block(vc_b.id, Dtype::F16, vec![nb, hkv, hd, p]))
-        .arg(&TensorOps::from_host(Dtype::F32, vec![1, 2], &f32b(&tables)))
-        .arg(&TensorOps::from_host(Dtype::F32, vec![1, 1], &f32b(&[t_ctx as f32])))
-        .arg(&TensorOps::from_host(Dtype::F16, vec![1], &[0.0f32].iter().flat_map(|f| half::f16::from_f32(*f).to_le_bytes()).collect::<Vec<u8>>()))  // alibi 哑块(契约 F16)
+        .arg(&TensorOps::of_block(
+            kc_b.id,
+            Dtype::F16,
+            vec![nb, hkv, hd / 8, p, 8],
+        ))
+        .arg(&TensorOps::of_block(
+            vc_b.id,
+            Dtype::F16,
+            vec![nb, hkv, hd, p],
+        ))
+        .arg(&TensorOps::from_host(
+            Dtype::F32,
+            vec![1, 2],
+            &f32b(&tables),
+        ))
+        .arg(&TensorOps::from_host(
+            Dtype::F32,
+            vec![1, 1],
+            &f32b(&[t_ctx as f32]),
+        ))
+        .arg(&TensorOps::from_host(
+            Dtype::F16,
+            vec![1],
+            &[0.0f32]
+                .iter()
+                .flat_map(|f| half::f16::from_f32(*f).to_le_bytes())
+                .collect::<Vec<u8>>(),
+        )) // alibi 哑块(契约 F16)
         .arg(&TensorOps::of_block(es_b.id, Dtype::F32, vec![1, hq]))
         .arg(&TensorOps::of_block(ml_b.id, Dtype::F32, vec![1, hq]))
         .arg_i32(hkv as i32)
@@ -474,7 +688,8 @@ async fn gpu_paged_attention_v2_reduce_f16_smoke() {
         .expect("v2 eval");
 
     // reduce:分片归约 → 终出(aux = [hd, hq, nparts, seqs];E16 seqs 入参)
-    let rd = TensorOps::call(SemanticKernel::PagedV2Reduce).aux(&[hd, hq, 1, 1])
+    let rd = TensorOps::call(SemanticKernel::PagedV2Reduce)
+        .aux(&[hd, hq, 1, 1])
         .arg(&TensorOps::of_block(es_b.id, Dtype::F32, vec![1, hq]))
         .arg(&TensorOps::of_block(ml_b.id, Dtype::F32, vec![1, hq]))
         .arg(&TensorOps::of_block(tmp.id, Dtype::F16, vec![hq * hd]))
@@ -489,7 +704,17 @@ async fn gpu_paged_attention_v2_reduce_f16_smoke() {
 
     let mut ref_out = Vec::new();
     for h in 0..hq {
-        ref_out.extend(host_attn_ref(&q[h * hd..(h + 1) * hd], &key, &value, h, &kvh_map, hkv, hd, t_ctx, scale));
+        ref_out.extend(host_attn_ref(
+            &q[h * hd..(h + 1) * hd],
+            &key,
+            &value,
+            h,
+            &kvh_map,
+            hkv,
+            hd,
+            t_ctx,
+            scale,
+        ));
     }
     crate::testkit::assert_close(&got, &ref_out, 2e-2, "paged v2+reduce f16");
     gpu.close().await.expect("关机");
@@ -516,32 +741,64 @@ async fn gpu_prefill_paged_attn_f16_smoke() {
     let scale = 1.0 / (hd as f32).sqrt();
     let _smem = (64 + 2 * hd * p * 2) as u32; // 头注契约
     let q8 = |v: f32| half::f16::from_f32(v).to_f32();
-    let qb = |v: &[f32]| v.iter().flat_map(|f| half::f16::from_f32(*f).to_le_bytes()).collect::<Vec<u8>>();
+    let qb = |v: &[f32]| {
+        v.iter()
+            .flat_map(|f| half::f16::from_f32(*f).to_le_bytes())
+            .collect::<Vec<u8>>()
+    };
 
-    let decl = TensorOps::call(SemanticKernel::PagedPrefill).aux(&[hd, hkv, hq, t_ctx])
-    .arg(&TensorOps::from_host(Dtype::F16, vec![t_ctx, hq * hd], &qb(&q)))
-    .arg(&TensorOps::of_block(kc_b.id, Dtype::F16, vec![nb, hkv, hd / 8, p, 8]))
-    .arg(&TensorOps::of_block(vc_b.id, Dtype::F16, vec![nb, hkv, hd, p]))
-    .arg(&TensorOps::from_host(Dtype::F32, vec![1, 1], &f32b(&[0.0]))) // 恒等块表
-    .arg(&TensorOps::from_host(Dtype::F32, vec![1], &f32b(&[t_ctx as f32])))
-    .arg(&TensorOps::from_host(Dtype::F32, vec![2], &f32b(&[0.0, t_ctx as f32]))) // query_start_len
-    .arg(&TensorOps::from_host(Dtype::F16, vec![1], &[0.0f32].iter().flat_map(|f| half::f16::from_f32(*f).to_le_bytes()).collect::<Vec<u8>>())) // alibi 哑
-    .arg(&TensorOps::from_host(Dtype::F32, vec![1], &f32b(&[0.0]))) // sinks 哑
-    .arg_i32(hkv as i32)
-    .arg_f32(scale)
-    .arg_i32(1)                    // block_table_stride
-    .arg_i32(1)                    // num_seqs
-    .arg_i32(hq as i32)
-    .arg_i32(t_ctx as i32)
-    .arg_f32(1.0)                  // softscapping
-    .arg_i32(hq as i32 * hd as i32) // o_stride_tokens
-    .arg_i32(-1)                   // sliding_window 关
-    .arg_i32(nb as i32)            // total_num_blocks
-    .arg_i32(hkv as i32 * hd as i32 * p as i32) // kv_block_stride
-    .arg_i32(hd as i32 * p as i32) // kv_head_stride
-    .arg_i32(0)                    // use_alibi
-    .arg_i32(0)                    // use_sinks
-    .with_shape(Dtype::F16, vec![t_ctx, hq * hd]);
+    let decl = TensorOps::call(SemanticKernel::PagedPrefill)
+        .aux(&[hd, hkv, hq, t_ctx])
+        .arg(&TensorOps::from_host(
+            Dtype::F16,
+            vec![t_ctx, hq * hd],
+            &qb(&q),
+        ))
+        .arg(&TensorOps::of_block(
+            kc_b.id,
+            Dtype::F16,
+            vec![nb, hkv, hd / 8, p, 8],
+        ))
+        .arg(&TensorOps::of_block(
+            vc_b.id,
+            Dtype::F16,
+            vec![nb, hkv, hd, p],
+        ))
+        .arg(&TensorOps::from_host(Dtype::F32, vec![1, 1], &f32b(&[0.0]))) // 恒等块表
+        .arg(&TensorOps::from_host(
+            Dtype::F32,
+            vec![1],
+            &f32b(&[t_ctx as f32]),
+        ))
+        .arg(&TensorOps::from_host(
+            Dtype::F32,
+            vec![2],
+            &f32b(&[0.0, t_ctx as f32]),
+        )) // query_start_len
+        .arg(&TensorOps::from_host(
+            Dtype::F16,
+            vec![1],
+            &[0.0f32]
+                .iter()
+                .flat_map(|f| half::f16::from_f32(*f).to_le_bytes())
+                .collect::<Vec<u8>>(),
+        )) // alibi 哑
+        .arg(&TensorOps::from_host(Dtype::F32, vec![1], &f32b(&[0.0]))) // sinks 哑
+        .arg_i32(hkv as i32)
+        .arg_f32(scale)
+        .arg_i32(1) // block_table_stride
+        .arg_i32(1) // num_seqs
+        .arg_i32(hq as i32)
+        .arg_i32(t_ctx as i32)
+        .arg_f32(1.0) // softscapping
+        .arg_i32(hq as i32 * hd as i32) // o_stride_tokens
+        .arg_i32(-1) // sliding_window 关
+        .arg_i32(nb as i32) // total_num_blocks
+        .arg_i32(hkv as i32 * hd as i32 * p as i32) // kv_block_stride
+        .arg_i32(hd as i32 * p as i32) // kv_head_stride
+        .arg_i32(0) // use_alibi
+        .arg_i32(0) // use_sinks
+        .with_shape(Dtype::F16, vec![t_ctx, hq * hd]);
     let got = crate::testkit::harvest_f16(&mut gpu, &decl).await;
 
     // host 参照:逐 token 因果(token t 看 [0,t])
@@ -610,7 +867,11 @@ async fn gpu_argmax_f32idx_matches_host() {
             .iter()
             .enumerate()
             .fold((0usize, f32::NEG_INFINITY), |a, (i, &v)| {
-                if q(v) > a.1 { (i, q(v)) } else { a }
+                if q(v) > a.1 {
+                    (i, q(v))
+                } else {
+                    a
+                }
             })
             .0
             + off
@@ -618,26 +879,34 @@ async fn gpu_argmax_f32idx_matches_host() {
 
     // 用例 1:offset = 0
     let decl = argmax_f32idx(&TensorOps::from_host(Dtype::F16, vec![n], &bytes), n, 0);
-    let b = crate::interpreters::eval_ops(decl.step(), &mut gpu).await.expect("eval");
+    let b = crate::interpreters::eval_ops(decl.step(), &mut gpu)
+        .await
+        .expect("eval");
     let mut buf = [0u8; 4];
     gpu.dtoh(&b, &mut buf).await.expect("dtoh");
     let got = f32::from_le_bytes(buf) as usize;
-    eprintln!("[dbg argmax] got={got} host={} max_host_val={}", host(&vals, 0), vals[host(&vals, 0)]);
+    eprintln!(
+        "[dbg argmax] got={got} host={} max_host_val={}",
+        host(&vals, 0),
+        vals[host(&vals, 0)]
+    );
     eprintln!("[dbg argmax] vals[got]={:?}", vals.get(got));
     assert_eq!(got, host(&vals, 0), "offset=0 argmax 错位");
 
     // 用例 2:offset = 1000(末行窄视等价;平局验证首见胜)
     let n2 = n - 1000;
-    let decl = argmax_f32idx(&TensorOps::from_host(Dtype::F16, vec![n2], &bytes[2000..]), n2, 0);
-    let b = crate::interpreters::eval_ops(decl.step(), &mut gpu).await.expect("eval");
+    let decl = argmax_f32idx(
+        &TensorOps::from_host(Dtype::F16, vec![n2], &bytes[2000..]),
+        n2,
+        0,
+    );
+    let b = crate::interpreters::eval_ops(decl.step(), &mut gpu)
+        .await
+        .expect("eval");
     let mut buf = [0u8; 4];
     gpu.dtoh(&b, &mut buf).await.expect("dtoh");
     let got = f32::from_le_bytes(buf) as usize;
-    assert_eq!(
-        got,
-        host(&vals, 1000) - 1000,
-        "切片相对索引 argmax 错位"
-    );
+    assert_eq!(got, host(&vals, 1000) - 1000, "切片相对索引 argmax 错位");
 
     // 用例 3:大 n(词表量级 151_936,越 64K 边界扫查)
     let n3 = 151_936usize;
@@ -649,7 +918,9 @@ async fn gpu_argmax_f32idx_matches_host() {
         .flat_map(|v| half::f16::from_f32(*v).to_le_bytes())
         .collect();
     let decl = argmax_f32idx(&TensorOps::from_host(Dtype::F16, vec![n3], &bytes3), n3, 0);
-    let b = crate::interpreters::eval_ops(decl.step(), &mut gpu).await.expect("eval");
+    let b = crate::interpreters::eval_ops(decl.step(), &mut gpu)
+        .await
+        .expect("eval");
     let mut buf = [0u8; 4];
     gpu.dtoh(&b, &mut buf).await.expect("dtoh");
     let got = f32::from_le_bytes(buf) as usize;

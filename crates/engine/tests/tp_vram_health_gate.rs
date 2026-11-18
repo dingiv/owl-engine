@@ -46,8 +46,12 @@ fn cfg_of(ordinal: usize) -> EngineConfig {
 #[test]
 fn tp_vram_health_gate() {
     let (Some(oa), Some(ob)) = (
-        std::env::var("OWL_TP_TEST_DEV_A").ok().and_then(|s| s.parse().ok()),
-        std::env::var("OWL_TP_TEST_DEV_B").ok().and_then(|s| s.parse().ok()),
+        std::env::var("OWL_TP_TEST_DEV_A")
+            .ok()
+            .and_then(|s| s.parse().ok()),
+        std::env::var("OWL_TP_TEST_DEV_B")
+            .ok()
+            .and_then(|s| s.parse().ok()),
     ) else {
         owl_shared::testkit::report::skip("需 OWL_TP_TEST_DEV_A / _B(TP2 双 rank;CUDA ordinal)");
         return;
@@ -88,7 +92,9 @@ async fn body(oa: usize, ob: usize, dir: PathBuf) {
         .load_qwen35_0_8b(&dir)
         .await
         .expect("rank1 装载");
-    let tp = TpEngine::assemble(vec![e0, e1], vec![m0, m1]).await.expect("TP2 装配");
+    let tp = TpEngine::assemble(vec![e0, e1], vec![m0, m1])
+        .await
+        .expect("TP2 装配");
     let mut r = tp.run().expect("进执行态");
 
     // H3 基线:装配之后(权重/图/池都已就位)的设备块数 vs 账本块数
@@ -96,10 +102,16 @@ async fn body(oa: usize, ob: usize, dir: PathBuf) {
     let base_gap = dev.saturating_sub(led) as i64;
     eprintln!("[vram-gate] 基线:device={dev} ledger={led} gap={base_gap}");
 
-    let prompts = ["用五十字介绍长城。", "一个水池有甲乙两个进水管。", "用 Rust 写一个求中位数的函数。"];
+    let prompts = [
+        "用五十字介绍长城。",
+        "一个水池有甲乙两个进水管。",
+        "用 Rust 写一个求中位数的函数。",
+    ];
     for (i, p) in prompts.iter().enumerate() {
         let sid = 11 + i as u64;
-        let (_sid, turn) = r.submit_session_ex(Some(sid), *p, 24, true).expect("submit");
+        let (_sid, turn) = r
+            .submit_session_ex(Some(sid), *p, 24, true)
+            .expect("submit");
         loop {
             match r.pump().await.expect("pump") {
                 owl_engine::TurnEvent::Idle => break,
@@ -109,7 +121,10 @@ async fn body(oa: usize, ob: usize, dir: PathBuf) {
         }
         // H1:账本拒收必须为 0(hook_fail = 跨 rank 归还 / 双 free / 幽灵)
         let hf = r.store_report().events.hook_fail;
-        assert_eq!(hf, 0, "H1 破:账本 hook_fail = {hf}(跨 rank / 双 free / 幽灵都会记在这)");
+        assert_eq!(
+            hf, 0,
+            "H1 破:账本 hook_fail = {hf}(跨 rank / 双 free / 幽灵都会记在这)"
+        );
         // H2:收尾之后**任何** turn 归属都不应再有在借(兜底释放已逐 rank 结清)
         let left = r
             .store_report()
@@ -118,7 +133,10 @@ async fn body(oa: usize, ob: usize, dir: PathBuf) {
             .iter()
             .filter(|l| matches!(l.owner, owl_iface::handle::Owner::Turn(_)))
             .count();
-        assert_eq!(left, 0, "H2 破:第 {i} 轮收尾后仍有 {left} 块挂在 turn 归属下");
+        assert_eq!(
+            left, 0,
+            "H2 破:第 {i} 轮收尾后仍有 {left} 块挂在 turn 归属下"
+        );
         let _ = turn;
         // H3:设备块 − 账本块 的缺口不得增长
         let (dev, led) = dev_and_ledger(&mut r).await;
@@ -149,6 +167,12 @@ async fn dev_and_ledger<D: owl_iface::contract::DeviceClient>(
             Err(e) => panic!("rank{rank} 设备块表不可用: {e}"),
         }
     }
-    let led: usize = r.store_report().events.ids.iter().map(|(_, v)| v.len()).sum();
+    let led: usize = r
+        .store_report()
+        .events
+        .ids
+        .iter()
+        .map(|(_, v)| v.len())
+        .sum();
     (dev, led)
 }

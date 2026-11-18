@@ -9,8 +9,8 @@
 //! CUDA cuda_fp8.hpp 语义一致(直接对照同输入核内转换)。
 //! 无 GPU 跳过(OWL_TEST_DEVICE)。
 
-use owl_macros::owl_test;
 use cudarc::driver::{CudaContext, DevicePtr, LaunchConfig, PushKernelArg};
+use owl_macros::owl_test;
 
 const HD: usize = 256;
 const PAGE: usize = 32;
@@ -105,7 +105,10 @@ fn paged_attn_v2_fp8_matches_f16() {
     ctx.bind_to_thread().expect("bind");
     let stream = ctx.default_stream();
     let ptx = cudarc::nvrtc::compile_ptx_with_opts(
-        owl_kernels::cu_sig::cu_text(owl_kernels::ops::source("vllm_paged_attention_v2_fp8_knhd_hd256bs32")).as_str(),
+        owl_kernels::cu_sig::cu_text(owl_kernels::ops::source(
+            "vllm_paged_attention_v2_fp8_knhd_hd256bs32",
+        ))
+        .as_str(),
         cudarc::nvrtc::CompileOptions {
             arch: Some("compute_86"),
             include_paths: vec!["/usr/local/cuda/include".into()],
@@ -113,7 +116,7 @@ fn paged_attn_v2_fp8_matches_f16() {
         },
     )
     .expect("nvrtc compile pagedattention");
-        if let Some(bytes) = ptx.as_bytes() {
+    if let Some(bytes) = ptx.as_bytes() {
         owl_shared::file_loader::write("/tmp/b6.ptx", bytes).ok();
     }
     let m = ctx.load_module(ptx).expect("module");
@@ -147,7 +150,9 @@ fn paged_attn_v2_fp8_matches_f16() {
 
     // fp8 量化(只量化引用到的块;全量量化 NUM_BLOCKS×16384×2 = 6MB 亦可)
     let quant = |src: &Vec<u16>| -> Vec<u8> {
-        src.iter().map(|&h| e4m3_encode(f16_bits_to_f32(h))).collect()
+        src.iter()
+            .map(|&h| e4m3_encode(f16_bits_to_f32(h)))
+            .collect()
     };
     let k_fp8 = quant(&k_f16);
     let v_fp8 = quant(&v_f16);
@@ -212,10 +217,17 @@ fn paged_attn_v2_fp8_matches_f16() {
             let ml_p = ml.device_ptr(&stream).0 + (s * NUM_HEADS * nparts * 4) as u64;
             let tp_p = tmp.device_ptr(&stream).0 + (s * NUM_HEADS * nparts * HD * 2) as u64;
             let o_p = out.device_ptr(&stream).0 + (s * NUM_HEADS * HD * 2) as u64;
-            let (nkv, scale, mnbp, qst, bst, hst, ss, sw, ua) =
-                (NUM_KV_HEADS as i32, 1f32 / (HD as f32).sqrt(), blocks_per_seq as i32,
-                 (NUM_HEADS * HD) as i32, kv_block_stride as i32, (HD / X * PAGE * X) as i32,
-                 1f32, 0i32, 0i32);
+            let (nkv, scale, mnbp, qst, bst, hst, ss, sw, ua) = (
+                NUM_KV_HEADS as i32,
+                1f32 / (HD as f32).sqrt(),
+                blocks_per_seq as i32,
+                (NUM_HEADS * HD) as i32,
+                kv_block_stride as i32,
+                (HD / X * PAGE * X) as i32,
+                1f32,
+                0i32,
+                0i32,
+            );
             // extern 入口序(q,k,v,bt,lens,alibi,es,ml,nkv,scale,
             // mnbp,qst,bst,hst,ss,sw,use_alibi,tmp_out 末参;out 由
             // reduce 写)
@@ -251,7 +263,12 @@ fn paged_attn_v2_fp8_matches_f16() {
             let ln_r = d_lens.device_ptr(&stream).0 + lens_off as u64;
             let mut rb = stream.launch_builder(&rf);
             let np = nparts as i32;
-            rb.arg(&es_r).arg(&ml_r).arg(&tp_r).arg(&ln_r).arg(&np).arg(&o_p);
+            rb.arg(&es_r)
+                .arg(&ml_r)
+                .arg(&tp_r)
+                .arg(&ln_r)
+                .arg(&np)
+                .arg(&o_p);
             let rcfg = LaunchConfig {
                 grid_dim: (NUM_HEADS as u32, 1, 1),
                 block_dim: (NUM_THREADS as u32, 1, 1),

@@ -20,12 +20,12 @@ use serde::Deserialize;
 use serde_json::{json, Value};
 use tokio::sync::mpsc;
 
-use owl_engine::{EngineClient, StreamEvent, TurnEvent, TurnOpts};
-use crate::config::AgentCfg;
 use crate::agent_trace::{AgentTrace, OutcomeFacts, ReqFacts, TurnLedger, UsageFacts};
 use crate::chat_tpl::{ChatTpl, RenderArgs};
+use crate::config::AgentCfg;
 use crate::http;
 use crate::toolcall::{raw_for_log, Chan, ChannelSplitter, Item, ToolSchemas};
+use owl_engine::{EngineClient, StreamEvent, TurnEvent, TurnOpts};
 
 // ============================================================================
 // §1 协议数据与校验
@@ -58,9 +58,7 @@ pub(crate) async fn chat(
     }
     let mut req: ChatRequest = match serde_json::from_slice::<ChatRequest>(body) {
         Ok(r) => r,
-        Err(e) => {
-            return http::respond_json(w, 400, &error_json(format!("请求体非法: {e}"))).await
-        }
+        Err(e) => return http::respond_json(w, 400, &error_json(format!("请求体非法: {e}"))).await,
     };
     if let Err(e) = req
         .validate()
@@ -78,7 +76,11 @@ pub(crate) async fn chat(
         Ok(s) => s,
         Err(e) => return http::respond_json(w, 400, &error_json(e)).await,
     };
-    let mode = if req.stream { ReplyMode::Stream } else { ReplyMode::Aggregate };
+    let mode = if req.stream {
+        ReplyMode::Stream
+    } else {
+        ReplyMode::Aggregate
+    };
     let model_name = req.model.as_deref().unwrap_or(model_name);
     let (max_new, clamped) = req.max_new(agent);
     if clamped {
@@ -176,16 +178,16 @@ pub(crate) async fn chat(
     });
     led.set_prompt(&prompt);
     let chat_opts = TurnOpts {
-            ignore_eos: req.ignore_eos,
-            sampler: req.sampler_override(),
-            stop,
-            seed: req.seed.map(|s| s as u64),
-            // 直接显存地板(**per-turn**,设计卷 §2.4/§23.5):OpenAI 面暂无
-            // 扩展字段 —— 走引擎 `knobs.dense_floor`(缺省 `Strict`)。
-            // 将来加请求字段时在这里映射;非 `Strict` 由引擎**响亮拒**
-            // (选择层 B 轴未落地,地板语义无从兼现)。
-            dense_floor: None,
-            images,
+        ignore_eos: req.ignore_eos,
+        sampler: req.sampler_override(),
+        stop,
+        seed: req.seed.map(|s| s as u64),
+        // 直接显存地板(**per-turn**,设计卷 §2.4/§23.5):OpenAI 面暂无
+        // 扩展字段 —— 走引擎 `knobs.dense_floor`(缺省 `Strict`)。
+        // 将来加请求字段时在这里映射;非 `Strict` 由引擎**响亮拒**
+        // (选择层 B 轴未落地,地板语义无从兼现)。
+        dense_floor: None,
+        images,
     };
     if tx
         .chat(session, prompt, max_new, chat_opts, sink_tx)
@@ -200,7 +202,13 @@ pub(crate) async fn chat(
     // 预算被夹紧 ⇒ 响应头如实带出（`X-Owl-Max-New`；非私有 body 字段）
     let mut clamped_max_new: Option<usize> = None;
     let turn = match sink_rx.recv().await {
-        Some(StreamEvent::Accepted { session, turn, prompt_tokens, cached_tokens, max_new }) => {
+        Some(StreamEvent::Accepted {
+            session,
+            turn,
+            prompt_tokens,
+            cached_tokens,
+            max_new,
+        }) => {
             usage.prompt = prompt_tokens;
             usage.cached = cached_tokens;
             // 预算被准入夹紧 ⇒ 如实留痕（客户端会看到 finish_reason=length）
@@ -244,12 +252,8 @@ pub(crate) async fn chat(
         // 契约:首笔必为 Accepted/Rejected(executor 在 pump 前投递)⇒ 不会走到
         // 这里(真走到 = 协议序错乱,不静默吞)
         Some(StreamEvent::CachedTokens { .. }) => {
-            return http::respond_json(
-                w,
-                503,
-                &error_json("协议序错乱:缓存校正帧先于受理确认"),
-            )
-            .await
+            return http::respond_json(w, 503, &error_json("协议序错乱:缓存校正帧先于受理确认"))
+                .await
         }
         _ => return http::respond_json(w, 503, &error_json("引擎退役")).await,
     };
@@ -445,7 +449,10 @@ pub(crate) async fn chat(
                 usage.prompt = total;
             }
             // 缓存校正帧(AGT-12):块级前缀缓存命中的真值(覆盖 submit 时估值)
-            Some(StreamEvent::CachedTokens { turn: t, cached_tokens }) => {
+            Some(StreamEvent::CachedTokens {
+                turn: t,
+                cached_tokens,
+            }) => {
                 if turn.map(|(_, x)| x) == Some(t) && cached_tokens != usage.cached {
                     owl_shared::log_info!(
                         "chat",
@@ -457,7 +464,10 @@ pub(crate) async fn chat(
                 }
             }
             Some(StreamEvent::Turn(TurnEvent::Completed {
-                text, finish, stats, ..
+                text,
+                finish,
+                stats,
+                ..
             })) => {
                 let items = splitter.finish();
                 emit!(items);
@@ -488,9 +498,8 @@ pub(crate) async fn chat(
                     );
                 }
                 if let Some(kind) = protocol_error.filter(|_| acc.tools.is_empty() && !len_cut) {
-                    let msg = format!(
-                        "模型工具调用不符合 OpenAI 协议({kind});服务端已拒绝返回无效结果"
-                    );
+                    let msg =
+                        format!("模型工具调用不符合 OpenAI 协议({kind});服务端已拒绝返回无效结果");
                     led.fail(msg.clone());
                     owl_shared::log_warn!(
                         "chat",
@@ -499,8 +508,7 @@ pub(crate) async fn chat(
                     );
                     return match mode {
                         ReplyMode::Stream => {
-                            let mut chunk =
-                                chunk_json(&id, model_name, json!({}), Some("error"));
+                            let mut chunk = chunk_json(&id, model_name, json!({}), Some("error"));
                             chunk["error"] = json!({
                                 "message": msg,
                                 "type": "tool_call_error",
@@ -696,13 +704,22 @@ pub(crate) async fn chat(
                         }
                         ReplyMode::Stream => {
                             if let Err(e) = http::sse_data(w, &error_json(msg).to_string()).await {
-                                owl_shared::log_info!("chat", "准入错误帧写失败(客户端可能已断开): {e}");
+                                owl_shared::log_info!(
+                                    "chat",
+                                    "准入错误帧写失败(客户端可能已断开): {e}"
+                                );
                             }
                             if let Err(e) = http::sse_data(w, "[DONE]").await {
-                                owl_shared::log_info!("chat", "准入收尾帧写失败(客户端可能已断开): {e}");
+                                owl_shared::log_info!(
+                                    "chat",
+                                    "准入收尾帧写失败(客户端可能已断开): {e}"
+                                );
                             }
                             if let Err(e) = http::sse_end(w).await {
-                                owl_shared::log_info!("chat", "准入终止块写失败(客户端可能已断开): {e}");
+                                owl_shared::log_info!(
+                                    "chat",
+                                    "准入终止块写失败(客户端可能已断开): {e}"
+                                );
                             }
                             Ok(())
                         }
@@ -714,14 +731,23 @@ pub(crate) async fn chat(
                     ReplyMode::Stream => {
                         // 客户端可能已断开(写失败属正常),但不许静默(律 #1)
                         if let Err(e) = http::sse_data(w, &error_json(&msg).to_string()).await {
-                            owl_shared::log_info!("chat", "流式错误帧写失败(客户端可能已断开): {e}");
+                            owl_shared::log_info!(
+                                "chat",
+                                "流式错误帧写失败(客户端可能已断开): {e}"
+                            );
                         }
                         if let Err(e) = http::sse_data(w, "[DONE]").await {
-                            owl_shared::log_info!("chat", "流式收尾帧写失败(客户端可能已断开): {e}");
+                            owl_shared::log_info!(
+                                "chat",
+                                "流式收尾帧写失败(客户端可能已断开): {e}"
+                            );
                         }
                         // 错误流也要收口(chunked 终止块;失败 = 客户端已走)
                         if let Err(e) = http::sse_end(w).await {
-                            owl_shared::log_info!("chat", "流式终止块写失败(客户端可能已断开): {e}");
+                            owl_shared::log_info!(
+                                "chat",
+                                "流式终止块写失败(客户端可能已断开): {e}"
+                            );
                         }
                         Ok(())
                     }
@@ -734,7 +760,7 @@ pub(crate) async fn chat(
                 if mode == ReplyMode::Stream =>
             {
                 led.fail("协议序错乱:受理帧之后再现受理/拒绝帧");
-                break
+                break;
             }
             Some(StreamEvent::Accepted { .. }) | Some(StreamEvent::Rejected { .. }) => {
                 led.fail("引擎连接中断(受理帧之后)");
@@ -742,7 +768,7 @@ pub(crate) async fn chat(
             }
             None if mode == ReplyMode::Stream => {
                 led.fail("客户端断开(流式;引擎 turn 由 executor 侧弃置)");
-                break
+                break;
             }
             None => {
                 led.fail("引擎连接中断(通道关闭)");
@@ -903,8 +929,12 @@ async fn emit_items<W: tokio::io::AsyncWrite + Unpin>(
                 if mode == ReplyMode::Stream {
                     if !*role_sent {
                         *role_sent = true;
-                        let first =
-                            chunk_json(id, model, json!({"role": "assistant", "content": ""}), None);
+                        let first = chunk_json(
+                            id,
+                            model,
+                            json!({"role": "assistant", "content": ""}),
+                            None,
+                        );
                         http::sse_data(w, &first.to_string()).await?;
                     }
                     let delta = match chan {
@@ -920,13 +950,21 @@ async fn emit_items<W: tokio::io::AsyncWrite + Unpin>(
                     }
                 }
             }
-            Item::ToolCall { index, name, arguments } => {
+            Item::ToolCall {
+                index,
+                name,
+                arguments,
+            } => {
                 let cid = acc.tool_id(index);
                 if mode == ReplyMode::Stream {
                     if !*role_sent {
                         *role_sent = true;
-                        let first =
-                            chunk_json(id, model, json!({"role": "assistant", "content": ""}), None);
+                        let first = chunk_json(
+                            id,
+                            model,
+                            json!({"role": "assistant", "content": ""}),
+                            None,
+                        );
                         http::sse_data(w, &first.to_string()).await?;
                     }
                     // pi 按 `index` 归并工具块(id 只作标识);一次性给全 name+arguments
@@ -987,9 +1025,7 @@ fn tokenize_plan(req: &TokenizeRequest) -> Result<(String, bool, &'static str), 
     let text = match req.prompt.as_deref() {
         Some(t) if !t.is_empty() => t.to_string(),
         _ => {
-            return Err(
-                "prompt 必填且非空(messages 渲染未做 —— 需要时先自己渲染再送本端点)".into(),
-            )
+            return Err("prompt 必填且非空(messages 渲染未做 —— 需要时先自己渲染再送本端点)".into())
         }
     };
     let mode = req.mode.as_deref().unwrap_or("raw");
@@ -1103,9 +1139,18 @@ mod tests {
         ]}]));
         r.validate().unwrap();
         r.normalize_tool_calls().unwrap();
-        assert_eq!(r.messages[0]["tool_calls"][0]["function"]["arguments"]["command"], "ls");
-        assert_eq!(r.messages[0]["tool_calls"][1]["function"]["arguments"], json!({}));
-        assert_eq!(r.messages[0]["tool_calls"][2]["function"]["arguments"], json!({"a": 1}));
+        assert_eq!(
+            r.messages[0]["tool_calls"][0]["function"]["arguments"]["command"],
+            "ls"
+        );
+        assert_eq!(
+            r.messages[0]["tool_calls"][1]["function"]["arguments"],
+            json!({})
+        );
+        assert_eq!(
+            r.messages[0]["tool_calls"][2]["function"]["arguments"],
+            json!({"a": 1})
+        );
     }
 
     /// 空 tool_calls 数组剔除(模板回普通 assistant 路径)
@@ -1135,12 +1180,18 @@ mod tests {
     fn warnings_surface_only_unknown_fields() {
         let r: ChatRequest = serde_json::from_value(json!({
             "messages":[{"role":"user","content":"hi"}],
-            "temperature": 0.7, "stop": ["x"], "seed": 1})).expect("parse");
+            "temperature": 0.7, "stop": ["x"], "seed": 1}))
+        .expect("parse");
         r.validate().unwrap();
-        assert!(r.warnings().is_empty(), "已生效参数不该再告警:{:?}", r.warnings());
+        assert!(
+            r.warnings().is_empty(),
+            "已生效参数不该再告警:{:?}",
+            r.warnings()
+        );
         let r: ChatRequest = serde_json::from_value(json!({
             "messages":[{"role":"user","content":"hi"}],
-            "presence_penalty": 0.5})).expect("parse");
+            "presence_penalty": 0.5}))
+        .expect("parse");
         assert_eq!(r.warnings().len(), 1, "未知字段必须可见");
     }
 
@@ -1148,10 +1199,12 @@ mod tests {
     #[test]
     fn sampler_override_partial() {
         let r: ChatRequest = serde_json::from_value(json!({
-            "messages":[{"role":"user","content":"hi"}]})).expect("parse");
+            "messages":[{"role":"user","content":"hi"}]}))
+        .expect("parse");
         assert!(r.sampler_override().is_none(), "未带采样参数 ⇒ 无覆写");
         let r: ChatRequest = serde_json::from_value(json!({
-            "messages":[{"role":"user","content":"hi"}], "temperature": 0.0})).expect("parse");
+            "messages":[{"role":"user","content":"hi"}], "temperature": 0.0}))
+        .expect("parse");
         let o = r.sampler_override().expect("有覆写");
         assert_eq!(o.temp, Some(0.0));
         assert_eq!(o.topk, None);
@@ -1162,16 +1215,23 @@ mod tests {
     #[test]
     fn stop_strings_shapes() {
         let r: ChatRequest = serde_json::from_value(json!({
-            "messages":[{"role":"user","content":"hi"}], "stop": "\n\n"})).expect("parse");
+            "messages":[{"role":"user","content":"hi"}], "stop": "\n\n"}))
+        .expect("parse");
         assert_eq!(r.stop_strings().unwrap(), vec!["\n\n".to_string()]);
         let r: ChatRequest = serde_json::from_value(json!({
-            "messages":[{"role":"user","content":"hi"}], "stop": ["a", "b"]})).expect("parse");
-        assert_eq!(r.stop_strings().unwrap(), vec!["a".to_string(), "b".to_string()]);
+            "messages":[{"role":"user","content":"hi"}], "stop": ["a", "b"]}))
+        .expect("parse");
+        assert_eq!(
+            r.stop_strings().unwrap(),
+            vec!["a".to_string(), "b".to_string()]
+        );
         let r: ChatRequest = serde_json::from_value(json!({
-            "messages":[{"role":"user","content":"hi"}], "stop": [1, 2]})).expect("parse");
+            "messages":[{"role":"user","content":"hi"}], "stop": [1, 2]}))
+        .expect("parse");
         assert!(r.stop_strings().is_err(), "非字符串元素应被拒");
         let r: ChatRequest = serde_json::from_value(json!({
-            "messages":[{"role":"user","content":"hi"}], "stop": 7})).expect("parse");
+            "messages":[{"role":"user","content":"hi"}], "stop": 7}))
+        .expect("parse");
         assert!(r.stop_strings().is_err(), "非 string/array 应被拒");
     }
 
@@ -1180,34 +1240,49 @@ mod tests {
     fn max_new_clamp_and_thinking_flag() {
         let agent = AgentCfg::default();
         let r: ChatRequest = serde_json::from_value(json!({
-            "messages":[{"role":"user","content":"x"}], "max_tokens": 32000})).expect("parse");
+            "messages":[{"role":"user","content":"x"}], "max_tokens": 32000}))
+        .expect("parse");
         assert_eq!(r.max_new(&agent), (agent.max_generation_length, true));
         let r: ChatRequest = serde_json::from_value(json!({
-            "messages":[{"role":"user","content":"x"}]})).expect("parse");
+            "messages":[{"role":"user","content":"x"}]}))
+        .expect("parse");
         assert_eq!(r.max_new(&agent), (agent.max_generation_length, false));
         // `defaults` = `chat_template.toml`（模板变量；空表 = 无文件）
         let none = serde_json::Map::new();
         let r: ChatRequest = serde_json::from_value(json!({
             "messages":[{"role":"user","content":"x"}],
-            "chat_template_kwargs": {"enable_thinking": false}})).expect("parse");
+            "chat_template_kwargs": {"enable_thinking": false}}))
+        .expect("parse");
         assert!(!r.enable_thinking(&none, false));
         // `reasoning_effort=none/off` 与模板同口径：splitter 也必须按关思考启动
         for off in ["none", "off", "NONE", "Off"] {
             let r: ChatRequest = serde_json::from_value(json!({
                 "messages":[{"role":"user","content":"x"}],
-                "reasoning_effort": off})).expect("parse");
-            assert!(!r.enable_thinking(&none, false), "reasoning_effort={off} 应关思考");
+                "reasoning_effort": off}))
+            .expect("parse");
+            assert!(
+                !r.enable_thinking(&none, false),
+                "reasoning_effort={off} 应关思考"
+            );
         }
         let r: ChatRequest = serde_json::from_value(json!({
             "messages":[{"role":"user","content":"x"}],
-            "reasoning_effort": "high"})).expect("parse");
-        assert!(r.enable_thinking(&none, false), "reasoning_effort=high 应开思考");
+            "reasoning_effort": "high"}))
+        .expect("parse");
+        assert!(
+            r.enable_thinking(&none, false),
+            "reasoning_effort=high 应开思考"
+        );
         // 显式 enable_thinking 覆盖 reasoning_effort
         let r: ChatRequest = serde_json::from_value(json!({
             "messages":[{"role":"user","content":"x"}],
             "reasoning_effort": "none",
-            "chat_template_kwargs": {"enable_thinking": true}})).expect("parse");
-        assert!(r.enable_thinking(&none, false), "显式 enable_thinking=true 应优先");
+            "chat_template_kwargs": {"enable_thinking": true}}))
+        .expect("parse");
+        assert!(
+            r.enable_thinking(&none, false),
+            "显式 enable_thinking=true 应优先"
+        );
 
         // **模板变量文件**（2026-11-16）：文件缺省 < 请求
         let mut defaults = serde_json::Map::new();
@@ -1222,22 +1297,22 @@ mod tests {
         );
         let r: ChatRequest = serde_json::from_value(json!({
             "messages":[{"role":"user","content":"x"}],
-            "reasoning_effort": "high"})).expect("parse");
-        assert!(
-            r.enable_thinking(&defaults, false),
-            "请求档位覆盖文件缺省"
-        );
+            "reasoning_effort": "high"}))
+        .expect("parse");
+        assert!(r.enable_thinking(&defaults, false), "请求档位覆盖文件缺省");
 
         // vLLM 同款归一化：reasoning_effort 必须同步派生 enable_thinking
         let r: ChatRequest = serde_json::from_value(json!({
             "messages":[{"role":"user","content":"x"}],
-            "reasoning_effort": "none"})).expect("parse");
+            "reasoning_effort": "none"}))
+        .expect("parse");
         let kw = r.effective_template_kwargs(&none);
         assert_eq!(kw.get("reasoning_effort"), Some(&json!("none")));
         assert_eq!(kw.get("enable_thinking"), Some(&json!(false)));
         let r: ChatRequest = serde_json::from_value(json!({
             "messages":[{"role":"user","content":"x"}],
-            "reasoning_effort": "high"})).expect("parse");
+            "reasoning_effort": "high"}))
+        .expect("parse");
         assert_eq!(
             r.effective_template_kwargs(&none).get("enable_thinking"),
             Some(&json!(true))
@@ -1246,7 +1321,8 @@ mod tests {
         let r: ChatRequest = serde_json::from_value(json!({
             "messages":[{"role":"user","content":"x"}],
             "reasoning_effort": "none",
-            "chat_template_kwargs": {"enable_thinking": true}})).expect("parse");
+            "chat_template_kwargs": {"enable_thinking": true}}))
+        .expect("parse");
         assert_eq!(
             r.effective_template_kwargs(&none).get("enable_thinking"),
             Some(&json!(true))
@@ -1255,23 +1331,30 @@ mod tests {
         let mut file_high = serde_json::Map::new();
         file_high.insert("reasoning_effort".into(), json!("high"));
         assert_eq!(
-            r.effective_template_kwargs(&file_high).get("reasoning_effort"),
+            r.effective_template_kwargs(&file_high)
+                .get("reasoning_effort"),
             Some(&json!("none")),
             "请求里的 reasoning_effort 覆盖文件值"
         );
         assert_eq!(
-            r.effective_template_kwargs(&file_high).get("enable_thinking"),
+            r.effective_template_kwargs(&file_high)
+                .get("enable_thinking"),
             Some(&json!(true)),
             "请求显式 enable_thinking 覆盖文件"
         );
 
         // [agent] 定制上限生效(配置面唯一旋钮)
-        let agent = AgentCfg { max_generation_length: 32768, ..AgentCfg::default() };
+        let agent = AgentCfg {
+            max_generation_length: 32768,
+            ..AgentCfg::default()
+        };
         let r: ChatRequest = serde_json::from_value(json!({
-            "messages":[{"role":"user","content":"x"}], "max_tokens": 40000})).expect("parse");
+            "messages":[{"role":"user","content":"x"}], "max_tokens": 40000}))
+        .expect("parse");
         assert_eq!(r.max_new(&agent), (32768, true));
         let r: ChatRequest = serde_json::from_value(json!({
-            "messages":[{"role":"user","content":"x"}]})).expect("parse");
+            "messages":[{"role":"user","content":"x"}]}))
+        .expect("parse");
         assert_eq!(r.max_new(&agent), (2048, false));
     }
 
@@ -1317,25 +1400,40 @@ mod tests {
             let req: TokenizeRequest = serde_json::from_str(j).expect("请求体应可解析");
             tokenize_plan(&req)
         };
-        assert_eq!(plan(r#"{"prompt":"你好"}"#).unwrap(), ("你好".into(), false, "raw"));
+        assert_eq!(
+            plan(r#"{"prompt":"你好"}"#).unwrap(),
+            ("你好".into(), false, "raw")
+        );
         assert_eq!(
             plan(r#"{"prompt":"你好","mode":"chat"}"#).unwrap(),
             ("你好".into(), true, "chat")
         );
-        assert!(plan(r#"{"prompt":"你好","add_special_tokens":false}"#).is_ok(), "false 可接");
-        assert!(plan(r#"{"prompt":""}"#).unwrap_err().contains("prompt 必填"), "空 prompt 拒");
-        assert!(plan(r#"{"mode":"chat"}"#).unwrap_err().contains("prompt 必填"), "缺 prompt 拒");
-        assert!(plan(r#"{"prompt":"x","mode":"tokens"}"#).unwrap_err().contains("raw|chat"));
         assert!(
-            plan(r#"{"prompt":"x","add_special_tokens":true}"#)
-                .unwrap_err()
-                .contains("add_special_tokens=true 未支持")
+            plan(r#"{"prompt":"你好","add_special_tokens":false}"#).is_ok(),
+            "false 可接"
         );
+        assert!(
+            plan(r#"{"prompt":""}"#)
+                .unwrap_err()
+                .contains("prompt 必填"),
+            "空 prompt 拒"
+        );
+        assert!(
+            plan(r#"{"mode":"chat"}"#)
+                .unwrap_err()
+                .contains("prompt 必填"),
+            "缺 prompt 拒"
+        );
+        assert!(plan(r#"{"prompt":"x","mode":"tokens"}"#)
+            .unwrap_err()
+            .contains("raw|chat"));
+        assert!(plan(r#"{"prompt":"x","add_special_tokens":true}"#)
+            .unwrap_err()
+            .contains("add_special_tokens=true 未支持"));
         // 未知字段:本端点开着 deny_unknown_fields(自有面,不背兼容史)
         assert!(serde_json::from_str::<TokenizeRequest>(r#"{"prompt":"x","nope":1}"#).is_err());
     }
 }
-
 
 #[cfg(test)]
 mod admission_tests {
@@ -1414,17 +1512,25 @@ mod multipart_text_tests {
         let changed = r.normalize_multipart_text();
         assert_eq!(changed, 1, "只有 a 需要补;b 已带换行");
         assert_eq!(r.messages[0]["content"][0]["text"], "sys", "system 不动");
-        assert_eq!(r.messages[1]["content"], "plain string", "string 逐字节不动");
-        assert_eq!(r.messages[2]["content"][0]["text"], "single", "单 text 数组不动");
+        assert_eq!(
+            r.messages[1]["content"], "plain string",
+            "string 逐字节不动"
+        );
+        assert_eq!(
+            r.messages[2]["content"][0]["text"], "single",
+            "单 text 数组不动"
+        );
         assert_eq!(r.messages[3]["content"][0]["text"], "a\n");
         assert_eq!(r.messages[3]["content"][2]["text"], "b\n");
         assert_eq!(r.messages[3]["content"][1]["owl_evict"], true, "标记保留");
         assert_eq!(
-            r.messages[3]["content"][1]["image_url"]["url"],
-            "data:image/png;base64,AA",
+            r.messages[3]["content"][1]["image_url"]["url"], "data:image/png;base64,AA",
             "image 原样"
         );
-        assert_eq!(r.messages[4]["content"][0]["text"], "asst", "assistant 不动");
+        assert_eq!(
+            r.messages[4]["content"][0]["text"], "asst",
+            "assistant 不动"
+        );
         let snapshot = r.messages.clone();
         assert_eq!(r.normalize_multipart_text(), 0, "幂等");
         assert_eq!(snapshot, r.messages, "第二次调用零变化");

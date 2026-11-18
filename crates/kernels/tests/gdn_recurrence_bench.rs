@@ -40,7 +40,6 @@ use owl_kernels::device::{DevPtr, DeviceRes, Exec, LaunchNote, ScratchBuf};
 // §1 测试资源面(最小实现;与 ln_elems_bench.rs 同款 —— 勿改语义)
 // ============================================================================
 
-
 struct TestRes {
     ctx: Arc<CudaContext>,
     stream: Arc<CudaStream>,
@@ -54,7 +53,12 @@ impl TestRes {
         let ctx = CudaContext::new(ordinal).expect("ctx");
         ctx.bind_to_thread().expect("bind");
         let stream = ctx.default_stream();
-        Some(Self { ctx, stream, blocks: HashMap::new(), next: 1 })
+        Some(Self {
+            ctx,
+            stream,
+            blocks: HashMap::new(),
+            next: 1,
+        })
     }
     fn blk(&mut self, nbytes: usize, tag: &str) -> u64 {
         match self.alloc_block(nbytes, tag) {
@@ -90,7 +94,8 @@ impl TestRes {
         }
     }
     fn ptr(&self, id: u64) -> u64 {
-        self.resolve(id).unwrap_or_else(|e| panic!("resolve(id={id}): {e:?}"))
+        self.resolve(id)
+            .unwrap_or_else(|e| panic!("resolve(id={id}): {e:?}"))
     }
     fn sync(&self) {
         self.stream.synchronize().expect("sync");
@@ -105,28 +110,35 @@ impl DeviceRes for TestRes {
         Ok(self.stream.clone())
     }
     fn resolve(&self, id: u64) -> Result<DevPtr, OpError> {
-        self.blocks.get(&id).map(|s| s.device_ptr(&self.stream).0).ok_or_else(|| OpError::Contract {
-            op: "bench".into(),
-            field: "resolve",
-            expect: "块在册".into(),
-            got: format!("id={id}"),
-        })
+        self.blocks
+            .get(&id)
+            .map(|s| s.device_ptr(&self.stream).0)
+            .ok_or_else(|| OpError::Contract {
+                op: "bench".into(),
+                field: "resolve",
+                expect: "块在册".into(),
+                got: format!("id={id}"),
+            })
     }
     fn resolve_len(&self, id: u64) -> Result<usize, OpError> {
-        self.blocks.get(&id).map(|s| s.len()).ok_or_else(|| OpError::Contract {
-            op: "bench".into(),
-            field: "resolve_len",
-            expect: "块在册".into(),
-            got: format!("id={id}"),
-        })
+        self.blocks
+            .get(&id)
+            .map(|s| s.len())
+            .ok_or_else(|| OpError::Contract {
+                op: "bench".into(),
+                field: "resolve_len",
+                expect: "块在册".into(),
+                got: format!("id={id}"),
+            })
     }
     fn alloc(&mut self, bytes: usize, _tag: &str) -> Result<ScratchBuf, OpError> {
-        let s = unsafe { self.stream.alloc::<u8>(bytes.max(1)) }.map_err(|e| OpError::Contract {
-            op: "bench".into(),
-            field: "alloc",
-            expect: "设备分配".into(),
-            got: format!("{e:?}"),
-        })?;
+        let s =
+            unsafe { self.stream.alloc::<u8>(bytes.max(1)) }.map_err(|e| OpError::Contract {
+                op: "bench".into(),
+                field: "alloc",
+                expect: "设备分配".into(),
+                got: format!("{e:?}"),
+            })?;
         let ptr = s.device_ptr(&self.stream).0;
         Ok(ScratchBuf { ptr, bytes })
     }
@@ -148,31 +160,37 @@ impl DeviceRes for TestRes {
         Ok(self.ctx.ordinal() as i32)
     }
     fn alloc_block(&mut self, bytes: usize, _tag: &str) -> Result<Bytes, OpError> {
-        let s = unsafe { self.stream.alloc::<u8>(bytes.max(1)) }.map_err(|e| OpError::Contract {
-            op: "bench".into(),
-            field: "alloc_block",
-            expect: "设备分配".into(),
-            got: format!("{e:?}"),
-        })?;
+        let s =
+            unsafe { self.stream.alloc::<u8>(bytes.max(1)) }.map_err(|e| OpError::Contract {
+                op: "bench".into(),
+                field: "alloc_block",
+                expect: "设备分配".into(),
+                got: format!("{e:?}"),
+            })?;
         let id = self.next;
         self.next += 1;
         self.blocks.insert(id, s);
         Ok(Bytes::new(id, bytes, Dtype::U8, 0))
     }
     fn upload_block(&mut self, b: &Bytes, src: &[u8]) -> Result<(), OpError> {
-        let s = self.blocks.get_mut(&b.id).ok_or_else(|| OpError::Contract {
-            op: "bench".into(),
-            field: "upload_block",
-            expect: "块在册".into(),
-            got: format!("id={}", b.id),
-        })?;
+        let s = self
+            .blocks
+            .get_mut(&b.id)
+            .ok_or_else(|| OpError::Contract {
+                op: "bench".into(),
+                field: "upload_block",
+                expect: "块在册".into(),
+                got: format!("id={}", b.id),
+            })?;
         let n = src.len().min(s.len());
-        self.stream.memcpy_htod(&src[..n], &mut *s).map_err(|e| OpError::Contract {
-            op: "bench".into(),
-            field: "upload_block",
-            expect: "htod".into(),
-            got: format!("{e:?}"),
-        })
+        self.stream
+            .memcpy_htod(&src[..n], &mut *s)
+            .map_err(|e| OpError::Contract {
+                op: "bench".into(),
+                field: "upload_block",
+                expect: "htod".into(),
+                got: format!("{e:?}"),
+            })
     }
     fn download(&mut self, src: DevPtr, dst: &mut [u8]) -> Result<(), OpError> {
         let id = self
@@ -188,12 +206,14 @@ impl DeviceRes for TestRes {
             })?;
         let s = self.blocks.get(&id).expect("刚找到");
         let mut tmp = vec![0u8; s.len()];
-        self.stream.memcpy_dtoh(s, &mut tmp).map_err(|e| OpError::Contract {
-            op: "bench".into(),
-            field: "download",
-            expect: "dtoh".into(),
-            got: format!("{e:?}"),
-        })?;
+        self.stream
+            .memcpy_dtoh(s, &mut tmp)
+            .map_err(|e| OpError::Contract {
+                op: "bench".into(),
+                field: "download",
+                expect: "dtoh".into(),
+                got: format!("{e:?}"),
+            })?;
         dst.copy_from_slice(&tmp[..dst.len()]);
         Ok(())
     }
@@ -214,7 +234,12 @@ const VD: usize = 128;
 /// `gdn_recurrence` 的 grid = `(16, 24, 1)` ⇒ `nv = 24`、`nk = 8`;
 /// 全量档(nv=48/nk=16)只在 TP1 出现)。台子默认跟生产走,可用 env 覆盖。
 fn shape_env() -> (usize, usize) {
-    let e = |k: &str, d: usize| std::env::var(k).ok().and_then(|v| v.parse().ok()).unwrap_or(d);
+    let e = |k: &str, d: usize| {
+        std::env::var(k)
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(d)
+    };
     (e("OWL_GDN_NV", 24), e("OWL_GDN_NK", 8))
 }
 
@@ -256,9 +281,13 @@ fn gen(t: usize, nv: usize, nk: usize) -> In {
         q: (0..n_qk).map(|i| h((rnd(0x51, i) - 0.5) * 0.1)).collect(),
         k: (0..n_qk).map(|i| h((rnd(0x52, i) - 0.5) * 0.1)).collect(),
         v: (0..n_v).map(|i| h((rnd(0x53, i) - 0.5) * 0.1)).collect(),
-        g: (0..t * nv).map(|i| h(-0.01 - rnd(0x54, i) * 0.49)).collect(),
+        g: (0..t * nv)
+            .map(|i| h(-0.01 - rnd(0x54, i) * 0.49))
+            .collect(),
         beta: (0..t * nv).map(|i| h(0.1 + rnd(0x55, i) * 0.8)).collect(),
-        state: (0..nv * KD * VD).map(|i| (rnd(0x56, i) - 0.5) * 0.02).collect(),
+        state: (0..nv * KD * VD)
+            .map(|i| (rnd(0x56, i) - 0.5) * 0.02)
+            .collect(),
     }
 }
 
@@ -274,8 +303,16 @@ fn fire(
     smem: u32,
     vals: &[LaunchVal],
 ) {
-    if let Err(e) = exec.launch(res, OpId(owl_kernels::spec::NATIVE), f, entry, grid, block, smem, vals)
-    {
+    if let Err(e) = exec.launch(
+        res,
+        OpId(owl_kernels::spec::NATIVE),
+        f,
+        entry,
+        grid,
+        block,
+        smem,
+        vals,
+    ) {
         panic!("launch({entry}) grid={grid:?} block={block:?}: {e:?}");
     }
 }
@@ -284,7 +321,12 @@ fn fire(
 /// 不预热就量的读数会系统性偏低 2× 以上;2026-10-19 首轮踩过)。
 fn sm_clock_mhz(ordinal: usize) -> String {
     let out = std::process::Command::new("nvidia-smi")
-        .args(["--query-gpu=clocks.sm","--format=csv,noheader,nounits","-i", &ordinal.to_string()])
+        .args([
+            "--query-gpu=clocks.sm",
+            "--format=csv,noheader,nounits",
+            "-i",
+            &ordinal.to_string(),
+        ])
         .output();
     match out {
         Ok(o) => String::from_utf8_lossy(&o.stdout).trim().to_string(),
@@ -345,9 +387,18 @@ fn time_us(
 // §2 台子
 // ============================================================================
 
-fn bench_one(res: &mut TestRes, entry: &'static str, src: &'static str, t: usize, nv: usize, nk: usize) {
+fn bench_one(
+    res: &mut TestRes,
+    entry: &'static str,
+    src: &'static str,
+    t: usize,
+    nv: usize,
+    nk: usize,
+) {
     let mut exec = Exec::new();
-    let f = exec.load_aot(res, src, entry, OpId(owl_kernels::spec::NATIVE)).expect("资产");
+    let f = exec
+        .load_aot(res, src, entry, OpId(owl_kernels::spec::NATIVE))
+        .expect("资产");
 
     let inp = gen(t, nv, nk);
     let bq = res.blk(t * nk * KD * 2, "q");
@@ -401,7 +452,7 @@ fn bench_one(res: &mut TestRes, entry: &'static str, src: &'static str, t: usize
         LaunchVal::Ptr(ps),
         LaunchVal::Ptr(psl),
         LaunchVal::Ptr(pcu),
-        LaunchVal::U64(1),   // batch
+        LaunchVal::U64(1), // batch
         LaunchVal::U64(nv as u64),
         LaunchVal::U64(nk as u64),
         LaunchVal::U64(KD as u64),
@@ -430,7 +481,11 @@ fn bench_one(res: &mut TestRes, entry: &'static str, src: &'static str, t: usize
         } else {
             let n = want.len().min(blob.len());
             let at = (0..n).find(|i| want[*i] != blob[*i]).unwrap_or(n);
-            format!("✗ 首个不同字节 @{at}(want {} got {})", want[at], blob.get(at).copied().unwrap_or(0))
+            format!(
+                "✗ 首个不同字节 @{at}(want {} got {})",
+                want[at],
+                blob.get(at).copied().unwrap_or(0)
+            )
         };
         println!("  [ref] vs {reff}: {diff}");
     } else {
@@ -441,8 +496,14 @@ fn bench_one(res: &mut TestRes, entry: &'static str, src: &'static str, t: usize
     res.up(bs, &as_bytes_f32(&inp.state));
     res.sync();
 
-    let ord: usize = std::env::var("OWL_TEST_DEVICE").ok().and_then(|v| v.parse().ok()).unwrap_or(0);
-    let warm_ms: u64 = std::env::var("OWL_GDN_WARM_MS").ok().and_then(|v| v.parse().ok()).unwrap_or(2500);
+    let ord: usize = std::env::var("OWL_TEST_DEVICE")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(0);
+    let warm_ms: u64 = std::env::var("OWL_GDN_WARM_MS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(2500);
     spin_up(res, &mut exec, &f, entry, grid, block, smem, &vals, warm_ms);
     let c0 = sm_clock_mhz(ord);
     let us1 = time_us(res, &mut exec, &f, entry, grid, block, smem, &vals, 20, 1);

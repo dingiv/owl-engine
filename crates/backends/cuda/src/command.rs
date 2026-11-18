@@ -22,9 +22,7 @@ use std::task::{Context, Poll, Waker};
 /// COMPUTE,dtoh→D2H,sync 排空全部)。
 pub enum Command {
     /// 图捕获开始(护栏见 state.rs graph_begin;捕获期仅 Launch/Alloc 放行)
-    GraphBegin {
-        ack: Ack<Result<(), ModelError>>,
-    },
+    GraphBegin { ack: Ack<Result<(), ModelError>> },
     /// 图捕获结束(实例化 + 登记;空捕获窗拒绝)
     GraphEnd {
         ack: Ack<Result<GraphId, ModelError>>,
@@ -38,9 +36,7 @@ pub enum Command {
     /// 收尾手段)。语义 = "这一窗从未存在":退出捕获态 + 销毁半成品图 +
     /// **窗内自产块整批移出账房**(⇒ slab 释放)。不做它则失败捕获会把整条
     /// slab 钉到进程结束(state.rs `graph_abort`)
-    GraphAbort {
-        ack: Ack<Result<(), ModelError>>,
-    },
+    GraphAbort { ack: Ack<Result<(), ModelError>> },
     /// ★ **捕获期的发射路由切换**(图内 fork/join,2026-10-18;B1 门)。
     ///
     /// `sid` = 目标流(0=H2D / 1=COMPUTE / 2=D2H / 3=COMPUTE_AUX;
@@ -63,9 +59,7 @@ pub enum Command {
     /// 在当前路由流记一个 `DISABLE_TIMING` 事件,**origin 等它**,路由切回 origin。
     /// 只在**有人真的要消费支链结果**时用 —— 拿它当"切流程"用会把两条链拴成
     /// 串行(`capture_route_to` 的 M5 教训同源)。
-    CaptureJoin {
-        ack: Ack<Result<(), ModelError>>,
-    },
+    CaptureJoin { ack: Ack<Result<(), ModelError>> },
     /// **销毁已登记图**(单图退休:LRU 驱逐 / plan `close()` 底层)。三件事:
     /// 排空回放 → 解除本图块租约(归零即解钉)→ 本图 slab 块整批移出账房
     GraphDestroy {
@@ -299,9 +293,7 @@ pub enum Command {
     /// **设备池回收**(内存面):池内已 free 的缓存块还 OS;
     /// ack 回**释放字节数**(`RESERVED_MEM_CURRENT` 差值;0 = 无可回收)。
     /// 用法 = 装载收尾(暂存槽 free 之后)—— 见 `DeviceClient::mem_pool_trim`。
-    MemPoolTrim {
-        ack: Ack<Result<u64, ModelError>>,
-    },
+    MemPoolTrim { ack: Ack<Result<u64, ModelError>> },
     /// **设备池账**(内存面;只读):(used, used_high, reserved, reserved_high)
     /// —— `/debug/vram` 的 per-rank 行(物理 − live = 池缓存,见 §23.9)。
     MemPoolStats {
@@ -314,9 +306,7 @@ pub enum Command {
     },
     /// **设备 SM 数查询**(宿主面只读;`cuDeviceGetAttribute(MULTIPROCESSOR_COUNT)`)。
     /// 与 `BlockLedgerDump` 同族:无 GPU 活、无流、捕获期可放行(恒定值,不碰设备状态)。
-    DeviceSmCount {
-        ack: Ack<Result<usize, ModelError>>,
-    },
+    DeviceSmCount { ack: Ack<Result<usize, ModelError>> },
     /// **设备代际查询**(宿主面只读;`COMPUTE_CAPABILITY_MAJOR/MINOR` → `Arch`)。
     /// 与 `DeviceSmCount` 同族。语义 = **运行期代际真值**(构建期真值 = Cargo feature `arch-smXX`,
     /// 两者由装机期架构门对齐;见 `owl_kernels::arch`)。
@@ -353,9 +343,7 @@ pub enum Command {
         ack: Ack<Result<Bytes, ModelError>>,
     },
     /// 排空点(三条流全部 synchronize)
-    Sync {
-        ack: Ack<Result<(), ModelError>>,
-    },
+    Sync { ack: Ack<Result<(), ModelError>> },
     /// **命令面原生批**(2026-10-21):一条信箱消息装 N 条**设备命令**,
     /// 服务端在同一线程逐条派发、全部子回执落定后一次性回执。
     ///
@@ -369,9 +357,7 @@ pub enum Command {
     },
     /// 优雅关机:回执后进入 Closing —— 排空积压命令(结构化拒绝),
     /// 排空在飞完成回调,设备栅栏,线程退出
-    Close {
-        ack: Ack<Result<(), ModelError>>,
-    },
+    Close { ack: Ack<Result<(), ModelError>> },
 }
 
 impl Command {
@@ -512,7 +498,10 @@ impl<T> Ack<T> {
             created: std::time::Instant::now(),
         });
         (
-            Self { repr: AckRepr::Once(inner.clone()), created: inner.created },
+            Self {
+                repr: AckRepr::Once(inner.clone()),
+                created: inner.created,
+            },
             Waiter(inner),
         )
     }
@@ -617,7 +606,12 @@ pub fn envelope_of(cmd: DeviceCommand, ack: Ack<Result<Outcome, ModelError>>) ->
     };
 
     match cmd {
-        DeviceCommand::Alloc { dtype, elems, zero, name } => Command::Alloc {
+        DeviceCommand::Alloc {
+            dtype,
+            elems,
+            zero,
+            name,
+        } => Command::Alloc {
             n_bytes: elems * dtype.size_bytes(),
             elems,
             zero,
@@ -632,8 +626,17 @@ pub fn envelope_of(cmd: DeviceCommand, ack: Ack<Result<Outcome, ModelError>>) ->
                 })
             }),
         },
-        DeviceCommand::Free { ids } => Command::Free { ids, ack: done_ack(ack) },
-        DeviceCommand::Htod { dtype, shape, src, stream, name } => {
+        DeviceCommand::Free { ids } => Command::Free {
+            ids,
+            ack: done_ack(ack),
+        },
+        DeviceCommand::Htod {
+            dtype,
+            shape,
+            src,
+            stream,
+            name,
+        } => {
             // 事实面(元素数/阶数)随命令走 —— 服务端只回 id,**由本面按命令定形**
             // (与旧 `GpuClient::htod` 逐字同口径:U8/rank0 占位由信封携带)
             let (elems, rank) = (numel(&shape), shape.len() as u8);
@@ -651,31 +654,57 @@ pub fn envelope_of(cmd: DeviceCommand, ack: Ack<Result<Outcome, ModelError>>) ->
                 }),
             }
         }
-        DeviceCommand::Dtoh { id, off_bytes, want_bytes } => {
+        DeviceCommand::Dtoh {
+            id,
+            off_bytes,
+            want_bytes,
+        } => {
             if off_bytes == 0 {
-                Command::Dtoh { id, want_bytes, ack: bytes_ack(ack) }
+                Command::Dtoh {
+                    id,
+                    want_bytes,
+                    ack: bytes_ack(ack),
+                }
             } else {
-                Command::DtohAt { id, off_bytes, want_bytes, ack: bytes_ack(ack) }
+                Command::DtohAt {
+                    id,
+                    off_bytes,
+                    want_bytes,
+                    ack: bytes_ack(ack),
+                }
             }
         }
-        DeviceCommand::CopyBlock { src, src_off_bytes, dst, dst_off_bytes, len_bytes } => {
-            Command::CopyBlock {
-                src,
-                src_off_bytes,
-                dst,
-                dst_off_bytes,
-                len_bytes,
-                ack: done_ack(ack),
-            }
-        }
-        DeviceCommand::Launch { msg } => Command::Launch { msg, ack: buf_ack(ack) },
+        DeviceCommand::CopyBlock {
+            src,
+            src_off_bytes,
+            dst,
+            dst_off_bytes,
+            len_bytes,
+        } => Command::CopyBlock {
+            src,
+            src_off_bytes,
+            dst,
+            dst_off_bytes,
+            len_bytes,
+            ack: done_ack(ack),
+        },
+        DeviceCommand::Launch { msg } => Command::Launch {
+            msg,
+            ack: buf_ack(ack),
+        },
         DeviceCommand::Sync => Command::Sync { ack: done_ack(ack) },
         DeviceCommand::GraphBegin => Command::GraphBegin { ack: done_ack(ack) },
-        DeviceCommand::GraphEnd => Command::GraphEnd { ack: graph_ack(ack) },
-        DeviceCommand::GraphLaunch { graph } => Command::GraphLaunch { graph, ack: done_ack(ack) },
+        DeviceCommand::GraphEnd => Command::GraphEnd {
+            ack: graph_ack(ack),
+        },
+        DeviceCommand::GraphLaunch { graph } => Command::GraphLaunch {
+            graph,
+            ack: done_ack(ack),
+        },
         DeviceCommand::GraphAbort => Command::GraphAbort { ack: done_ack(ack) },
-        DeviceCommand::GraphDestroy { graph } => {
-            Command::GraphDestroy { graph, ack: done_ack(ack) }
-        }
+        DeviceCommand::GraphDestroy { graph } => Command::GraphDestroy {
+            graph,
+            ack: done_ack(ack),
+        },
     }
 }

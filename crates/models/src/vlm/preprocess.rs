@@ -33,8 +33,7 @@ pub const MAX_PIXELS: usize = 16_777_216;
 
 /// **字节流 → VlmImage**(PNG/JPEG;其他格式由 image crate 报错)
 pub fn from_bytes(bytes: &[u8], max_pixels: usize) -> Result<VlmImage, String> {
-    let img = image::load_from_memory(bytes)
-        .map_err(|e| format!("图像解码失败(PNG/JPEG): {e}"))?;
+    let img = image::load_from_memory(bytes).map_err(|e| format!("图像解码失败(PNG/JPEG): {e}"))?;
     from_image(img, max_pixels)
 }
 
@@ -48,7 +47,10 @@ pub fn from_image(img: DynamicImage, max_pixels: usize) -> Result<VlmImage, Stri
     let (h_bar, w_bar) = smart_resize(h as usize, w as usize, max_pixels)?;
     let resized = resize_pil(&rgb, w_bar, h_bar);
     let (pixel_values, grid_h, grid_w) = patchify(&resized);
-    Ok(VlmImage { pixel_values, grid: (1, grid_h, grid_w) })
+    Ok(VlmImage {
+        pixel_values,
+        grid: (1, grid_h, grid_w),
+    })
 }
 
 /// `smart_resize`(Qwen2VL 逐式;factor = PATCH*MERGE = 32)
@@ -62,7 +64,11 @@ pub fn smart_resize(
     width: usize,
     max_pixels: usize,
 ) -> Result<(usize, usize), String> {
-    let max_pixels = if max_pixels == 0 { MAX_PIXELS } else { max_pixels };
+    let max_pixels = if max_pixels == 0 {
+        MAX_PIXELS
+    } else {
+        max_pixels
+    };
     let factor = PATCH * MERGE;
     let (h, w) = (height as f64, width as f64);
     if h.max(w) / h.min(w) > 200.0 {
@@ -251,7 +257,6 @@ mod tests {
         let v = from_image(DynamicImage::ImageRgb8(img), 0).expect("upscale");
         assert!(v.grid.1 >= PATCH && v.grid.2 >= PATCH);
     }
-
 }
 
 #[cfg(test)]
@@ -261,7 +266,10 @@ mod parity_probe {
     /// 真图探针(不是门;`--nocapture` 看前 8 个归一化值,与 Python 金标对望)。
     #[test]
     fn bird_probe() {
-        let Ok(bytes) = std::fs::read(concat!(env!("CARGO_MANIFEST_DIR"), "/../../assets/images/bird.png")) else {
+        let Ok(bytes) = std::fs::read(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../assets/images/bird.png"
+        )) else {
             return;
         };
         let v = from_bytes(&bytes, 0).expect("bird");
@@ -298,7 +306,11 @@ mod parity_exact {
         // 指纹取自 2026-11-16 搬家**前**的实现（server::vision_processor 同一份
         // 代码跑同一张图）。改预处理算法 = 必须换这个常量并在文档里说明理由；
         // 搬家/重构 = 常量不许动。
-        assert_eq!(v.grid, (1, 34, 22), "网格变了(说明 resize/patchify 语义变了)");
+        assert_eq!(
+            v.grid,
+            (1, 34, 22),
+            "网格变了(说明 resize/patchify 语义变了)"
+        );
         assert_eq!(v.pixel_values.len(), 1_148_928, "patch 数变了");
         assert_eq!(h, 0xd44c_4b2a_274d_0a91, "像素指纹变了(行李动了算法)");
     }
@@ -309,7 +321,11 @@ mod parity_exact {
         let Ok(golden) = std::fs::read("/tmp/bird_pv.f32") else {
             return;
         };
-        let bytes = std::fs::read(concat!(env!("CARGO_MANIFEST_DIR"), "/../../assets/images/bird.png")).expect("bird");
+        let bytes = std::fs::read(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../assets/images/bird.png"
+        ))
+        .expect("bird");
         let v = from_bytes(&bytes, 0).expect("preprocess");
         assert_eq!(v.pixel_values.len() * 4, golden.len(), "长度");
         let want: Vec<f32> = golden

@@ -122,15 +122,25 @@ async fn t1_captured_memcpy_enters_graph_and_replays() {
         .await
         .expect("alloc junk")
         .view(Dtype::F32, 1);
-    c.copy_block_at(&seed, 0, &dst, 0, N * 4).await.expect("种 dst = 9.0");
+    c.copy_block_at(&seed, 0, &dst, 0, N * 4)
+        .await
+        .expect("种 dst = 9.0");
     c.sync().await.expect("sync seed");
-    assert_eq!(read_f32(&mut c, &dst, 1).await[0], 9.0, "前置:种 dst 未生效");
+    assert_eq!(
+        read_f32(&mut c, &dst, 1).await[0],
+        9.0,
+        "前置:种 dst 未生效"
+    );
 
     // ── 捕获窗:[无关核(满足空窗哨兵), D2D 搬运] ────────────────────
     // ⚠️ 陪跑核必须与搬运**不同格**:否则"搬运是否生效"会被陪跑核的输出掩埋。
     c.graph_begin().await.expect("graph_begin");
-    c.launch(add_msg(&src, &src, &junk, N)).await.expect("窗内陪跑核");
-    c.copy_block_at(&src, 0, &dst, 0, N * 4).await.expect("窗内 CopyBlock 应被放行");
+    c.launch(add_msg(&src, &src, &junk, N))
+        .await
+        .expect("窗内陪跑核");
+    c.copy_block_at(&src, 0, &dst, 0, N * 4)
+        .await
+        .expect("窗内 CopyBlock 应被放行");
     let gid = c.graph_end().await.expect("graph_end");
 
     // ── T1a:回放一次 → dst 应为 src(1.0)───────────────────────────
@@ -142,12 +152,17 @@ async fn t1_captured_memcpy_enters_graph_and_replays() {
          9.0 = 搬运没执行(节点没进图);0 = 从未写过。dev={d}",
         g1[0]
     );
-    assert!(g1.iter().all(|&v| v == 1.0), "T1a 红:除首元素外也不符(g1[1]={})", g1[1]);
+    assert!(
+        g1.iter().all(|&v| v == 1.0),
+        "T1a 红:除首元素外也不符(g1[1]={})",
+        g1[1]
+    );
 
     // ── T1b:图外清零 dst → 再回放 → 只有"回放真执行"才能复原 ────────
     c.memset_zero(&dst, N * 4).await.expect("图外清零 dst");
     assert_eq!(
-        read_f32(&mut c, &dst, 1).await[0], 0.0,
+        read_f32(&mut c, &dst, 1).await[0],
+        0.0,
         "前置自证:图外 memset_zero 未生效(否则 T1b 无分辨力)"
     );
     c.graph_launch(gid).await.expect("replay#2");
@@ -159,7 +174,9 @@ async fn t1_captured_memcpy_enters_graph_and_replays() {
         g2[0]
     );
 
-    c.free(&[src.id, seed.id, dst.id, junk.id]).await.expect("free");
+    c.free(&[src.id, seed.id, dst.id, junk.id])
+        .await
+        .expect("free");
     c.graph_destroy(gid).await.expect("graph_destroy");
     eprintln!("[graph_memcpy_gate] T1a/T1b 绿(dev={d}, N={N}, 回放 2 次)");
 }
@@ -192,13 +209,19 @@ async fn t2_captured_memcpy_orders_before_consumer_kernel() {
         .await
         .expect("alloc out")
         .view(Dtype::F32, 1);
-    c.copy_block_at(&seed, 0, &dst, 0, N * 4).await.expect("种 dst = 9.0");
+    c.copy_block_at(&seed, 0, &dst, 0, N * 4)
+        .await
+        .expect("种 dst = 9.0");
     c.sync().await.expect("sync seed");
 
     // ── 捕获窗:[D2D 搬运, 消费核 `out = dst + dst`] ─────────────────
     c.graph_begin().await.expect("graph_begin");
-    c.copy_block_at(&src, 0, &dst, 0, N * 4).await.expect("窗内 CopyBlock");
-    c.launch(add_msg(&dst, &dst, &out, N)).await.expect("窗内消费核(读 dst)");
+    c.copy_block_at(&src, 0, &dst, 0, N * 4)
+        .await
+        .expect("窗内 CopyBlock");
+    c.launch(add_msg(&dst, &dst, &out, N))
+        .await
+        .expect("窗内消费核(读 dst)");
     let gid = c.graph_end().await.expect("graph_end");
 
     c.graph_launch(gid).await.expect("replay");
@@ -210,7 +233,9 @@ async fn t2_captured_memcpy_orders_before_consumer_kernel() {
         g[0]
     );
 
-    c.free(&[src.id, seed.id, dst.id, out.id]).await.expect("free");
+    c.free(&[src.id, seed.id, dst.id, out.id])
+        .await
+        .expect("free");
     c.graph_destroy(gid).await.expect("graph_destroy");
     eprintln!("[graph_memcpy_gate] T2 绿(dev={d}, N={N})");
 }
@@ -239,8 +264,12 @@ fn uuid_of(ordinal: usize) -> String {
 #[tokio::test]
 async fn t3_captured_peer_memcpy_cross_device() {
     let (Some(oa), Some(ob)) = (
-        std::env::var("OWL_PEER_TEST_DEV_A").ok().and_then(|v| v.parse().ok()),
-        std::env::var("OWL_PEER_TEST_DEV_B").ok().and_then(|v| v.parse().ok()),
+        std::env::var("OWL_PEER_TEST_DEV_A")
+            .ok()
+            .and_then(|v| v.parse().ok()),
+        std::env::var("OWL_PEER_TEST_DEV_B")
+            .ok()
+            .and_then(|v| v.parse().ok()),
     ) else {
         eprintln!("skip T3:需 OWL_PEER_TEST_DEV_A / OWL_PEER_TEST_DEV_B(两张可 P2P 的空闲卡)");
         return;
@@ -255,23 +284,38 @@ async fn t3_captured_peer_memcpy_cross_device() {
     let mut b = assemble(ob, "t3b");
     let (ua, ub) = (uuid_of(oa), uuid_of(ob));
     let (own_a, cred_a) = a.peer_alloc(SZ, "t3:own-a").await.expect("A PeerAlloc");
-    let alias_a_on_b = b.peer_import(cred_a, SZ, &ua, "t3:alias-a@b").await.expect("B 导入 A");
+    let alias_a_on_b = b
+        .peer_import(cred_a, SZ, &ua, "t3:alias-a@b")
+        .await
+        .expect("B 导入 A");
 
     // A 侧写 X(htod 窗外;peer 块自身不能 htod ⇒ 用一块普通源 + 设备内拷过去)
     let src_x = owl_iface::htod!(a, Dtype::F32, &Shape::from(vec![N]), &x)
         .await
         .expect("A htod x")
         .view(Dtype::F32, 1);
-    a.copy_block_at(&src_x, 0, &own_a, 0, N * 4).await.expect("A 写自己的 peer 块");
+    a.copy_block_at(&src_x, 0, &own_a, 0, N * 4)
+        .await
+        .expect("A 写自己的 peer 块");
     a.sync().await.expect("A sync");
 
-    let inbox = owl_iface::alloc_uninit!(b, Dtype::F32, N).await.expect("B alloc inbox").view(Dtype::F32, 1);
-    let out = owl_iface::alloc_uninit!(b, Dtype::F32, N).await.expect("B alloc out").view(Dtype::F32, 1);
+    let inbox = owl_iface::alloc_uninit!(b, Dtype::F32, N)
+        .await
+        .expect("B alloc inbox")
+        .view(Dtype::F32, 1);
+    let out = owl_iface::alloc_uninit!(b, Dtype::F32, N)
+        .await
+        .expect("B alloc out")
+        .view(Dtype::F32, 1);
 
     // ── B 侧捕获窗:[跨卡 CE 拷(对端块 → 本端 inbox), 消费核] ────────
     b.graph_begin().await.expect("graph_begin");
-    b.copy_block_at(&alias_a_on_b, 0, &inbox, 0, N * 4).await.expect("窗内跨卡 CopyBlock");
-    b.launch(add_msg(&inbox, &inbox, &out, N)).await.expect("窗内消费核");
+    b.copy_block_at(&alias_a_on_b, 0, &inbox, 0, N * 4)
+        .await
+        .expect("窗内跨卡 CopyBlock");
+    b.launch(add_msg(&inbox, &inbox, &out, N))
+        .await
+        .expect("窗内消费核");
     let gid = b.graph_end().await.expect("graph_end");
     let _ = ub;
 
@@ -290,7 +334,9 @@ async fn t3_captured_peer_memcpy_cross_device() {
         .await
         .expect("A htod y")
         .view(Dtype::F32, 1);
-    a.copy_block_at(&src_y, 0, &own_a, 0, N * 4).await.expect("A 改写 peer 块");
+    a.copy_block_at(&src_y, 0, &own_a, 0, N * 4)
+        .await
+        .expect("A 改写 peer 块");
     a.sync().await.expect("A sync y");
     b.graph_launch(gid).await.expect("replay#2");
     let g2 = read_f32(&mut b, &out, 1).await;
@@ -306,7 +352,11 @@ async fn t3_captured_peer_memcpy_cross_device() {
     b.graph_destroy(gid).await.expect("graph_destroy");
     b.free(&[inbox.id, out.id]).await.expect("B free");
     a.free(&[src_x.id, src_y.id]).await.expect("A free");
-    b.peer_release(vec![alias_a_on_b.id]).await.expect("B peer_release");
-    a.peer_release(vec![own_a.id]).await.expect("A peer_release");
+    b.peer_release(vec![alias_a_on_b.id])
+        .await
+        .expect("B peer_release");
+    a.peer_release(vec![own_a.id])
+        .await
+        .expect("A peer_release");
     eprintln!("[graph_memcpy_gate] T3 绿(跨卡 peer 搬运,回放 2 次读到最新值;dev A={oa} B={ob})");
 }

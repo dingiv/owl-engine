@@ -22,7 +22,15 @@ fn main() {
         .into_iter()
         .find(|p| p.exists())
         .expect("找不到 W4A16 检查点目录(从仓库根或 crates/models 下运行)");
-    println!("[bench] dir={} 模式={}", dir.display(), if touch { "索引+全键物化" } else { "仅索引" });
+    println!(
+        "[bench] dir={} 模式={}",
+        dir.display(),
+        if touch {
+            "索引+全键物化"
+        } else {
+            "仅索引"
+        }
+    );
 
     let t = Instant::now();
     let src = W4A16Source::open_dir(&dir).expect("open_dir");
@@ -81,6 +89,9 @@ fn main() {
             }
         }
     }
-    println!("[bench] 触达 passthrough {touched} / 派生 {} / 缺 elem_len {missing}", derived.len());
+    println!(
+        "[bench] 触达 passthrough {touched} / 派生 {} / 缺 elem_len {missing}",
+        derived.len()
+    );
     println!("[bench] 总耗时 {:?}", t.elapsed());
 }

@@ -8,8 +8,8 @@
 
 use std::path::{Path, PathBuf};
 
-use owl_shared::config::{OwlConfig, ResolvedConfig, SpecDraft};
 pub use owl_shared::config::ModelFormat;
+use owl_shared::config::{OwlConfig, ResolvedConfig, SpecDraft};
 
 // ── app 面缺省(总账外的 server 组装缺省;R2 命名常量)──
 const DEFAULT_MODEL_DIR: &str = concat!(
@@ -70,11 +70,9 @@ impl CliArgs {
         while let Some(a) = it.next() {
             match a.as_str() {
                 "--flavor" => {
-                    return Err(
-                        "--flavor 已移除:配置档统一为 `-p/--profile <profile_path>`\
+                    return Err("--flavor 已移除:配置档统一为 `-p/--profile <profile_path>`\
                          (源码 profiles/ 下可直接复制修改)"
-                            .into(),
-                    );
+                        .into());
                 }
                 "--profile" | "-p" => {
                     out.profile = Some(PathBuf::from(
@@ -83,7 +81,8 @@ impl CliArgs {
                 }
                 "--site" => {
                     out.site = Some(PathBuf::from(
-                        it.next().ok_or("--site 需要路径(站点档:[site] 或普通配置表)")?,
+                        it.next()
+                            .ok_or("--site 需要路径(站点档:[site] 或普通配置表)")?,
                     ));
                 }
                 "--list-flavors" | "--list-profiles" => {
@@ -104,7 +103,8 @@ impl CliArgs {
                 }
                 "--explain" => {
                     out.explain.push(
-                        it.next().ok_or("--explain 需要键(点路径,如 runtime.max_context_length)")?,
+                        it.next()
+                            .ok_or("--explain 需要键(点路径,如 runtime.max_context_length)")?,
                     );
                 }
                 "--set" => {
@@ -113,18 +113,23 @@ impl CliArgs {
                 }
                 "--perf-dump" => {
                     out.perf_dump = Some(PathBuf::from(
-                        it.next().ok_or("--perf-dump 需要路径(CSV 基名;同名 .json 一并写)")?,
+                        it.next()
+                            .ok_or("--perf-dump 需要路径(CSV 基名;同名 .json 一并写)")?,
                     ));
                 }
                 "--perf-level" => {
-                    let v = it.next().ok_or("--perf-level 需要值(off|counters|host|gpu)")?;
+                    let v = it
+                        .next()
+                        .ok_or("--perf-level 需要值(off|counters|host|gpu)")?;
                     if owl_shared::metrics::level::parse(&v).is_none() {
                         return Err(format!("--perf-level 非法值 {v:?}(off|counters|host|gpu)"));
                     }
                     out.perf_level = Some(v);
                 }
                 "--log-level" => {
-                    let v = it.next().ok_or("--log-level 需要值(off|error|warn|info|debug|trace)")?;
+                    let v = it
+                        .next()
+                        .ok_or("--log-level 需要值(off|error|warn|info|debug|trace)")?;
                     if owl_shared::log::Level::parse_threshold(&v).is_none() {
                         return Err(format!(
                             "--log-level 非法值 {v:?}(off|error|warn|info|debug|trace)"
@@ -147,26 +152,27 @@ impl CliArgs {
                 "--step-gate-ms" => {
                     let v = it.next().ok_or("--step-gate-ms 需要毫秒数")?;
                     out.step_gate_ms = Some(
-                        v.parse().map_err(|_| format!("--step-gate-ms 非法值 {v:?}"))?,
+                        v.parse()
+                            .map_err(|_| format!("--step-gate-ms 非法值 {v:?}"))?,
                     );
                 }
                 "--step-gate-us" => {
                     let v = it.next().ok_or("--step-gate-us 需要微秒数")?;
                     out.step_gate_us = Some(
-                        v.parse().map_err(|_| format!("--step-gate-us 非法值 {v:?}"))?,
+                        v.parse()
+                            .map_err(|_| format!("--step-gate-us 非法值 {v:?}"))?,
                     );
                 }
                 "--step-gate-every" => {
                     let v = it.next().ok_or("--step-gate-every 需要正整数")?;
                     out.step_gate_every = Some(
-                        v.parse().map_err(|_| format!("--step-gate-every 非法值 {v:?}"))?,
+                        v.parse()
+                            .map_err(|_| format!("--step-gate-every 非法值 {v:?}"))?,
                     );
                 }
                 "--help" | "-h" => out.help = true,
                 _ if a.starts_with('-') => {
-                    return Err(format!(
-                        "未知参数 {a:?}\n\n{HELP}"
-                    ));
+                    return Err(format!("未知参数 {a:?}\n\n{HELP}"));
                 }
                 _ => {
                     if out.config.is_some() {
@@ -190,10 +196,7 @@ impl CliArgs {
             push("log.level", toml::Value::String(x.clone()));
         }
         if let Some(x) = &self.log_file {
-            push(
-                "log.file",
-                toml::Value::String(x.display().to_string()),
-            );
+            push("log.file", toml::Value::String(x.display().to_string()));
         }
         if let Some(x) = &self.perf_level {
             push("probes.perf_level", toml::Value::String(x.clone()));
@@ -306,7 +309,11 @@ fn load_template_vars(
     let explicit = cfg.server.template_vars.trim();
     let path = if !explicit.is_empty() {
         let p = PathBuf::from(explicit);
-        Some(if p.is_absolute() { p } else { model_dir.join(p) })
+        Some(if p.is_absolute() {
+            p
+        } else {
+            model_dir.join(p)
+        })
     } else {
         let p = model_dir.join(FILE);
         p.is_file().then_some(p)
@@ -351,7 +358,11 @@ fn toml_to_json(v: &toml::Value) -> serde_json::Value {
         toml::Value::Boolean(b) => J::Bool(*b),
         toml::Value::Datetime(d) => J::String(d.to_string()),
         toml::Value::Array(a) => J::Array(a.iter().map(toml_to_json).collect()),
-        toml::Value::Table(t) => J::Object(t.iter().map(|(k, v)| (k.clone(), toml_to_json(v))).collect()),
+        toml::Value::Table(t) => J::Object(
+            t.iter()
+                .map(|(k, v)| (k.clone(), toml_to_json(v)))
+                .collect(),
+        ),
     }
 }
 
@@ -450,10 +461,7 @@ impl ServerConfig {
     }
 
     /// 完整解析产物 → server 形态（设备选卡已下沉到 `EngineService::boot`）。
-    pub fn from_resolved(
-        resolved: ResolvedConfig,
-        args: &CliArgs,
-    ) -> Result<Self, String> {
+    pub fn from_resolved(resolved: ResolvedConfig, args: &CliArgs) -> Result<Self, String> {
         let mut out = Self::from_config(resolved.config)?;
         out.perf_dump = args.perf_dump.clone();
         Ok(out)
@@ -499,11 +507,9 @@ impl ServerConfig {
             vision_max_pixels: cfg.vision.max_pixels,
             model_dir,
             model_format: cfg.model.format,
-            model_name: cfg
-                .model
-                .name
-                .clone()
-                .unwrap_or_else(|| Self::default_model_name(cfg.model.format, cfg.model.path.as_deref())),
+            model_name: cfg.model.name.clone().unwrap_or_else(|| {
+                Self::default_model_name(cfg.model.format, cfg.model.path.as_deref())
+            }),
             knobs: owl_engine::EngineKnobs::from_config(&cfg)
                 .map_err(|e| format!("engine knobs: {e}"))?,
             device_opts: owl_engine::DeviceOpts {
@@ -566,7 +572,11 @@ pub fn summary_line(r: &ResolvedConfig) -> Option<String> {
         "prefill={} decode={} gdn={}",
         "eager",
         c.kernel.decode_arm.as_str(),
-        if c.kernel.gdn_chunked { "chunked" } else { "scalar" },
+        if c.kernel.gdn_chunked {
+            "chunked"
+        } else {
+            "scalar"
+        },
     );
     Some(format!(
         "[owl] profile={} card={} ctx={} pool=auto({}) {} mem={}/{} (余 {}) reuse={} spec={} c={}",
@@ -578,8 +588,16 @@ pub fn summary_line(r: &ResolvedConfig) -> Option<String> {
         gib(e.used_bytes()),
         gib(e.total_bytes),
         gib(e.total_bytes.saturating_sub(e.used_bytes())),
-        if c.store.prefix_cache { format!("snap{}", c.store.gdn.snap_max) } else { "off".into() },
-        if c.spec.depth > 0 { format!("dflash{}", c.spec.depth) } else { "off".into() },
+        if c.store.prefix_cache {
+            format!("snap{}", c.store.gdn.snap_max)
+        } else {
+            "off".into()
+        },
+        if c.spec.depth > 0 {
+            format!("dflash{}", c.spec.depth)
+        } else {
+            "off".into()
+        },
         c.store.gdn.gdn_slots,
     ))
 }
@@ -600,7 +618,11 @@ pub fn check_report(r: &ResolvedConfig) -> Result<CheckReport, String> {
     let c = &r.config;
     out.push_str(&format!(
         "[check] layers: {}\n",
-        if r.layers.is_empty() { "(纯缺省)".to_string() } else { r.layers.join(" → ") }
+        if r.layers.is_empty() {
+            "(纯缺省)".to_string()
+        } else {
+            r.layers.join(" → ")
+        }
     ));
     let intent = r.intent();
     if let Some(m) = intent {
@@ -645,7 +667,11 @@ pub fn check_report(r: &ResolvedConfig) -> Result<CheckReport, String> {
                 gib(e.budget_bytes),
                 e.cap_tokens,
                 e.pool_tokens,
-                if e.pool_tokens <= e.cap_tokens { "≤" } else { ">" },
+                if e.pool_tokens <= e.cap_tokens {
+                    "≤"
+                } else {
+                    ">"
+                },
             ));
             out.push_str(&format!(
                 "[check] basis: per_tok {}B(主 {} + 草稿 {})·激活 {}·固定 = gdn {} + snap {}·预留 {}\n",
@@ -703,7 +729,11 @@ pub fn check_report(r: &ResolvedConfig) -> Result<CheckReport, String> {
         Some(dir) => {
             // **一条路径**:臂 → 源族 → 声明事实;几何对账 / 视觉声明 / 摘要
             // 全部走 `CheckpointDecl` 接口(与 boot 同一份解析)。
-            let vision_path = c.vision.path.as_deref().filter(|p| !p.as_os_str().is_empty());
+            let vision_path = c
+                .vision
+                .path
+                .as_deref()
+                .filter(|p| !p.as_os_str().is_empty());
             let spec = owl_engine::preflight::ModelCheckSpec {
                 path: dir,
                 format: c.model.format,
@@ -754,9 +784,7 @@ pub fn check_report(r: &ResolvedConfig) -> Result<CheckReport, String> {
             out.push_str("[check] draft: dumb(诊断哑草稿;不需要 MTP/DFlash2 资产)\n");
         } else {
             if c.spec.draft_path.is_some() {
-                out.push_str(
-                    "[check] note: spec.draft=mtp 忽略 spec.draft_path(显式选择优先)\n",
-                );
+                out.push_str("[check] note: spec.draft=mtp 忽略 spec.draft_path(显式选择优先)\n");
             }
             match c.model.path.as_deref() {
                 Some(dir) => {
@@ -921,10 +949,7 @@ mod template_vars_tests {
     use super::*;
 
     fn tmp(tag: &str) -> PathBuf {
-        let p = std::env::temp_dir().join(format!(
-            "owl-ctvars-{tag}-{}",
-            std::process::id()
-        ));
+        let p = std::env::temp_dir().join(format!("owl-ctvars-{tag}-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&p);
         std::fs::create_dir_all(&p).expect("tmp");
         p
@@ -946,10 +971,13 @@ mod template_vars_tests {
         )
         .expect("写文件");
         let model = dir.join("model");
-        let (vars, src) = load_template_vars(&cfg_with(&f.display().to_string()), &model)
-            .expect("应加载");
+        let (vars, src) =
+            load_template_vars(&cfg_with(&f.display().to_string()), &model).expect("应加载");
         assert_eq!(src.as_deref(), Some(f.as_path()));
-        assert_eq!(vars.get("tool_call_format"), Some(&serde_json::json!("json")));
+        assert_eq!(
+            vars.get("tool_call_format"),
+            Some(&serde_json::json!("json"))
+        );
         assert_eq!(
             vars.get("auto_disable_thinking_with_tools"),
             Some(&serde_json::json!(true))
@@ -1022,7 +1050,10 @@ mod template_vars_tests {
         let cfg = OwlConfig::default();
         let agent = AgentCfg::from_config(&cfg, &dir).expect("应加载");
         assert_eq!(agent.vars.len(), 2);
-        assert_eq!(agent.vars.get("reasoning_effort"), Some(&serde_json::json!("high")));
+        assert_eq!(
+            agent.vars.get("reasoning_effort"),
+            Some(&serde_json::json!("high"))
+        );
         assert!(agent.vars_source.is_some());
         let _ = std::fs::remove_dir_all(&dir);
     }

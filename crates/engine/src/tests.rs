@@ -11,12 +11,12 @@
 //! 会话连续 / 4k 长 ctx / W4A16 / 27B AWQ / 多会话隔离 / 前缀缓存命中 /
 //! S0 调度决策面。
 
-use crate::spec_runtime::DraftHead as _;
 use crate::engine::{Engine, EngineConfig, EngineKnobs};
 #[cfg(test)] // 仅单元档的 decode 差分用例消费;e2e 档不编该函数
 use crate::exec::decode_delta;
 use crate::running::RunningEngine;
 use crate::scheduler::{SchedulerOutput, StepAction};
+use crate::spec_runtime::DraftHead as _;
 use crate::turn::TurnEvent;
 #[cfg(test)]
 use owl_cpu::CpuFace; // dev-dep:仅 cfg(test) 单元档可用
@@ -29,7 +29,11 @@ use owl_shared::config::OwlConfig;
 
 /// v4 快照布局的机械不变量（图像删除后尤其容易两套坐标/两套角色）。
 fn assert_snap_layout_invariants(s: &crate::session::AgentSession) {
-    assert_eq!(s.msg_snaps.len(), s.msg_snap_roles.len(), "布局点/角色不等长");
+    assert_eq!(
+        s.msg_snaps.len(),
+        s.msg_snap_roles.len(),
+        "布局点/角色不等长"
+    );
     assert_eq!(s.msg_snap_keys.len(), s.msg_snaps.len(), "布局点/键不等长");
     assert!(
         s.msg_snaps.windows(2).all(|w| w[0] < w[1]),
@@ -37,7 +41,11 @@ fn assert_snap_layout_invariants(s: &crate::session::AgentSession) {
         s.msg_snaps
     );
     if let Some(at) = s.tail_at {
-        assert!(at <= s.tokens.len(), "tail_at={at} 越过会话 token {}", s.tokens.len());
+        assert!(
+            at <= s.tokens.len(),
+            "tail_at={at} 越过会话 token {}",
+            s.tokens.len()
+        );
     }
     if let Some(k) = s.tail_snap {
         assert!(
@@ -172,8 +180,7 @@ async fn mock_snap_engine(
         ..Default::default()
     };
     knobs.pool_tokens = Some(256);
-    knobs.ram_pool_size = 8;
-    knobs.snap_host_mb = 64;
+    knobs.ram_pool_size = 72;
     knobs.snap_max = snap_max;
     let cfg = EngineConfig {
         device_ordinal: 0,
@@ -216,8 +223,7 @@ async fn multi_active_decode_uses_selected_turn_gdn_row() {
         ..Default::default()
     };
     knobs.pool_tokens = Some(256);
-    knobs.ram_pool_size = 8;
-    knobs.snap_host_mb = 64;
+    knobs.ram_pool_size = 72;
     knobs.snap_max = 1;
     let cfg = EngineConfig {
         device_ordinal: 0,
@@ -387,7 +393,12 @@ async fn keyless_continuation_matches_session_by_prefix() {
         ids1 = running.boot.tok.encode(&p1);
     }
     let sid = {
-        let (id, s) = running.bank.parts_mut().sessions.get_or_create(None).expect("建会话");
+        let (id, s) = running
+            .bank
+            .parts_mut()
+            .sessions
+            .get_or_create(None)
+            .expect("建会话");
         let pos: Vec<[i32; 3]> = (0..ids1.len() as i32).map(|i| [i, i, i]).collect();
         s.commit_turn(&ids1, &[], &pos).expect("种账");
         id
@@ -401,8 +412,9 @@ async fn keyless_continuation_matches_session_by_prefix() {
     // 跑到终局，让会话回到 idle（否则下一条会被"忙会话不参与匹配"跳过）
     loop {
         match running.pump().await.expect("pump") {
-            TurnEvent::Completed { turn, .. } | TurnEvent::Failed { turn, .. }
-                if turn == t2 => break,
+            TurnEvent::Completed { turn, .. } | TurnEvent::Failed { turn, .. } if turn == t2 => {
+                break
+            }
             TurnEvent::Idle => panic!("turn {t2} 丢失"),
             _ => {}
         }
@@ -431,8 +443,7 @@ async fn pressure_evicts_cold_sessions_whole() {
         ..Default::default()
     };
     knobs.pool_tokens = Some(256);
-    knobs.ram_pool_size = 8;
-    knobs.snap_host_mb = 64;
+    knobs.ram_pool_size = 72;
     knobs.snap_max = 1;
     let mut running = mock_engine_with(knobs).await;
 
@@ -460,13 +471,20 @@ async fn pressure_evicts_cold_sessions_whole() {
 
     let (n, pages) = running.evict_cold_sessions(total);
     assert_eq!(n, 3, "空闲会话应逐个被淘汰（最冷优先）");
-    assert!(running.bank.parts().sessions.is_empty(), "淘汰后会话表应清空");
+    assert!(
+        running.bank.parts().sessions.is_empty(),
+        "淘汰后会话表应清空"
+    );
     assert!(
         pages > 0,
         "整会话淘汰必须真还页：{free_before} → {}（共 {total}）",
         running.bank.parts().rel.slots_free()
     );
-    assert_eq!(running.bank.parts().rel.slots_free(), total, "目标 = 全自由");
+    assert_eq!(
+        running.bank.parts().rel.slots_free(),
+        total,
+        "目标 = 全自由"
+    );
 }
 
 /// **准入预留 = 上下文 + 本请求的 max_tokens**（2026-11-17 裁决 A）。
@@ -486,8 +504,7 @@ async fn submit_reserves_request_max_new() {
         ..Default::default()
     };
     knobs.pool_tokens = Some(256);
-    knobs.ram_pool_size = 8;
-    knobs.snap_host_mb = 64;
+    knobs.ram_pool_size = 72;
     knobs.snap_max = 1;
     let mut running = mock_engine_with(knobs).await;
 
@@ -562,7 +579,10 @@ async fn queued_cancel_keeps_persistent_session() {
         !running.bank.parts().sessions.is_empty(),
         "会话是持久资产：排队取消不得抹掉会话账"
     );
-    assert!(running.bank.parts().sessions.get(s1).is_some(), "活跃会话原样");
+    assert!(
+        running.bank.parts().sessions.get(s1).is_some(),
+        "活跃会话原样"
+    );
 }
 
 /// **F-01 回归门**：纯配置门必须返回 `Err`（旧实现 `process::exit(2)`），
@@ -626,8 +646,7 @@ async fn failed_start_returns_gdn_row() {
         ..Default::default()
     };
     knobs.pool_tokens = Some(256);
-    knobs.ram_pool_size = 8;
-    knobs.snap_host_mb = 64;
+    knobs.ram_pool_size = 72;
     knobs.snap_max = 1;
     let cfg = EngineConfig {
         device_ordinal: 0,
@@ -725,8 +744,7 @@ async fn failed_start_does_not_kill_active_turn() {
         ..Default::default()
     };
     knobs.pool_tokens = Some(512);
-    knobs.ram_pool_size = 8;
-    knobs.snap_host_mb = 64;
+    knobs.ram_pool_size = 72;
     knobs.snap_max = 2;
     let mut running = mock_engine_with(knobs).await;
 
@@ -748,13 +766,20 @@ async fn failed_start_does_not_kill_active_turn() {
         .submit_session_opts(Some(12), "beta alpha gamma", 4, Default::default())
         .expect("submit B");
     running
-        .bank.parts_mut().rel.borrow_row(owl_store::tier::Owner::System)
+        .bank
+        .parts_mut()
+        .rel
+        .borrow_row(owl_store::tier::Owner::System)
         .expect("借走最后一行");
 
     // 起 B 失败必须是**事件**（Failed{turn=B}），不是 `Err`（`Err` 会触发 abandon）。
     let mut got_own_fail = false;
     for _ in 0..32 {
-        match running.pump().await.expect("单 turn 启动失败不得报引擎错误") {
+        match running
+            .pump()
+            .await
+            .expect("单 turn 启动失败不得报引擎错误")
+        {
             TurnEvent::Failed { turn, .. } if turn == b => {
                 got_own_fail = true;
                 break;
@@ -765,8 +790,14 @@ async fn failed_start_does_not_kill_active_turn() {
             _ => {}
         }
     }
-    assert!(got_own_fail, "启动失败的 turn 必须收到自己的 Failed（否则 HTTP 永挂）");
-    assert!(running.turns.active_of(a).is_some(), "在跑的 A 不得被连坐弃掉");
+    assert!(
+        got_own_fail,
+        "启动失败的 turn 必须收到自己的 Failed（否则 HTTP 永挂）"
+    );
+    assert!(
+        running.turns.active_of(a).is_some(),
+        "在跑的 A 不得被连坐弃掉"
+    );
     assert!(running.turns.active_of(b).is_none(), "B 从没进 active");
 }
 
@@ -787,8 +818,7 @@ async fn position_consolidation_resets_high_water() {
         ..Default::default()
     };
     knobs.pool_tokens = Some(256);
-    knobs.ram_pool_size = 8;
-    knobs.snap_host_mb = 64;
+    knobs.ram_pool_size = 72;
     knobs.snap_max = 2;
     let mut running = mock_engine_with(knobs).await;
 
@@ -799,9 +829,7 @@ async fn position_consolidation_resets_high_water() {
         .expect("submit warm");
     loop {
         match running.pump().await.expect("pump warm") {
-            TurnEvent::Completed { turn, .. } | TurnEvent::Failed { turn, .. }
-                if turn == warm =>
-            {
+            TurnEvent::Completed { turn, .. } | TurnEvent::Failed { turn, .. } if turn == warm => {
                 break
             }
             _ => {}
@@ -810,7 +838,12 @@ async fn position_consolidation_resets_high_water() {
 
     // 模拟“删图留下的大 gap”：把位置账抬到 319（末位）。
     {
-        let s = running.bank.parts_mut().sessions.get_mut(sid).expect("会话");
+        let s = running
+            .bank
+            .parts_mut()
+            .sessions
+            .get_mut(sid)
+            .expect("会话");
         let n = s.positions.len();
         let base = 319 - (n as i32 - 1);
         for (i, p) in s.positions.iter_mut().enumerate() {
@@ -827,9 +860,7 @@ async fn position_consolidation_resets_high_water() {
     let mut done = false;
     for _ in 0..64 {
         match running.pump().await.expect("pump compact") {
-            TurnEvent::Completed { turn, .. } | TurnEvent::Failed { turn, .. }
-                if turn == tid =>
-            {
+            TurnEvent::Completed { turn, .. } | TurnEvent::Failed { turn, .. } if turn == tid => {
                 done = true;
                 break;
             }
@@ -876,7 +907,12 @@ async fn mock_engine_with(
 #[tokio::test]
 async fn memory_plan_uses_measured_graph_slab_after_capture() {
     let running = mock_snap_engine(1).await;
-    let plan = running.bank.parts().rel.memory_plan().expect("MemoryPlan 应已注入");
+    let plan = running
+        .bank
+        .parts()
+        .rel
+        .memory_plan()
+        .expect("MemoryPlan 应已注入");
     let slab = plan
         .component(owl_store::ComponentId::GraphSlab)
         .expect("GraphSlab 项");
@@ -886,8 +922,10 @@ async fn memory_plan_uses_measured_graph_slab_after_capture() {
         "捕获后 GraphSlab 应回填实测"
     );
     assert!(
-        plan.fixed.iter().all(|c| c.id != owl_store::ComponentId::GraphSlab
-            || c.source == owl_store::PlanSource::Measured),
+        plan.fixed
+            .iter()
+            .all(|c| c.id != owl_store::ComponentId::GraphSlab
+                || c.source == owl_store::PlanSource::Measured),
         "图 slab 项必须实测"
     );
 }
@@ -1004,11 +1042,9 @@ async fn disk_spill_and_fill_roundtrip() {
         ..Default::default()
     };
     knobs.pool_tokens = Some(256);
-    knobs.ram_pool_size = 0;
-    knobs.snap_host_mb = 24; // 只装得下一张快照(0.8B 一条 ≈19MiB)
+    knobs.ram_pool_size = 24;
     knobs.snap_max = 2;
-    knobs.disk_pool_size = 8;
-    knobs.snap_disk_mb = 24;
+    knobs.disk_pool_size = 32;
     knobs.disk_dir = dir.display().to_string();
     let cfg = EngineConfig {
         device_ordinal: 0,
@@ -1031,7 +1067,10 @@ async fn disk_spill_and_fill_roundtrip() {
 
     let bytes = running.bank.parts().rel.snap_bytes();
     assert!(bytes > 0, "状态腿布局应已注册");
-    assert!(running.bank.parts().rel.disk_enabled(), "盘层应已接线(配额+目录)");
+    assert!(
+        running.bank.parts().rel.disk_enabled(),
+        "盘层应已接线(配额+目录)"
+    );
     // **P2 磁盘腿入准入**：`store_facts()` 必须看见盘上余量（旧行为恒 0
     // ⇒ 超卖档配了盘也不用，宿主满 = 拒新）。单卡：盘块 = 一页 ⇒ 页数 = 槽数。
     let facts = running.store_facts();
@@ -1105,7 +1144,13 @@ async fn disk_spill_and_fill_roundtrip() {
         Some(owl_store::Tier::Gpu),
         "设备那张仍在(内容不丢优先:本轮不出 Drop)"
     );
-    let path = running.bank.parts().rel.snap_disk_path_of(in_host).unwrap().to_path_buf();
+    let path = running
+        .bank
+        .parts()
+        .rel
+        .snap_disk_path_of(in_host)
+        .unwrap()
+        .to_path_buf();
     assert!(path.exists(), "文件应真写盘:{}", path.display());
     assert_eq!(
         std::fs::metadata(&path).unwrap().len() as usize,
@@ -1144,11 +1189,9 @@ async fn state_slot_spills_host_snapshot_to_disk_before_drop() {
         ..Default::default()
     };
     knobs.pool_tokens = Some(256);
-    knobs.ram_pool_size = 0;
-    knobs.snap_host_mb = 24; // 只装一条快照
+    knobs.ram_pool_size = 24;
     knobs.snap_max = 2;
-    knobs.disk_pool_size = 8;
-    knobs.snap_disk_mb = 24; // 盘再装一条
+    knobs.disk_pool_size = 32;
     knobs.disk_dir = dir.display().to_string();
     let cfg = EngineConfig {
         device_ordinal: 0,
@@ -1260,7 +1303,10 @@ async fn turn_records_session_ownership_for_kv_and_snaps() {
     let full = toks.len() / page;
     assert!(full >= 2, "prompt 应覆盖至少两块");
     let tail = running
-        .bank.parts().rel.tail_hash(&toks, full)
+        .bank
+        .parts()
+        .rel
+        .tail_hash(&toks, full)
         .expect("链尾身份");
     assert_eq!(
         running.bank.parts().rel.session_of(tail),
@@ -1271,7 +1317,10 @@ async fn turn_records_session_ownership_for_kv_and_snaps() {
 
     // 快照(页边界)也要带归属与深度
     let snaps: Vec<_> = running
-        .bank.parts().rel.snap_evict_candidates(&[])
+        .bank
+        .parts()
+        .rel
+        .snap_evict_candidates(&[])
         .into_iter()
         .filter_map(|c| c.snap)
         .collect();
@@ -1297,9 +1346,7 @@ async fn gdn_row_is_owned_by_the_active_turn() {
         .map(|i| ["alpha", "bravo", "cedar", "delta", "ember", "falcon"][i % 6])
         .collect::<Vec<_>>()
         .join(" ");
-    let (_sid, tid) = running
-        .submit_session(None, &prompt, 16)
-        .expect("submit");
+    let (_sid, tid) = running.submit_session(None, &prompt, 16).expect("submit");
     for _ in 0..4 {
         if let TurnEvent::Failed { turn, err } = running.pump().await.expect("pump") {
             panic!("t{turn} 失败:{err}")
@@ -1360,10 +1407,8 @@ async fn disk_checkpoint_survives_restart_without_host_pressure() {
         .join(" ");
 
     for (ckpt_mb, expect_hit) in [(0usize, false), (8usize, true)] {
-        let dir = std::env::temp_dir().join(format!(
-            "owl-ckpt-e2e-{}-{ckpt_mb}",
-            std::process::id()
-        ));
+        let dir =
+            std::env::temp_dir().join(format!("owl-ckpt-e2e-{}-{ckpt_mb}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         let mk = |dir: &std::path::Path| {
             let mut knobs = EngineKnobs {
@@ -1374,7 +1419,6 @@ async fn disk_checkpoint_survives_restart_without_host_pressure() {
             knobs.ram_pool_size = 8; // 宿主够装整链 ⇒ **永不产生磁盘压力**
             knobs.snap_max = 0;
             knobs.disk_pool_size = 8;
-            knobs.snap_disk_mb = 0;
             knobs.disk_dir = dir.display().to_string();
             // 本门的主角：主动 checkpoint（对照组 = 0 = 测试关闭；生产自动）
             knobs.checkpoint_policy = crate::running::CheckpointPolicy {
@@ -1439,14 +1483,24 @@ async fn disk_checkpoint_survives_restart_without_host_pressure() {
                 assert_eq!(bins, 0, "关 checkpoint 且宿主够大 ⇒ 不该有盘上内容(旧行为)");
             }
             let t0 = running.tokenize(&prompt, true).expect("tokenize").tokens;
-            let (h, _) = running.bank.parts_mut().rel.match_prefix(&t0).expect("命中查询");
+            let (h, _) = running
+                .bank
+                .parts_mut()
+                .rel
+                .match_prefix(&t0)
+                .expect("命中查询");
             (t0, h.matched_blocks)
         };
         assert!(matched0 > 0, "重启前同进程应命中(对照组另说:内容在宿主)");
 
         // ── 第二次进程：同目录 ⇒ boot 按索引 adopt ⇒ 命中面来自盘层
         let mut running2 = boot(mk(&dir)).await;
-        let (h2, _) = running2.bank.parts_mut().rel.match_prefix(&t0).expect("重启后命中查询");
+        let (h2, _) = running2
+            .bank
+            .parts_mut()
+            .rel
+            .match_prefix(&t0)
+            .expect("重启后命中查询");
         eprintln!(
             "[ckpt] 重启后: ckpt={ckpt_mb} 盘 entries={} matched={}",
             running2.bank.parts().rel.kv_disk_resident_count(),
@@ -1485,7 +1539,6 @@ async fn disk_chain_index_enables_cross_restart_reuse() {
         knobs.ram_pool_size = 1; // 宿主只装得下 ~2 块(0.8B 块 ≈384KiB)
         knobs.snap_max = 0;
         knobs.disk_pool_size = 8;
-        knobs.snap_disk_mb = 0;
         knobs.disk_dir = dir.display().to_string();
         EngineConfig {
             device_ordinal: 0,
@@ -1547,7 +1600,12 @@ async fn disk_chain_index_enables_cross_restart_reuse() {
         // 重启前的对照:同一份 token 化应命中(证明索引 tokens 与查询同源)
         // 提交路径会套 chat 模板 ⇒ 查询侧同口径(chat_wrap = true)
         let t0 = running.tokenize(&prompt, true).expect("tokenize").tokens;
-        let (h0, _) = running.bank.parts_mut().rel.match_prefix(&t0).expect("命中");
+        let (h0, _) = running
+            .bank
+            .parts_mut()
+            .rel
+            .match_prefix(&t0)
+            .expect("命中");
         assert!(h0.matched_blocks > 0, "重启前应命中(否则 tokens 不同源)");
         let idx_n = std::fs::read_dir(dir.join("kv"))
             .map(|rd| {
@@ -1584,7 +1642,12 @@ async fn disk_chain_index_enables_cross_restart_reuse() {
     let rebuilt = running2.bank.parts().rel.kv_stats().host_blocks;
     assert!(rebuilt > 0, "重启后应按索引重建出条目(非设备层)");
     let toks = running2.tokenize(&prompt, true).expect("tokenize").tokens;
-    let (hit, _recall) = running2.bank.parts_mut().rel.match_prefix(&toks).expect("命中");
+    let (hit, _recall) = running2
+        .bank
+        .parts_mut()
+        .rel
+        .match_prefix(&toks)
+        .expect("命中");
     assert!(hit.matched_blocks > 0, "重建的树应命中同一 prompt 前缀");
     // 命中面允许回读(内容在盘 ⇒ pending_host/回灌路径);这里只验"选得中"
     assert_eq!(
@@ -1609,11 +1672,9 @@ async fn disk_adopt_on_boot_restores_ledger() {
             ..Default::default()
         };
         knobs.pool_tokens = Some(256);
-        knobs.ram_pool_size = 0;
-        knobs.snap_host_mb = 24;
+        knobs.ram_pool_size = 24;
         knobs.snap_max = 2;
-        knobs.disk_pool_size = 8;
-        knobs.snap_disk_mb = 24;
+        knobs.disk_pool_size = 32;
         knobs.disk_dir = dir.display().to_string();
         EngineConfig {
             device_ordinal: 0,
@@ -1879,9 +1940,10 @@ pub async fn gpu_schedule_decision_surface() {
                     assert_eq!(pos, n);
                     // 物理槽 = 块表[pos/page]×page + pos%page(页 16 后
                     // 17 token 提示词跨入块 1,恒 b0 假设已不成立)
-                    let expect_slot =
-                        eng.bank.parts().sessions.get(sid).unwrap().block_table[n / page] as usize * page
-                            + n % page;
+                    let expect_slot = eng.bank.parts().sessions.get(sid).unwrap().block_table
+                        [n / page] as usize
+                        * page
+                        + n % page;
                     assert_eq!(kv_slot as usize, expect_slot, "物理槽 = 块链换算");
                     assert_eq!(gdn_slot, 0, "首会话格 0");
                     assert!(!grew, "页内不跨页");
@@ -1902,13 +1964,14 @@ pub async fn gpu_schedule_decision_surface() {
         let act = eng.turns.active.pop().expect("模拟器活跃 turn");
         eng.turns.select(None);
         eng.close_admission(act.id);
-        let s = eng.bank.parts_mut().sessions.get_mut(act.session_id).unwrap();
-        s.commit_turn(
-            &act.prompt_ids,
-            &[],
-            &act.positions[..act.prompt_ids.len()],
-        )
-        .expect("提交位置账");
+        let s = eng
+            .bank
+            .parts_mut()
+            .sessions
+            .get_mut(act.session_id)
+            .unwrap();
+        s.commit_turn(&act.prompt_ids, &[], &act.positions[..act.prompt_ids.len()])
+            .expect("提交位置账");
     }
     eng.submit_session(Some(sid), "一二三四五六七八九十", 2)
         .unwrap();
@@ -2028,7 +2091,10 @@ async fn state_leg_probe_scenario<D: DeviceClient>(running: &mut RunningEngine<D
 
     // ② 宿主 → 设备回灌:找一条宿主层快照,就位到设备槽
     let host_key = running
-        .bank.parts().rel.snap_evict_candidates(&[])
+        .bank
+        .parts()
+        .rel
+        .snap_evict_candidates(&[])
         .into_iter()
         .filter_map(|c| c.snap)
         .find(|k| running.bank.parts().rel.state_locate(*k) == Some(owl_store::Tier::Host))
@@ -2114,8 +2180,7 @@ fn state_leg_probe_config(ordinal: usize) -> EngineConfig {
         ..Default::default()
     };
     knobs.pool_tokens = Some(256);
-    knobs.ram_pool_size = 8;
-    knobs.snap_host_mb = 64;
+    knobs.ram_pool_size = 72;
     knobs.snap_max = 1;
     EngineConfig {
         device_ordinal: ordinal,
@@ -2175,7 +2240,10 @@ async fn index_probe_scenario<D: DeviceClient>(
     let after = running.bank.parts().rel.index_bytes();
     let rep = running.store_report();
     let (blocks, per_block) = running
-        .bank.parts().rel.index()
+        .bank
+        .parts()
+        .rel
+        .index()
         .as_ref()
         .map(|i| (i.len(), i.block_bytes()))
         .unwrap_or((0, 0));
@@ -2216,7 +2284,10 @@ async fn index_probe_scenario<D: DeviceClient>(
     // 幂等:同一 fed 再跑一次采集(直接调采集口)不应重复登记
     let n0 = blocks;
     if let Some(k) = running
-        .bank.parts().rel.index()
+        .bank
+        .parts()
+        .rel
+        .index()
         .as_ref()
         .and(None::<owl_store::SnapKey>)
     {
@@ -2224,7 +2295,10 @@ async fn index_probe_scenario<D: DeviceClient>(
     }
     assert_eq!(
         running
-            .bank.parts().rel.index()
+            .bank
+            .parts()
+            .rel
+            .index()
             .as_ref()
             .map(|i| i.len())
             .unwrap_or(0),
@@ -2477,9 +2551,8 @@ async fn select_decode_scenario() {
         cfg.knobs.select_decode = mode == "view" || mode == "partial";
         cfg.knobs.select_partial = mode == "partial";
         if mode == "partial" {
-            // 部分驻留要真下沉 ⇒ 宿主层必须开(两条腿成对:见 §8.17(2) 律)
-            cfg.knobs.ram_pool_size = 32;
-            cfg.knobs.snap_host_mb = 32;
+            // 部分驻留要真下沉 ⇒ 宿主总池必须开（KV + 快照共享）
+            cfg.knobs.ram_pool_size = 64;
         }
         if mode == "plain" {
             cfg.knobs.coverage_probe = false;
@@ -3033,10 +3106,8 @@ fn stage_in_config(ordinal: usize) -> EngineConfig {
         ..Default::default()
     };
     knobs.pool_tokens = Some(512);
-    knobs.ram_pool_size = 32;
-    // 状态腿宿主层也开:命中面的**边界快照**沉下去才不被压力挤掉
-    // (`reuse_face` 要求边界有快照 ⇒ 没它复用面会被裁到 0,回灌永不发生)
-    knobs.snap_host_mb = 32;
+    // 宿主总池（KV + 边界快照共享；2026-11-18 裁决）
+    knobs.ram_pool_size = 64;
     knobs.snap_max = 8;
     knobs.gdn_slots = 8;
     EngineConfig {
@@ -3282,9 +3353,9 @@ fn index_probe_config(ordinal: usize) -> EngineConfig {
     // **廉价边界暂存路径**（P1）：每 4 个边界才完整采集一次；
     // 本测试的 prompt 会跨多个边界，从而覆盖 push/take/末边界排空。
     knobs.recall_every = 4;
-    // 索引账落在 store 的 **host 层总账**上(与 KV/快照分片共用总账;
+    // 索引账落在 store 的 **host 层总账**上(与 KV/快照共享总池;
     // 索引自己的淘汰序 = 近期 + 累积频率,见 `MeanKIndex::evict_candidates`)
-    knobs.snap_host_mb = 64;
+    knobs.ram_pool_size = 64;
     EngineConfig {
         device_ordinal: ordinal,
         max_context_length_tokens: 256,
@@ -3395,7 +3466,13 @@ async fn offload_probe_scenario<D: DeviceClient>(running: &mut RunningEngine<D>)
         let mut diag = |tag: &str, p: &str| {
             let wrapped = running.boot.tok.chat_wrap(p);
             let ids = running.boot.tok.encode(&wrapped);
-            let hit = running.bank.parts_mut().rel.match_prefix(&ids).expect("match").0;
+            let hit = running
+                .bank
+                .parts_mut()
+                .rel
+                .match_prefix(&ids)
+                .expect("match")
+                .0;
             let rows: Vec<String> = hit
                 .hashes
                 .iter()
@@ -3407,7 +3484,10 @@ async fn offload_probe_scenario<D: DeviceClient>(running: &mut RunningEngine<D>)
                         if s.is_some() { "dev" } else { "host" },
                         // S2:在场性查 **store 的层账**(设备/宿主都算)
                         if running
-                            .bank.parts().rel.state_locate(owl_store::SnapKey::at_boundary(*h))
+                            .bank
+                            .parts()
+                            .rel
+                            .state_locate(owl_store::SnapKey::at_boundary(*h))
                             .is_some()
                         {
                             "Y"
@@ -4302,7 +4382,10 @@ pub async fn gpu_multi_session_isolation(shared: Option<&mut RunningEngine<crate
         .tok
         .encode(&running.boot.tok.chat_wrap(a_prompt.as_str()));
     let (a_hit_1, _) = running
-        .bank.parts_mut().rel.match_prefix(&a_tokens)
+        .bank
+        .parts_mut()
+        .rel
+        .match_prefix(&a_tokens)
         .expect("A 命中查询");
     assert!(a_hit_1.matched_blocks >= 1, "A 的历史应进缓存(内容身份)");
 
@@ -4315,7 +4398,10 @@ pub async fn gpu_multi_session_isolation(shared: Option<&mut RunningEngine<crate
 
     // 隔离断言 ①:B 的 turn 后,A 的**内容链**与账本都不变
     let (a_hit_2, _) = running
-        .bank.parts_mut().rel.match_prefix(&a_tokens)
+        .bank
+        .parts_mut()
+        .rel
+        .match_prefix(&a_tokens)
         .expect("A 命中查询");
     assert_eq!(
         a_hit_1.hashes, a_hit_2.hashes,
@@ -4332,7 +4418,10 @@ pub async fn gpu_multi_session_isolation(shared: Option<&mut RunningEngine<crate
         .tok
         .encode(&running.boot.tok.chat_wrap("我的代号是贝塔。"));
     let (b_hit, _) = running
-        .bank.parts_mut().rel.match_prefix(&b_tokens)
+        .bank
+        .parts_mut()
+        .rel
+        .match_prefix(&b_tokens)
         .expect("B 命中查询");
     assert!(
         b_hit.hashes.iter().all(|h| !a_hit_2.hashes.contains(h)),
@@ -4481,10 +4570,16 @@ pub async fn gpu_prefix_cache_hit(shared: Option<&mut RunningEngine<crate::GpuFa
         .tok
         .encode(&running.boot.tok.chat_wrap(prompt_b.as_str()));
     let (hit_a, _) = running
-        .bank.parts_mut().rel.match_prefix(&a_ids)
+        .bank
+        .parts_mut()
+        .rel
+        .match_prefix(&a_ids)
         .expect("A 命中查询");
     let (hit_b, _) = running
-        .bank.parts_mut().rel.match_prefix(&b_ids)
+        .bank
+        .parts_mut()
+        .rel
+        .match_prefix(&b_ids)
         .expect("B 命中查询");
     let shared = hit_b
         .hashes
@@ -5053,7 +5148,10 @@ pub async fn gpu_spec_identity_gate() {
                 .expect("submit");
             let text = drive_turn(&mut running, id).await;
             let toks = running
-                .bank.parts().sessions.get(sid)
+                .bank
+                .parts()
+                .sessions
+                .get(sid)
                 .map(|s| s.tokens.clone())
                 .unwrap_or_default();
             out.push((text, toks));
@@ -5070,7 +5168,10 @@ pub async fn gpu_spec_identity_gate() {
                 .expect("submit(ignore_eos)");
             let text_ie = drive_turn(&mut running, id_ie).await;
             let n = running
-                .bank.parts().sessions.get(sid_ie)
+                .bank
+                .parts()
+                .sessions
+                .get(sid_ie)
                 .map(|s| s.tokens.len())
                 .unwrap_or(0);
             eprintln!("[spec-gate] 预算尽门(ignore_eos): {n} tok,文本 {text_ie:?}");
@@ -5199,7 +5300,10 @@ pub async fn gpu_spec_identity_gate_27b() {
         let (sid, id) = running.submit_session(Some(7), prompt, 40).expect("submit");
         let text = drive_turn(running, id).await;
         let toks = running
-            .bank.parts().sessions.get(sid)
+            .bank
+            .parts()
+            .sessions
+            .get(sid)
             .map(|s| s.tokens.clone())
             .unwrap_or_default();
         let st = running.dev.spec_rt.stats;
@@ -5363,7 +5467,10 @@ pub async fn gpu_dflash2_identity_gate_27b() {
         let text = drive_turn(running, id).await;
         let t_gen = tg.elapsed();
         let toks = running
-            .bank.parts().sessions.get(sid)
+            .bank
+            .parts()
+            .sessions
+            .get(sid)
             .map(|s| s.tokens.clone())
             .unwrap_or_default();
         let gen_n = toks.len().saturating_sub(prompt_len);
@@ -5621,7 +5728,10 @@ pub async fn gpu_decode_marginal_bench() {
         let _text = drive_turn(&mut running, id).await;
         let wall = t0.elapsed().as_secs_f64();
         let n = running
-            .bank.parts().sessions.get(7)
+            .bank
+            .parts()
+            .sessions
+            .get(7)
             .map(|v| v.tokens.len())
             .unwrap_or(0);
         drop(running);
@@ -5758,7 +5868,10 @@ pub async fn gpu_head_int8_gate() {
         let (_sid, id) = running.submit_session(Some(7), prompt, n).expect("submit");
         let _ = drive_turn(&mut running, id).await;
         let toks = running
-            .bank.parts().sessions.get(7)
+            .bank
+            .parts()
+            .sessions
+            .get(7)
             .map(|s| s.tokens.clone())
             .unwrap_or_default();
         drop(running);
@@ -5810,7 +5923,10 @@ pub async fn gpu_head_int8_gate() {
             let (_s, id) = running.submit_session(Some(sid), *p, n).expect("submit");
             let _ = drive_turn(&mut running, id).await;
             let t = running
-                .bank.parts().sessions.get(sid)
+                .bank
+                .parts()
+                .sessions
+                .get(sid)
                 .map(|s| s.tokens.clone())
                 .unwrap_or_default();
             eprintln!(
@@ -5961,7 +6077,9 @@ fn spec_restore_verdict_needs_two_hits() {
 #[test]
 fn degraded_turn_heals_without_oscillating() {
     use crate::exec::RESTORE_DECISIVE_M;
-    use crate::exec::{spec_degrade_verdict as dv, spec_restore_verdict as rv, spec_streak_step as ss};
+    use crate::exec::{
+        spec_degrade_verdict as dv, spec_restore_verdict as rv, spec_streak_step as ss,
+    };
     const FLOOR: usize = 8;
     // 模拟框架：返回 (降级轮数, 降级次数, 恢复次数, 最大探测周期, 恢复发生步)
     struct Sim {
@@ -5983,9 +6101,20 @@ fn degraded_turn_heals_without_oscillating() {
     impl Sim {
         fn new() -> Self {
             Self {
-                streak: 0, degraded: false, probe: FLOOR, steps: 0, low: 0, hits: 0,
-                recent_r: 0, recent_t: 0, deg_rounds: 0, degrades: 0, restores: 0,
-                max_probe: 0, healed_at: None, probes: 0,
+                streak: 0,
+                degraded: false,
+                probe: FLOOR,
+                steps: 0,
+                low: 0,
+                hits: 0,
+                recent_r: 0,
+                recent_t: 0,
+                deg_rounds: 0,
+                degrades: 0,
+                restores: 0,
+                max_probe: 0,
+                healed_at: None,
+                probes: 0,
             }
         }
         /// `line` 盈亏线；`m_of(round)` 给出该轮接受数；`rounds` 总轮数
@@ -6069,8 +6198,16 @@ fn degraded_turn_heals_without_oscillating() {
     const CREATIVE: [usize; 16] = [0, 0, 1, 0, 0, 1, 2, 0, 0, 1, 0, 0, 0, 1, 0, 3];
     let mut c = Sim::new();
     c.run(363, 1.60, |i| CREATIVE[i % CREATIVE.len()]);
-    assert!(c.deg_rounds * 100 / 363 >= 60, "创作档该以裸 decode 为主（覆盖率 {}%）", c.deg_rounds * 100 / 363);
-    assert!(c.restores <= 3, "恢复次数 {}（旧实现 363 轮 3 次 = 节拍器）", c.restores);
+    assert!(
+        c.deg_rounds * 100 / 363 >= 60,
+        "创作档该以裸 decode 为主（覆盖率 {}%）",
+        c.deg_rounds * 100 / 363
+    );
+    assert!(
+        c.restores <= 3,
+        "恢复次数 {}（旧实现 363 轮 3 次 = 节拍器）",
+        c.restores
+    );
     assert!(c.deg_rounds > 0 && c.degrades >= 1);
     // 决定性命中门槛来自常量（防"改了常量忘了门"）
     assert_eq!(RESTORE_DECISIVE_M, 3);
@@ -6301,8 +6438,7 @@ async fn abort_publishes_written_prompt_prefix() {
         ..Default::default()
     };
     knobs.pool_tokens = Some(2048); // 64 页(页 32)⇒ 前缀面够放
-    knobs.ram_pool_size = 8;
-    knobs.snap_host_mb = 64;
+    knobs.ram_pool_size = 72;
     knobs.snap_max = 64;
     let cfg = EngineConfig {
         device_ordinal: 0,
@@ -6329,7 +6465,13 @@ async fn abort_publishes_written_prompt_prefix() {
     };
     let mut body = String::new();
     let mut i = 0usize;
-    while running.boot.tok.encode(&format!("{body}{}", filler(i))).len() < 300 {
+    while running
+        .boot
+        .tok
+        .encode(&format!("{body}{}", filler(i)))
+        .len()
+        < 300
+    {
         body = format!("{body}{}", filler(i));
         i += 1;
     }
@@ -6358,7 +6500,10 @@ async fn abort_publishes_written_prompt_prefix() {
         }
     }
     assert!(a_first_token, "A 必须进到生成段才能验「生成中中断」");
-    assert!(a_chunks >= 8, "A 的全量 prefill 应跨多 chunk,实测 {a_chunks}");
+    assert!(
+        a_chunks >= 8,
+        "A 的全量 prefill 应跨多 chunk,实测 {a_chunks}"
+    );
     assert!(
         running.cancel_turn(ta).await.is_some(),
         "活跃 turn 应可取消"
@@ -6406,8 +6551,7 @@ async fn same_session_queues_instead_of_rejecting() {
         max_batch: 2, // 批位容得下两个 —— 串行只能由会话判据挡住
         gdn_slots: 2,
         pool_tokens: Some(512),
-        ram_pool_size: 8,
-        snap_host_mb: 64,
+        ram_pool_size: 72,
         snap_max: 1,
         ..Default::default()
     };
@@ -7080,14 +7224,13 @@ pub async fn gpu_image_evict_gate() {
         )
     };
     // 旧链槽位（内容树；turn 收口后会话不持表）。图像/位置指纹必须同源。
-    let old_tags = crate::img_evict::block_tags_pos(
-        old_tokens.len(),
-        page,
-        &old_spans,
-        &old_positions,
-    );
+    let old_tags =
+        crate::img_evict::block_tags_pos(old_tokens.len(), page, &old_spans, &old_positions);
     let (hit, _) = running
-        .bank.parts_mut().rel.match_prefix_tagged(&old_tokens, &old_tags)
+        .bank
+        .parts_mut()
+        .rel
+        .match_prefix_tagged(&old_tokens, &old_tags)
         .expect("旧链命中");
     assert!(
         hit.matched_blocks > (del.end / page),
@@ -7224,12 +7367,8 @@ pub async fn gpu_image_evict_gate() {
         let bank = running.bank.parts_mut();
         let s = bank.sessions.session(sid).expect("会话账");
         assert_snap_layout_invariants(s);
-        let tags = crate::img_evict::block_tags_pos(
-            s.tokens.len(),
-            page,
-            &s.img_spans,
-            &s.positions,
-        );
+        let tags =
+            crate::img_evict::block_tags_pos(s.tokens.len(), page, &s.img_spans, &s.positions);
         let (hit_new, _) = bank
             .rel
             .match_prefix_tagged(&s.tokens, &tags)
@@ -7286,7 +7425,10 @@ pub async fn gpu_image_evict_gate() {
     // KV 槽不再被缓存引用站住；保留前缀仍可命中。
     {
         let (hit_old, _) = running
-            .bank.parts_mut().rel.match_prefix_tagged(&old_tokens, &old_tags)
+            .bank
+            .parts_mut()
+            .rel
+            .match_prefix_tagged(&old_tokens, &old_tags)
             .expect("旧链查询");
         assert_eq!(
             hit_old.matched_blocks,
@@ -7644,21 +7786,23 @@ pub async fn gpu_image_evict_anchor_gate() {
     let (old_tokens, old_positions, old_img_spans) = {
         let s = running.bank.parts().sessions.session(sid).expect("会话账");
         assert_eq!(
-            s.img_spans.iter().map(|x| (x.start, x.end)).collect::<Vec<_>>(),
+            s.img_spans
+                .iter()
+                .map(|x| (x.start, x.end))
+                .collect::<Vec<_>>(),
             spans.iter().map(|x| (x.start, x.end)).collect::<Vec<_>>(),
             "会话账图像段坐标必须与测试侧 pad 律一致"
         );
         (s.tokens.clone(), s.positions.clone(), s.img_spans.clone())
     };
     let old_blocks = old_tokens.len() / page;
-    let old_tags = crate::img_evict::block_tags_pos(
-        old_tokens.len(),
-        page,
-        &old_img_spans,
-        &old_positions,
-    );
+    let old_tags =
+        crate::img_evict::block_tags_pos(old_tokens.len(), page, &old_img_spans, &old_positions);
     let (hit, _) = running
-        .bank.parts_mut().rel.match_prefix_tagged(&old_tokens, &old_tags)
+        .bank
+        .parts_mut()
+        .rel
+        .match_prefix_tagged(&old_tokens, &old_tags)
         .expect("旧链命中");
     assert!(
         hit.matched_blocks >= old_blocks,
@@ -7680,18 +7824,18 @@ pub async fn gpu_image_evict_anchor_gate() {
         false,
     );
     let (_, t2) = running
-        .submit_session_opts(Some(21), prompt2.as_str(), 12, crate::turn::TurnOpts::default())
+        .submit_session_opts(
+            Some(21),
+            prompt2.as_str(),
+            12,
+            crate::turn::TurnOpts::default(),
+        )
         .expect("anchor t2 提交");
     // **删除轮的 admission 估计门**（2026-11-15）：submit 的 `cached` 必须覆盖
     // 第一段删除之前的旧前缀（真机 bug：leave-gap 轮 cached=0 ⇒ floor 按全量
     // ctx 预留，30k 会话删图轮 1952 页 vs 正常 1036 页，多留 ~1GB）。
     {
-        let est = running
-            .turns
-            .queue
-            .back()
-            .expect("t2 在队列里")
-            .cached;
+        let est = running.turns.queue.back().expect("t2 在队列里").cached;
         assert!(
             est >= del0.start,
             "删除轮 admission cached 估计不足：{est} < 删除前前缀 {}",
@@ -7733,7 +7877,10 @@ pub async fn gpu_image_evict_anchor_gate() {
         );
     }
     let (hit_old, _) = running
-        .bank.parts_mut().rel.match_prefix_tagged(&old_tokens, &old_tags)
+        .bank
+        .parts_mut()
+        .rel
+        .match_prefix_tagged(&old_tokens, &old_tags)
         .expect("旧链查询");
     assert_eq!(
         hit_old.matched_blocks,
@@ -7742,11 +7889,7 @@ pub async fn gpu_image_evict_anchor_gate() {
     );
     eprintln!(
         "[test] 尾删锚点:删 [{}, {}) · 锚点 {} · 复用 {} 页(旧链 {} 页)",
-        trace.a,
-        trace.b,
-        anchor,
-        reused_pages,
-        old_blocks
+        trace.a, trace.b, anchor, reused_pages, old_blocks
     );
 
     // ── 臂 2：同一游程两张相邻图 ⇒ **每张图前都要有锚点**，只删后一张 ──
@@ -7810,12 +7953,8 @@ pub async fn gpu_image_evict_anchor_gate() {
         let (sess, hit_a) = {
             let bank = running.bank.parts_mut();
             let s = bank.sessions.session(sid2).expect("run 会话账");
-            let tags = crate::img_evict::block_tags_pos(
-                s.tokens.len(),
-                page,
-                &s.img_spans,
-                &s.positions,
-            );
+            let tags =
+                crate::img_evict::block_tags_pos(s.tokens.len(), page, &s.img_spans, &s.positions);
             let (h, _) = bank
                 .rel
                 .match_prefix_tagged(&s.tokens, &tags)
@@ -7869,9 +8008,7 @@ pub async fn gpu_image_evict_anchor_gate() {
             _ => panic!("run t2 决策应带 begin + Prefill"),
         };
         running.execute_begin(begin).await.expect("run t2 begin");
-        let cached = running
-            .active_cached_len(a2)
-            .expect("run t2 active");
+        let cached = running.active_cached_len(a2).expect("run t2 active");
         assert!(
             cached >= r1.start,
             "只删后一张时复用面必须覆盖前一张（cached={cached} 需 >= r1.start={}）",
@@ -7886,7 +8023,12 @@ pub async fn gpu_image_evict_anchor_gate() {
             }
         };
         assert!(!a2_text.trim().is_empty(), "run t2 必须出文本");
-        let s = running.bank.parts().sessions.session(sid2).expect("run 会话账");
+        let s = running
+            .bank
+            .parts()
+            .sessions
+            .session(sid2)
+            .expect("run 会话账");
         assert_eq!(s.img_spans.len(), 1, "只保留被重发的那一张图");
         assert!(
             sess.len() > r1.start,
@@ -7977,9 +8119,7 @@ pub async fn gpu_image_evict_anchor_gate() {
             _ => panic!("trim t2 决策应带 begin + Prefill"),
         };
         running.execute_begin(begin).await.expect("trim t2 begin");
-        let cached = running
-            .active_cached_len(b2)
-            .expect("trim t2 active");
+        let cached = running.active_cached_len(b2).expect("trim t2 active");
         assert!(
             cached >= t0.start,
             "模板 trim 边界未复原：cached={cached} 需 >= 图前起点 {}",
@@ -8190,14 +8330,21 @@ pub async fn gpu_image_evict_multi_gate() {
     let old_tags =
         crate::img_evict::block_tags_pos(old_tokens.len(), page, &old_spans, &old_positions);
     let (hit, _) = running
-        .bank.parts_mut().rel.match_prefix_tagged(&old_tokens, &old_tags)
+        .bank
+        .parts_mut()
+        .rel
+        .match_prefix_tagged(&old_tokens, &old_tags)
         .expect("旧链命中");
     assert!(
         hit.matched_blocks >= old_blocks,
         "多段门前提 = 旧链整链在缓存里: matched={} blocks={old_blocks}",
         hit.matched_blocks
     );
-    assert_eq!(hit.slots.len(), hit.matched_blocks, "slots 必须与 matched 等长");
+    assert_eq!(
+        hit.slots.len(),
+        hit.matched_blocks,
+        "slots 必须与 matched 等长"
+    );
 
     // ── 读 K（第一段删点之后的**全部幸存页**；段间文本页也在内） ──
     async fn read_slot(
@@ -8253,7 +8400,12 @@ pub async fn gpu_image_evict_multi_gate() {
         false,
     );
     let (_, t2) = running
-        .submit_session_opts(Some(11), prompt2.as_str(), 12, crate::turn::TurnOpts::default())
+        .submit_session_opts(
+            Some(11),
+            prompt2.as_str(),
+            12,
+            crate::turn::TurnOpts::default(),
+        )
         .expect("multi t2 提交");
     {
         let est = running
@@ -8371,7 +8523,8 @@ pub async fn gpu_image_evict_multi_gate() {
     for (b, slot) in &survivor_slots {
         let after = read_slot(&mut running, *slot, per_page_bytes).await;
         assert_eq!(
-            &after, k_before.get(slot).expect("k_before"),
+            &after,
+            k_before.get(slot).expect("k_before"),
             "幸存页 {b}(槽 {slot}) 的 K 在多段 leave-gap 后被改写(必须一字节不动)"
         );
     }
@@ -8380,11 +8533,12 @@ pub async fn gpu_image_evict_multi_gate() {
         let s = running.bank.parts().sessions.session(sid).expect("会话账");
         assert_eq!(s.positions.len(), s.tokens.len(), "位置账与 token 账等长");
         assert!(s.max_pos >= old_max, "max_pos 不回退");
-        let in_del = |i: usize| {
-            (del0.start..del0.end).contains(&i) || (del1.start..del1.end).contains(&i)
-        };
+        let in_del =
+            |i: usize| (del0.start..del0.end).contains(&i) || (del1.start..del1.end).contains(&i);
         let surv_idx: Vec<usize> = (0..old_tokens.len()).filter(|i| !in_del(*i)).collect();
-        let n = (reused_pages * page).min(s.tokens.len()).min(surv_idx.len());
+        let n = (reused_pages * page)
+            .min(s.tokens.len())
+            .min(surv_idx.len());
         assert!(n > 0, "复用面为空");
         for i in 0..n {
             let oi = surv_idx[i];
@@ -8401,7 +8555,10 @@ pub async fn gpu_image_evict_multi_gate() {
     // ⑦ 旧链从第一段删点起的身份全部释放
     {
         let (hit_old, _) = running
-            .bank.parts_mut().rel.match_prefix_tagged(&old_tokens, &old_tags)
+            .bank
+            .parts_mut()
+            .rel
+            .match_prefix_tagged(&old_tokens, &old_tags)
             .expect("旧链查询");
         assert_eq!(
             hit_old.matched_blocks,
@@ -8513,11 +8670,7 @@ pub async fn gpu_image_evict_multi_gate() {
             before + 1,
             "删两段旧图 + 追加新图 必须被吸收"
         );
-        let tr = running
-            .img_evict
-            .last
-            .clone()
-            .expect("replace 吸收 trace");
+        let tr = running.img_evict.last.clone().expect("replace 吸收 trace");
         assert_eq!(tr.a, rp0.start, "删除起点必须是第一段旧图段首");
         assert_eq!(tr.b, rp1.end, "删除终点必须是第二段旧图段尾");
         let bank = running.bank.parts_mut();
@@ -8760,14 +8913,20 @@ pub async fn gpu_image_evict_spec_identity_gate() {
             }
         }
         let gen1: Vec<u32> = running
-            .bank.parts().sessions.get(sid)
+            .bank
+            .parts()
+            .sessions
+            .get(sid)
             .map(|s| s.tokens[plen1.min(s.tokens.len())..].to_vec())
             .unwrap_or_default();
         eprintln!("[D] t1 生成(len={}) {gen1:?}", gen1.len());
         // 文本由 token 账反解(仅供 prompt2 回填;与客户端回同一份文本同等语义)
         let text1 = {
             let ids: Vec<u32> = running
-                .bank.parts().sessions.get(sid)
+                .bank
+                .parts()
+                .sessions
+                .get(sid)
                 .map(|s| s.tokens[plen1.min(s.tokens.len())..].to_vec())
                 .unwrap_or_default();
             running.boot.tok.decode(&ids)
@@ -8869,7 +9028,10 @@ pub async fn gpu_image_evict_spec_identity_gate() {
         let absorbed = running.img_evict.absorbed == 1;
         let pages = 0usize; // leave-gap 不转 K
         let toks = running
-            .bank.parts().sessions.get(sid)
+            .bank
+            .parts()
+            .sessions
+            .get(sid)
             .map(|s| s.tokens[plen2.min(s.tokens.len())..].to_vec())
             .unwrap_or_default();
         (toks, absorbed, pages)
@@ -8994,7 +9156,10 @@ pub async fn gpu_mtp_kv_parity() {
         let dtype = running.dev.pool.geom.dims.dtype;
         let hidden = running.dev.pool.geom.dims.hidden;
         let bt = running
-            .bank.parts().sessions.session(sid)
+            .bank
+            .parts()
+            .sessions
+            .session(sid)
             .expect("session")
             .mtp_block_table
             .clone();

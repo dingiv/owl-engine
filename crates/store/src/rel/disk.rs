@@ -119,7 +119,10 @@ impl Rel {
 
     /// KV 盘层驻留键。
     pub fn kv_disk_resident_keys(&self) -> Vec<ChainHash> {
-        self.disk.as_ref().map(|d| d.resident_keys()).unwrap_or_default()
+        self.disk
+            .as_ref()
+            .map(|d| d.resident_keys())
+            .unwrap_or_default()
     }
 
     /// 制定 KV 溢写计划（未接线 = 结构化错）。
@@ -202,9 +205,9 @@ impl Rel {
             .touch(key)
     }
 
-    /// 状态腿盘层是否接线。
+    /// 状态腿盘层是否**可用**（接盘 + 已注册快照布局 + 总池未关）。
     pub fn snap_disk_enabled(&self) -> bool {
-        self.snap_disk.as_ref().is_some_and(|d| !d.is_disabled())
+        self.snap_bytes > 0 && self.snap_disk.as_ref().is_some_and(|d| !d.is_disabled())
     }
 
     /// 状态腿盘层是否有该快照内容。
@@ -212,13 +215,18 @@ impl Rel {
         self.snap_disk.as_ref().is_some_and(|d| d.contains(key))
     }
 
-    /// 状态腿盘层单块字节（未接线 = `None`）。
+    /// 状态腿盘层单块字节（未接线 / 未注册快照布局 = `None`）。
     pub fn snap_disk_block_bytes(&self) -> Option<usize> {
-        self.snap_disk.as_ref().map(|d| d.block_bytes())
+        self.snap_disk_enabled()
+            .then(|| self.snap_disk.as_ref().map(|d| d.block_bytes()))
+            .flatten()
     }
 
-    /// 状态腿盘层空闲槽数（未接线 = 0）。
+    /// 状态腿盘层空闲槽数（未接线 / 未注册快照布局 = 0）。
     pub fn snap_disk_free_slots(&self) -> usize {
+        if !self.snap_disk_enabled() {
+            return 0;
+        }
         self.snap_disk.as_ref().map_or(0, |d| d.free_slots())
     }
 
@@ -244,11 +252,19 @@ impl Rel {
 
     /// 状态腿盘层驻留键。
     pub fn snap_disk_resident_keys(&self) -> Vec<SnapKey> {
-        self.snap_disk.as_ref().map(|d| d.resident_keys()).unwrap_or_default()
+        self.snap_disk
+            .as_ref()
+            .map(|d| d.resident_keys())
+            .unwrap_or_default()
     }
 
-    /// 制定快照溢写计划（未接线 = 结构化错）。
+    /// 制定快照溢写计划（未接线 / 未注册快照布局 = 结构化错）。
     pub fn snap_disk_plan_spill(&self, key: SnapKey) -> StoreResult<SpillPlanOf<SnapKey>> {
+        if !self.snap_disk_enabled() {
+            return Err(StoreError::Invariant(
+                "状态腿盘层未启用(需磁盘总池 + 已注册快照布局)".into(),
+            ));
+        }
         self.snap_disk
             .as_ref()
             .ok_or_else(|| StoreError::Invariant("状态腿盘层未接线".into()))?
@@ -332,57 +348,45 @@ impl Rel {
     ///
     /// - 目录布局:`root/kv/` + `root/snap/`(两腿分目录 —— 混放会让启动扫描
     ///   与清理串腿);
-    /// - 配额：**分片不许超总账**（`kv_bytes + snap_bytes ≤ inputs.disk_bytes`，
-    ///   与 host 同一条律；总账为 0 = 配置没给盘配额 ⇒ 响亮拒）；
+    /// - **一层一个总池**（2026-11-18 用户裁决）：KV 与快照共享
+    ///   `inputs.disk_bytes`；不再用 `snap_disk_mb` 预切分片；
     /// - **盘块 = 一条链的宿主槽**（`world ×` 单页）：溢写取料口是 `host_take`
     ///   （整槽交出去），回填也落整槽 —— 用单平面字节会让 `plan_spill.bytes`
     ///   与内容长度不符（TP 下写 2 倍、读 1 倍 = 静默截断）；
-    /// - `snap_bytes` 的分片粒度 = 一条快照的字节（需先 `attach_snap_layout`）。
-    pub fn attach_disk(
-        &mut self,
-        root: impl Into<std::path::PathBuf>,
-        kv_bytes: usize,
-        snap_bytes: usize,
-    ) -> StoreResult<DiskAttach> {
+    /// - 快照块 = `snap_bytes × world`（需先 `attach_snap_layout`；未注册时
+    ///   快照盘腿不可用）。
+    pub fn attach_disk(&mut self, root: impl Into<std::path::PathBuf>) -> StoreResult<DiskAttach> {
         let total = self.budget.tier_budget().disk_bytes;
         if total == 0 {
             return Err(StoreError::Budget(
                 "磁盘层配置为 0(先给 [store] disk_pool_size)".into(),
             ));
         }
-        let want = kv_bytes
-            .checked_add(snap_bytes)
-            .ok_or_else(|| StoreError::Budget("磁盘分片溢出".to_string()))?;
-        if want > total {
-            return Err(StoreError::Budget(format!(
-                "磁盘分片超总账:{kv_bytes} + {snap_bytes} > {total}(中层分片不许超总账)"
-            )));
-        }
         let snap_blk = self.snap_bytes;
-        if snap_bytes > 0 && snap_blk == 0 {
-            return Err(StoreError::Invariant(
-                "状态腿盘层要先注册快照布局(attach_snap_layout)".into(),
-            ));
-        }
         let root = root.into();
         let kv_root = root.join("kv");
         let snap_root = root.join("snap");
-        let kv = DiskTier::<ChainHash>::new(kv_root.clone(), self.leg.host_slot_bytes(), kv_bytes)?;
+        let shared = crate::shared_budget::SharedTierBudget::new(total);
+        let kv = DiskTier::<ChainHash>::new_shared(
+            kv_root.clone(),
+            self.leg.host_slot_bytes(),
+            shared.clone(),
+        )?;
         // **盘上一个快照文件 = 全部 rank 平面**(2026-10-31 修):宿主层早就按
         // `slot_bytes × world` 建块(`attach_snap_layout`),盘层却只按**单 rank**
-        // (`snap_bytes`)建 ⇒ TP2 写出的文件是单块的 2 倍 ⇒ 启动回填逐条
-        // 「大小不符 ⇒ 隔离」⇒ 锚点快照全废、跨重启召回被 `reuse_face` 裁到 0。
-        // 实测:2400 块 KV 全部回填,但 6 张快照全部隔离(159252480 ≠ 79626240)。
-        let snap = DiskTier::<SnapKey>::new(
+        // 建 ⇒ TP2 写出的文件是单块的 2 倍 ⇒ 启动回填逐条「大小不符 ⇒ 隔离」⇒
+        // 锚点快照全废、跨重启召回被 `reuse_face` 裁到 0。
+        let snap = DiskTier::<SnapKey>::new_shared(
             snap_root.clone(),
             snap_blk.max(1).saturating_mul(self.world),
-            snap_bytes,
+            shared,
         )?;
         let attach = DiskAttach {
             kv_root,
             snap_root,
             kv_slots: kv.free_slots(),
-            snap_slots: snap.free_slots(),
+            // 未注册快照布局时状态腿盘不可用；不要把 1B 占位块的槽数当容量。
+            snap_slots: if snap_blk > 0 { snap.free_slots() } else { 0 },
         };
         self.disk = Some(kv);
         self.snap_disk = Some(snap);
@@ -539,16 +543,12 @@ impl Rel {
             if ok == 0 {
                 // **身份对拍诊断**(2026-11-01 P1):索引算出的前几个块身份 vs 盘上
                 // 真实键 —— "盘上有内容却一块都不认"时,这一行直接给谁对不上。
-                if let (Some(first), Some(disk_keys)) = (
-                    idx.tokens.chunks(page).next(),
-                    Some(disk.resident_keys()),
-                ) {
+                if let (Some(first), Some(disk_keys)) =
+                    (idx.tokens.chunks(page).next(), Some(disk.resident_keys()))
+                {
                     let h0 = crate::kv::hash_block(ChainHash::new(0), first, 0);
-                    let sample: Vec<String> = disk_keys
-                        .iter()
-                        .take(3)
-                        .map(|k| format!("{k:?}"))
-                        .collect();
+                    let sample: Vec<String> =
+                        disk_keys.iter().take(3).map(|k| format!("{k:?}")).collect();
                     owl_shared::log_warn!(
                         "store",
                         "身份对拍:索引首块 h={h0:?}(tokens[0..{page}]) 盘上含={} · \

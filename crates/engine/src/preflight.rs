@@ -100,8 +100,7 @@ pub struct ModelCheckSpec<'a> {
 ///
 /// `Err` 只用于**配置级**失败（装载臂分派）；检查点本身的拒绝是 `Fail` 项。
 pub fn check_model_dir(spec: &ModelCheckSpec<'_>) -> Result<CheckLines, String> {
-    let arm = load_arm_of(spec.format, spec.quant)
-        .map_err(|e| format!("装载臂分派失败:{e}"))?;
+    let arm = load_arm_of(spec.format, spec.quant).map_err(|e| format!("装载臂分派失败:{e}"))?;
     let intent = LoadIntent::of(arm, spec.head_quant, spec.embed_quant);
     let mut out = CheckLines::default();
     // 注册表里没有该 format ⇒ 只做声明摘要，不做逐项几何对账（仍然打开声明：
@@ -141,7 +140,9 @@ fn model_decl(
     }
     // max_pos 的**软**超标只在摘要里提示(HF 是硬拒,已在 check_geom_against 抛)
     let g = decl.geom();
-    if decl.max_pos_policy() == MaxPosPolicy::WarnYarn && g.max_pos != 0 && spec.max_context_length > g.max_pos
+    if decl.max_pos_policy() == MaxPosPolicy::WarnYarn
+        && g.max_pos != 0
+        && spec.max_context_length > g.max_pos
     {
         note.push_str(&format!(
             "（runtime.max_context_length={} > 模型 ctx；需 YaRN）",
@@ -176,7 +177,10 @@ fn draft_dir(dir: &Path) -> Result<String, String> {
     // GGUF 草稿单文件(DFlash2-GGUF;2026-10-21 feat/gguf 线)
     if dir.is_file() {
         if dir.extension().and_then(|s| s.to_str()) != Some("gguf") {
-            return Err(format!("草稿 {} 既不是目录也不是 .gguf 单文件", dir.display()));
+            return Err(format!(
+                "草稿 {} 既不是目录也不是 .gguf 单文件",
+                dir.display()
+            ));
         }
         let g = owl_models::formats::gguf::Gguf::open(dir)
             .map_err(|e| format!("打开草稿 GGUF {} 失败: {e}", dir.display()))?;
@@ -184,7 +188,9 @@ fn draft_dir(dir: &Path) -> Result<String, String> {
             "{} ✓ GGUF 草稿 / {} 张量(arch={})",
             dir.display(),
             g.tensors.len(),
-            g.arch().map(|a| a.to_string()).unwrap_or_else(|_| "?".into())
+            g.arch()
+                .map(|a| a.to_string())
+                .unwrap_or_else(|_| "?".into())
         ));
     }
     let p = dir.join("config.json");
@@ -196,8 +202,8 @@ fn draft_dir(dir: &Path) -> Result<String, String> {
     }
     let raw = owl_shared::file_loader::read_to_string(&p)
         .map_err(|e| format!("读取 {} 失败: {e}", p.display()))?;
-    let v: serde_json::Value = serde_json::from_str(&raw)
-        .map_err(|e| format!("{} 不是合法 JSON: {e}", p.display()))?;
+    let v: serde_json::Value =
+        serde_json::from_str(&raw).map_err(|e| format!("{} 不是合法 JSON: {e}", p.display()))?;
     let arch: Vec<String> = v
         .get("architectures")
         .and_then(|x| x.as_array())
@@ -275,8 +281,8 @@ fn mtp_head(dir: &Path) -> Result<String, String> {
     }
     let raw = owl_shared::file_loader::read_to_string(&p)
         .map_err(|e| format!("读取 {} 失败: {e}", p.display()))?;
-    let v: serde_json::Value = serde_json::from_str(&raw)
-        .map_err(|e| format!("{} 不是合法 JSON: {e}", p.display()))?;
+    let v: serde_json::Value =
+        serde_json::from_str(&raw).map_err(|e| format!("{} 不是合法 JSON: {e}", p.display()))?;
     let n = v
         .get("weight_map")
         .and_then(|x| x.as_object())
@@ -327,10 +333,7 @@ mod tests {
         assert_eq!(lines.items.len(), 2, "{:?}", lines.items);
         // 第一行是"注册表无该 format"跳过硬答，第二行才是声明不可读
         assert!(
-            lines
-                .items
-                .iter()
-                .any(|i| i.text().contains("不可读")),
+            lines.items.iter().any(|i| i.text().contains("不可读")),
             "{:?}",
             lines.items
         );
@@ -369,7 +372,11 @@ mod tests {
         .expect("写索引");
         let lines = check_mtp_head(&dir);
         assert!(lines.ok());
-        assert!(lines.items[0].text().contains("1 个 mtp.* 键"), "{:?}", lines.items);
+        assert!(
+            lines.items[0].text().contains("1 个 mtp.* 键"),
+            "{:?}",
+            lines.items
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 

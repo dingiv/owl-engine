@@ -25,7 +25,10 @@ pub fn family_of_plan(p: QuantPlan) -> OpFamily {
 }
 
 /// 环境 → 当前会用到哪些算子族(顺序即日志顺序)
-pub fn families_of_env(env: &EnvProvider, plan: Option<QuantPlan>) -> Vec<(&'static str, OpFamily)> {
+pub fn families_of_env(
+    env: &EnvProvider,
+    plan: Option<QuantPlan>,
+) -> Vec<(&'static str, OpFamily)> {
     let mut v: Vec<(&'static str, OpFamily)> = Vec::new();
     if let Some(p) = plan {
         let f = family_of_plan(p);
@@ -72,9 +75,7 @@ pub fn check_env(
     for (name, fam) in families_of_env(env, plan) {
         let a = fam.admit(ctx);
         if let Admit::Deny(why) = a {
-            return Err(format!(
-                "代际准入门:{name} 不允许在 {arch} 上跑 —— {why}"
-            ));
+            return Err(format!("代际准入门:{name} 不允许在 {arch} 上跑 —— {why}"));
         }
         brief.push(format!("{name}={}", a.describe()));
     }
@@ -96,5 +97,8 @@ pub fn check_env(
     if let Some(banner) = owl_kernels::fp4_banner() {
         brief.push(format!("nvfp4={banner}"));
     }
-    Ok(format!("{arch} · spec={spec_depth} ⇒ {}", brief.join(" · ")))
+    Ok(format!(
+        "{arch} · spec={spec_depth} ⇒ {}",
+        brief.join(" · ")
+    ))
 }

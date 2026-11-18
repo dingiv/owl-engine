@@ -27,8 +27,8 @@
 //! - [`crate::driver`] 的 `KernelPick` 携带 `&'static KernelMeta`(算子身份),
 //!   不再携带裸名字字符串。
 
-use crate::contract::{Arg, Dtype, Law, OpError, OpId};
 use crate::bootcheck::{BootCheck, CheckCtx};
+use crate::contract::{Arg, Dtype, Law, OpError, OpId};
 
 // 构建期 tag 词表(`tags.toml` → `$OUT_DIR/kernel_tags.rs`;2026-10-20)。
 // 生成物定义 `KernelTag` / `KERNEL_TAGS` / `tag_mask`;本模块只消费。
@@ -114,7 +114,10 @@ pub struct ShapeRule {
 impl ShapeRule {
     /// 不约束(未建形状族的算子显式用这个,而不是留白 —— 留白无法区分
     /// "还没写"和"确实无约束")
-    pub const NONE: ShapeRule = ShapeRule { dims: &[], rels: &[] };
+    pub const NONE: ShapeRule = ShapeRule {
+        dims: &[],
+        rels: &[],
+    };
 }
 
 /// 数值/长度范围规则
@@ -127,9 +130,17 @@ pub struct RangeRule {
 }
 
 impl RangeRule {
-    pub const NONE: RangeRule = RangeRule { min: None, max: None, set: None };
+    pub const NONE: RangeRule = RangeRule {
+        min: None,
+        max: None,
+        set: None,
+    };
     /// `[1, +∞)` —— 零值即上游形状 bug(标量槽用;如页数/序列长)
-    pub const POSITIVE: RangeRule = RangeRule { min: Some(1.0), max: None, set: None };
+    pub const POSITIVE: RangeRule = RangeRule {
+        min: Some(1.0),
+        max: None,
+        set: None,
+    };
 }
 
 /// 单个参数(表的一行;**全部 const 可构造**,进 `static` 表零运行期初始化)
@@ -183,7 +194,10 @@ impl Param {
 
     /// 张量原地读写
     pub const fn t_inout(name: &'static str, dtype: Dtype, rank: u8) -> Self {
-        Self { role: ParamRole::InOut, ..Self::t_in(name, dtype, rank) }
+        Self {
+            role: ParamRole::InOut,
+            ..Self::t_in(name, dtype, rank)
+        }
     }
 
     /// 标量入参
@@ -354,8 +368,14 @@ impl ShapeFamily {
         // 池 dtype/布局**不在此**:它们属于"哪个池"的身份,不是模型的全局几何
         // (主池 fp8 + 草稿池 bf16 并存 ⇒ 全局事实无法表达)——
         // 由 `PoolAccess` 审计负责(写者/读者声明互证 + 与 ShapeFamily.kv_dtype 自洽)。
-        if !self.head_dim.is_empty() && q.head_dim != 0 && !self.head_dim.contains(&(q.head_dim as u32)) {
-            return Err(format!("head_dim 要求 ∈ {:?},实得 {}", self.head_dim, q.head_dim));
+        if !self.head_dim.is_empty()
+            && q.head_dim != 0
+            && !self.head_dim.contains(&(q.head_dim as u32))
+        {
+            return Err(format!(
+                "head_dim 要求 ∈ {:?},实得 {}",
+                self.head_dim, q.head_dim
+            ));
         }
         if !self.page.is_empty() && q.page != 0 && !self.page.contains(&(q.page as u32)) {
             return Err(format!("page 要求 ∈ {:?},实得 {}", self.page, q.page));
@@ -410,15 +430,30 @@ pub struct PoolAccess {
 impl PoolAccess {
     /// 读池(不含写)
     pub const fn read(pool: &'static str, layout: LayoutTag, dtype: Dtype) -> Self {
-        Self { pool, mode: AccessMode::Read, layout: Some(layout), dtype: Some(dtype) }
+        Self {
+            pool,
+            mode: AccessMode::Read,
+            layout: Some(layout),
+            dtype: Some(dtype),
+        }
     }
     /// 写池
     pub const fn write(pool: &'static str, layout: LayoutTag, dtype: Dtype) -> Self {
-        Self { pool, mode: AccessMode::Write, layout: Some(layout), dtype: Some(dtype) }
+        Self {
+            pool,
+            mode: AccessMode::Write,
+            layout: Some(layout),
+            dtype: Some(dtype),
+        }
     }
     /// 原地读写(状态池:GDN 状态格)
     pub const fn rw(pool: &'static str, dtype: Dtype) -> Self {
-        Self { pool, mode: AccessMode::ReadWrite, layout: None, dtype: Some(dtype) }
+        Self {
+            pool,
+            mode: AccessMode::ReadWrite,
+            layout: None,
+            dtype: Some(dtype),
+        }
     }
 
     pub const fn is_reader(&self) -> bool {
@@ -571,7 +606,10 @@ impl std::fmt::Debug for KernelMeta {
             .field("capture", &self.capture)
             .field("determinism", &self.determinism)
             .field("selfcheck", &self.selfcheck.is_some())
-            .field("tags", &self.tags.iter().map(|t| t.as_str()).collect::<Vec<_>>())
+            .field(
+                "tags",
+                &self.tags.iter().map(|t| t.as_str()).collect::<Vec<_>>(),
+            )
             .finish()
     }
 }
@@ -609,10 +647,13 @@ impl KernelMeta {
     ///
     /// `None` = 无输出槽(部分 foreign 虚拟核)。调用方按需降级。
     pub fn out_dtype(&self) -> Option<Dtype> {
-        self.params.iter().find(|p| p.role == ParamRole::Out).and_then(|p| match p.ty {
-            ParamType::Tensor { dtype, .. } => Some(dtype),
-            _ => None,
-        })
+        self.params
+            .iter()
+            .find(|p| p.role == ParamRole::Out)
+            .and_then(|p| match p.ty {
+                ParamType::Tensor { dtype, .. } => Some(dtype),
+                _ => None,
+            })
     }
 
     /// 槽序串(`T,O,sz,...`;诊断/文档/`--print-op-table` 用)
@@ -757,7 +798,10 @@ pub fn check_from_params(
 /// 服务端侧的**线格式完整性**复核:切片输出会让回传句柄与写窗口对不上。
 fn check_out_role(op: &str, p: &Param, i: usize, a: &Arg) -> Result<(), OpError> {
     if p.role == ParamRole::Out {
-        if let Arg::BlockSlice { id, byte_offset, .. } = a {
+        if let Arg::BlockSlice {
+            id, byte_offset, ..
+        } = a
+        {
             return Err(OpError::Contract {
                 op: op.to_string(),
                 field: p.name,
@@ -771,7 +815,9 @@ fn check_out_role(op: &str, p: &Param, i: usize, a: &Arg) -> Result<(), OpError>
 
 /// 标量范围(`RangeRule` 的唯一求值点;张量槽的 range **不在此求值** —— 见 `t_out`)
 fn check_scalar_range(op: &str, p: &Param, i: usize, a: &Arg) -> Result<(), OpError> {
-    let Some(v) = arg_scalar(a) else { return Ok(()) };
+    let Some(v) = arg_scalar(a) else {
+        return Ok(());
+    };
     let field = p.name;
     if let Some(set) = p.range.set {
         if !set.contains(&v) {
@@ -871,7 +917,11 @@ pub fn slot_sources_of_tokens(toks: &[&str]) -> Vec<SlotSrc> {
 /// - `rank`:声明 `0` = **显式阶数无关**(核按计数扁平索引);否则精确相等;
 ///   发送方 `rank = 0`(未定形)在张量槽 = **拒**(不许用"未定形"蒙混)。
 fn check_tensor_facts(op: &str, p: &Param, i: usize, a: &Arg) -> Result<(), OpError> {
-    let ParamType::Tensor { dtype: want_dtype, rank: want_rank } = p.ty else {
+    let ParamType::Tensor {
+        dtype: want_dtype,
+        rank: want_rank,
+    } = p.ty
+    else {
         return Ok(());
     };
     let Some((got_dtype, got_rank)) = a.facts() else {
@@ -903,9 +953,9 @@ fn check_tensor_facts(op: &str, p: &Param, i: usize, a: &Arg) -> Result<(), OpEr
         // [临时审计 F5c] 声明 0 的槽,记录**实际喂进来的 rank** ——
         // 用途:找出哪些 "阶数无关" 其实在全部生产臂上都是固定阶数(可收紧)。
         // 去重键 = (op, 槽名, rank);`[probes] l3_audit` 才开(零成本关账)。
-        if *L3_AUDIT_ON.get_or_init(|| {
-            L3_AUDIT_REQUESTED.load(std::sync::atomic::Ordering::Relaxed)
-        }) {
+        if *L3_AUDIT_ON
+            .get_or_init(|| L3_AUDIT_REQUESTED.load(std::sync::atomic::Ordering::Relaxed))
+        {
             l3_audit_note(op, p.name, got_rank);
         }
     }
@@ -950,7 +1000,8 @@ static L3_AUDIT_SEEN: std::sync::OnceLock<
 > = std::sync::OnceLock::new();
 
 fn l3_audit_note(op: &str, slot: &'static str, rank: u8) {
-    let seen = L3_AUDIT_SEEN.get_or_init(|| std::sync::Mutex::new(std::collections::BTreeSet::new()));
+    let seen =
+        L3_AUDIT_SEEN.get_or_init(|| std::sync::Mutex::new(std::collections::BTreeSet::new()));
     let fresh = match seen.lock() {
         Ok(mut s) => s.insert((op.to_string(), slot, rank)),
         Err(_) => false,
@@ -961,7 +1012,8 @@ fn l3_audit_note(op: &str, slot: &'static str, rank: u8) {
     }
 }
 
-fn type_name(p: &Param) -> &'static str {    match p.ty {
+fn type_name(p: &Param) -> &'static str {
+    match p.ty {
         ParamType::Tensor { dtype, rank } => match (dtype, rank) {
             (Dtype::F32, _) => "tensor f32",
             (Dtype::F16, _) => "tensor f16",
@@ -1002,8 +1054,8 @@ fn arg_scalar(a: &Arg) -> Option<i64> {
 
 #[cfg(test)]
 mod tests {
-    use crate::bootcheck::{CheckCtx, Geom};
     use super::*;
+    use crate::bootcheck::{CheckCtx, Geom};
     use crate::contract::Dtype;
 
     struct Demo;
@@ -1039,10 +1091,20 @@ mod tests {
         assert_eq!(S, "T,O,sz,f32");
     }
 
-    const GEOM: Geom = Geom { grid: (1, 1, 1), block: (256, 1, 1), smem: 0, out_elems: 4 };
+    const GEOM: Geom = Geom {
+        grid: (1, 1, 1),
+        block: (256, 1, 1),
+        smem: 0,
+        out_elems: 4,
+    };
 
     fn ctx<'a>(args: &'a [Arg], len: &'a dyn Fn(u64) -> Option<usize>) -> CheckCtx<'a> {
-        CheckCtx { op: "demo_op", args, geom: &GEOM, len }
+        CheckCtx {
+            op: "demo_op",
+            args,
+            geom: &GEOM,
+            len,
+        }
     }
 
     /// **事实面**:线格式携带的事实与声明一致 ⇒ 过;声明 `rank = 0` = 显式阶数无关。
@@ -1059,8 +1121,10 @@ mod tests {
         let c = ctx(&args, &probe);
         check_from_params("demo_op", Demo::PARAMS, &c).expect("事实一致应过");
         // 声明 rank = 0(阶数无关核)⇒ 任意阶数放行
-        const ZERO_RANK: &[Param] =
-            &[Param::t_in("a", Dtype::F16, 0), Param::t_out("out", Dtype::F16, 0)];
+        const ZERO_RANK: &[Param] = &[
+            Param::t_in("a", Dtype::F16, 0),
+            Param::t_out("out", Dtype::F16, 0),
+        ];
         let any = [Arg::block(1, Dtype::F16, 3), Arg::block(2, Dtype::F16, 5)];
         let c = ctx(&any, &probe);
         check_from_params("demo_op", ZERO_RANK, &c).expect("rank=0 应放行任意阶");
@@ -1114,7 +1178,12 @@ mod tests {
     #[test]
     fn default_check_rejects_unknown_block() {
         let unknown = |_id: u64| None;
-        let args = [Arg::block(7, Dtype::F16, 2), Arg::block(2, Dtype::F16, 2), Arg::U64(8), Arg::F32(0.5)];
+        let args = [
+            Arg::block(7, Dtype::F16, 2),
+            Arg::block(2, Dtype::F16, 2),
+            Arg::U64(8),
+            Arg::F32(0.5),
+        ];
         let c = ctx(&args, &unknown);
         let e = check_from_params("demo_op", Demo::PARAMS, &c).unwrap_err();
         assert!(format!("{e}").contains("账本"), "未知块应早报:{e}");
@@ -1124,17 +1193,52 @@ mod tests {
     #[test]
     fn default_check_geometry_laws() {
         let probe = |_id: u64| Some(8usize);
-        let args = [Arg::block(1, Dtype::F16, 2), Arg::block(2, Dtype::F16, 2), Arg::U64(8), Arg::F32(0.5)];
-        let zero_out = Geom { grid: (1, 1, 1), block: (256, 1, 1), smem: 0, out_elems: 0 };
-        let c = CheckCtx { op: "demo_op", args: &args, geom: &zero_out, len: &probe };
+        let args = [
+            Arg::block(1, Dtype::F16, 2),
+            Arg::block(2, Dtype::F16, 2),
+            Arg::U64(8),
+            Arg::F32(0.5),
+        ];
+        let zero_out = Geom {
+            grid: (1, 1, 1),
+            block: (256, 1, 1),
+            smem: 0,
+            out_elems: 0,
+        };
+        let c = CheckCtx {
+            op: "demo_op",
+            args: &args,
+            geom: &zero_out,
+            len: &probe,
+        };
         let e = check_from_params("demo_op", Demo::PARAMS, &c).unwrap_err();
         assert!(format!("{e}").contains("out_elems"), "零元素输出应拒:{e}");
-        let bad_grid = Geom { grid: (0, 2, 1), block: (256, 1, 1), smem: 0, out_elems: 4 };
-        let c = CheckCtx { op: "demo_op", args: &args, geom: &bad_grid, len: &probe };
+        let bad_grid = Geom {
+            grid: (0, 2, 1),
+            block: (256, 1, 1),
+            smem: 0,
+            out_elems: 4,
+        };
+        let c = CheckCtx {
+            op: "demo_op",
+            args: &args,
+            geom: &bad_grid,
+            len: &probe,
+        };
         let e = check_from_params("demo_op", Demo::PARAMS, &c).unwrap_err();
         assert!(format!("{e}").contains("grid"), "半零 grid 应拒:{e}");
-        let sentinel = Geom { grid: (0, 0, 0), block: (0, 0, 0), smem: 0, out_elems: 4 };
-        let c = CheckCtx { op: "demo_op", args: &args, geom: &sentinel, len: &probe };
+        let sentinel = Geom {
+            grid: (0, 0, 0),
+            block: (0, 0, 0),
+            smem: 0,
+            out_elems: 4,
+        };
+        let c = CheckCtx {
+            op: "demo_op",
+            args: &args,
+            geom: &sentinel,
+            len: &probe,
+        };
         check_from_params("demo_op", Demo::PARAMS, &c).expect("全零哨兵 = runtime 自持,应放行");
     }
 
@@ -1142,16 +1246,35 @@ mod tests {
     #[test]
     fn slot_sources_track_out_position() {
         let s = slot_sources(Demo::PARAMS); // T,O,sz,f32
-        assert_eq!(s, vec![SlotSrc::Parent(0), SlotSrc::Out, SlotSrc::Scalar, SlotSrc::Scalar]);
-        let legacy = [Param::t_in("a", Dtype::F16, 2), Param::t_in("out", Dtype::F16, 2)];
-        assert_eq!(slot_sources(&legacy), vec![SlotSrc::Parent(0), SlotSrc::Out]);
+        assert_eq!(
+            s,
+            vec![
+                SlotSrc::Parent(0),
+                SlotSrc::Out,
+                SlotSrc::Scalar,
+                SlotSrc::Scalar
+            ]
+        );
+        let legacy = [
+            Param::t_in("a", Dtype::F16, 2),
+            Param::t_in("out", Dtype::F16, 2),
+        ];
+        assert_eq!(
+            slot_sources(&legacy),
+            vec![SlotSrc::Parent(0), SlotSrc::Out]
+        );
     }
 
     /// 正例:槽数/类型/非零长全对 ⇒ 过
     #[test]
     fn default_check_passes_on_wellformed_args() {
         let probe = |_id: u64| Some(8usize);
-        let args = [Arg::block(1, Dtype::F16, 2), Arg::block(2, Dtype::F16, 2), Arg::U64(8), Arg::F32(0.5)];
+        let args = [
+            Arg::block(1, Dtype::F16, 2),
+            Arg::block(2, Dtype::F16, 2),
+            Arg::U64(8),
+            Arg::F32(0.5),
+        ];
         let c = ctx(&args, &probe);
         assert!(meta_of::<Demo>().check(&c).is_ok());
     }
@@ -1160,7 +1283,12 @@ mod tests {
     #[test]
     fn default_check_rejects_zero_numel_with_names() {
         let probe = |id: u64| if id == 2 { Some(0usize) } else { Some(8) };
-        let args = [Arg::block(1, Dtype::F16, 2), Arg::block(2, Dtype::F16, 2), Arg::U64(8), Arg::F32(0.5)];
+        let args = [
+            Arg::block(1, Dtype::F16, 2),
+            Arg::block(2, Dtype::F16, 2),
+            Arg::U64(8),
+            Arg::F32(0.5),
+        ];
         let c = ctx(&args, &probe);
         let e = meta_of::<Demo>().check(&c).unwrap_err();
         let s = e.to_string();
@@ -1173,7 +1301,12 @@ mod tests {
     #[test]
     fn default_check_rejects_slot_type_mismatch() {
         let probe = |_id: u64| Some(8usize);
-        let args = [Arg::block(1, Dtype::F16, 2), Arg::block(2, Dtype::F16, 2), Arg::I32(8), Arg::F32(0.5)];
+        let args = [
+            Arg::block(1, Dtype::F16, 2),
+            Arg::block(2, Dtype::F16, 2),
+            Arg::I32(8),
+            Arg::F32(0.5),
+        ];
         let c = ctx(&args, &probe);
         let e = meta_of::<Demo>().check(&c).unwrap_err();
         let s = e.to_string();
@@ -1203,7 +1336,10 @@ mod tests {
         };
         assert!(decl.accepts(&ok).is_ok());
         // head_dim 错 ⇒ 拒
-        let bad_hd = ShapeQuery { head_dim: 192, ..ok };
+        let bad_hd = ShapeQuery {
+            head_dim: 192,
+            ..ok
+        };
         assert!(decl.accepts(&bad_hd).unwrap_err().contains("head_dim"));
         // page 错 ⇒ 拒
         let bad_page = ShapeQuery { page: 16, ..ok };
@@ -1212,7 +1348,12 @@ mod tests {
         let bad_tile = ShapeQuery { tile: 32, ..ok };
         assert!(decl.accepts(&bad_tile).unwrap_err().contains("行数上界"));
         // **未知事实不检查**(0/None ⇒ 放行)
-        let unknown = ShapeQuery { head_dim: 0, page: 0, grp: 0, tile: 0 };
+        let unknown = ShapeQuery {
+            head_dim: 0,
+            page: 0,
+            grp: 0,
+            tile: 0,
+        };
         assert!(decl.accepts(&unknown).is_ok());
     }
 

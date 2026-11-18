@@ -146,15 +146,25 @@ fn nb_pages(kv: &KvBuffers, dt: Dtype, shape: Vec<usize>, what: &str) -> Result<
 /// `plan_decode` 的**首选序**里插一行,不必再改动 15 个 `if` 的嵌套。
 enum DecodeArm<'c> {
     /// 融合插池(qknorm+rope+K/V 插入三合一);scratch 在场走 v2 分块
-    Fused { pol: crate::module::KvPagedPolicy, v2: Option<&'c crate::module::AttnV2Scratch> },
+    Fused {
+        pol: crate::module::KvPagedPolicy,
+        v2: Option<&'c crate::module::AttnV2Scratch>,
+    },
     /// int8 专用族(K int8 + token-major V + 两张 scale;自带 verify 分片)
     Int8,
     /// 批 decode(T>1):伪序列 verify 臂(v2 scratch + v2_bt8)
-    BatchV2 { pol: crate::module::KvPagedPolicy, s2: &'c crate::module::AttnV2Scratch, bt8: &'c TensorOps },
+    BatchV2 {
+        pol: crate::module::KvPagedPolicy,
+        s2: &'c crate::module::AttnV2Scratch,
+        bt8: &'c TensorOps,
+    },
     /// T>1 但缺批面(scratch/bt8 不齐)⇒ 显式毒化,不许静默落单行
     BatchMissingFace,
     /// 单行分页(K0 写池 → v1/v2 打分)
-    Paged { pol: crate::module::KvPagedPolicy, v2: Option<&'c crate::module::AttnV2Scratch> },
+    Paged {
+        pol: crate::module::KvPagedPolicy,
+        v2: Option<&'c crate::module::AttnV2Scratch>,
+    },
     /// 槽窗 naive(无策略 / 小几何 / force_naive 对照)
     Naive,
 }
@@ -167,7 +177,10 @@ enum Int8PrefillArm<'c> {
     /// verify 面在场但 scratch/seqs 不配 ⇒ 显式毒化(不许落按页寻址的核)
     MissingScratch,
     /// verify 伪序列臂(T 行各自一条页链)
-    Verify { s2: &'c crate::module::AttnV2Scratch, bt8: &'c TensorOps },
+    Verify {
+        s2: &'c crate::module::AttnV2Scratch,
+        bt8: &'c TensorOps,
+    },
     /// 普通 chunk prefill
     Plain,
 }
@@ -186,7 +199,10 @@ enum PrefillArm<'c> {
         bt8: &'c TensorOps,
     },
     /// FlashInfer 主臂(prefill 面 / `verify_arm="fi"` 的 verify 面)
-    Fi { pol: crate::module::KvPagedPolicy, fi: &'c crate::module::FiPrefillCtx<'c> },
+    Fi {
+        pol: crate::module::KvPagedPolicy,
+        fi: &'c crate::module::FiPrefillCtx<'c>,
+    },
     /// chunked_opt(读 classic 主池)
     Chunked { pol: crate::module::KvPagedPolicy },
     /// 逐 token naive 段(f32 锚链 / force_naive 对照 / 非分页 / 小几何)
@@ -273,7 +289,10 @@ impl Attention {
                 && ctx.env.kv.supports_fused_insert()
                 && crate::ops::paged_decode_ok(self.hd, pol.page)
             {
-                return DecodeArm::Fused { pol, v2: ctx.attn_v2.as_ref() };
+                return DecodeArm::Fused {
+                    pol,
+                    v2: ctx.attn_v2.as_ref(),
+                };
             }
         }
         // ② int8 族(自带 verify 分片;不分 T)
@@ -297,7 +316,10 @@ impl Attention {
         // ④ 单行分页
         if let Some(pol) = ctx.env.kv.policy() {
             if !ctx.env.attn.force_naive_prefill && crate::ops::paged_decode_ok(self.hd, pol.page) {
-                return DecodeArm::Paged { pol, v2: ctx.attn_v2.as_ref() };
+                return DecodeArm::Paged {
+                    pol,
+                    v2: ctx.attn_v2.as_ref(),
+                };
             }
         }
         DecodeArm::Naive
@@ -514,11 +536,24 @@ impl Attention {
         // **非融合臂**(决策已定;臂体原样,不再自检前置条件)
         match arm {
             DecodeArm::Fused { .. } => unreachable!("融合臂已在上面早返"),
-            DecodeArm::Int8 => return self.paged_decode_int8_output(&q, &k, &v, &gate, kv, tokens, ctx),
+            DecodeArm::Int8 => {
+                return self.paged_decode_int8_output(&q, &k, &v, &gate, kv, tokens, ctx)
+            }
             DecodeArm::BatchV2 { pol, s2, bt8 } => {
                 note_arm("attn.arm.decode.batch");
                 return self.verify_v2_arm(
-                    &q, &k, &v, &gate, kv, tokens, ctx, &pol, &kv.slots, &kv.kv_lens, bt8, s2,
+                    &q,
+                    &k,
+                    &v,
+                    &gate,
+                    kv,
+                    tokens,
+                    ctx,
+                    &pol,
+                    &kv.slots,
+                    &kv.kv_lens,
+                    bt8,
+                    s2,
                 );
             }
             DecodeArm::BatchMissingFace => {
@@ -1110,11 +1145,8 @@ impl Attention {
         // GQA 头合并 + tensor-core QK/PV:一个 block 服务同 KV head 的 grp 个
         // q head,K/V 只读一遍;grp<=8 / hd256 / page32 是核契约。
         let grp = self.hq.checked_div(self.hkv).unwrap_or(0);
-        let tc_ok = grp > 0
-            && grp <= 8
-            && self.hq % self.hkv == 0
-            && self.hd == 256
-            && pol.page == 32;
+        let tc_ok =
+            grp > 0 && grp <= 8 && self.hq % self.hkv == 0 && self.hd == 256 && pol.page == 32;
         // 单序列 decode 走 PTH producer/consumer 臂(4+4 warp,2-stage
         // 64-token tile,1 CTA/SM):3090 84 SM 取 4 kv_head × 21 = 84 blocks,
         // 正好一波。批 decode/verify 仍走旧 64/256 片,避免 64-token 单序列
@@ -1343,26 +1375,26 @@ impl Attention {
         } else {
             SemanticKernel::Int8DecodeGqaTcSplit
         })
-            .aux(&[tokens, self.hq, self.hkv, nparts])
-            .arg(&q8)
-            .arg(&q_scale)
-            .arg(&kv.k_cache)
-            .arg(&planes.k_scale)
-            .arg(&kv.v_cache)
-            .arg(&planes.v_scale)
-            .arg(bt8)
-            .arg(kv_lens)
-            .arg(&partial_out)
-            .arg(&partial_stat)
-            .arg(&vw)
-            .arg(&vw)
-            .arg_i32(tokens as i32)
-            .arg_i32(self.hq as i32)
-            .arg_i32(self.hkv as i32)
-            .arg_i32(pol.page as i32)
-            .arg_i32(bt_stride as i32)
-            .arg_i32(nparts as i32)
-            .with_shape(Dtype::F16, vec![1]);
+        .aux(&[tokens, self.hq, self.hkv, nparts])
+        .arg(&q8)
+        .arg(&q_scale)
+        .arg(&kv.k_cache)
+        .arg(&planes.k_scale)
+        .arg(&kv.v_cache)
+        .arg(&planes.v_scale)
+        .arg(bt8)
+        .arg(kv_lens)
+        .arg(&partial_out)
+        .arg(&partial_stat)
+        .arg(&vw)
+        .arg(&vw)
+        .arg_i32(tokens as i32)
+        .arg_i32(self.hq as i32)
+        .arg_i32(self.hkv as i32)
+        .arg_i32(pol.page as i32)
+        .arg_i32(bt_stride as i32)
+        .arg_i32(nparts as i32)
+        .with_shape(Dtype::F16, vec![1]);
         let y = TensorOps::call(SemanticKernel::Int8DecodeReduce)
             .aux(&[tokens, self.hq, nparts])
             .arg(&partial_out)
@@ -1731,7 +1763,11 @@ impl Attention {
             }
             let (cos_d, sin_d) = rope.cos_sin_of(ctx);
             let gate = narrow_strided(
-                &q_raw, tokens * self.hq, self.hd * 2, self.hd, self.hd,
+                &q_raw,
+                tokens * self.hq,
+                self.hd * 2,
+                self.hd,
+                self.hd,
                 vec![tokens, row_q],
             );
             // INT8 prefill 走 fused Q 量化，不产出 f16 post-RoPE Q；
@@ -1756,8 +1792,21 @@ impl Attention {
             match i8arm {
                 Int8PrefillArm::Verify { s2, bt8 } => {
                     return self.paged_verify_int8_output(
-                        &q_raw, &k, &v, &gate, kv, tokens, ctx, kv_slots, kv_lens, bt8, s2,
-                        &cos_d, &sin_d, pos, rope.rotary_half(),
+                        &q_raw,
+                        &k,
+                        &v,
+                        &gate,
+                        kv,
+                        tokens,
+                        ctx,
+                        kv_slots,
+                        kv_lens,
+                        bt8,
+                        s2,
+                        &cos_d,
+                        &sin_d,
+                        pos,
+                        rope.rotary_half(),
                     );
                 }
                 Int8PrefillArm::MissingScratch => {
@@ -1770,8 +1819,18 @@ impl Attention {
                 Int8PrefillArm::NonF16 | Int8PrefillArm::Plain => {}
             }
             return self.paged_prefill_int8_output(
-                &q_raw, &k, &v, &gate, kv, tokens, ctx, kv_slots,
-                &cos_d, &sin_d, pos, rope.rotary_half(),
+                &q_raw,
+                &k,
+                &v,
+                &gate,
+                kv,
+                tokens,
+                ctx,
+                kv_slots,
+                &cos_d,
+                &sin_d,
+                pos,
+                rope.rotary_half(),
             );
         }
         let (q, gate, k) = if dt_raw == Dtype::F16 {
@@ -1847,8 +1906,17 @@ impl Attention {
             PrefillArm::VerifyXqa { pol, x } => {
                 note_arm("attn.arm.verify.xqa");
                 return self.xqa_specdec_arm(
-                    SemanticKernel::XqaVerify, &q, &k, &v, &gate, kv, tokens, ctx, &pol,
-                    kv_slots, x,
+                    SemanticKernel::XqaVerify,
+                    &q,
+                    &k,
+                    &v,
+                    &gate,
+                    kv,
+                    tokens,
+                    ctx,
+                    &pol,
+                    kv_slots,
+                    x,
                 );
             }
             PrefillArm::VerifyV2 { pol, s2, bt8 } => {
@@ -2020,11 +2088,17 @@ mod tests {
 
         // ① 无 FI 面、无 verify 面 ⇒ chunked_opt
         let mut c = mk(8);
-        c.env = EnvProvider { kv: KvEnv::f16_paged(), ..Default::default() };
+        c.env = EnvProvider {
+            kv: KvEnv::f16_paged(),
+            ..Default::default()
+        };
         assert_eq!(arm_of!(&c, 8), chunked, "无面 ⇒ chunked_opt");
 
         // ② vibverify 面(v2_bt8 + scratch.seqs==T)+ verify_arm 缺省 ⇒ v2 优先于 FI
-        c.env.attn = AttnEnv { verify_arm: VerifyArm::Xqa, ..Default::default() };
+        c.env.attn = AttnEnv {
+            verify_arm: VerifyArm::Xqa,
+            ..Default::default()
+        };
         c.attn_v2 = Some(scratch(8));
         c.v2_bt8 = Some(&bt8);
         c.env.attn.verify_arm = VerifyArm::Xqa; // Xqa 但无 xqa 面 ⇒ 落 v2
@@ -2032,11 +2106,18 @@ mod tests {
 
         // ③ verify_arm = Fi ⇒ 跳过 v2
         c.env.attn.verify_arm = VerifyArm::Fi;
-        assert_eq!(arm_of!(&c, 8), chunked, "Fi 臂但无 FI 面 ⇒ chunked(不是 v2)");
+        assert_eq!(
+            arm_of!(&c, 8),
+            chunked,
+            "Fi 臂但无 FI 面 ⇒ chunked(不是 v2)"
+        );
 
         // ④ force_naive 只拦**预填族**(FI/chunked),不拦 verify 臂(v2 仍在前面;
         //    这是 2026-11-04 之前的既有次序,决策表按原样钉住)
-        c.env.attn = AttnEnv { force_naive_prefill: true, ..Default::default() };
+        c.env.attn = AttnEnv {
+            force_naive_prefill: true,
+            ..Default::default()
+        };
         assert_eq!(arm_of!(&c, 8), v2, "force_naive 不拦 verify v2 臂");
         //    撤掉 verify 面后,force_naive 才轮到 naive
         c.v2_bt8 = None;
@@ -2046,7 +2127,10 @@ mod tests {
         // ⑤ 小几何(hd 不配对)⇒ naive
         let attn_small = Attention::new(hq, hkv, 32, hidden, 1e-6, QuantPlan::F16);
         let mut c2 = mk(8);
-        c2.env = EnvProvider { kv: KvEnv::f16_paged(), ..Default::default() };
+        c2.env = EnvProvider {
+            kv: KvEnv::f16_paged(),
+            ..Default::default()
+        };
         assert_eq!(
             match attn_small.plan_prefill(&c2, Dtype::F16, 8) {
                 PrefillArm::Naive => naive,
@@ -2057,16 +2141,17 @@ mod tests {
         );
 
         // int8 族:三态(Plain / Verify / MissingScratch / NonF16)
-        let i8arm = |c: &ForwardCtx, dt: Dtype, t: usize| {
-            match attn.plan_int8_prefill(c, dt, t) {
-                Int8PrefillArm::NonF16 => 0u8,
-                Int8PrefillArm::MissingScratch => 1,
-                Int8PrefillArm::Verify { .. } => 2,
-                Int8PrefillArm::Plain => 3,
-            }
+        let i8arm = |c: &ForwardCtx, dt: Dtype, t: usize| match attn.plan_int8_prefill(c, dt, t) {
+            Int8PrefillArm::NonF16 => 0u8,
+            Int8PrefillArm::MissingScratch => 1,
+            Int8PrefillArm::Verify { .. } => 2,
+            Int8PrefillArm::Plain => 3,
         };
         let mut c3 = mk(8);
-        c3.env = EnvProvider { kv: KvEnv::int8_paged(), ..Default::default() };
+        c3.env = EnvProvider {
+            kv: KvEnv::int8_paged(),
+            ..Default::default()
+        };
         assert_eq!(i8arm(&c3, Dtype::F16, 8), 3, "int8 普通 chunk");
         assert_eq!(i8arm(&c3, Dtype::F32, 8), 0, "int8 非 f16 = 结构违约");
         c3.v2_bt8 = Some(&bt8);
@@ -2107,7 +2192,11 @@ mod tests {
         };
         let env_with = |kv_env: KvEnv, qkv_fuse: bool, force_naive: bool| EnvProvider {
             kv: kv_env,
-            attn: AttnEnv { qkv_fuse, force_naive_prefill: force_naive, ..Default::default() },
+            attn: AttnEnv {
+                qkv_fuse,
+                force_naive_prefill: force_naive,
+                ..Default::default()
+            },
             ..Default::default()
         };
         let base = || ForwardCtx::decode(1, &pos, &kv, &rope);
@@ -2155,7 +2244,14 @@ mod tests {
         assert_eq!(arm_of!(&c, Dtype::F16, 1), naive, "force_naive 直落 naive");
         // ⑤ 非 paged 池 ⇒ naive
         let mut c = base();
-        c.env = env_with(KvEnv { paged: false, ..KvEnv::f16_paged() }, true, false);
+        c.env = env_with(
+            KvEnv {
+                paged: false,
+                ..KvEnv::f16_paged()
+            },
+            true,
+            false,
+        );
         assert_eq!(arm_of!(&c, Dtype::F16, 1), naive, "legacy 直排 = naive");
     }
 

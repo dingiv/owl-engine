@@ -94,6 +94,13 @@ impl Rel {
         self.leg.host_budget_bytes()
     }
 
+    /// **共享宿主池对 KV 的可用字节**（含本腿空转缓冲；快照占用已扣除）。
+    pub fn host_available_bytes(&self) -> usize {
+        self.leg
+            .host_free_slots()
+            .saturating_mul(self.leg.host_slot_bytes())
+    }
+
     /// 整链块身份（根 → tail）。
     pub fn chain_blocks(&self, tail: ChainHash) -> Vec<ChainHash> {
         self.leg.chain_blocks(tail)
@@ -163,7 +170,8 @@ impl Rel {
         session: u64,
         tags: &[crate::kv::BlockTag],
     ) -> StoreResult<CacheUpdate> {
-        self.leg.register_chain_owned_tagged(tokens, table, session, tags)
+        self.leg
+            .register_chain_owned_tagged(tokens, table, session, tags)
     }
 
     /// 从宿主层取走内容（溢写/下沉）。
@@ -413,6 +421,11 @@ impl Rel {
         if self.leg.host_enabled() && self.leg.host_free_slots() == 0 {
             let protect = self.leg.chain_blocks(chain);
             let _ = self.leg.host_relieve(1, &protect)?;
+            self.leg.host_drop_free();
+            if self.leg.host_free_slots() == 0 {
+                let need = self.leg.host_slot_bytes().max(1);
+                let _ = self.evict_snap_host_bytes(need, &[])?;
+            }
         }
         self.leg.host_put(chain, buf)
     }
@@ -435,8 +448,11 @@ impl Rel {
                 // 保护面 = 本链全部块（已在宿主的那些不能被“让位”删掉 ——
                 // 否则搬完设备的块，链上缺一段，前缀永远拼不回来）
                 let protect = self.leg.chain_blocks(tail);
-                if self.leg.host_relieve(need, &protect)? == 0 {
-                    return Err(StoreError::Exhausted(why));
+                let _ = self.leg.host_relieve(need, &protect)?;
+                self.leg.host_drop_free();
+                if self.leg.host_free_slots() == 0 {
+                    let need_bytes = need.saturating_mul(self.leg.host_slot_bytes());
+                    let _ = self.evict_snap_host_bytes(need_bytes, &[])?;
                 }
                 crate::leg::plan_offload(&mut self.leg, tail)
             }
@@ -464,10 +480,13 @@ impl Rel {
     ) -> StoreResult<crate::leg::BlockOutPlan> {
         match crate::leg::plan_offload_blocks(&mut self.leg, chains) {
             Ok(p) => Ok(p),
-            Err(StoreError::Exhausted(why)) => {
+            Err(StoreError::Exhausted(_why)) => {
                 // 需求 = 本批块数（上界；让位是多删无害的冷块，少删才会再撞）
-                if self.leg.host_relieve(chains.len(), chains)? == 0 {
-                    return Err(StoreError::Exhausted(why));
+                let _ = self.leg.host_relieve(chains.len(), chains)?;
+                self.leg.host_drop_free();
+                if self.leg.host_free_slots() < chains.len() {
+                    let need_bytes = chains.len().saturating_mul(self.leg.host_slot_bytes());
+                    let _ = self.evict_snap_host_bytes(need_bytes, &[])?;
                 }
                 crate::leg::plan_offload_blocks(&mut self.leg, chains)
             }

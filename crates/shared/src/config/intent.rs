@@ -66,9 +66,9 @@ impl<'de> Deserialize<'de> for ContextSpec {
         let v = toml::Value::deserialize(d)?;
         match v {
             toml::Value::Integer(n) if n > 0 => Ok(Self::Tokens(n as usize)),
-            toml::Value::Integer(n) => {
-                Err(D::Error::custom(format!("[intent].context = {n} 非法:须 > 0")))
-            }
+            toml::Value::Integer(n) => Err(D::Error::custom(format!(
+                "[intent].context = {n} 非法:须 > 0"
+            ))),
             toml::Value::String(s) if s.trim().eq_ignore_ascii_case("max") => Ok(Self::Max),
             toml::Value::String(s) => Err(D::Error::custom(format!(
                 "[intent].context = {s:?} 非法:写数字(token)或 \"max\""
@@ -308,7 +308,8 @@ pub struct ModelProfile {
 impl ModelProfile {
     /// 主池每 token 字节(K+V × n_full 层 × 头 × 头维 × elem)
     pub fn kv_bytes_per_token(&self, kv_bytes_per_elem: usize) -> u64 {
-        (self.geom.n_full * 2 * self.geom.n_kv_heads * self.geom.head_dim * kv_bytes_per_elem) as u64
+        (self.geom.n_full * 2 * self.geom.n_kv_heads * self.geom.head_dim * kv_bytes_per_elem)
+            as u64
     }
 
     /// 草稿池每 token 字节(f16;草稿池固定 bf16 档)
@@ -327,7 +328,12 @@ impl ModelProfile {
     }
 
     pub fn weights_bytes(&self, spec_dflash: bool) -> u64 {
-        self.weights_base_bytes + if spec_dflash { self.draft_weights_bytes } else { 0 }
+        self.weights_base_bytes
+            + if spec_dflash {
+                self.draft_weights_bytes
+            } else {
+                0
+            }
     }
 }
 
@@ -365,7 +371,12 @@ pub const QWEN38_27B_AWQ: ModelProfile = ModelProfile {
     draft_weights_tp2_bytes: 870 << 20,
     // 27B 视觉塔 model.visual.* ≈1.5G f16;**每 rank 全量**(TP2 不切视觉)
     vision_weights_bytes: 1_536 << 20,
-    draft: Some(DraftGeom { n_layers: 5, n_kv_heads: 8, head_dim: 128, kv_elems_per_token: 10240 }),
+    draft: Some(DraftGeom {
+        n_layers: 5,
+        n_kv_heads: 8,
+        head_dim: 128,
+        kv_elems_per_token: 10240,
+    }),
     calibrated: true,
 };
 
@@ -537,10 +548,18 @@ mod tests {
     #[test]
     fn m27b_geometry_matches_engine_calibration() {
         let p = model_profile("qwen3.8-27b-awq").expect("注册表");
-        assert_eq!(p.gdn_row_bytes(), 155_713_536, "GDN 单行 = 148.5 MiB(engine 实测)");
+        assert_eq!(
+            p.gdn_row_bytes(),
+            155_713_536,
+            "GDN 单行 = 148.5 MiB(engine 实测)"
+        );
         assert_eq!(p.kv_bytes_per_token(1), 32768, "fp8 主池 = 32 KiB/token");
         assert_eq!(p.kv_bytes_per_token(2), 65536, "f16 主池 = 64 KiB/token");
-        assert_eq!(p.draft_bytes_per_token(), 20480, "草稿池 bf16 = 20 KiB/token");
+        assert_eq!(
+            p.draft_bytes_per_token(),
+            20480,
+            "草稿池 bf16 = 20 KiB/token"
+        );
         assert_eq!(p.weights_bytes(false), 16_650 << 20);
         assert_eq!(p.weights_bytes(true), (16_650 + 1_290) << 20);
         assert!(p.calibrated);
@@ -559,18 +578,16 @@ mod tests {
 
     #[test]
     fn context_spec_parses_number_and_max() {
-        let i: Intent = toml::from_str(
-            "model = \"qwen3.8-27b-awq\"\ncontext = 8192\n",
-        )
-        .expect("数字");
+        let i: Intent =
+            toml::from_str("model = \"qwen3.8-27b-awq\"\ncontext = 8192\n").expect("数字");
         assert_eq!(i.context, ContextSpec::Tokens(8192));
-        let i: Intent = toml::from_str(
-            "model = \"qwen3.8-27b-awq\"\ncontext = \"max\"\n",
-        )
-        .expect("max");
+        let i: Intent =
+            toml::from_str("model = \"qwen3.8-27b-awq\"\ncontext = \"max\"\n").expect("max");
         assert_eq!(i.context, ContextSpec::Max);
         assert!(toml::from_str::<Intent>("model = \"qwen3.8-27b-awq\"\ncontext = 0\n").is_err());
-        assert!(toml::from_str::<Intent>("model = \"qwen3.8-27b-awq\"\ncontext = \"MAX!\"\n").is_err());
+        assert!(
+            toml::from_str::<Intent>("model = \"qwen3.8-27b-awq\"\ncontext = \"MAX!\"\n").is_err()
+        );
     }
 
     #[test]

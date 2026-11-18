@@ -230,7 +230,16 @@ mod tests {
     use super::*;
 
     fn c(last_use: u64, bytes: usize, leg: Leg) -> EvictCandidate {
-        EvictCandidate { leg, tier: Tier::Gpu, bytes, last_use, chain: None, snap: None, session: 0, depth: 0 }
+        EvictCandidate {
+            leg,
+            tier: Tier::Gpu,
+            bytes,
+            last_use,
+            chain: None,
+            snap: None,
+            session: 0,
+            depth: 0,
+        }
     }
 
     #[test]
@@ -238,12 +247,24 @@ mod tests {
         let p = LruPolicy;
         let mut v = vec![c(30, 1, Leg::Kv), c(10, 1, Leg::State), c(20, 1, Leg::Kv)];
         p.order(&mut v);
-        assert_eq!(v.iter().map(|x| x.last_use).collect::<Vec<_>>(), vec![10, 20, 30]);
+        assert_eq!(
+            v.iter().map(|x| x.last_use).collect::<Vec<_>>(),
+            vec![10, 20, 30]
+        );
         assert_eq!(p.name(), "lru");
     }
 
     fn cand(chain: u64, last_use: u64) -> EvictCandidate {
-        EvictCandidate { leg: Leg::Kv, tier: Tier::Gpu, bytes: 1024, last_use, chain: Some(ChainHash::new(chain)), snap: None, session: 0, depth: 1 }
+        EvictCandidate {
+            leg: Leg::Kv,
+            tier: Tier::Gpu,
+            bytes: 1024,
+            last_use,
+            chain: Some(ChainHash::new(chain)),
+            snap: None,
+            session: 0,
+            depth: 1,
+        }
     }
 
     /// **B-4 门**:"反复被注意力选中"的块,即使 `last_use` 更老,也要**排在后面**
@@ -265,7 +286,11 @@ mod tests {
         // 对照:LRU 的序正相反(纯看 last_use)
         let mut v2 = vec![cand(1, 10), cand(2, 100)];
         LruPolicy.order(&mut v2);
-        assert_eq!(v2[0].chain, Some(ChainHash::new(1)), "LRU 先逐最老 —— 本测试要修的病");
+        assert_eq!(
+            v2[0].chain,
+            Some(ChainHash::new(1)),
+            "LRU 先逐最老 —— 本测试要修的病"
+        );
     }
 
     /// **懒衰减 ≡ 逐步衰减**:空转 N 步后 KS 应缩到 `λ^N`。
@@ -282,7 +307,10 @@ mod tests {
             stepwise *= l;
         }
         let lazy = p.ks(c, now0 + 4);
-        assert!((lazy - stepwise).abs() < 1e-12, "惰性 {lazy} vs 逐步 {stepwise}");
+        assert!(
+            (lazy - stepwise).abs() < 1e-12,
+            "惰性 {lazy} vs 逐步 {stepwise}"
+        );
     }
 
     /// 状态腿候选(无 chain)退化按 `last_use`;λ 越界取缺省且不 panic;

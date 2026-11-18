@@ -23,9 +23,7 @@ use owl_models::vlm::VlmImage;
 pub fn from_data_url(url: &str, max_pixels: usize) -> Result<VlmImage, String> {
     let key = cache_key(url, max_pixels);
     {
-        let mut c = cache()
-            .lock()
-            .map_err(|_| "图像缓存锁不可用".to_string())?;
+        let mut c = cache().lock().map_err(|_| "图像缓存锁不可用".to_string())?;
         c.tick += 1;
         let tick = c.tick;
         if let Some(e) = c.map.get_mut(&key) {
@@ -36,18 +34,11 @@ pub fn from_data_url(url: &str, max_pixels: usize) -> Result<VlmImage, String> {
     let bytes = decode_data_url(url)?;
     let image = owl_models::vlm::preprocess::from_bytes(&bytes, max_pixels)?;
     {
-        let mut c = cache()
-            .lock()
-            .map_err(|_| "图像缓存锁不可用".to_string())?;
+        let mut c = cache().lock().map_err(|_| "图像缓存锁不可用".to_string())?;
         c.tick += 1;
         let tick = c.tick;
         if c.map.len() >= IMAGE_CACHE_CAP {
-            if let Some(old) = c
-                .map
-                .iter()
-                .min_by_key(|(_, e)| e.tick)
-                .map(|(k, _)| *k)
-            {
+            if let Some(old) = c.map.iter().min_by_key(|(_, e)| e.tick).map(|(k, _)| *k) {
                 c.map.remove(&old);
             }
         }

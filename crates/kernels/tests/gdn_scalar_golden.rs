@@ -8,8 +8,8 @@
 //! 是 FLA 侧量化误差,沿既有 5e-2 硬门。
 //! 无 GPU 跳过(OWL_TEST_DEVICE)。
 
-use owl_macros::owl_test;
 use cudarc::driver::{CudaContext, DevicePtr, LaunchConfig, PushKernelArg};
+use owl_macros::owl_test;
 
 const CASES: &[(&str, usize)] = &[
     ("c1_t64", 64),
@@ -88,7 +88,9 @@ fn gdn_scalar_golden() {
 
     let dir = concat!(env!("CARGO_MANIFEST_DIR"), "/../../testdata/gdn_fla/cases");
     if !std::path::Path::new(dir).join("c1_t64.q.bin").is_file() {
-        owl_shared::testkit::report::skip(format_args!("金标 bin 不在({dir};`gen.py` 生成,或从主树 testdata/gdn_fla/cases 链接)"));
+        owl_shared::testkit::report::skip(format_args!(
+            "金标 bin 不在({dir};`gen.py` 生成,或从主树 testdata/gdn_fla/cases 链接)"
+        ));
         return;
     }
 

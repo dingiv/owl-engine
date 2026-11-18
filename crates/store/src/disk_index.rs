@@ -66,11 +66,7 @@ impl ChainIndex {
     }
 
     /// 带逐块指纹构造（指纹长度必须 = 整块数，否则拒绝）。
-    pub fn with_tags(
-        block_tokens: usize,
-        tokens: Vec<u32>,
-        tags: Vec<u64>,
-    ) -> StoreResult<Self> {
+    pub fn with_tags(block_tokens: usize, tokens: Vec<u32>, tags: Vec<u64>) -> StoreResult<Self> {
         let mut idx = Self::new(block_tokens, tokens)?;
         if !tags.is_empty() && tags.len() != idx.blocks() {
             return Err(StoreError::Invariant(format!(
@@ -122,7 +118,8 @@ impl ChainIndex {
                 "索引魔数不符(不是本版索引文件;空的/别的格式一律拒)".into(),
             ));
         }
-        let block_tokens = u32::from_le_bytes(bytes[8..12].try_into().expect("切片长度由上面保证")) as usize;
+        let block_tokens =
+            u32::from_le_bytes(bytes[8..12].try_into().expect("切片长度由上面保证")) as usize;
         let n = u32::from_le_bytes(bytes[12..16].try_into().expect("同上")) as usize;
         let n_tags = u32::from_le_bytes(bytes[16..20].try_into().expect("同上")) as usize;
         let want = 20 + n * 4 + n_tags * 8;
@@ -136,7 +133,9 @@ impl ChainIndex {
         let mut tokens = Vec::with_capacity(n);
         for i in 0..n {
             let at = 20 + i * 4;
-            tokens.push(u32::from_le_bytes(bytes[at..at + 4].try_into().expect("上面校验过")));
+            tokens.push(u32::from_le_bytes(
+                bytes[at..at + 4].try_into().expect("上面校验过"),
+            ));
         }
         let mut tags = Vec::with_capacity(n_tags);
         for i in 0..n_tags {
@@ -165,12 +164,8 @@ mod tests {
 
     #[test]
     fn encode_decode_roundtrip() {
-        let idx = ChainIndex::with_tags(
-            32,
-            (0..96u32).collect(),
-            vec![0x11, 0x22, 0x33],
-        )
-        .expect("构造");
+        let idx =
+            ChainIndex::with_tags(32, (0..96u32).collect(), vec![0x11, 0x22, 0x33]).expect("构造");
         assert_eq!(idx.blocks(), 3);
         let bytes = idx.encode();
         assert_eq!(bytes.len(), idx.encoded_len());

@@ -131,12 +131,21 @@ pub struct Bytes {
 
 impl Bytes {
     pub const fn new(id: u64, len: usize, dtype: Dtype, rank: u8) -> Self {
-        Self { id, len, dtype, rank }
+        Self {
+            id,
+            len,
+            dtype,
+            rank,
+        }
     }
 
     /// 视图重声明(只改标注,不动 id/len):`alloc` 后按形状定形、切片重解释用。
     pub const fn view(self, dtype: Dtype, rank: u8) -> Self {
-        Self { dtype, rank, ..self }
+        Self {
+            dtype,
+            rank,
+            ..self
+        }
     }
 
     /// 事实面(块句柄自带的 dtype + 阶数)
@@ -164,12 +173,22 @@ pub struct KernelSource {
 /// 不静默)。声明侧 `rank = 0` 才是"阶数无关"的显式标记。
 #[derive(Clone, Debug)]
 pub enum Arg {
-    Block { id: u64, dtype: Dtype, rank: u8 },
+    Block {
+        id: u64,
+        dtype: Dtype,
+        rank: u8,
+    },
     /// 刀1:块内连续切片视图(发射 ptr = block_ptr(id) + byte_offset;
     /// elems = 元素数,供 CPU 面切片与校验;kernel ABI 不感知 —— 尺寸
     /// 标量已由槽序携带)。输出槽恒为全块 Block,BlockSlice 仅入参。
     /// `dtype`/`rank` = **切片视图**的事实(与全块可能不同)。
-    BlockSlice { id: u64, byte_offset: u64, elems: u64, dtype: Dtype, rank: u8 },
+    BlockSlice {
+        id: u64,
+        byte_offset: u64,
+        elems: u64,
+        dtype: Dtype,
+        rank: u8,
+    },
     U64(u64),
     I32(i32),
     F32(f32),
@@ -182,8 +201,20 @@ impl Arg {
     }
 
     /// 切片视图(事实随行)
-    pub const fn block_slice(id: u64, byte_offset: u64, elems: u64, dtype: Dtype, rank: u8) -> Self {
-        Arg::BlockSlice { id, byte_offset, elems, dtype, rank }
+    pub const fn block_slice(
+        id: u64,
+        byte_offset: u64,
+        elems: u64,
+        dtype: Dtype,
+        rank: u8,
+    ) -> Self {
+        Arg::BlockSlice {
+            id,
+            byte_offset,
+            elems,
+            dtype,
+            rank,
+        }
     }
 
     /// 块参的事实面(标量槽 = `None`)—— L3 事实面的**唯一读取口**
@@ -245,10 +276,7 @@ pub enum LaunchVal {
     /// 内联存储 ⇒ 值随 `LaunchVal` 一起 owned,压槽时取地址天然安全(无悬垂)。
     /// 调用方保证 `#[repr(C)]` 镜像与内核形参**逐字节一致**(size 断言 + 资产
     /// 自描述可双重锁死,见 `family::xqa`)。
-    Blob {
-        len: u32,
-        bytes: [u8; BLOB_MAX],
-    },
+    Blob { len: u32, bytes: [u8; BLOB_MAX] },
 }
 
 /// [`LaunchVal::Blob`] 内联容量(够 XQA `KVCacheList`=40B 等小结构体)
@@ -264,7 +292,10 @@ impl LaunchVal {
         );
         let mut buf = [0u8; BLOB_MAX];
         buf[..bytes.len()].copy_from_slice(bytes);
-        LaunchVal::Blob { len: bytes.len() as u32, bytes: buf }
+        LaunchVal::Blob {
+            len: bytes.len() as u32,
+            bytes: buf,
+        }
     }
 }
 
@@ -318,19 +349,37 @@ pub struct FieldStats {
 pub enum OpError {
     /// 契约违反:槽位/数量/dtype/shape(Call::parse 期)。
     /// op = String(错误路径非热;未注册名字等动态面也能入账)
-    Contract { op: String, field: &'static str, expect: String, got: String },
+    Contract {
+        op: String,
+        field: &'static str,
+        expect: String,
+        got: String,
+    },
     /// 装配违反:符号缺失 / 资产指纹失配(init 期;P4 装配门)
     Asset { op: String, detail: String },
     /// 发射失败:cast / launch / memcpy(cudarc 错误原样保链)
-    Launch { op: String, stage: Stage, detail: String },
+    Launch {
+        op: String,
+        stage: Stage,
+        detail: String,
+    },
     /// 不变量违反:数学律被破(run 期;策略表裁决处置)
-    Invariant { op: String, law: Law, stats: FieldStats },
+    Invariant {
+        op: String,
+        law: Law,
+        stats: FieldStats,
+    },
 }
 
 impl std::fmt::Display for OpError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            OpError::Contract { op, field, expect, got } => {
+            OpError::Contract {
+                op,
+                field,
+                expect,
+                got,
+            } => {
                 write!(f, "contract {op}: {field} 期望 {expect} 实得 {got}")
             }
             OpError::Asset { op, detail } => write!(f, "asset {op}: {detail}"),
@@ -388,7 +437,6 @@ impl InvariantBox {
         self.bytes.is_empty()
     }
 }
-
 
 // ============================================================================
 // 胖算子契约(历史注记,2026-10-12 用户律:三形态归一 Call 后退役)

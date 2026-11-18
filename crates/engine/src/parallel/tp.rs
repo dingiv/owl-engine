@@ -192,8 +192,7 @@ fn staging_header_bytes(layout: StagingLayout) -> Vec<u8> {
     // `wait_done` 若留非 0 残值且 ≥ 本轮 want,非 0 号 block 会**跳过两级等待**
     // ⇒ 静默读到未就绪的对端数据(核**无法自检**,只能在这里保证)。
     debug_assert!(
-        b.len() == owl_cuda::comm::ar::HEADER_BYTES as usize
-            && b[28..].iter().all(|&x| x == 0),
+        b.len() == owl_cuda::comm::ar::HEADER_BYTES as usize && b[28..].iter().all(|&x| x == 0),
         "staging header 的 28..64(含 wait_done@32 / blocks_done@40)必须全 0;\
          核无法自检这一条 —— 残值会导致非 0 号 block 跳过等待、静默读到未就绪数据"
     );
@@ -291,7 +290,9 @@ impl<D: DeviceClient + 'static> TpEngine<D> {
     ) -> Result<Self> {
         let world = loadeds.len();
         if world != 2 {
-            return loud(format!("TP v1 只支持 world = 2(得 {world};单卡走 Engine::run)"));
+            return loud(format!(
+                "TP v1 只支持 world = 2(得 {world};单卡走 Engine::run)"
+            ));
         }
         if engines.len() != world {
             return loud(format!(
@@ -305,10 +306,8 @@ impl<D: DeviceClient + 'static> TpEngine<D> {
         let boot1 = engines[1].boot_vram();
         let boot = boot0;
         let mut it = engines.into_iter();
-        let (face0, mut cfg0, cell0, _boot0) =
-            it.next().expect("world = 2 已守门").into_parts();
-        let (face1, mut cfg1, cell1, _boot1) =
-            it.next().expect("world = 2 已守门").into_parts();
+        let (face0, mut cfg0, cell0, _boot0) = it.next().expect("world = 2 已守门").into_parts();
+        let (face1, mut cfg1, cell1, _boot1) = it.next().expect("world = 2 已守门").into_parts();
         // **合流自证**(可判):rank1 自己的那个单元在装配期**必须为空** ——
         // 非空就说明 rank1 在接管之前已经记过账(事件落进了没人读的孤儿账)。
         //
@@ -340,7 +339,7 @@ impl<D: DeviceClient + 'static> TpEngine<D> {
         drop(tok1); // host 侧 tokenizer 唯一(rank1 的直接放)
         let tokenizer = tok0;
         if staging1.slot_bytes() != staging0.slot_bytes() {
-            return loud("TP staging 布局两侧不一致(协议对称性前提)")
+            return loud("TP staging 布局两侧不一致(协议对称性前提)");
         }
         let plan0 = TpPlan::new(0, world).map_err(ModelError::Msg)?;
         let plan1 = TpPlan::new(1, world).map_err(ModelError::Msg)?;
@@ -393,8 +392,24 @@ impl<D: DeviceClient + 'static> TpEngine<D> {
         // 保守边（草稿实际 ~0.83 GiB，1 GiB 会多扣 ~0.17 GiB）。
         let (share0, share1) = crate::engine::TpPoolShare::pair();
         let (r0, r1) = tokio::join!(
-            boot_rank(face0, &mut cfg0, rm0, Some(ctx0), baseline0, Some(share0), t_boot),
-            boot_rank(face1, &mut cfg1, rm1, Some(ctx1), baseline1, Some(share1), t_boot),
+            boot_rank(
+                face0,
+                &mut cfg0,
+                rm0,
+                Some(ctx0),
+                baseline0,
+                Some(share0),
+                t_boot
+            ),
+            boot_rank(
+                face1,
+                &mut cfg1,
+                rm1,
+                Some(ctx1),
+                baseline1,
+                Some(share1),
+                t_boot
+            ),
         );
         let (dev0, dev1) = match (r0, r1) {
             (Ok(a), Ok(b)) => (a, b),
@@ -435,8 +450,16 @@ impl<D: DeviceClient + 'static> TpEngine<D> {
             return Err(e);
         }
         let ranks = vec![
-            TpRank { plan: plan0, staging: staging0.clone(), dev: dev0 },
-            TpRank { plan: plan1, staging: staging1.clone(), dev: dev1 },
+            TpRank {
+                plan: plan0,
+                staging: staging0.clone(),
+                dev: dev0,
+            },
+            TpRank {
+                plan: plan1,
+                staging: staging1.clone(),
+                dev: dev1,
+            },
         ];
         Ok(Self {
             ranks,
@@ -453,8 +476,12 @@ impl<D: DeviceClient + 'static> TpEngine<D> {
     pub fn run(self) -> Result<crate::running::RunningEngine<DeviceHandle<D>>> {
         let boot = self.boot; // Copy:先取(下一行 `self.ranks` 会被 part-move)
         let mut it = self.ranks.into_iter();
-        let r0 = it.next().ok_or_else(|| ModelError::Msg("TP run: rank0 缺".into()))?;
-        let r1 = it.next().ok_or_else(|| ModelError::Msg("TP run: rank1 缺".into()))?;
+        let r0 = it
+            .next()
+            .ok_or_else(|| ModelError::Msg("TP run: rank0 缺".into()))?;
+        let r1 = it
+            .next()
+            .ok_or_else(|| ModelError::Msg("TP run: rank1 缺".into()))?;
         crate::engine::into_running(
             self.cfg,
             self.tokenizer,
@@ -503,7 +530,10 @@ impl<D: DeviceClient + 'static> TpEngine<D> {
 
     /// 主会话图捕获结果(`Captured` = 回放态)
     pub fn session_captured(&self, rank: usize) -> bool {
-        matches!(self.ranks[rank].dev.graphs.capture_outcome, PlanOutcome::Captured)
+        matches!(
+            self.ranks[rank].dev.graphs.capture_outcome,
+            PlanOutcome::Captured
+        )
     }
 
     /// 本 rank 的 face 句柄克隆(诊断/门面:同一个 actor 的另一个发送端)
@@ -515,7 +545,6 @@ impl<D: DeviceClient + 'static> TpEngine<D> {
     pub fn config(&self) -> &EngineConfig {
         &self.cfg
     }
-
 }
 
 // ============================================================================
@@ -547,7 +576,10 @@ impl TpEngine<GpuClient> {
     ///
     /// 装载在调用方手里完成(每 rank `engine.loader().slice(id, world)` ——
     /// 确定性分片协议,零协调)。
-    pub async fn assemble(engines: Vec<Engine<GpuClient>>, loadeds: Vec<LoadedModel>) -> Result<Self> {
+    pub async fn assemble(
+        engines: Vec<Engine<GpuClient>>,
+        loadeds: Vec<LoadedModel>,
+    ) -> Result<Self> {
         Self::assemble_with(engines, loadeds, TpOpts::default()).await
     }
 
@@ -609,8 +641,7 @@ impl TpEngine<GpuClient> {
         // ── ② staging 对称握手(**建图之前**)───────────────────────────
         let mut it = engines.into_iter();
         let (face0, cfg, cell0, boot0) = it.next().expect("world = 2 已守门").into_parts();
-        let (mut face1, cfg1, _cell1, boot1) =
-            it.next().expect("world = 2 已守门").into_parts();
+        let (mut face1, cfg1, _cell1, boot1) = it.next().expect("world = 2 已守门").into_parts();
         // 纯配置护栏在 staging 握手之前（F-05：坏配置不白分配 staging）。
         check_assemble_guards(&cfg, &loadeds)?;
         let mut face0 = face0;
@@ -651,8 +682,7 @@ impl TpEngine<GpuClient> {
             Engine::from_handle(cfg1, face1, cell0.clone(), boot1)
                 .map_err(|e| ModelError::Msg(format!("TP 重装 rank1 引擎壳失败:{e}")))?,
         ];
-        Self::assemble_with_staging(engines, loadeds, staging0, staging1)
-            .await
+        Self::assemble_with_staging(engines, loadeds, staging0, staging1).await
     }
 
     /// **同卡双 rank 装配(T3 位级 transport 档;测试/取证面)** —— 与
@@ -699,8 +729,7 @@ impl TpEngine<GpuClient> {
         );
         let mut it = engines.into_iter();
         let (face0, cfg, cell0, boot0) = it.next().expect("world = 2 已守门").into_parts();
-        let (mut face1, cfg1, _cell1, boot1) =
-            it.next().expect("world = 2 已守门").into_parts();
+        let (mut face1, cfg1, _cell1, boot1) = it.next().expect("world = 2 已守门").into_parts();
         check_assemble_guards(&cfg, &loadeds)?;
         let mut face0 = face0;
         face1.set_dev_rank(1);
@@ -713,9 +742,15 @@ impl TpEngine<GpuClient> {
                 ))
             })?;
         let uuid = caps0.uuid.clone();
-        let (staging0, staging1) =
-            handshake_staging(&mut face0, &mut face1, &uuid, &uuid, layout, TpOpts::default())
-                .await?;
+        let (staging0, staging1) = handshake_staging(
+            &mut face0,
+            &mut face1,
+            &uuid,
+            &uuid,
+            layout,
+            TpOpts::default(),
+        )
+        .await?;
         let engines = vec![
             Engine::from_handle(cfg, face0, cell0.clone(), boot0)
                 .map_err(|e| ModelError::Msg(format!("同卡档重装 rank0 引擎壳失败:{e}")))?,
@@ -725,8 +760,7 @@ impl TpEngine<GpuClient> {
             Engine::from_handle(cfg1, face1, cell0.clone(), boot1)
                 .map_err(|e| ModelError::Msg(format!("同卡档重装 rank1 引擎壳失败:{e}")))?,
         ];
-        Self::assemble_with_staging(engines, loadeds, staging0, staging1)
-            .await
+        Self::assemble_with_staging(engines, loadeds, staging0, staging1).await
     }
 
     /// **收尾**:先卸图(图租约钉住 staging ⇒ 必须先销毁图),再
@@ -822,7 +856,11 @@ async fn release_staging_pair(
     // host：owner 在 rank0 ⇒ 先 rank1(attach) 后 rank0(owner)。
     let order: [usize; 2] = if host { [1, 0] } else { [0, 1] };
     for i in order {
-        let (st, tag) = if i == 0 { (staging0, "rank0") } else { (staging1, "rank1") };
+        let (st, tag) = if i == 0 {
+            (staging0, "rank0")
+        } else {
+            (staging1, "rank1")
+        };
         let Some(face) = faces.get_mut(i).and_then(Option::as_mut) else {
             owl_shared::log_warn!(
                 "tp",
@@ -850,10 +888,7 @@ async fn release_staging_pair(
 ///
 /// `GpuClient` 特化:`peer_release` / `host_release` 是 GpuClient 固有方法
 /// (非 trait 面)。
-async fn retire_rank(
-    dev: &mut RankDev<DeviceHandle<GpuClient>>,
-    tag: &str,
-) -> Option<ModelError> {
+async fn retire_rank(dev: &mut RankDev<DeviceHandle<GpuClient>>, tag: &str) -> Option<ModelError> {
     let mut first: Option<ModelError> = None;
     let note = |e: ModelError, first: &mut Option<ModelError>| {
         owl_shared::log_warn!("tp", "{e}");
@@ -862,7 +897,10 @@ async fn retire_rank(
         }
     };
     if let Err(e) = dev.graphs.close().await {
-        note(ModelError::Msg(format!("{tag} 图族退役失败:{e}")), &mut first);
+        note(
+            ModelError::Msg(format!("{tag} 图族退役失败:{e}")),
+            &mut first,
+        );
     }
     match dev.graphs.face_clone() {
         None => note(
@@ -898,12 +936,21 @@ async fn retire_rank(
                 // peer/host 面不经 `DeviceClient`(自成命令族)⇒ 走可变直通口
                 // (设计卷 §六 白名单:peer_* 指令;**这些块不入事件账** —— 见 §十二 步 3 注)
                 let released = if tp.host_own != 0 {
-                    face.client_mut().host_release(ids).await.map(|_| "HostRelease")
+                    face.client_mut()
+                        .host_release(ids)
+                        .await
+                        .map(|_| "HostRelease")
                 } else {
-                    face.client_mut().peer_release(ids).await.map(|_| "PeerRelease")
+                    face.client_mut()
+                        .peer_release(ids)
+                        .await
+                        .map(|_| "PeerRelease")
                 };
                 if let Err(e) = released {
-                    note(ModelError::Msg(format!("{tag} staging 释放失败:{e}")), &mut first);
+                    note(
+                        ModelError::Msg(format!("{tag} staging 释放失败:{e}")),
+                        &mut first,
+                    );
                 }
             }
         },
@@ -943,12 +990,13 @@ impl RunningEngine<DeviceHandle<GpuClient>> {
     /// —— 否则 AR 未配对(超时 / 头校验失败 / 序列不同步)。装配期自证在
     /// [`TpEngine::assemble`];本口是每 turn 之后的同一判据。
     pub async fn tp_staging_state(&mut self) -> Result<Option<((u64, u64, u32), (u64, u64, u32))>> {
-        let Some(p) = self.peer.as_mut() else { return Ok(None) };
+        let Some(p) = self.peer.as_mut() else {
+            return Ok(None);
+        };
         let a = staging_state_of(&mut self.dev).await?;
         let b = staging_state_of(p).await?;
         Ok(Some((a, b)))
     }
-
 
     /// **执行态 TP 收尾**(T1 门与生产停止路径共用):rank0 束 + peer 束各走
     /// [`retire_rank`](卸图 → `PeerRelease`)。
@@ -962,12 +1010,7 @@ impl RunningEngine<DeviceHandle<GpuClient>> {
             return loud("shutdown_tp: 本引擎不是 TP 态(无 peer 束;单卡请走 Drop)");
         }
         let mut first: Option<ModelError> = None;
-        let host = self
-            .dev
-            .boot
-            .tp
-            .as_ref()
-            .is_some_and(|tp| tp.host_own != 0);
+        let host = self.dev.boot.tp.as_ref().is_some_and(|tp| tp.host_own != 0);
         if host {
             // host owner 在 rank0:先收 rank1 的 attach
             if let Some(peer) = self.peer.as_mut() {
@@ -1088,7 +1131,9 @@ async fn handshake_staging(
                     "tp.host.quant.r0",
                 )
                 .await
-                .map_err(|e| ModelError::Msg(format!("TP host f8 quant scratch 分配失败(rank0):{e}")))?;
+                .map_err(|e| {
+                    ModelError::Msg(format!("TP host f8 quant scratch 分配失败(rank0):{e}"))
+                })?;
             let d = face0
                 .htod(
                     Dtype::U8,
@@ -1097,7 +1142,9 @@ async fn handshake_staging(
                     "tp.host.dummy.r0",
                 )
                 .await
-                .map_err(|e| ModelError::Msg(format!("TP host f8 dummy header 写入失败(rank0):{e}")))?;
+                .map_err(|e| {
+                    ModelError::Msg(format!("TP host f8 dummy header 写入失败(rank0):{e}"))
+                })?;
             (Some(q.view(Dtype::U8, 1)), Some(d))
         } else {
             (None, None)
@@ -1110,7 +1157,9 @@ async fn handshake_staging(
                     "tp.host.quant.r1",
                 )
                 .await
-                .map_err(|e| ModelError::Msg(format!("TP host f8 quant scratch 分配失败(rank1):{e}")))?;
+                .map_err(|e| {
+                    ModelError::Msg(format!("TP host f8 quant scratch 分配失败(rank1):{e}"))
+                })?;
             let d = face1
                 .htod(
                     Dtype::U8,
@@ -1119,7 +1168,9 @@ async fn handshake_staging(
                     "tp.host.dummy.r1",
                 )
                 .await
-                .map_err(|e| ModelError::Msg(format!("TP host f8 dummy header 写入失败(rank1):{e}")))?;
+                .map_err(|e| {
+                    ModelError::Msg(format!("TP host f8 dummy header 写入失败(rank1):{e}"))
+                })?;
             (Some(q.view(Dtype::U8, 1)), Some(d))
         } else {
             (None, None)
@@ -1273,7 +1324,10 @@ fn probe_uuids_pair(a: usize, b: usize) -> Result<(String, String)> {
         .map_err(|e| ModelError::Msg(format!("TP 探测:设备枚举失败 {e}")))?;
     let row_of = |o: usize| -> Result<&owl_shared::device::DeviceRow> {
         rows.iter().find(|r| r.ordinal == o).ok_or_else(|| {
-            ModelError::Msg(format!("TP 探测:ordinal {o} 不在设备表(共 {} 张)", rows.len()))
+            ModelError::Msg(format!(
+                "TP 探测:ordinal {o} 不在设备表(共 {} 张)",
+                rows.len()
+            ))
         })
     };
     let (ra, rb) = (row_of(a)?, row_of(b)?);
@@ -1288,7 +1342,10 @@ fn probe_caps_pair(a: usize, b: usize) -> Result<(PeerCaps, PeerCaps)> {
         .map_err(|e| ModelError::Msg(format!("TP 探测:设备枚举失败 {e}")))?;
     let row_of = |o: usize| -> Result<&owl_shared::device::DeviceRow> {
         rows.iter().find(|r| r.ordinal == o).ok_or_else(|| {
-            ModelError::Msg(format!("TP 探测:ordinal {o} 不在设备表(共 {} 张)", rows.len()))
+            ModelError::Msg(format!(
+                "TP 探测:ordinal {o} 不在设备表(共 {} 张)",
+                rows.len()
+            ))
         })
     };
     let (ra, rb) = (row_of(a)?, row_of(b)?);
@@ -1309,15 +1366,13 @@ fn probe_caps_pair(a: usize, b: usize) -> Result<(PeerCaps, PeerCaps)> {
     };
     let (ba, bb) = (bar1_of(ra)?, bar1_of(rb)?);
     let p2p = |x: usize, y: usize| -> Result<bool> {
-        owl_cuda::ffi::peer_supported(x, y)
-            .map_err(|e| ModelError::Msg(format!("TP 探测:cuDeviceCanAccessPeer({x},{y}) 失败:{e}")))
+        owl_cuda::ffi::peer_supported(x, y).map_err(|e| {
+            ModelError::Msg(format!("TP 探测:cuDeviceCanAccessPeer({x},{y}) 失败:{e}"))
+        })
     };
     let (p_ab, p_ba) = (p2p(a, b)?, p2p(b, a)?);
     let both = p_ab && p_ba; // 单向不成立 ⇒ 组合不可用(双向都要)
-    Ok((
-        PeerCaps::new(ua, ba, both),
-        PeerCaps::new(ub, bb, both),
-    ))
+    Ok((PeerCaps::new(ua, ba, both), PeerCaps::new(ub, bb, both)))
 }
 
 /// BAR1 表(BDF 规范 → bytes):`nvidia-smi -q -d MEMORY` 详查面。
@@ -1337,4 +1392,3 @@ fn query_bar1_bytes() -> Result<std::collections::HashMap<String, u64>> {
     }
     Ok(m)
 }
-

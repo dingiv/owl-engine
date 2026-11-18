@@ -43,7 +43,9 @@ fn launch_awq(
         b = stream.alloc::<i32>((k / 8) * n).unwrap();
         c = stream.alloc::<u16>(m * n).unwrap();
         s = stream.alloc::<u16>((k / G as usize) * n).unwrap();
-        z = stream.alloc::<i32>((k / G as usize) * (n / 8) + 16).unwrap();
+        z = stream
+            .alloc::<i32>((k / G as usize) * (n / 8) + 16)
+            .unwrap();
         ws = stream.alloc::<i32>(ws_len).unwrap();
         tmp = stream.alloc::<u8>(64 << 20).unwrap();
     }
@@ -57,11 +59,19 @@ fn launch_awq(
     let cu = stream.cu_stream() as usize;
     let go = || unsafe {
         owl_kernels::family::marlin::gemm_v2_awq_raw(
-            a_p as *const u16, b_p as *const i32, c_p as *mut u16,
-            s_p as *const u16, z_p as *const i32,
+            a_p as *const u16,
+            b_p as *const i32,
+            c_p as *mut u16,
+            s_p as *const u16,
+            z_p as *const i32,
             tmp_p as *const std::ffi::c_void,
-            m as i32, n as i32, k as i32, ws_p as *mut i32, G,
-            ctx.ordinal() as i32, cu,
+            m as i32,
+            n as i32,
+            k as i32,
+            ws_p as *mut i32,
+            G,
+            ctx.ordinal() as i32,
+            cu,
         )
         .expect("marlin awq launch")
     };
@@ -93,7 +103,9 @@ fn launch_w4a8(
         b = stream.alloc::<i32>((k / 8) * n).unwrap();
         c = stream.alloc::<u16>(m * n).unwrap();
         s = stream.alloc::<u16>((k / G as usize) * n).unwrap();
-        z = stream.alloc::<i32>((k / G as usize) * (n / 8) + 16).unwrap();
+        z = stream
+            .alloc::<i32>((k / G as usize) * (n / 8) + 16)
+            .unwrap();
         ws = stream.alloc::<i32>(ws_len).unwrap();
     }
     let (a_p, _) = a.device_ptr(stream);
@@ -106,10 +118,20 @@ fn launch_w4a8(
     let cu = stream.cu_stream() as usize;
     let go = || unsafe {
         owl_kernels::family::marlin::gemm_v2_awq_w4a8_raw(
-            a_p as *const i8, b_p as *const i32, c_p as *mut u16,
-            s_p as *const u16, z_p as *const i32, asc_p as *const f32,
-            std::ptr::null(), m as i32, n as i32, k as i32,
-            ws_p as *mut i32, G, ctx.ordinal() as i32, cu,
+            a_p as *const i8,
+            b_p as *const i32,
+            c_p as *mut u16,
+            s_p as *const u16,
+            z_p as *const i32,
+            asc_p as *const f32,
+            std::ptr::null(),
+            m as i32,
+            n as i32,
+            k as i32,
+            ws_p as *mut i32,
+            G,
+            ctx.ordinal() as i32,
+            cu,
             false,
         )
         .expect("marlin w4a8 launch")
@@ -130,13 +152,21 @@ fn launch_w4a8(
 /// fp16 dense 峰值(TFLOPS)= SM × boost clk × 1024(Ampere GA10x:每 SM 每拍
 /// 1024 个 fp16 TC FLOP,FP32 累加口径)。
 fn peak_tflops(ctx: &std::sync::Arc<CudaContext>) -> f64 {
-    use cudarc::driver::sys::{CUdevice_attribute, cuDeviceGetAttribute};
+    use cudarc::driver::sys::{cuDeviceGetAttribute, CUdevice_attribute};
     let dev = ctx.ordinal() as i32;
     let mut sm = 0i32;
     let mut khz = 0i32;
     unsafe {
-        cuDeviceGetAttribute(&mut sm, CUdevice_attribute::CU_DEVICE_ATTRIBUTE_MULTIPROCESSOR_COUNT, dev);
-        cuDeviceGetAttribute(&mut khz, CUdevice_attribute::CU_DEVICE_ATTRIBUTE_CLOCK_RATE, dev);
+        cuDeviceGetAttribute(
+            &mut sm,
+            CUdevice_attribute::CU_DEVICE_ATTRIBUTE_MULTIPROCESSOR_COUNT,
+            dev,
+        );
+        cuDeviceGetAttribute(
+            &mut khz,
+            CUdevice_attribute::CU_DEVICE_ATTRIBUTE_CLOCK_RATE,
+            dev,
+        );
     }
     sm as f64 * khz as f64 * 1e3 * 1024.0 / 1e12
 }
@@ -154,7 +184,11 @@ fn marlin_prefill_eff() {
     let peak = peak_tflops(&ctx);
     // 带宽用规格值做参照(3080=760, 3090 Ti=1008 GB/s)——
     // 本探针只回答"计算受限还是带宽受限",不需要实测 HBM 峰值。
-    let hbm_gbs = if ctx.name().unwrap_or_default().contains("3090") { 1008.0 } else { 760.0 };
+    let hbm_gbs = if ctx.name().unwrap_or_default().contains("3090") {
+        1008.0
+    } else {
+        760.0
+    };
     println!(
         "[device] {} ordinal={dev} · fp16 dense 峰值 {peak:.1} TFLOPS · HBM 参照 {hbm_gbs} GB/s",
         ctx.name().unwrap_or_default()
@@ -170,7 +204,7 @@ fn marlin_prefill_eff() {
         let flops = 2.0 * m as f64 * n as f64 * k as f64;
         let tf16 = flops / (us16 * 1e-6) / 1e12;
         let _tf8 = flops / (us8 * 1e-6) / 1e12; // W4A8 臂:本探针暂只报 W4A16
-        // int4 权重 + f16 scales + 激活/输出(f16)
+                                                // int4 权重 + f16 scales + 激活/输出(f16)
         let bytes = (n * k / 2 + (k / G as usize) * n * 2 + m * k * 2 + m * n * 2) as f64;
         let gbs = bytes / (us16 * 1e-6) / 1e9;
         println!(

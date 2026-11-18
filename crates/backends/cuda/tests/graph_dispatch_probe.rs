@@ -8,7 +8,9 @@
 //! - big:大块(执行时间 > 派发:间隙是否被隐藏)
 //!   另测同链 eager(host 直发)对照。
 
-use owl_cuda::{test_device_ordinal, DeviceClient as _, DeviceSelector, Dtype, GpuClient, GpuServer};
+use owl_cuda::{
+    test_device_ordinal, DeviceClient as _, DeviceSelector, Dtype, GpuClient, GpuServer,
+};
 use owl_iface::contract::{Arg, Bytes, KernelSource, LaunchMsg};
 use std::time::Instant;
 
@@ -22,7 +24,10 @@ extern "C" __global__ void probe_add_f32(
 
 fn add_msg_owned(a: &Bytes, b: &Bytes, out_id: u64, n: usize) -> LaunchMsg {
     LaunchMsg {
-        kernel: KernelSource { name: "probe_add_f32".into(), source: ADD_CU.into() },
+        kernel: KernelSource {
+            name: "probe_add_f32".into(),
+            source: ADD_CU.into(),
+        },
         args: vec![
             Arg::block(a.id, a.dtype, a.rank),
             Arg::block(b.id, b.dtype, b.rank),
@@ -37,7 +42,9 @@ fn add_msg_owned(a: &Bytes, b: &Bytes, out_id: u64, n: usize) -> LaunchMsg {
 }
 
 async fn alloc(client: &mut GpuClient, elems: usize) -> Bytes {
-    owl_iface::client_alloc!(client, Dtype::F32, elems).await.expect("alloc")
+    owl_iface::client_alloc!(client, Dtype::F32, elems)
+        .await
+        .expect("alloc")
 }
 
 /// 计时壳:捕获链 → 暖机 3 → 重放 R 次 sync 墙
@@ -47,7 +54,10 @@ async fn time_replays(client: &mut GpuClient, n_nodes: usize, elems: usize, tag:
     let mut cur = alloc(client, elems).await;
     for _ in 0..n_nodes {
         let nxt = alloc(client, elems).await;
-        client.launch(add_msg_owned(&cur, &b, nxt.id, elems)).await.expect("captured launch");
+        client
+            .launch(add_msg_owned(&cur, &b, nxt.id, elems))
+            .await
+            .expect("captured launch");
         cur = nxt;
     }
     let gid = client.graph_end().await.expect("graph_end");
@@ -78,7 +88,9 @@ async fn graph_dispatch_rate_probe() {
     let (tx, rx) = std::sync::mpsc::channel::<owl_cuda::Command>();
     let server = GpuServer::new(rx, DeviceSelector::Ordinal(test_device_ordinal()), None);
     let mut client = GpuClient::new(tx);
-    std::thread::Builder::new().spawn(move || server.run().expect("server run")).unwrap();
+    std::thread::Builder::new()
+        .spawn(move || server.run().expect("server run"))
+        .unwrap();
     client.sync().await.unwrap();
 
     // A. 基线:单一小内核链(驱动地板;256 元素 = 内核 ~1-2µs)
@@ -100,10 +112,14 @@ async fn graph_dispatch_rate_probe() {
             cur = nxt;
         }
         let gid = client.graph_end().await.expect("graph_end");
-        for _ in 0..3 { client.graph_launch(gid).await.expect("warm"); }
+        for _ in 0..3 {
+            client.graph_launch(gid).await.expect("warm");
+        }
         client.sync().await.unwrap();
         let t0 = Instant::now();
-        for _ in 0..20 { client.graph_launch(gid).await.expect("replay"); }
+        for _ in 0..20 {
+            client.graph_launch(gid).await.expect("replay");
+        }
         client.sync().await.unwrap();
         let wall = (Instant::now() - t0).as_secs_f64() * 1e3 / 20.0;
         eprintln!(
@@ -134,7 +150,10 @@ async fn graph_dispatch_rate_probe() {
         let nxt = alloc(&mut client, elems).await;
         let ki = i % k;
         let msg = LaunchMsg {
-            kernel: KernelSource { name: format!("probe_add_d{ki}"), source: sources[ki].clone() },
+            kernel: KernelSource {
+                name: format!("probe_add_d{ki}"),
+                source: sources[ki].clone(),
+            },
             args: vec![
                 Arg::block(cur.id, cur.dtype, cur.rank),
                 Arg::block(b.id, b.dtype, b.rank),
@@ -173,11 +192,17 @@ async fn graph_dispatch_rate_probe() {
         let mut cur = alloc(&mut client, elems).await;
         for _ in 0..n_nodes {
             let nxt = alloc(&mut client, elems).await;
-            client.launch(add_msg_owned(&cur, &b, nxt.id, elems)).await.expect("eager launch");
+            client
+                .launch(add_msg_owned(&cur, &b, nxt.id, elems))
+                .await
+                .expect("eager launch");
             cur = nxt;
         }
         client.sync().await.unwrap();
     }
     let eager = (Instant::now() - t0).as_secs_f64() * 1e3 / 3.0;
-    eprintln!("[probe] eager N={n_nodes}: {eager:.2}ms/链 → {:.2} µs/节点", eager * 1e3 / n_nodes as f64);
+    eprintln!(
+        "[probe] eager N={n_nodes}: {eager:.2}ms/链 → {:.2} µs/节点",
+        eager * 1e3 / n_nodes as f64
+    );
 }

@@ -111,15 +111,8 @@ pub(crate) fn suffix_lookup(hist: &[u32], k: usize, cfg: LookupCfg) -> Option<Lo
 /// 把 lookup 提案融合进草稿头(in-place)。返回是否发生了覆盖。
 ///
 /// 只处理 head:调用方传入的 `drafts` 就是草稿器自己的 7 个位置。
-pub(crate) fn fuse_lookup(
-    drafts: &mut [u32],
-    proposal: &LookupProposal,
-    cfg: LookupCfg,
-) -> bool {
-    let valid = proposal
-        .valid
-        .min(proposal.tokens.len())
-        .min(drafts.len());
+pub(crate) fn fuse_lookup(drafts: &mut [u32], proposal: &LookupProposal, cfg: LookupCfg) -> bool {
+    let valid = proposal.valid.min(proposal.tokens.len()).min(drafts.len());
     if valid == 0 {
         return false;
     }
@@ -127,8 +120,8 @@ pub(crate) fn fuse_lookup(
     let agree = (0..valid)
         .take_while(|&i| drafts[i] == proposal.tokens[i])
         .count();
-    let take = proposal.match_len >= cfg.nstrong
-        || (proposal.match_len >= cfg.nmin && agree >= cfg.agree);
+    let take =
+        proposal.match_len >= cfg.nstrong || (proposal.match_len >= cfg.nmin && agree >= cfg.agree);
     if !take {
         return false;
     }
@@ -187,9 +180,7 @@ mod tests {
     #[test]
     fn prefers_longest_then_recent() {
         // 当前后缀 = [P,Q,A,B,C,D](末 6 个);老候选 6-token,近候选 4-token。
-        let hist = [
-            1, 2, 3, 4, 5, 6, 9, 3, 4, 5, 6, 8, 1, 2, 3, 4, 5, 6,
-        ];
+        let hist = [1, 2, 3, 4, 5, 6, 9, 3, 4, 5, 6, 8, 1, 2, 3, 4, 5, 6];
         let p = suffix_lookup(&hist, 7, cfg(4, 8)).expect("命中");
         assert_eq!(p.match_len, 6);
         assert_eq!(p.valid, 7);

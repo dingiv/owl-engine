@@ -80,7 +80,15 @@ impl ScenarioReport {
 
 pub fn print_report(r: &ScenarioReport) {
     let tag = if r.pass { "PASS" } else { "FAIL" };
-    println!("[{tag}] {}{}", r.name, if r.detail.is_empty() { String::new() } else { format!(" — {}", r.detail) });
+    println!(
+        "[{tag}] {}{}",
+        r.name,
+        if r.detail.is_empty() {
+            String::new()
+        } else {
+            format!(" — {}", r.detail)
+        }
+    );
     for t in &r.turns {
         println!(
             "  round {:<2} finish={:<10} prompt={:<6} images={} cached={:<6} ({:5.1}%) completion={:<4} reasoning={:<4} absorbed=+{:<2} rotate=+{:<8} rebase=+{} tools=[{}] {}ms{}",

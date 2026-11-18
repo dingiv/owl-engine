@@ -179,9 +179,7 @@ impl PressurePolicy {
         if free >= self.pool_low_slots(total) {
             return 0;
         }
-        self.pool_high_slots(total)
-            .saturating_sub(free)
-            .min(cap)
+        self.pool_high_slots(total).saturating_sub(free).min(cap)
     }
 
     /// **宿主腿目标**（KV 前缀块数 / 快照条数；已含每请求配额与绝对上限）。

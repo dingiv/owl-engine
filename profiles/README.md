@@ -54,6 +54,7 @@ extends = [
 |---|---|---|
 | `qwen38_27b-3090.toml` | 8137 | 单 3090 Ti / 27B AWQ-INT4 + 视觉 / DFlash2 d7 / FI+图 / **INT8 KV（30 系默认）** / 前缀缓存 / image_evict / **max_context_length 57344（a8 版全特性稳定点）** / chunk 2048 |
 | `qwen38_27b-3080_tp2.toml` | 8135 | 2×3080 20G TP2 / 27B AWQ-INT4 + 视觉 / DFlash2 d7 / **INT8 KV（30 系默认）** / 前缀缓存 / image_evict / **max_context_length 262144** / chunk 1024（20G 稳定点）/ **满池双活跃（`max_concurrency=2` · `snap_max=6` · `vram_activation_reserve=1024` · `snap_session_cap=30`/`snap_tail=12`）** |
+| `qwen38_27b-3080_tp2-150k.toml` | 8135 | 150k follow-up 档：同卡同 draft，目标切回 **W4A16**，**F16 KV**（int8 长 ctx verify 慢 30%），单并发；147k/320tok 实测 78.7 t/s（主档 60.5） |
 | `qwen38_27b-gguf_3090.toml` | 8137 | 单 3090 Ti / 27B **GGUF UD-IQ4_XS**（14.3GB）+ **mmproj-F16 视觉塔** / DFlash2 d7 / fp8 KV / 前缀缓存 / **max_context_length 172032（168k）** / chunk 2048。prefill 1633–1681 t/s、decode 127–135、128k prompt 零拒发；代价 = prefill 比 a8 档(同端口)慢 ~24% |
 | `qwen38_27b-gguf-iq3_3090.toml` | 8137 | 单 3090 Ti / 27B **GGUF UD-IQ3_S**（12.0GB）+ mmproj-F16 / DFlash2 d7 / **FP8 KV（例外：3-bit 主干对 INT8 KV 的 1k needle 敏感）** / **max_context_length 229376（224k，逼近 native 262144）** / chunk 2048。prefill 1409–1509 t/s、decode 97–121；**与 8137 上的其它单卡 3090 档互斥**（同一张卡二选一），速度慢 ~13%、3bit 质量低一档 |
 | `qwen38_27b-4080.toml` | 8138 | 单 **4080 SUPER（Ada sm_89 / 32G）** / 27B AWQ-INT4 **a8** + 视觉 / DFlash2 d7 / FI+图 / fp8 KV / 前缀缓存 / image_evict / **max_context_length 262144（= 模型 native 上限，32 KiB/token ⇒ 池 8192MiB）** / chunk 2048。std 五点三轮（`perf-runs/std-4080-20261030/`）：**spec-off prefill 2392→3084 t/s、decode 35.9 t/s 长 ctx 平坦**；spec-d7 decode ×1.70（60.1@8k）；**同二进制 3090 Ti 对照：prefill ×1.21–1.37、decode ×0.81、TTFT ×0.73–0.83**。**需 sm_89 二进制**（`cargo build --release -p server --no-default-features --features arch-sm89`，落到独立 target 目录）——单份 `.a` 家族取最高代，30 系与 40 系不混在一份构建里。**2026-11-04 原生 FP8 MMA**（KernelPick 按运行期 Sm89/Sm120 选臂；e4m3 Q×KV，CTA16）：std 1024–8192 均值 3113 t/s（旧 3030，+2.8%）、32k 2844（旧 2379，+19.6%）、65k 2435（旧 2099，+16.0%），decode 不变；1k/8k/65k needle + 视觉 36/36 全绿（`docs/bench/fp8-sm89-native-mma-2026-11-04.md`） |
@@ -86,8 +87,8 @@ extends = [
   2026-11-16 原始算法；旧 `implicit_session` 键已删）；
 - `image_evict=true`（最终方案 = **leave-gap**：删后不转 K、保留位置洞，
   可无限次丢弃旧图片缓存；旧的 rebase/K 旋转路径已删除）；
-- 3090：`max_context_length=57344 / snap_max=2 / host_cache=10G / snap_host=3G`；
-- 3080 TP2：`max_context_length=262144 / max_concurrency=2 / snap_max=6 / vram_activation_reserve=1024M / snap_session_cap=30 / snap_tail=12 / host_cache=10G / snap_host=3G`。
+- 3090：`max_context_length=57344 / snap_max=2 / ram_pool_size=13312`（宿主总池，KV+快照共享）；
+- 3080 TP2：`max_context_length=262144 / max_concurrency=2 / snap_max=6 / vram_activation_reserve=1024M / snap_session_cap=30 / snap_tail=12 / ram_pool_size=13312`（宿主总池，KV+快照共享）/ `ttft_on_expire=warn`（TTFT 超期只告警、不强停）。
 
 pi 实测工具跟进 cached 95.6% / TTFT 149ms，手动新消息 96.2% / 97ms，
 新会话 98.3% / 116ms；8135 的 `image-evict` 5/5、GUI 窗口 PASS。
@@ -100,9 +101,9 @@ fresh boot 驱动余量高于 1GiB；前缀缓存饱和后可能短暂出现 N6 
 image_evict 的前缀块会被下沉到 host（`前缀有宿主占位 ⇒ 不吸收`），
 不再作为生产默认；长上下文/大图窗口由 3080 TP2（262144/snap6/满池）承担。
 
-宿主 KV 腿 **10GiB**（≈4 条 63k 链）：4GiB 时两发长 prompt 后第三发的
-27k 前缀回灌会撞「槽池耗尽」；10GiB 让整链下沉、设备槽立刻回来
-（2026-10-25 修复配套）。自动池在 overcommit 之前先判 `max_context_length ≤ ctx_max`，
+宿主总池 **13GiB**（KV+快照共享；≈4 条 63k 链）：4GiB 时两发长 prompt 后第三发的
+27k 前缀回灌会撞「槽池耗尽」；10GiB 档已让整链下沉、设备槽立刻回来
+（2026-10-25 修复配套；现 13GiB 留出快照余量）。自动池在 overcommit 之前先判 `max_context_length ≤ ctx_max`，
 262k 在单 3090 上会 boot 响亮拒；要 262k 需改引擎（逻辑 ctx 与物理池解耦），
 不是配置能开出来的。
 

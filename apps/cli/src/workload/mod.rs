@@ -73,7 +73,7 @@ pub fn run(args: Args) -> i32 {
                  ./target/release/server -p profiles/qwen38_27b-3080_tp2.toml \\\n\
                    --set vision.image_evict=true \\\n\
                    --set store.prefix_cache=true --set store.gdn.snap_max=2 \\\n\
-                   --set store.snap_host_mb=1024 --set runtime.max_context_length=131072 \\\n\
+                   --set store.ram_pool_size=11264 --set runtime.max_context_length=131072 \\\n\
                    --log-level info\n\
                  或直接:tools/run-agent-workload.sh gui"
             );
@@ -84,7 +84,12 @@ pub fn run(args: Args) -> i32 {
     let suite = args.suite.to_ascii_lowercase();
     if !matches!(
         suite.as_str(),
-        "core" | "image-evict" | "gui" | "gui-capability" | "vision-identity" | "all"
+        "core"
+            | "image-evict"
+            | "gui"
+            | "gui-capability"
+            | "vision-identity"
+            | "all"
             | "decode-prefill"
     ) {
         eprintln!(
@@ -112,10 +117,7 @@ pub fn run(args: Args) -> i32 {
         ("text_multiturn", scenarios::text_multiturn),
         ("tool_roundtrip", scenarios::tool_roundtrip),
         ("vision_chat", scenarios::vision_chat),
-        (
-            "image_content_identity",
-            scenarios::image_content_identity,
-        ),
+        ("image_content_identity", scenarios::image_content_identity),
         ("mixed_tool_image", scenarios::mixed_tool_image),
         ("image_delete_marked", scenarios::image_delete_marked),
         ("image_delete_middle", scenarios::image_delete_middle),

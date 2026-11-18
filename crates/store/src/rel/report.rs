@@ -90,13 +90,15 @@ impl Rel {
         }
         tiers.owners = owner_map
             .into_iter()
-            .map(|((owner, tier, kind), (bytes, entries))| crate::tier::OwnerRow {
-                owner,
-                tier,
-                kind,
-                bytes,
-                entries,
-            })
+            .map(
+                |((owner, tier, kind), (bytes, entries))| crate::tier::OwnerRow {
+                    owner,
+                    tier,
+                    kind,
+                    bytes,
+                    entries,
+                },
+            )
             .collect();
         tiers
             .owners

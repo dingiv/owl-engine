@@ -215,8 +215,16 @@ impl FileSink {
     fn open(path: PathBuf, max_bytes: u64, keep: usize) -> Result<Self, LogError> {
         let file = crate::file_loader::append(&path)
             .map_err(|e| LogError::Open(format!("{}: {e}", path.display())))?;
-        let written = crate::file_loader::metadata(&path).map(|m| m.len()).unwrap_or(0);
-        Ok(Self { path, file, written, max_bytes, keep })
+        let written = crate::file_loader::metadata(&path)
+            .map(|m| m.len())
+            .unwrap_or(0);
+        Ok(Self {
+            path,
+            file,
+            written,
+            max_bytes,
+            keep,
+        })
     }
 
     /// 按尺寸 rotation:`f` → `f.1` → `f.2`…(最多 keep 份,超出丢最旧)
@@ -347,8 +355,7 @@ impl Logger {
         if inner.tags_deny.iter().any(|p| tag.starts_with(p.as_str())) {
             return false;
         }
-        inner.tags_allow.is_empty()
-            || inner.tags_allow.iter().any(|p| tag.starts_with(p.as_str()))
+        inner.tags_allow.is_empty() || inner.tags_allow.iter().any(|p| tag.starts_with(p.as_str()))
     }
 
     /// 产出一行(准入判定 + 渲染 + 分发;rotation 内聚)
@@ -368,7 +375,9 @@ impl Logger {
             }
             line.push_str(&format!("[{}] [{}] {}\n", level_tag(level), tag, msg));
             if let Some(buf) = &inner.memory {
-                buf.lock().unwrap_or_else(|p| p.into_inner()).push(line.clone());
+                buf.lock()
+                    .unwrap_or_else(|p| p.into_inner())
+                    .push(line.clone());
             }
             if inner.to_stderr {
                 let _ = std::io::stderr().write_all(line.as_bytes());
@@ -442,7 +451,9 @@ pub const LOG_BUILD: bool = false;
 
 /// 程序早期初始化(重复 = [`LogError::AlreadyInit`],保留首个)
 pub fn init_logger(cfg: LogConfig) -> Result<(), LogError> {
-    LOGGER.set(Logger::new(cfg)?).map_err(|_| LogError::AlreadyInit)
+    LOGGER
+        .set(Logger::new(cfg)?)
+        .map_err(|_| LogError::AlreadyInit)
 }
 
 /// 全局是否已初始化
@@ -751,7 +762,11 @@ mod tests {
     fn mem_cfg(level: u8) -> (LogConfig, Arc<Mutex<Vec<String>>>) {
         let buf = Arc::new(Mutex::new(Vec::new()));
         (
-            LogConfig { level, target: Target::Memory(buf.clone()), ..Default::default() },
+            LogConfig {
+                level,
+                target: Target::Memory(buf.clone()),
+                ..Default::default()
+            },
             buf,
         )
     }
@@ -760,7 +775,10 @@ mod tests {
         std::env::temp_dir().join(format!(
             "owl_log_{}_{}_{tag}",
             std::process::id(),
-            SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_nanos()
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos()
         ))
     }
 
@@ -781,7 +799,10 @@ mod tests {
         assert!(l.inner.is_poisoned(), "本门前提 = 锁已被毒化");
         l.emit(LVL_ERROR, "boot", "post-poison");
         let got = buf.lock().unwrap().clone();
-        assert!(got.iter().any(|s| s.contains("post-poison")), "中毒后仍应落账:{got:?}");
+        assert!(
+            got.iter().any(|s| s.contains("post-poison")),
+            "中毒后仍应落账:{got:?}"
+        );
     }
 
     #[test]
@@ -845,7 +866,11 @@ mod tests {
         let b1 = PathBuf::from(format!("{}.1", p.display()));
         assert!(crate::file_loader::exists(&b1), "应产生备份 .1");
         // 单文件不超过上限(行小、80B 上限 ⇒ 允许超出最后一行)
-        assert!(cur.len() as u64 <= 80 + 64, "当前文件尺寸 {} 应受 max_bytes 约束", cur.len());
+        assert!(
+            cur.len() as u64 <= 80 + 64,
+            "当前文件尺寸 {} 应受 max_bytes 约束",
+            cur.len()
+        );
         for f in [p.clone(), b1, PathBuf::from(format!("{}.2", p.display()))] {
             let _ = crate::file_loader::remove_file(&f);
         }
@@ -859,7 +884,10 @@ mod tests {
         l.emit(LVL_INFO, "boot", "t");
         let line = buf.lock().unwrap()[0].clone();
         // 形如 2026-10-14T00:12:33.123Z [INFO] [boot] t
-        assert!(line.len() > 24 && line.as_bytes()[4] == b'-' && line.contains("T"), "{line}");
+        assert!(
+            line.len() > 24 && line.as_bytes()[4] == b'-' && line.contains("T"),
+            "{line}"
+        );
         assert!(line.ends_with("[INFO] [boot] t\n"), "{line}");
     }
 

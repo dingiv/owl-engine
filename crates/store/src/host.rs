@@ -21,6 +21,7 @@ use owl_iface::contract::{ConnSlot, Connector, ModelError};
 
 use crate::error::{StoreError, StoreResult};
 use crate::id::ChainHash;
+use crate::shared_budget::SharedTierBudgetRef;
 
 /// 宿主层的一块存储(pageable;大小 = 逻辑块字节)。
 ///
@@ -35,6 +36,10 @@ pub struct HostBlock {
     /// 大页提示是否生效(可观测面:失败 = 冷写回到 4 KiB 缺页速度;
     /// 纠错/报告靠它 —— 不许静默吞掉)。
     hugepage: bool,
+    /// 共享层预算句柄（`None` = 本地预算/未绑定）。
+    budget: Option<SharedTierBudgetRef>,
+    /// 本块字节是否已计入共享预算（Drop 时按此释放）。
+    accounted: bool,
 }
 
 /// 大页提示:把 `bytes` 的 **2 MiB 对齐内区间**申请为 THP(边缘不足一页的段
@@ -49,9 +54,7 @@ fn hint_hugepage(bytes: &mut [u8]) -> std::io::Result<()> {
     if hi <= lo {
         return Ok(()); // 块 < 一页大页:没东西可提示(小 KV 块走这条路)
     }
-    let r = unsafe {
-        libc::madvise(lo as *mut libc::c_void, hi - lo, libc::MADV_HUGEPAGE)
-    };
+    let r = unsafe { libc::madvise(lo as *mut libc::c_void, hi - lo, libc::MADV_HUGEPAGE) };
     if r == 0 {
         Ok(())
     } else {
@@ -71,7 +74,12 @@ impl HostBlock {
     pub fn zeroed(len: usize) -> Self {
         let mut bytes = vec![0u8; len];
         let hugepage = hint_hugepage(&mut bytes).is_ok();
-        Self { bytes, hugepage }
+        Self {
+            bytes,
+            hugepage,
+            budget: None,
+            accounted: false,
+        }
     }
 
     /// **从已有字节构造**(磁盘读回 / 溢写回滚用:内容已在,无需再零填)。
@@ -79,7 +87,79 @@ impl HostBlock {
     /// 大页提示不适用(内存来自 `Vec` 的既有分配);`hugepage` 记 `false`
     /// ⇒ 报告面的 `hint_failures` 不该被这条计入,故本构造**不**自报失败。
     pub fn from_bytes(bytes: Vec<u8>) -> Self {
-        Self { bytes, hugepage: false }
+        Self {
+            bytes,
+            hugepage: false,
+            budget: None,
+            accounted: false,
+        }
+    }
+
+    /// **绑定共享预算并预留本块字节**（新分配 / 从外部字节装入时用）。
+    ///
+    /// 已经计过账的块再绑 = 不变量违反（会双算）。
+    pub fn attach_budget(&mut self, budget: SharedTierBudgetRef) -> StoreResult<()> {
+        if self.accounted {
+            return Err(StoreError::Invariant(
+                "宿主块已计入共享预算,不许重复绑定".into(),
+            ));
+        }
+        let ok = budget
+            .lock()
+            .map_err(|_| StoreError::Invariant("共享层预算锁中毒".into()))?
+            .try_reserve(self.bytes.len());
+        if !ok {
+            return Err(StoreError::Exhausted(format!(
+                "共享宿主层越界:装不下单块 {}B",
+                self.bytes.len()
+            )));
+        }
+        self.budget = Some(budget);
+        self.accounted = true;
+        Ok(())
+    }
+
+    /// **预算已由调用方预留**，只把句柄挂上（不重复 reserve）。
+    fn bind_reserved_budget(&mut self, budget: SharedTierBudgetRef) -> StoreResult<()> {
+        if self.accounted {
+            return Err(StoreError::Invariant(
+                "宿主块已计入共享预算,不许重复绑定".into(),
+            ));
+        }
+        self.budget = Some(budget);
+        self.accounted = true;
+        Ok(())
+    }
+
+    /// 本块是否已计入共享预算。
+    pub fn is_accounted(&self) -> bool {
+        self.accounted
+    }
+
+    /// 释放本块的共享预算（可重复调用；第二次是 no-op）。
+    pub fn release_budget(&mut self) {
+        if !self.accounted {
+            return;
+        }
+        let Some(budget) = self.budget.take() else {
+            self.accounted = false;
+            return;
+        };
+        match budget.lock() {
+            Ok(mut g) => {
+                if let Err(e) = g.release(self.bytes.len()) {
+                    owl_shared::log_warn!(
+                        "store",
+                        "宿主块预算释放失败({}B):{e}(账目已失守,继续释放内存)",
+                        self.bytes.len()
+                    );
+                }
+            }
+            Err(_) => {
+                owl_shared::log_warn!("store", "宿主块预算释放失败:锁中毒({}B)", self.bytes.len())
+            }
+        }
+        self.accounted = false;
     }
 
     /// 本块的大页提示是否生效。
@@ -109,8 +189,19 @@ impl HostBlock {
 
     /// **取出内部字节**(零拷贝;磁盘溢写把内容交给 I/O 任务时用 ——
     /// 159 MiB 的快照不该为了搬运再拷一份)。
-    pub fn into_bytes(self) -> Vec<u8> {
-        self.bytes
+    ///
+    /// 取出即离开宿主账：`Drop` 会释放共享预算；内容本身交给调用方。
+    pub fn into_bytes(mut self) -> Vec<u8> {
+        // 先把预算按**原始长度**释放，再把 Vec 移出；否则 Drop 看到的 len=0
+        // 会漏账（共享池会被永久占住）。
+        self.release_budget();
+        std::mem::take(&mut self.bytes)
+    }
+}
+
+impl Drop for HostBlock {
+    fn drop(&mut self) {
+        self.release_budget();
     }
 }
 
@@ -121,7 +212,10 @@ impl HostBlock {
 #[derive(Debug)]
 pub struct HostTier<K = ChainHash> {
     block_bytes: usize,
+    /// 本层上限；共享档 = 两腿总预算（真实占用由 `shared` 记）。
     budget_bytes: usize,
+    /// **跨腿共享预算**（`None` = 本层独占的旧式预算）。
+    shared: Option<SharedTierBudgetRef>,
     free_cap: usize,
     resident: BTreeMap<K, HostBlock>,
     free: Vec<HostBlock>,
@@ -168,6 +262,7 @@ impl<K: HostKey> HostTier<K> {
         Ok(Self {
             block_bytes,
             budget_bytes,
+            shared: None,
             free_cap: DEFAULT_FREE_CAP,
             resident: BTreeMap::new(),
             free: Vec::new(),
@@ -176,6 +271,41 @@ impl<K: HostKey> HostTier<K> {
             hint_failures: 0,
             outstanding: 0,
         })
+    }
+
+    /// **共享档构造**：`budget_bytes` = 两腿总预算；本层不再单独切分。
+    pub fn new_shared(block_bytes: usize, shared: SharedTierBudgetRef) -> StoreResult<Self> {
+        if block_bytes == 0 {
+            return Err(StoreError::Invariant("宿主层块字节为 0".into()));
+        }
+        let budget_bytes = shared
+            .lock()
+            .map_err(|_| StoreError::Invariant("共享层预算锁中毒".into()))?
+            .total_bytes();
+        // 共享档允许“本腿单块 > 总池”（该腿永远借不到，但另一腿仍可用）；
+        // 不在这里拒 —— 否则小快照池会被 KV 的大块粒度误杀。
+        Ok(Self {
+            block_bytes,
+            budget_bytes,
+            shared: Some(shared),
+            free_cap: DEFAULT_FREE_CAP,
+            resident: BTreeMap::new(),
+            free: Vec::new(),
+            evicted_bytes: 0,
+            duplicate_landings: 0,
+            hint_failures: 0,
+            outstanding: 0,
+        })
+    }
+
+    /// 共享预算句柄（`None` = 本地预算）。
+    pub fn shared_budget(&self) -> Option<&SharedTierBudgetRef> {
+        self.shared.as_ref()
+    }
+
+    /// 本层已计入共享预算的物理字节（驻留 + 空转 + 在飞借台）。
+    pub fn physical_bytes(&self) -> usize {
+        self.used_bytes() + self.free_bytes() + self.outstanding * self.block_bytes
     }
 
     /// 单块字节。
@@ -195,8 +325,17 @@ impl<K: HostKey> HostTier<K> {
 
     /// 取一块空缓冲(优先复用;新建时**先判预算** —— 超界响亮拒)。
     pub fn acquire(&mut self) -> StoreResult<HostBlock> {
-        if let Some(b) = self.free.pop() {
-            // 空转缓冲 → 借出台(free → outstanding;总量不变,不必再判预算)
+        if let Some(mut b) = self.free.pop() {
+            // 空转缓冲 → 借出台(free → outstanding)。
+            // 若该缓冲来自 `take`（预算已释放），重新入账后才可借出。
+            if !b.is_accounted() {
+                if let Some(shared) = self.shared.clone() {
+                    if let Err(e) = b.attach_budget(shared) {
+                        self.free.push(b);
+                        return Err(e);
+                    }
+                }
+            }
             self.outstanding += 1;
             return Ok(b);
         }
@@ -208,6 +347,28 @@ impl<K: HostKey> HostTier<K> {
             + self.free_bytes()
             + self.outstanding * self.block_bytes
             + self.block_bytes;
+        if let Some(shared) = self.shared.clone() {
+            let ok = shared
+                .lock()
+                .map_err(|_| StoreError::Invariant("共享层预算锁中毒".into()))?
+                .try_reserve(self.block_bytes);
+            if !ok {
+                return Err(StoreError::Exhausted(format!(
+                    "共享宿主层越界:需 {}B(驻留 {} + 空转 {} + 在飞 {} 块)",
+                    self.block_bytes,
+                    self.used_bytes(),
+                    self.free_bytes(),
+                    self.outstanding
+                )));
+            }
+            let mut b = HostBlock::zeroed(self.block_bytes);
+            b.bind_reserved_budget(shared)?;
+            if !b.hugepage() {
+                self.hint_failures += 1;
+            }
+            self.outstanding += 1;
+            return Ok(b);
+        }
         if after > self.budget_bytes {
             return Err(StoreError::Exhausted(format!(
                 "宿主层越界:{after} > {}(关层请置 0,放量请调大 host_bytes;在飞借台 {} 块)",
@@ -220,6 +381,19 @@ impl<K: HostKey> HostTier<K> {
         }
         self.outstanding += 1;
         Ok(b)
+    }
+
+    /// 宿主层剩余可借槽（共享档 = 共享余量 + 本层空转缓冲）。
+    pub fn free_slots(&self) -> usize {
+        if self.is_disabled() {
+            return 0;
+        }
+        let shared_free = self
+            .shared
+            .as_ref()
+            .and_then(|b| b.lock().ok().map(|g| g.available_bytes()))
+            .unwrap_or_else(|| self.budget_bytes.saturating_sub(self.physical_bytes()));
+        self.free.len() + shared_free / self.block_bytes.max(1)
     }
 
     /// 大页提示未生效的块数(0 = 全部生效;>0 = 冷写回到 4 KiB 缺页速度 ——
@@ -258,7 +432,7 @@ impl<K: HostKey> HostTier<K> {
     /// ② 落地：同身份重复 = **同一内容**(K 内容寻址)⇒ 幂等换新，留本次刚从
     ///    设备搬来的那份(它对应设备现状)，旧缓冲回收，并计入
     ///    [`HostTier::duplicate_landings`](响亮，不静默)。
-    pub fn land(&mut self, items: Vec<(K, HostBlock)>) -> StoreResult<()> {
+    pub fn land(&mut self, mut items: Vec<(K, HostBlock)>) -> StoreResult<()> {
         // ① 预检
         let mut fresh = 0usize;
         for (chain, buf) in &items {
@@ -273,15 +447,19 @@ impl<K: HostKey> HostTier<K> {
                 fresh += 1;
             }
         }
+        // 共享档：借台/外部装入的块必须先入共享账（已入账的块不重复 reserve）。
+        self.bind_items_budget(&mut items)?;
         // 落地后物理占用 = 驻留(+新落) + 仍在飞的借台(其余批次)
         let landing = items.len().min(self.outstanding);
         let remain = self.outstanding - landing;
-        let after = self.used_bytes() + fresh * self.block_bytes + remain * self.block_bytes;
-        if self.budget_bytes != 0 && after > self.budget_bytes {
-            return Err(StoreError::Exhausted(format!(
-                "宿主层越界:{after} > {}(需先驱逐;在飞借台 {} 块)",
-                self.budget_bytes, remain
-            )));
+        if self.shared.is_none() {
+            let after = self.used_bytes() + fresh * self.block_bytes + remain * self.block_bytes;
+            if self.budget_bytes != 0 && after > self.budget_bytes {
+                return Err(StoreError::Exhausted(format!(
+                    "宿主层越界:{after} > {}(需先驱逐;在飞借台 {} 块)",
+                    self.budget_bytes, remain
+                )));
+            }
         }
         self.outstanding = remain;
         // ② 落地
@@ -291,6 +469,43 @@ impl<K: HostKey> HostTier<K> {
                 self.duplicate_landings += 1;
             }
             self.resident.insert(chain, buf);
+        }
+        Ok(())
+    }
+
+    /// 把未入账的块挂到共享预算上；**先整批 reserve，再挂句柄**（零半态）。
+    fn bind_items_budget(&mut self, items: &mut [(K, HostBlock)]) -> StoreResult<()> {
+        let Some(shared) = self.shared.clone() else {
+            return Ok(());
+        };
+        let need = items
+            .iter()
+            .filter(|(_, b)| !b.is_accounted())
+            .count()
+            .saturating_mul(self.block_bytes);
+        if need > 0 {
+            let mut ok = shared
+                .lock()
+                .map_err(|_| StoreError::Invariant("共享层预算锁中毒".into()))?
+                .try_reserve(need);
+            if !ok {
+                // 空转缓冲仍占共享账；落地前先真释放，再重试一次。
+                self.free.clear();
+                ok = shared
+                    .lock()
+                    .map_err(|_| StoreError::Invariant("共享层预算锁中毒".into()))?
+                    .try_reserve(need);
+            }
+            if !ok {
+                return Err(StoreError::Exhausted(format!(
+                    "共享宿主层越界:落地需再预留 {need}B"
+                )));
+            }
+        }
+        for (_, b) in items.iter_mut() {
+            if !b.is_accounted() {
+                b.bind_reserved_budget(shared.clone())?;
+            }
         }
         Ok(())
     }
@@ -321,13 +536,19 @@ impl<K: HostKey> HostTier<K> {
         if self.budget_bytes == 0 {
             return 0;
         }
+        // 共享档：借台/落地块已经计入共享账；没有“落地才新增”的缺口。
+        if self.shared.is_some() {
+            return 0;
+        }
         let remain = self.outstanding.saturating_sub(landing);
         let after = self.used_bytes() + (fresh + remain) * self.block_bytes;
-        after.saturating_sub(self.budget_bytes).div_ceil(self.block_bytes.max(1))
+        after
+            .saturating_sub(self.budget_bytes)
+            .div_ceil(self.block_bytes.max(1))
     }
 
     /// 登记驻留(内容落到宿主层)。
-    pub fn put(&mut self, block: K, buf: HostBlock) -> StoreResult<()> {
+    pub fn put(&mut self, block: K, mut buf: HostBlock) -> StoreResult<()> {
         if buf.len() != self.block_bytes {
             return Err(StoreError::Invariant(format!(
                 "宿主块大小不符:{} ≠ {}",
@@ -338,15 +559,26 @@ impl<K: HostKey> HostTier<K> {
         if self.resident.contains_key(&block) {
             return Err(StoreError::Invariant(format!("块 {block:?} 已在宿主层")));
         }
-        // 本块来自借台 ⇒ 结算在飞计数(仍要按**物理占用**判预算)
-        self.outstanding = self.outstanding.saturating_sub(1);
-        let after = self.used_bytes() + self.outstanding * self.block_bytes + self.block_bytes;
-        if self.budget_bytes != 0 && after > self.budget_bytes {
-            return Err(StoreError::Exhausted(format!(
-                "宿主层越界:{after} > {}(需先驱逐;在飞借台 {} 块)",
-                self.budget_bytes, self.outstanding
-            )));
+        if let Some(shared) = self.shared.clone() {
+            if !buf.is_accounted() {
+                if let Err(e) = buf.attach_budget(shared.clone()) {
+                    // 空转缓冲仍占共享账：先释放，再重试；仍失败则上抛原错误。
+                    self.free.clear();
+                    buf.attach_budget(shared).map_err(|_| e)?;
+                }
+            }
+        } else {
+            let remain = self.outstanding.saturating_sub(1);
+            let after = self.used_bytes() + remain * self.block_bytes + self.block_bytes;
+            if self.budget_bytes != 0 && after > self.budget_bytes {
+                return Err(StoreError::Exhausted(format!(
+                    "宿主层越界:{after} > {}(需先驱逐;在飞借台 {} 块)",
+                    self.budget_bytes, remain
+                )));
+            }
         }
+        // 本块来自借台 ⇒ 结算在飞计数
+        self.outstanding = self.outstanding.saturating_sub(1);
         self.resident.insert(block, buf);
         Ok(())
     }
@@ -410,12 +642,27 @@ impl<K: HostKey> HostTier<K> {
         self.free.len() * self.block_bytes
     }
 
+    /// 在飞借台字节（已计入共享预算，但既不在驻留也不在空转表）。
+    pub fn outstanding_bytes(&self) -> usize {
+        self.outstanding * self.block_bytes
+    }
+
     /// 驱逐累计字节。
     pub fn evicted_bytes(&self) -> u64 {
         self.evicted_bytes
     }
 
+    /// **释放空转缓冲**（跨腿让位/关层时用；drop 会把共享预算真正还给总账）。
+    pub fn drop_free(&mut self) {
+        self.free.clear();
+    }
+
     fn recycle(&mut self, buf: HostBlock) {
+        // 共享档：未入账的块（来自 `take`，预算已释放）不再留空转表 ——
+        // 留着会让 `free_slots` 虚高，且它已经不占共享账。
+        if self.shared.is_some() && !buf.is_accounted() {
+            return; // drop ⇒ 真释放
+        }
         if self.free.len() < self.free_cap {
             self.free.push(buf);
         }
@@ -473,7 +720,12 @@ impl SlotTable {
     }
 
     /// 片窗口(统一越界/溢出检查 —— put/get 同一条口径)。
-    fn window(&self, slot: ConnSlot, off: usize, len: usize) -> Result<std::ops::Range<usize>, ModelError> {
+    fn window(
+        &self,
+        slot: ConnSlot,
+        off: usize,
+        len: usize,
+    ) -> Result<std::ops::Range<usize>, ModelError> {
         let i = slot.0 as usize;
         let n = self.slots.len();
         let buf = self
@@ -547,7 +799,10 @@ mod tests {
             (ChainHash::new(2), HostBlock::from_bytes(vec![2u8; 1024])),
             (ChainHash::new(3), HostBlock::from_bytes(vec![3u8; 1024])),
         ];
-        assert!(matches!(t.land(items).expect_err("3 块超 2 块预算"), StoreError::Exhausted(_)));
+        assert!(matches!(
+            t.land(items).expect_err("3 块超 2 块预算"),
+            StoreError::Exhausted(_)
+        ));
         assert_eq!(t.used_bytes(), 0, "超预算 ⇒ 零副作用");
     }
 
@@ -557,13 +812,22 @@ mod tests {
     fn land_merges_duplicate_identity_loudly() {
         let mut t: HostTier = HostTier::new(1024, 2048).expect("构造");
         let k = ChainHash::new(1);
-        t.put(k, HostBlock::from_bytes(vec![1u8; 1024])).expect("先落");
+        t.put(k, HostBlock::from_bytes(vec![1u8; 1024]))
+            .expect("先落");
         t.land(vec![(k, HostBlock::from_bytes(vec![2u8; 1024]))])
             .expect("同身份 ⇒ 不该炸 turn");
         assert_eq!(t.used_bytes(), 1024, "不重复占预算(驻留只一份)");
         assert_eq!(t.resident_blocks().len(), 1, "驻留表不涨");
-        assert_eq!(t.free_bytes(), 1024, "旧副本进空转缓冲(RAM 复用,不白还又要)");
-        assert_eq!(t.get(k).map(|b| b.as_slice()[0]), Some(2), "留本次从设备搬来的那份");
+        assert_eq!(
+            t.free_bytes(),
+            1024,
+            "旧副本进空转缓冲(RAM 复用,不白还又要)"
+        );
+        assert_eq!(
+            t.get(k).map(|b| b.as_slice()[0]),
+            Some(2),
+            "留本次从设备搬来的那份"
+        );
         assert_eq!(t.duplicate_landings(), 1, "账漂指纹必须记账");
     }
 
@@ -593,7 +857,11 @@ mod tests {
             }
         }
         assert_eq!(ok + fail, 3);
-        assert_eq!(t.hint_failures(), fail, "上报计数须与块自述一致(ok={ok} fail={fail})");
+        assert_eq!(
+            t.hint_failures(),
+            fail,
+            "上报计数须与块自述一致(ok={ok} fail={fail})"
+        );
         // 大块 ≥ 2MiB 在 Linux+THP[madvise] 上应拿到提示(拿不到也不断言,只打印事实)
         let big = HostBlock::zeroed(4 << 20);
         eprintln!("[host] 4MiB 块大页提示生效 = {}(本机 THP 姿态见 /sys/kernel/mm/transparent_hugepage/enabled)", big.hugepage());
@@ -611,9 +879,21 @@ mod tests {
         let mut zero = [9u8; 8];
         t.get(ConnSlot(0), 4, &mut zero).expect("读槽 0");
         assert_eq!(zero, [0u8; 8], "槽 0 未被写");
-        assert!(matches!(t.put(ConnSlot(2), 0, &[0u8; 4]), Err(ModelError::Msg(_))), "槽号越界");
-        assert!(matches!(t.put(ConnSlot(0), 12, &[0u8; 8]), Err(ModelError::Msg(_))), "槽内越界");
-        assert!(matches!(t.get(ConnSlot(0), usize::MAX, &mut [0u8; 4]), Err(ModelError::Msg(_))), "偏移溢出");
+        assert!(
+            matches!(t.put(ConnSlot(2), 0, &[0u8; 4]), Err(ModelError::Msg(_))),
+            "槽号越界"
+        );
+        assert!(
+            matches!(t.put(ConnSlot(0), 12, &[0u8; 8]), Err(ModelError::Msg(_))),
+            "槽内越界"
+        );
+        assert!(
+            matches!(
+                t.get(ConnSlot(0), usize::MAX, &mut [0u8; 4]),
+                Err(ModelError::Msg(_))
+            ),
+            "偏移溢出"
+        );
         assert_eq!(t.tier_name(), "ram");
     }
 
@@ -635,7 +915,10 @@ mod tests {
         assert_eq!(t.evicted_bytes(), 1024);
         let c = t.acquire().expect("复用小块池");
         t.put(ChainHash::new(3), c).expect("驻留 C");
-        assert_eq!(t.resident_blocks(), vec![ChainHash::new(2), ChainHash::new(3)]);
+        assert_eq!(
+            t.resident_blocks(),
+            vec![ChainHash::new(2), ChainHash::new(3)]
+        );
     }
 
     #[test]
@@ -689,7 +972,13 @@ mod tests {
         let b = t.acquire().expect("块");
         t.put(ChainHash::new(9), b).expect("驻留");
         let b2 = t.acquire().expect("块");
-        assert!(matches!(t.put(ChainHash::new(9), b2), Err(StoreError::Invariant(_))));
-        assert!(matches!(t.take(ChainHash::new(77)), Err(StoreError::Unknown(_))));
+        assert!(matches!(
+            t.put(ChainHash::new(9), b2),
+            Err(StoreError::Invariant(_))
+        ));
+        assert!(matches!(
+            t.take(ChainHash::new(77)),
+            Err(StoreError::Unknown(_))
+        ));
     }
 }

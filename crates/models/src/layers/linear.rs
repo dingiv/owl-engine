@@ -6,11 +6,11 @@
 //! 全删;旧"装载期转置"是 naive-matmul 时代产物)。
 
 use crate::contract::Dtype;
-use crate::ops::SemanticKernel;
-use crate::layers::narrow_strided;
-use crate::module::{ForwardCtx, Loadable, LoaderCtx, LoaderOps, Module, QuantPlan, Weight};
 use crate::formats::gguf::GgmlTy;
 use crate::formats::util::marlin_n_pack;
+use crate::layers::narrow_strided;
+use crate::module::{ForwardCtx, Loadable, LoaderCtx, LoaderOps, Module, QuantPlan, Weight};
+use crate::ops::SemanticKernel;
 use crate::TensorOps;
 
 /// **GGUF 块型 GEMM**(两发、零解量化中间态;设计 §四 L5 calltree)
@@ -104,7 +104,11 @@ pub(crate) fn gguf_quant_gemm(
 ) -> TensorOps {
     // 形状律:xs = [.., in](空形状 = 声明失守 ⇒ **毒化**,不 panic)
     if xs.shape().is_empty() {
-        return TensorOps::poisoned(Dtype::F16, vec![out_dim], "GGUF GEMM: xs 形状为空(需 [.., in])");
+        return TensorOps::poisoned(
+            Dtype::F16,
+            vec![out_dim],
+            "GGUF GEMM: xs 形状为空(需 [.., in])",
+        );
     }
     let m: usize = xs.shape()[..xs.shape().len() - 1].iter().product();
     let k = in_dim;
@@ -198,7 +202,9 @@ pub(crate) fn gguf_quant_gemm(
         // (2·rows·k 字节,不进双缓冲 —— 发射序串行),27B 最大 96 MiB。
         // 行窗 = 96 MiB 预算档(原 `gguf_cublas_tile` 诊断覆盖已退役,2026-10-27)
         let budget_rows = (96usize << 20) / (k.max(1) * 2);
-        let tile = (budget_rows.clamp(128, 8 * 1024) / 64 * 64).min(out_dim).max(64);
+        let tile = (budget_rows.clamp(128, 8 * 1024) / 64 * 64)
+            .min(out_dim)
+            .max(64);
         // 首 tile 用**普通 Call**(由 eval 分配并 `track_new` 整块 y —— 账本上
         // "这个块是新分配的"必须只说一次);后续 tile 用 `CallDst` 写同一块
         // (同块别名,链式)。若首 tile 也用 CallDst,块从未被 `track_new`,
@@ -631,10 +637,7 @@ impl Linear {
             key,
             vec![self.in_dim / 16, n_pack * 16 / 8],
         ));
-        self.sc = Some(Weight::new_typed_scales(
-            key,
-            vec![self.in_dim / g, n_pack],
-        ));
+        self.sc = Some(Weight::new_typed_scales(key, vec![self.in_dim / g, n_pack]));
         self.ws = Some(Weight::new_typed_u32(
             key,
             vec![crate::ops::marlin_ws_elems(n_pack)],
@@ -666,16 +669,16 @@ impl Linear {
             key,
             vec![self.in_dim / 16, n_pack * 16 / 8],
         ));
-        self.sc = Some(Weight::new_typed_scales(
-            key,
-            vec![self.in_dim / g, n_pack],
-        ));
+        self.sc = Some(Weight::new_typed_scales(key, vec![self.in_dim / g, n_pack]));
         // zeros:pack_marlin_z 产出 (groups, n/8) i32 —— 与 scales 同组轴
         self.zs = Some(Weight::new_typed_u32(
             key,
             vec![self.in_dim / g, n_pack / 8],
         ));
-        self.ws = Some(Weight::new_typed_u32(key, vec![crate::ops::marlin_ws_elems(n_pack)]));
+        self.ws = Some(Weight::new_typed_u32(
+            key,
+            vec![crate::ops::marlin_ws_elems(n_pack)],
+        ));
         self.ctmp = Some(Weight::new_typed_u32(key, vec![1]));
         self.quant_group = Some(g);
     }
@@ -706,15 +709,15 @@ impl Linear {
             vec![self.in_dim / 16, n_pack * 16 / 8],
         ));
         // scales_a8 线 dtype = F16 槽(int16 归一位型;与 a16 同尺寸)
-        self.sc = Some(Weight::new_typed_scales(
-            key,
-            vec![self.in_dim / g, n_pack],
-        ));
+        self.sc = Some(Weight::new_typed_scales(key, vec![self.in_dim / g, n_pack]));
         self.zs = Some(Weight::new_typed_u32(
             key,
             vec![self.in_dim / g, n_pack / 8],
         ));
-        self.ws = Some(Weight::new_typed_u32(key, vec![crate::ops::marlin_ws_elems(n_pack)]));
+        self.ws = Some(Weight::new_typed_u32(
+            key,
+            vec![crate::ops::marlin_ws_elems(n_pack)],
+        ));
         self.ctmp = Some(Weight::new_typed_u32(key, vec![1]));
         // 全局因子(装载器填;核侧设备标量块)
         self.a8_factor = Some(Weight::new_typed(key, vec![1], Dtype::F32));
@@ -732,14 +735,14 @@ impl Module for Linear {
     /// 插 zeros 槽;kU4 has_zp 内核,组大小 32)。
     fn forward(&self, xs: &TensorOps, ctx: &ForwardCtx) -> TensorOps {
         let _ = ctx; // 层**不读 ctx 的 TP 面**(S4 ③':决策在解释器)
-        // **输出 dtype 钉定 + GGUF 动态范围护栏**(仅显式声明者)
-        //
-        // GGUF 块型 GEMM 的输出核写 `half*`(F16 上限 65504),而 BF16 执行域
-        // (DFlash2 草稿)的层输出实测可达 ~6e4 ⇒ 直接落 F16 会饱和成 inf。
-        // 成对移位:`x·2⁻⁶ →(GEMM)→ f16→bf16 → ·2⁶`。2 的幂在 f16/bf16 上
-        // **精确**,相对精度仍由 F16 尾数决定 ⇒ 与"BF16 输出 GEMM"等价。
-        // `2⁶` = 64× 上限余量(1.7e7 以下不饱和);F16 次正规临界 6e-8·2⁶
-        // 远低于 bf16 自身粒度 ⇒ 无可见损失。
+                     // **输出 dtype 钉定 + GGUF 动态范围护栏**(仅显式声明者)
+                     //
+                     // GGUF 块型 GEMM 的输出核写 `half*`(F16 上限 65504),而 BF16 执行域
+                     // (DFlash2 草稿)的层输出实测可达 ~6e4 ⇒ 直接落 F16 会饱和成 inf。
+                     // 成对移位:`x·2⁻⁶ →(GEMM)→ f16→bf16 → ·2⁶`。2 的幂在 f16/bf16 上
+                     // **精确**,相对精度仍由 F16 尾数决定 ⇒ 与"BF16 输出 GEMM"等价。
+                     // `2⁶` = 64× 上限余量(1.7e7 以下不饱和);F16 次正规临界 6e-8·2⁶
+                     // 远低于 bf16 自身粒度 ⇒ 无可见损失。
         const GEMM_SCALE: f32 = 64.0;
         let (xs, out_dt) = match self.out_dt {
             Some(dt) if self.gguf_ty.is_some() && dt != Dtype::F16 => {
@@ -862,9 +865,9 @@ impl Linear {
                 .with_shape(Dtype::F16, vec![m, n_pack]);
             return narrow_strided(&gemm, m, n_pack, 0, self.out_dim, vec![m, self.out_dim]);
         }
-        if let (Some(g), Some(qw), Some(sc), Some(ws), Some(ctmp)) = (
-            self.quant_group, &self.qw, &self.sc, &self.ws, &self.ctmp,
-        ) {
+        if let (Some(g), Some(qw), Some(sc), Some(ws), Some(ctmp)) =
+            (self.quant_group, &self.qw, &self.sc, &self.ws, &self.ctmp)
+        {
             let m: usize = xs.shape()[..xs.shape().len() - 1].iter().product();
             // n_pack = 打包档(= out_dim;pad 路线废案)
             let n_pack = marlin_n_pack(self.out_dim);
@@ -906,15 +909,11 @@ impl Linear {
                 .arg_usize(self.in_dim)
                 .arg_usize(n_pack)
                 .arg_usize(g)
-                .with_shape(if bf16_act { Dtype::BF16 } else { Dtype::F16 }, vec![m, n_pack]);
-            return narrow_strided(
-                &marlin,
-                m,
-                n_pack,
-                0,
-                self.out_dim,
-                vec![m, self.out_dim],
-            );
+                .with_shape(
+                    if bf16_act { Dtype::BF16 } else { Dtype::F16 },
+                    vec![m, n_pack],
+                );
+            return narrow_strided(&marlin, m, n_pack, 0, self.out_dim, vec![m, self.out_dim]);
         }
         xs.matmul_nt(&self.w.decl())
     }
@@ -950,13 +949,7 @@ impl Linear {
         // 装载期现算 fp4 + 块缩放 ⇒ 走 `Layout::NvFp4Weight`(host 变换)。
         // `gb`(per-tensor 全局缩放)也是装载期产物 ⇒ 经 `ScalarSink` 回填。
         if let (Some(qw), Some(sf)) = (&self.nv_q, &self.nv_sf) {
-            return qw.layout_as_nvfp4(
-                self.w.key(),
-                self.out_dim,
-                self.in_dim,
-                sf,
-                &self.nv_gb,
-            );
+            return qw.layout_as_nvfp4(self.w.key(), self.out_dim, self.in_dim, sf, &self.nv_gb);
         }
         // ---- W4A8 键族(S2):与 a16 键族**并列**,同源不同布局 ----
         if let (Some(_g), Some(qw), Some(sc), Some(zs), Some(ws), Some(ctmp), Some(fac)) = (
@@ -1039,7 +1032,6 @@ impl Linear {
     }
 }
 
-
 #[cfg(test)]
 mod tp_marking_tests {
     //! S4 ③':TP **标记**面(纯逻辑;插入动作在解释器 —— 真机数值由 G8 验)。
@@ -1057,7 +1049,10 @@ mod tp_marking_tests {
             ("gate_proj", WeightRule::UniformCol),
             ("up_proj", WeightRule::UniformCol),
             ("q_proj", WeightRule::UniformCol),
-            ("in_proj_qkvz", WeightRule::SegmentedCol(crate::plan::rules::SegKind::QKVZ)),
+            (
+                "in_proj_qkvz",
+                WeightRule::SegmentedCol(crate::plan::rules::SegKind::QKVZ),
+            ),
             ("in_proj_a", WeightRule::PerHead),
         ];
         for (key, want) in cases {
@@ -1084,8 +1079,11 @@ mod tp_marking_tests {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::testkit::{assert_close, f32b, harvest, hf_python, parity_enabled, skip_note, st_read, st_write, tmp_path, Src};
     use crate::tensor::Dtype;
+    use crate::testkit::{
+        assert_close, f32b, harvest, hf_python, parity_enabled, skip_note, st_read, st_write,
+        tmp_path, Src,
+    };
     use std::collections::HashMap;
 
     /// **W4A8 验收门(S2;GPU + 真检查点)**:同一条真实 AWQ 层,两条 plan
@@ -1173,26 +1171,27 @@ mod tests {
         }
         // ---- 判据:噪声/信号 RMS(a8 vs a16),每个 m 单独判 ----
         for (mi, &m) in ms.iter().enumerate() {
-        let (a16, a8) = (&got[0][mi], &got[1][mi]);
-        assert_eq!(a16.len(), a8.len());
-        let n = a16.len();
-        let rms = (a16.iter().map(|v| (*v as f64) * (*v as f64)).sum::<f64>() / n as f64).sqrt();
-        let d: f64 = a16
-            .iter()
-            .zip(a8)
-            .map(|(x, y)| ((x - y) as f64).abs())
-            .sum::<f64>()
-            / n as f64;
-        let noise = d / rms.max(1e-9);
-        let nan = a8.iter().filter(|v| !v.is_finite()).count();
-        eprintln!(
+            let (a16, a8) = (&got[0][mi], &got[1][mi]);
+            assert_eq!(a16.len(), a8.len());
+            let n = a16.len();
+            let rms =
+                (a16.iter().map(|v| (*v as f64) * (*v as f64)).sum::<f64>() / n as f64).sqrt();
+            let d: f64 = a16
+                .iter()
+                .zip(a8)
+                .map(|(x, y)| ((x - y) as f64).abs())
+                .sum::<f64>()
+                / n as f64;
+            let noise = d / rms.max(1e-9);
+            let nan = a8.iter().filter(|v| !v.is_finite()).count();
+            eprintln!(
             "[w4a8-ab] 真实层 {prefix}{local} m={m}: 噪声/信号 RMS = {noise:.5}(a16 信号 RMS={rms:.4});a8 非有限 {nan}"
         );
-        assert_eq!(nan, 0, "a8 输出含非有限值");
-        assert!(
-            noise < 1e-2,
-            "a8 与 a16 偏差过大(m={m}, {noise:.5})—— 布局/接线级错误距此量级 ≫ 10⁻¹"
-        );
+            assert_eq!(nan, 0, "a8 输出含非有限值");
+            assert!(
+                noise < 1e-2,
+                "a8 与 a16 偏差过大(m={m}, {noise:.5})—— 布局/接线级错误距此量级 ≫ 10⁻¹"
+            );
         }
     }
 
@@ -1206,28 +1205,46 @@ mod tests {
         let lin = Linear::new("l.w", 256, 256, QuantPlan::W4A8Awq);
 
         // ---- ① 声明面:键族与 dtype(设备重排档 = 生产默认) ----
-        let ctx = LoaderCtx { device_repack: true, ..Default::default() };
+        let ctx = LoaderCtx {
+            device_repack: true,
+            ..Default::default()
+        };
         let ops = lin.layout(&ctx);
         let wants: Vec<(String, Dtype)> = ops
             .wants()
             .iter()
             .map(|w| (w.key.clone(), w.dtype))
             .collect();
-        let has = |suf: &str, dt: Dtype| {
-            wants.iter().any(|(k, d)| k.ends_with(suf) && *d == dt)
-        };
+        let has = |suf: &str, dt: Dtype| wants.iter().any(|(k, d)| k.ends_with(suf) && *d == dt);
         assert!(
             has(".packed_raw", Dtype::U32),
             "设备重排档:B 走原始 packed 源键(U32 位型;经 a8 repack 核);实得 {wants:?}"
         );
-        assert!(has(".scales_a8", Dtype::F16), "scales_a8 = int16 位型塞 F16 槽");
+        assert!(
+            has(".scales_a8", Dtype::F16),
+            "scales_a8 = int16 位型塞 F16 槽"
+        );
         assert!(has(".zeros_a8", Dtype::U32), "zeros_a8");
         assert!(has(".a8_factor", Dtype::F32), "全局因子(设备标量块)");
-        assert!(!has(".qweight_a8", Dtype::U32), "设备档不得同时要 CPU 版 B(白跑全模重排)");
+        assert!(
+            !has(".qweight_a8", Dtype::U32),
+            "设备档不得同时要 CPU 版 B(白跑全模重排)"
+        );
         // CPU 档换键
-        let ctx_cpu = LoaderCtx { device_repack: false, ..Default::default() };
-        let cpu_keys: Vec<String> = lin.layout(&ctx_cpu).wants().iter().map(|w| w.key.clone()).collect();
-        assert!(cpu_keys.iter().any(|k| k.ends_with(".qweight_a8")), "CPU 档要 qweight_a8");
+        let ctx_cpu = LoaderCtx {
+            device_repack: false,
+            ..Default::default()
+        };
+        let cpu_keys: Vec<String> = lin
+            .layout(&ctx_cpu)
+            .wants()
+            .iter()
+            .map(|w| w.key.clone())
+            .collect();
+        assert!(
+            cpu_keys.iter().any(|k| k.ends_with(".qweight_a8")),
+            "CPU 档要 qweight_a8"
+        );
 
         // ---- ② 前向面:量化(quant_int8_row) → a8 GEMM,7 父 ----
         let xs = TensorOps::zeros(Dtype::F16, vec![8, 256]);
@@ -1235,14 +1252,16 @@ mod tests {
         // 外层是窄视图(与 a16 臂同款的 out_dim 裁切)
         let gemm = out.parents.first().expect("窄视图的父 = GEMM").clone();
         match &gemm.op {
-            crate::ops::Op::Call { op, .. } => assert_eq!(
-                op.op_id().0,
-                "marlin.w4a8_awq",
-                "a8 臂必须发 w4a8 语义动作"
-            ),
+            crate::ops::Op::Call { op, .. } => {
+                assert_eq!(op.op_id().0, "marlin.w4a8_awq", "a8 臂必须发 w4a8 语义动作")
+            }
             other => panic!("期望 Call(MarlinW4A8Awq),实得 {other:?}"),
         }
-        assert_eq!(gemm.parents.len(), 7, "a8 槽 7 父:q/b/scales/zeros/a_scales/ws/c_tmp");
+        assert_eq!(
+            gemm.parents.len(),
+            7,
+            "a8 槽 7 父:q/b/scales/zeros/a_scales/ws/c_tmp"
+        );
         // 第一父 = 量化输出(其 op 必须是量化动作)
         let q = gemm.parents[0].clone();
         match &q.op {
@@ -1320,18 +1339,32 @@ mod tests {
             return;
         }
         let (tokens, out_dim, in_dim) = (2usize, 2usize, 3usize);
-        let x: Vec<f32> = (0..tokens * in_dim).map(|i| ((i as f32 * 0.53) - 1.2).cos()).collect();
-        let w: Vec<f32> = (0..out_dim * in_dim).map(|i| (i as f32 * 0.29) - 0.5).collect();
+        let x: Vec<f32> = (0..tokens * in_dim)
+            .map(|i| ((i as f32 * 0.53) - 1.2).cos())
+            .collect();
+        let w: Vec<f32> = (0..out_dim * in_dim)
+            .map(|i| (i as f32 * 0.29) - 0.5)
+            .collect();
         let xs = TensorOps::from_host(Dtype::F32, vec![tokens, in_dim], &f32b(&x));
         let ctx = ForwardCtx::minimal(tokens);
 
         let inp = tmp_path("linear_in");
         let outp = tmp_path("linear_out");
-        st_write(&inp, &[("x", &x, vec![tokens, in_dim]), ("w", &w, vec![out_dim, in_dim])]);
-        let manifest = hf_python("linear.py", &[
-            inp.to_str().unwrap(), outp.to_str().unwrap(),
-            &format!(r#"{{"out": {out_dim}, "in": {in_dim}}}"#),
-        ]);
+        st_write(
+            &inp,
+            &[
+                ("x", &x, vec![tokens, in_dim]),
+                ("w", &w, vec![out_dim, in_dim]),
+            ],
+        );
+        let manifest = hf_python(
+            "linear.py",
+            &[
+                inp.to_str().unwrap(),
+                outp.to_str().unwrap(),
+                &format!(r#"{{"out": {out_dim}, "in": {in_dim}}}"#),
+            ],
+        );
         eprintln!("[hf manifest] linear: {manifest}");
         let want = st_read(&outp, "y");
 
@@ -1341,14 +1374,16 @@ mod tests {
                 let lin = Linear::new("w", out_dim, in_dim, QuantPlan::F16);
                 let src = HashMap::from([("w".to_string(), w.clone())]);
                 crate::interpreters::eval_load(&lin, &mut face, &src, &Default::default())
-                    .await.expect("eval_load");
+                    .await
+                    .expect("eval_load");
                 ("cpu", harvest(&mut face, &lin.forward(&xs, &ctx)).await)
             } else {
                 let mut gpu = crate::testkit::gpu_client().await;
                 let lin = Linear::new("w", out_dim, in_dim, QuantPlan::F16);
                 let src = HashMap::from([("w".to_string(), w.clone())]);
                 crate::interpreters::eval_load(&lin, &mut gpu, &src, &Default::default())
-                    .await.expect("eval_load");
+                    .await
+                    .expect("eval_load");
                 let o = harvest(&mut gpu, &lin.forward(&xs, &ctx)).await;
                 gpu.close().await.expect("server 关机");
                 ("gpu", o)
@@ -1385,7 +1420,11 @@ mod tests {
         let xs = TensorOps::zeros(Dtype::F16, vec![GGUF_CUBLAS_MIN_M, in_dim]);
 
         let all = crate::env::GgufEnv::default();
-        assert_eq!(first_call(&lin.forward_inner(&xs, &all)), "gguf.mmq2", "缺省第一臂");
+        assert_eq!(
+            first_call(&lin.forward_inner(&xs, &all)),
+            "gguf.mmq2",
+            "缺省第一臂"
+        );
 
         let mut a = all;
         a.mmq2 = false;
@@ -1396,15 +1435,31 @@ mod tests {
         );
 
         a.cublas = false;
-        assert_eq!(first_call(&lin.forward_inner(&xs, &a)), "gguf.mmq", "关 cuBLAS ⇒ MMQ");
+        assert_eq!(
+            first_call(&lin.forward_inner(&xs, &a)),
+            "gguf.mmq",
+            "关 cuBLAS ⇒ MMQ"
+        );
 
         a.mmq = false;
-        assert_eq!(first_call(&lin.forward_inner(&xs, &a)), "gguf.gemm_smem", "关 MMQ ⇒ smem");
+        assert_eq!(
+            first_call(&lin.forward_inner(&xs, &a)),
+            "gguf.gemm_smem",
+            "关 MMQ ⇒ smem"
+        );
 
         a.smem = false;
-        assert_eq!(first_call(&lin.forward_inner(&xs, &a)), "gguf.gemm_tile", "关 smem ⇒ 复用臂");
+        assert_eq!(
+            first_call(&lin.forward_inner(&xs, &a)),
+            "gguf.gemm_tile",
+            "关 smem ⇒ 复用臂"
+        );
 
         a.tile = false;
-        assert_eq!(first_call(&lin.forward_inner(&xs, &a)), "gguf.gemm", "全关 ⇒ MMVQ 路(纯 gguf.gemm)");
+        assert_eq!(
+            first_call(&lin.forward_inner(&xs, &a)),
+            "gguf.gemm",
+            "全关 ⇒ MMVQ 路(纯 gguf.gemm)"
+        );
     }
 }

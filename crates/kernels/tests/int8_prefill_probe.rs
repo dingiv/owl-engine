@@ -405,7 +405,14 @@ fn int8_prefill_correctness_multi_page() {
     )
     .unwrap();
     r.sync().unwrap();
-    r.download(CheckBuf { ptr: dout.ptr, bytes: out.len() }, &mut out).unwrap();
+    r.download(
+        CheckBuf {
+            ptr: dout.ptr,
+            bytes: out.len(),
+        },
+        &mut out,
+    )
+    .unwrap();
     let got: Vec<f32> = out
         .chunks_exact(2)
         .map(|c| f16_to_f32(u16::from_le_bytes([c[0], c[1]])))
@@ -467,7 +474,6 @@ fn int8_prefill_correctness_multi_page() {
     assert!(mx < 2e-2, "max|d| {mx}");
 }
 
-
 /// f16 PV production kernel: P f16 x256, V f16 shadow token-major, f16 acc.
 #[test]
 fn int8_prefill_f16pv_correctness_small() {
@@ -481,11 +487,21 @@ fn int8_prefill_f16pv_correctness_small() {
     const SMEM_F16: u32 = 16384 + 8192 + 16384 + 4096 + 1024;
     let mut res = fi_support::TestRes::new(dev);
     let mut exec = Exec::new();
-    let mut r = Runner { res: &mut res, exec: &mut exec, registry: None };
+    let mut r = Runner {
+        res: &mut res,
+        exec: &mut exec,
+        registry: None,
+    };
 
-    let q = lcg_u8(T * HQ * D, 0x1111).iter().map(|&x| (x as i8) as u8).collect::<Vec<u8>>();
+    let q = lcg_u8(T * HQ * D, 0x1111)
+        .iter()
+        .map(|&x| (x as i8) as u8)
+        .collect::<Vec<u8>>();
     let qs = lcg_f32(T * HQ * 8, 0x2222, 0.004, 0.004);
-    let k = lcg_u8(L * HKV * D, 0x3333).iter().map(|&x| (x as i8) as u8).collect::<Vec<u8>>();
+    let k = lcg_u8(L * HKV * D, 0x3333)
+        .iter()
+        .map(|&x| (x as i8) as u8)
+        .collect::<Vec<u8>>();
     let ks = lcg_f32(L * HKV * 8, 0x4444, 0.004, 0.004);
     let v16: Vec<u16> = (0..L * HKV * D)
         .map(|i| {
@@ -517,19 +533,40 @@ fn int8_prefill_f16pv_correctness_small() {
     r.upload(dbt, &btb).unwrap();
 
     let vals = [
-        LaunchVal::Ptr(dq.ptr), LaunchVal::Ptr(dqs.ptr),
-        LaunchVal::Ptr(dk.ptr), LaunchVal::Ptr(dks.ptr),
-        LaunchVal::Ptr(dv.ptr), LaunchVal::Ptr(dbt.ptr),
+        LaunchVal::Ptr(dq.ptr),
+        LaunchVal::Ptr(dqs.ptr),
+        LaunchVal::Ptr(dk.ptr),
+        LaunchVal::Ptr(dks.ptr),
+        LaunchVal::Ptr(dv.ptr),
+        LaunchVal::Ptr(dbt.ptr),
         LaunchVal::Ptr(dout.ptr),
-        LaunchVal::I32(T as i32), LaunchVal::I32(L as i32),
-        LaunchVal::I32(HQ as i32), LaunchVal::I32(HKV as i32),
-        LaunchVal::I32(PAGE as i32), LaunchVal::I32((L - T) as i32),
-        LaunchVal::Ptr(dout.ptr), LaunchVal::Ptr(dout.ptr),
+        LaunchVal::I32(T as i32),
+        LaunchVal::I32(L as i32),
+        LaunchVal::I32(HQ as i32),
+        LaunchVal::I32(HKV as i32),
+        LaunchVal::I32(PAGE as i32),
+        LaunchVal::I32((L - T) as i32),
+        LaunchVal::Ptr(dout.ptr),
+        LaunchVal::Ptr(dout.ptr),
     ];
-    r.launch_aot(ENTRY_F16PV, SRC_F16PV, (1, HQ as u32, 1), (128, 1, 1), SMEM_F16, &vals)
-        .unwrap();
+    r.launch_aot(
+        ENTRY_F16PV,
+        SRC_F16PV,
+        (1, HQ as u32, 1),
+        (128, 1, 1),
+        SMEM_F16,
+        &vals,
+    )
+    .unwrap();
     r.sync().unwrap();
-    r.download(CheckBuf { ptr: dout.ptr, bytes: out.len() }, &mut out).unwrap();
+    r.download(
+        CheckBuf {
+            ptr: dout.ptr,
+            bytes: out.len(),
+        },
+        &mut out,
+    )
+    .unwrap();
     let got: Vec<f32> = out
         .chunks_exact(2)
         .map(|c| f16_to_f32(u16::from_le_bytes([c[0], c[1]])))
@@ -666,7 +703,14 @@ fn int8_prefill_1024_tail_rows_match_host() {
     )
     .unwrap();
     r.sync().unwrap();
-    r.download(CheckBuf { ptr: dout.ptr, bytes: out.len() }, &mut out).unwrap();
+    r.download(
+        CheckBuf {
+            ptr: dout.ptr,
+            bytes: out.len(),
+        },
+        &mut out,
+    )
+    .unwrap();
     let got: Vec<f32> = out
         .chunks_exact(2)
         .map(|c| f16_to_f32(u16::from_le_bytes([c[0], c[1]])))
@@ -818,7 +862,14 @@ fn int8_prefill_chunk_tail_rows_match_host() {
     )
     .unwrap();
     r.sync().unwrap();
-    r.download(CheckBuf { ptr: dout.ptr, bytes: out.len() }, &mut out).unwrap();
+    r.download(
+        CheckBuf {
+            ptr: dout.ptr,
+            bytes: out.len(),
+        },
+        &mut out,
+    )
+    .unwrap();
     let got: Vec<f32> = out
         .chunks_exact(2)
         .map(|c| f16_to_f32(u16::from_le_bytes([c[0], c[1]])))

@@ -128,7 +128,10 @@ pub struct StagingLayout {
 impl StagingLayout {
     /// 默认布局(32 MiB × 2)。
     pub const fn default_layout() -> Self {
-        Self { slot_bytes: SLOT_BYTES, slots: N_SLOTS }
+        Self {
+            slot_bytes: SLOT_BYTES,
+            slots: N_SLOTS,
+        }
     }
 
     pub const fn new(slot_bytes: u64, slots: u32) -> Self {
@@ -181,7 +184,11 @@ impl ArPlan {
 pub fn plan_ar(bytes: u64, layout: &StagingLayout) -> ArPlan {
     let slot = layout.slot_bytes.max(1);
     let calls = bytes.div_ceil(slot) as u32;
-    ArPlan { bytes, slot_bytes: layout.slot_bytes, calls }
+    ArPlan {
+        bytes,
+        slot_bytes: layout.slot_bytes,
+        calls,
+    }
 }
 
 /// allreduce 的调用阶段(两核交替:I5 两侧序列同构的载体)
@@ -227,8 +234,14 @@ impl AllReduce {
     pub fn steps(&self) -> Vec<(ArPhase, ArChunk)> {
         let mut out = Vec::with_capacity(self.plan.calls as usize * 2);
         for i in 0..self.plan.calls {
-            let Some((offset, bytes)) = self.plan.chunk(i) else { break };
-            let c = ArChunk { index: i, offset, bytes };
+            let Some((offset, bytes)) = self.plan.chunk(i) else {
+                break;
+            };
+            let c = ArChunk {
+                index: i,
+                offset,
+                bytes,
+            };
             out.push((ArPhase::Stage, c));
             out.push((ArPhase::Reduce, c));
         }
@@ -253,7 +266,11 @@ mod tests {
         let l = StagingLayout::default_layout();
         assert_eq!(l.slot_offset(0), Some(HEADER_BYTES));
         assert_eq!(l.slot_offset(1), Some(HEADER_BYTES + (32 << 20)));
-        assert_eq!(l.slot_offset(2), None, "越界 slot 必须返回 None(不许静默钳位)");
+        assert_eq!(
+            l.slot_offset(2),
+            None,
+            "越界 slot 必须返回 None(不许静默钳位)"
+        );
         assert_eq!(l.slot_of(0), 0);
         assert_eq!(l.slot_of(1), 1);
         assert_eq!(l.slot_of(2), 0, "乒乓:第 2 次回到 slot 0");

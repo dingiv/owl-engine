@@ -60,7 +60,10 @@ pub fn open(path: impl AsRef<Path>) -> Result<File> {
 
 /// 追加模式开句柄(日志落盘;不存在则建)
 pub fn append(path: impl AsRef<Path>) -> Result<File> {
-    std::fs::OpenOptions::new().create(true).append(true).open(path)
+    std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)
 }
 
 /// 重命名(日志 rotation;跨设备会 Err,调用方处理)

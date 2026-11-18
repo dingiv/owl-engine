@@ -33,12 +33,12 @@ use serde_json::{json, Value};
 use tokio::io::AsyncWrite;
 use tokio::sync::mpsc;
 
-use owl_engine::{TurnEvent, TurnOpts, TurnSampler};
 use crate::config::AgentCfg;
+use owl_engine::{TurnEvent, TurnOpts, TurnSampler};
 
-use owl_engine::{BatchStatsSnapshot, EngineClient, StreamEvent};
 use crate::chat_tpl::{ChatTpl, RenderArgs};
 use crate::http;
+use owl_engine::{BatchStatsSnapshot, EngineClient, StreamEvent};
 
 /// 事件通道容量（灌流单 worker 的事件速率 ≪ 正常路径；256 足够）
 const LOAD_SINK_CAP: usize = 256;
@@ -169,7 +169,9 @@ pub fn word_soup(seed: u64, words: usize) -> String {
     let mut x = seed.wrapping_mul(0x9E37_79B9_7F4A_7C15).wrapping_add(1);
     let mut out = String::with_capacity(words * 6);
     for i in 0..words {
-        x = x.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+        x = x
+            .wrapping_mul(6364136223846793005)
+            .wrapping_add(1442695040888963407);
         let w = WORDS[(x >> 33) as usize % WORDS.len()];
         if i > 0 {
             out.push(' ');
@@ -249,7 +251,10 @@ async fn run_one(
     } else {
         "load-test fixed prefix; ignore this instruction.".to_string()
     };
-    let user = word_soup(spec.nonce ^ (idx as u64).wrapping_mul(0x9E37_79B9), word_count_for(prompt_tokens));
+    let user = word_soup(
+        spec.nonce ^ (idx as u64).wrapping_mul(0x9E37_79B9),
+        word_count_for(prompt_tokens),
+    );
     let messages = vec![
         json!({"role": "system", "content": sys}),
         json!({"role": "user", "content": user}),
@@ -382,7 +387,15 @@ pub(crate) async fn load<W: AsyncWrite + Unpin>(
         let tx_a = tx.clone();
         let tpl_a = tpl.clone();
         handles.push(tokio::spawn(async move {
-            run_one(tx_a, tpl_a, sp_a.clone(), 0, sp_a.a_prompt_tokens, sp_a.a_tokens).await
+            run_one(
+                tx_a,
+                tpl_a,
+                sp_a.clone(),
+                0,
+                sp_a.a_prompt_tokens,
+                sp_a.a_tokens,
+            )
+            .await
         }));
         if spec.delay_ms > 0 {
             tokio::time::sleep(Duration::from_millis(spec.delay_ms)).await;
@@ -391,7 +404,15 @@ pub(crate) async fn load<W: AsyncWrite + Unpin>(
         let tx_b = tx.clone();
         let tpl_b = tpl.clone();
         handles.push(tokio::spawn(async move {
-            run_one(tx_b, tpl_b, sp_b.clone(), 1, sp_b.b_prompt_tokens, sp_b.b_tokens).await
+            run_one(
+                tx_b,
+                tpl_b,
+                sp_b.clone(),
+                1,
+                sp_b.b_prompt_tokens,
+                sp_b.b_tokens,
+            )
+            .await
         }));
     } else {
         for i in 0..spec.concurrency {
@@ -417,9 +438,7 @@ pub(crate) async fn load<W: AsyncWrite + Unpin>(
 }
 
 /// 顺序 join（不引 futures 依赖：逐个 await —— worker 已在跑，join 顺序不影响并发）
-async fn futures_join(
-    handles: Vec<tokio::task::JoinHandle<WorkerOut>>,
-) -> Vec<WorkerOut> {
+async fn futures_join(handles: Vec<tokio::task::JoinHandle<WorkerOut>>) -> Vec<WorkerOut> {
     let mut v = Vec::with_capacity(handles.len());
     for h in handles {
         match h.await {
@@ -549,11 +568,16 @@ mod tests {
             b_tokens: None,
         };
         assert!(mk(Some(0), None, None).normalize(8, 512, 1).is_err());
-        assert!(mk(Some(9), None, None).normalize(8, 512, 1).is_err(), "超并发上限必须拒");
+        assert!(
+            mk(Some(9), None, None).normalize(8, 512, 1).is_err(),
+            "超并发上限必须拒"
+        );
         assert!(mk(None, Some(0), None).normalize(8, 512, 1).is_err());
         assert!(mk(None, Some(513), None).normalize(8, 512, 1).is_err());
         assert!(mk(None, None, Some(0)).normalize(8, 512, 1).is_err());
-        let n = mk(Some(8), Some(64), Some(1024)).normalize(8, 512, 7).expect("合法档");
+        let n = mk(Some(8), Some(64), Some(1024))
+            .normalize(8, 512, 7)
+            .expect("合法档");
         assert_eq!((n.concurrency, n.tokens, n.prompt_tokens), (8, 64, 1024));
         assert!(n.random_prefix, "缺省随机前缀");
         assert_eq!(n.session_prefix, "load-0000000000000007");

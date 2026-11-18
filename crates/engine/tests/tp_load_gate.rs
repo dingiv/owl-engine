@@ -51,7 +51,8 @@ async fn load_once<F: DeviceClient>(
         Qwen35Convention::new(rep.keys_base.trim_end_matches('.')),
         QuantPlan::F16,
         QuantPlan::F16,
-    ).expect("Model::new");
+    )
+    .expect("Model::new");
     let opts = LoadOpts {
         dtype: spec.dtype,
         shard: n,
@@ -94,7 +95,9 @@ fn expected_slice(
     // 参考 = plan_span 的"全量 → 分片"正向读序列(与装载面同一条纯算术;
     // ⚠️ 行宽两维不同:目标 = 分片行宽,源 = **全量**行宽 —— 列切时二者不等,
     // 这正是 2026-10-17 首跑踩到的错位)
-    let (span, shard_shape) = plan_span(rule, shape, plan, segs, want_axis(key)).expect("plan_span").expect("需切分");
+    let (span, shard_shape) = plan_span(rule, shape, plan, segs, want_axis(key))
+        .expect("plan_span")
+        .expect("需切分");
     let tgt_w = shard_shape[1..].iter().product::<usize>().max(1);
     let src_w = shape[1..].iter().product::<usize>().max(1);
     let n_tgt: usize = shard_shape.iter().product();
@@ -132,10 +135,20 @@ async fn tp_load_body(dir: &Path) {
     let mut face = CpuFace::new();
     let t0 = std::time::Instant::now();
     let full = load_once(dir, &mut face, (0, 1)).await.expect("全量装载");
-    eprintln!("[tp-load] 全量装载 {} 键 / {:.1}s", full.0.len(), t0.elapsed().as_secs_f64());
+    eprintln!(
+        "[tp-load] 全量装载 {} 键 / {:.1}s",
+        full.0.len(),
+        t0.elapsed().as_secs_f64()
+    );
     let t1 = std::time::Instant::now();
-    let shard = load_once(dir, &mut face, (0, 2)).await.expect("分片装载(0/2)");
-    eprintln!("[tp-load] 分片装载 {} 键 / {:.1}s", shard.0.len(), t1.elapsed().as_secs_f64());
+    let shard = load_once(dir, &mut face, (0, 2))
+        .await
+        .expect("分片装载(0/2)");
+    eprintln!(
+        "[tp-load] 分片装载 {} 键 / {:.1}s",
+        shard.0.len(),
+        t1.elapsed().as_secs_f64()
+    );
 
     let plan = TpPlan::new(0, 2).unwrap();
     // 抽样键(覆盖 UnformCol / UniformRow / SegmentedCol / PerHead / Replicate)
@@ -149,8 +162,8 @@ async fn tp_load_body(dir: &Path) {
         "input_layernorm.weight",          // Replicate(小)
         // ⭐ 2026-10-17 G8 定谳补列:**大 Replicate 键**(embed/lm_head 各 508MB,
         // 走"超槽键流式"分段路)—— G8 的分歧在 embed 就出现,嫌疑就在这条路上。
-        "embed_tokens.weight",             // Replicate(大;流式 16 段)
-        // (0.8B 是 tied 检查点:无 lm_head.weight —— 大键只 embed 一个) 
+        "embed_tokens.weight", // Replicate(大;流式 16 段)
+                               // (0.8B 是 tied 检查点:无 lm_head.weight —— 大键只 embed 一个)
     ];
     let mut checked = 0usize;
     for tail in keys {
@@ -224,7 +237,9 @@ async fn gpu_timing(dir: &Path) {
         }
     };
     let t = std::time::Instant::now();
-    let full = load_once(dir, &mut face, (0, 1)).await.expect("GPU 装载(全量)");
+    let full = load_once(dir, &mut face, (0, 1))
+        .await
+        .expect("GPU 装载(全量)");
     let dt_full = t.elapsed();
     eprintln!(
         "[tp-load] GPU 生产口径:全量 shard=1 —— {} 键 / {:.2}s",
@@ -232,7 +247,9 @@ async fn gpu_timing(dir: &Path) {
         dt_full.as_secs_f64()
     );
     let t = std::time::Instant::now();
-    let shard = load_once(dir, &mut face, (0, 2)).await.expect("GPU 装载(分片)");
+    let shard = load_once(dir, &mut face, (0, 2))
+        .await
+        .expect("GPU 装载(分片)");
     let dt_shard = t.elapsed();
     eprintln!(
         "[tp-load] GPU 生产口径:分片 shard=2 slice=0 —— {} 键 / {:.2}s(比值 {:.2}×)",

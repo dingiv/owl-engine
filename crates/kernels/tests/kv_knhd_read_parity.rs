@@ -19,7 +19,9 @@ const HD: usize = 256;
 const PAGE: usize = 32;
 const NB: usize = 6; // 池块数
 const CTX: usize = 96; // 上下文 token 数(3 块)
-fn scale_f32() -> f32 { 1.0 / ((HD as f32).sqrt()) }
+fn scale_f32() -> f32 {
+    1.0 / ((HD as f32).sqrt())
+}
 
 fn half_bits(f: f32) -> u16 {
     half::f16::from_f32(f).to_bits()
@@ -49,8 +51,11 @@ fn compile(ctx: &Arc<CudaContext>, src: &str, name: &str) -> cudarc::driver::Cud
         },
     )
     .unwrap_or_else(|e| panic!("nvrtc({name}): {e:?}"));
-    let m = ctx.load_module(ptx).unwrap_or_else(|e| panic!("module({name}): {e:?}"));
-    m.load_function(name).unwrap_or_else(|e| panic!("fn({name}): {e:?}"))
+    let m = ctx
+        .load_module(ptx)
+        .unwrap_or_else(|e| panic!("module({name}): {e:?}"));
+    m.load_function(name)
+        .unwrap_or_else(|e| panic!("fn({name}): {e:?}"))
 }
 
 /// 双池生成:同一逻辑值序列,按两布局落位。gen(slot,h,d) = 值位型。
@@ -62,7 +67,10 @@ enum PoolKind {
     KClassic,
     VClassic,
 }
-fn fill_pools_u16(kind: PoolKind, gen: impl Fn(usize, usize, usize) -> u16) -> (Vec<u16>, Vec<u16>) {
+fn fill_pools_u16(
+    kind: PoolKind,
+    gen: impl Fn(usize, usize, usize) -> u16,
+) -> (Vec<u16>, Vec<u16>) {
     let n = NB * PAGE * HKV * HD;
     let mut c = vec![0u16; n];
     let mut k = vec![0u16; n];
@@ -106,7 +114,9 @@ fn paged_decode_v2_knhd_parity() {
     ctx.bind_to_thread().expect("bind");
     let stream: Arc<CudaStream> = ctx.default_stream();
 
-    let q: Vec<u16> = (0..HQ * HD).map(|i| half_bits(((i * 41) % 173) as f32 / 13.0 - 6.0)).collect();
+    let q: Vec<u16> = (0..HQ * HD)
+        .map(|i| half_bits(((i * 41) % 173) as f32 / 13.0 - 6.0))
+        .collect();
     let block_tables = [0f32, 1.0, 2.0, 3.0]; // 单序列恒等页表
     let context_lens = [CTX as f32];
     let nparts = 1usize;
@@ -156,7 +166,14 @@ fn paged_decode_v2_knhd_parity() {
     }
 
     let run = |name: &str, kcp: &[u16], vcp: &[u16], kstride: i32| -> Vec<u16> {
-        let f = compile(&ctx, owl_kernels::cu_sig::cu_text(owl_kernels::ops::source("vllm_paged_attention_v2_fp8_knhd_hd256bs32")).as_str(), name);
+        let f = compile(
+            &ctx,
+            owl_kernels::cu_sig::cu_text(owl_kernels::ops::source(
+                "vllm_paged_attention_v2_fp8_knhd_hd256bs32",
+            ))
+            .as_str(),
+            name,
+        );
         let mut d_q = unsafe { stream.alloc::<u16>(q.len()) }.unwrap();
         stream.memcpy_htod(&q, &mut d_q).unwrap();
         let mut d_kc = unsafe { stream.alloc::<u16>(kcp.len()) }.unwrap();
@@ -251,10 +268,19 @@ fn paged_decode_v2_knhd_parity() {
             }
             logits[s] = dot * scale_f32();
         }
-        if h == 0 { eprintln!("[hlog] rust logits[0..4] = {:?}", &logits[0..4]); }
+        if h == 0 {
+            eprintln!("[hlog] rust logits[0..4] = {:?}", &logits[0..4]);
+        }
         let m = logits.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
         let mut sum = 0f32;
-        let w: Vec<f32> = logits.iter().map(|&l| { let e = (l - m).exp(); sum += e; e }).collect();
+        let w: Vec<f32> = logits
+            .iter()
+            .map(|&l| {
+                let e = (l - m).exp();
+                sum += e;
+                e
+            })
+            .collect();
         for d in 0..HD {
             let mut acc = 0f32;
             for s in 0..CTX {
@@ -264,9 +290,20 @@ fn paged_decode_v2_knhd_parity() {
         }
     }
     let near = |a: &u16, b: &f32| (half::f16::from_bits(*a).to_f32() - *b).abs() < 5e-2;
-    let c_ok = out_c.iter().zip(host_ref.iter()).filter(|(a, b)| !near(a, b)).count();
-    let n_ok = out_n.iter().zip(host_ref.iter()).filter(|(a, b)| !near(a, b)).count();
-    eprintln!("[ref] host 参考比对:classic 离谱 {c_ok}/{} knhd 离谱 {n_ok}(容差 5e-2)", out_c.len());
+    let c_ok = out_c
+        .iter()
+        .zip(host_ref.iter())
+        .filter(|(a, b)| !near(a, b))
+        .count();
+    let n_ok = out_n
+        .iter()
+        .zip(host_ref.iter())
+        .filter(|(a, b)| !near(a, b))
+        .count();
+    eprintln!(
+        "[ref] host 参考比对:classic 离谱 {c_ok}/{} knhd 离谱 {n_ok}(容差 5e-2)",
+        out_c.len()
+    );
     eprintln!("[ref] host_ref[0..4] = {:?}", &host_ref[..4]);
 
     // 竞态判别:classic 连跑两次
@@ -295,18 +332,35 @@ fn paged_decode_v2_knhd_parity() {
     );
     let diag_same = out_diag == out_c;
     eprintln!("[diag] knhd入口×classic池×classic.stride == classic输出? {diag_same}");
-    let diff_n = out_diag.iter().zip(out_n.iter()).filter(|(a, b)| a != b).count();
-    eprintln!("[diag] knhd入口 classic池 vs knhd池 差异数 {diff_n}/{}", out_c.len());
+    let diff_n = out_diag
+        .iter()
+        .zip(out_n.iter())
+        .filter(|(a, b)| a != b)
+        .count();
+    eprintln!(
+        "[diag] knhd入口 classic池 vs knhd池 差异数 {diff_n}/{}",
+        out_c.len()
+    );
     let mut c_nonzero = 0usize;
     for (i, (&a, &b)) in out_c.iter().zip(out_n.iter()).enumerate() {
         if i < 4 {
-            eprintln!("[diag] out_c[{i}] = {:?} (0x{:04x})  out_n[{i}] = {:?} (0x{:04x})",
-                half::f16::from_bits(a), a, half::f16::from_bits(b), b);
+            eprintln!(
+                "[diag] out_c[{i}] = {:?} (0x{:04x})  out_n[{i}] = {:?} (0x{:04x})",
+                half::f16::from_bits(a),
+                a,
+                half::f16::from_bits(b),
+                b
+            );
         }
-        if a != 0 { c_nonzero += 1; }
+        if a != 0 {
+            c_nonzero += 1;
+        }
     }
     let n_nz = out_n.iter().filter(|&&v| v != 0).count();
-    eprintln!("[diag] out_c 非零 {c_nonzero}/{}  out_n 非零 {n_nz}", out_c.len());
+    eprintln!(
+        "[diag] out_c 非零 {c_nonzero}/{}  out_n 非零 {n_nz}",
+        out_c.len()
+    );
     for head in 0..2 {
         let bits: Vec<u32> = (0..6).map(|d| out_n[head * HD + d] as u32).collect();
         eprintln!("[diag] out_n head{head} d0..6 bits = {bits:08x?}");
@@ -314,15 +368,30 @@ fn paged_decode_v2_knhd_parity() {
     // 头间是否重复(只算了 head 0 并广播?)
     eprintln!("[diag] head0==head1? {}", out_n[0..HD] == out_n[HD..2 * HD]);
 
-    let bad = out_c.iter().zip(out_n.iter()).filter(|(a, b)| a != b).count();
+    let bad = out_c
+        .iter()
+        .zip(out_n.iter())
+        .filter(|(a, b)| a != b)
+        .count();
     assert_eq!(bad, 0, "v2 f16 decode parity:{bad} 处位型不符");
     assert!(out_c.iter().any(|&v| v != 0), "v2 f16 全零输出(装配错)");
 
     // ---- fp8 变体(e4m3 字节池;避 0x7F/0xFF NaN)----
-    let (kc_c8, kc_n8) = fill_pools_u8(PoolKind::KClassic, |s, h, d| (((s * 29 + h * 13 + d) % 120) + 1) as u8);
-    let (vc_c8, vc_n8) = fill_pools_u8(PoolKind::VClassic, |s, h, d| (((s * 31 + h * 17 + d) % 120) + 1) as u8);
+    let (kc_c8, kc_n8) = fill_pools_u8(PoolKind::KClassic, |s, h, d| {
+        (((s * 29 + h * 13 + d) % 120) + 1) as u8
+    });
+    let (vc_c8, vc_n8) = fill_pools_u8(PoolKind::VClassic, |s, h, d| {
+        (((s * 31 + h * 17 + d) % 120) + 1) as u8
+    });
     let run8 = |name: &str, kcp: &[u8], vcp: &[u8], kstride: i32| -> Vec<u16> {
-        let f = compile(&ctx, owl_kernels::cu_sig::cu_text(owl_kernels::ops::source("vllm_paged_attention_v2_fp8_knhd_hd256bs32")).as_str(), name);
+        let f = compile(
+            &ctx,
+            owl_kernels::cu_sig::cu_text(owl_kernels::ops::source(
+                "vllm_paged_attention_v2_fp8_knhd_hd256bs32",
+            ))
+            .as_str(),
+            name,
+        );
         let mut d_q = unsafe { stream.alloc::<u16>(q.len()) }.unwrap();
         stream.memcpy_htod(&q, &mut d_q).unwrap();
         let mut d_kc = unsafe { stream.alloc::<u8>(kcp.len()) }.unwrap();
@@ -401,7 +470,11 @@ fn paged_decode_v2_knhd_parity() {
         &vc_n8,
         HD as i32,
     );
-    let bad8 = out_c8.iter().zip(out_n8.iter()).filter(|(a, b)| a != b).count();
+    let bad8 = out_c8
+        .iter()
+        .zip(out_n8.iter())
+        .filter(|(a, b)| a != b)
+        .count();
     assert_eq!(bad8, 0, "v2 fp8 decode parity:{bad8} 处位型不符");
     assert!(out_c8.iter().any(|&v| v != 0), "v2 fp8 全零输出(装配错)");
 }
@@ -429,7 +502,14 @@ fn prefill_split_knhd_parity() {
     });
 
     let run = |name: &str, kcp: &[u16], vcp: &[u16], kstride: i32| -> (Vec<u16>, Vec<f32>) {
-        let f = compile(&ctx, owl_kernels::cu_sig::cu_text(owl_kernels::ops::source("owl_prefill_split_reduce_f16_hd256")).as_str(), name);
+        let f = compile(
+            &ctx,
+            owl_kernels::cu_sig::cu_text(owl_kernels::ops::source(
+                "owl_prefill_split_reduce_f16_hd256",
+            ))
+            .as_str(),
+            name,
+        );
         // >48K smem opt-in(与 server 侧 launch.rs / 既有 split 探针同款)
         f.set_attribute(
             cudarc::driver::sys::CUfunction_attribute_enum::CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES,
@@ -504,22 +584,28 @@ fn prefill_split_knhd_parity() {
         &vc_c,
         (HD * PAGE) as i32,
     );
-    let (so_n, ss_n) = run(
-        "owl_prefill_split_f16_knhd_hd256",
-        &kc_n,
-        &vc_n,
-        HD as i32,
-    );
+    let (so_n, ss_n) = run("owl_prefill_split_f16_knhd_hd256", &kc_n, &vc_n, HD as i32);
     let bad = so_c.iter().zip(so_n.iter()).filter(|(a, b)| a != b).count();
     assert_eq!(bad, 0, "split f16 scr_out parity:{bad} 处位型不符");
     assert_eq!(ss_c, ss_n, "split f16 scr_stat(m,l)不符");
     assert!(so_c.iter().any(|&v| v != 0), "split f16 全零输出(装配错)");
 
     // ---- fp8kv 变体 ----
-    let (kc_c8, kc_n8) = fill_pools_u8(PoolKind::KClassic, |s, h, d| (((s * 29 + h * 13 + d) % 120) + 1) as u8);
-    let (vc_c8, vc_n8) = fill_pools_u8(PoolKind::VClassic, |s, h, d| (((s * 31 + h * 17 + d) % 120) + 1) as u8);
+    let (kc_c8, kc_n8) = fill_pools_u8(PoolKind::KClassic, |s, h, d| {
+        (((s * 29 + h * 13 + d) % 120) + 1) as u8
+    });
+    let (vc_c8, vc_n8) = fill_pools_u8(PoolKind::VClassic, |s, h, d| {
+        (((s * 31 + h * 17 + d) % 120) + 1) as u8
+    });
     let run8 = |name: &str, kcp: &[u8], vcp: &[u8], kstride: i32| -> (Vec<u16>, Vec<f32>) {
-        let f = compile(&ctx, owl_kernels::cu_sig::cu_text(owl_kernels::ops::source("owl_prefill_split_reduce_f16_hd256")).as_str(), name);
+        let f = compile(
+            &ctx,
+            owl_kernels::cu_sig::cu_text(owl_kernels::ops::source(
+                "owl_prefill_split_reduce_f16_hd256",
+            ))
+            .as_str(),
+            name,
+        );
         // >48K smem opt-in(与 server 侧 launch.rs / 既有 split 探针同款)
         f.set_attribute(
             cudarc::driver::sys::CUfunction_attribute_enum::CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES,
@@ -599,7 +685,11 @@ fn prefill_split_knhd_parity() {
         &vc_n8,
         HD as i32,
     );
-    let bad8 = so_c8.iter().zip(so_n8.iter()).filter(|(a, b)| a != b).count();
+    let bad8 = so_c8
+        .iter()
+        .zip(so_n8.iter())
+        .filter(|(a, b)| a != b)
+        .count();
     assert_eq!(bad8, 0, "split fp8 scr_out parity:{bad8} 处位型不符");
     assert_eq!(ss_c8, ss_n8, "split fp8 scr_stat(m,l)不符");
     assert!(so_c8.iter().any(|&v| v != 0), "split fp8 全零输出(装配错)");

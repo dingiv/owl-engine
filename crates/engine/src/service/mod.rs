@@ -27,9 +27,9 @@ use std::sync::Arc;
 use owl_iface::contract::ModelError;
 use tokio::sync::mpsc;
 
+use crate::Result;
 use crate::TokenizeReply;
 use crate::TurnEvent;
-use crate::Result;
 
 pub use boot::{BootSpec, Booted, DeviceOpts, StepGate};
 pub use devices::{resolve_devices, Devices};
@@ -143,14 +143,18 @@ impl EngineService {
     pub fn boot(spec: BootSpec) -> Result<Self> {
         let (req_tx, req_rx) = mpsc::channel::<Request>(spec.channel_capacity.max(1));
         let (stop_tx, stop_rx) = tokio::sync::watch::channel(false);
-        let (ready_tx, ready_rx) = std::sync::mpsc::channel::<std::result::Result<Booted, String>>();
+        let (ready_tx, ready_rx) =
+            std::sync::mpsc::channel::<std::result::Result<Booted, String>>();
         let facts = diag::FactsCell::new();
         let facts_thread = facts.clone();
         let join = std::thread::Builder::new()
             .name("engine-service".into())
             .stack_size(SERVICE_STACK_BYTES)
             .spawn(move || {
-                let rt = match tokio::runtime::Builder::new_current_thread().enable_all().build() {
+                let rt = match tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                {
                     Ok(rt) => rt,
                     Err(e) => {
                         let _ = ready_tx.send(Err(format!("engine service runtime: {e}")));
@@ -168,16 +172,20 @@ impl EngineService {
             .map_err(|e| ModelError::Msg(format!("engine service 线程创建失败: {e}")))?;
         let client = EngineClient { tx: req_tx, facts };
         match ready_rx.recv() {
-            Ok(Ok(_booted)) => Ok(Self { client, stop: stop_tx, join: Some(join) }),
+            Ok(Ok(_booted)) => Ok(Self {
+                client,
+                stop: stop_tx,
+                join: Some(join),
+            }),
             Ok(Err(e)) => {
                 let _ = join.join();
                 Err(ModelError::Msg(e))
             }
             // 就绪前通道断开 = 引擎线程已死（panic 已被 catch 成 ServiceExit）
             Err(_) => {
-                let reason = join.join().unwrap_or_else(|_| {
-                    ServiceExit::Panic("engine service 线程 join 失败".into())
-                });
+                let reason = join
+                    .join()
+                    .unwrap_or_else(|_| ServiceExit::Panic("engine service 线程 join 失败".into()));
                 Err(ModelError::Msg(reason.describe()))
             }
         }
@@ -192,9 +200,9 @@ impl EngineService {
     pub fn shutdown(mut self) -> ServiceExit {
         let _ = self.stop.send(true);
         match self.join.take() {
-            Some(j) => j.join().unwrap_or_else(|_| {
-                ServiceExit::Panic("engine-service 线程 join 失败".into())
-            }),
+            Some(j) => j
+                .join()
+                .unwrap_or_else(|_| ServiceExit::Panic("engine-service 线程 join 失败".into())),
             None => ServiceExit::Normal,
         }
     }
@@ -226,7 +234,13 @@ impl EngineClient {
         sink: mpsc::Sender<StreamEvent>,
     ) -> Result<()> {
         self.tx
-            .send(Request::Chat { session, prompt, max_new, opts, sink })
+            .send(Request::Chat {
+                session,
+                prompt,
+                max_new,
+                opts,
+                sink,
+            })
             .await
             .map_err(|_| ModelError::ServerClosed)
     }
@@ -249,10 +263,15 @@ impl EngineClient {
     ) -> std::result::Result<TokenizeReply, String> {
         let (reply, rx) = tokio::sync::oneshot::channel();
         self.tx
-            .send(Request::Tokenize { text, chat_wrap, reply })
+            .send(Request::Tokenize {
+                text,
+                chat_wrap,
+                reply,
+            })
             .await
             .map_err(|_| "引擎已退役".to_string())?;
-        rx.await.map_err(|_| "引擎连接中断(tokenize 应答通道关闭)".to_string())?
+        rx.await
+            .map_err(|_| "引擎连接中断(tokenize 应答通道关闭)".to_string())?
     }
 
     /// 合批事实（灌流测量）。
@@ -262,7 +281,8 @@ impl EngineClient {
             .send(Request::BatchStats { reply })
             .await
             .map_err(|_| "引擎已退役".to_string())?;
-        rx.await.map_err(|_| "引擎连接中断(batch stats 应答通道关闭)".to_string())
+        rx.await
+            .map_err(|_| "引擎连接中断(batch stats 应答通道关闭)".to_string())
     }
 
     /// 诊断快照（`/debug/vram`；引擎空闲期取）。

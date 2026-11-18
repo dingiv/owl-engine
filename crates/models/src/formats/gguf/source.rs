@@ -30,7 +30,7 @@ use owl_kernels::family::gguf::GgmlTy;
 use super::dequant::dequant_all;
 use super::meta::spec_from_gguf;
 use super::reader::Gguf;
-use super::shard::{geom_of, Cols, KeyGeom, ShardSel, Shape, TensorFacts};
+use super::shard::{geom_of, Cols, KeyGeom, Shape, ShardSel, TensorFacts};
 use super::transform::{self, GgufDims, KeyXf, RowPerm, ValueXf};
 
 /// 源读取错误里的键上下文(装载面按 `Taken` 收割;错误自带键名便于归因)
@@ -94,10 +94,7 @@ impl GgufSource {
     ///
     /// 开箱即**逐键验一遍可分片性**(不整除 / 块不对齐 / 按头不可分 ⇒ 响亮拒),
     /// 而不是等装载到某个键才炸 —— 启动期一次判死(与计划表同律)。
-    pub fn open_shard(
-        path: &std::path::Path,
-        shard: Option<ShardSel>,
-    ) -> Result<Self, ModelError> {
+    pub fn open_shard(path: &std::path::Path, shard: Option<ShardSel>) -> Result<Self, ModelError> {
         let g = Gguf::open(path)?;
         let (spec, report) = spec_from_gguf(&g)?;
         let (nk, hk, nv, hv) = spec.gdn_heads;
@@ -106,7 +103,14 @@ impl GgufSource {
             g,
             spec,
             report,
-            dims: GgufDims { nk, nv, hk, hv, nq, nkv },
+            dims: GgufDims {
+                nk,
+                nv,
+                hk,
+                hv,
+                nq,
+                nkv,
+            },
             perms: std::sync::Mutex::new(Default::default()),
             shard,
             geoms: std::sync::Mutex::new(Default::default()),
@@ -122,7 +126,9 @@ impl GgufSource {
 
     /// **逐键分片几何**(懒算 + 缓存;`None` = 不切 / 单卡)
     fn geom(&self, key: &str) -> Result<Option<std::sync::Arc<KeyGeom>>, ModelError> {
-        let Some(sel) = self.shard else { return Ok(None) };
+        let Some(sel) = self.shard else {
+            return Ok(None);
+        };
         if let Some(hit) = self
             .geoms
             .lock()
@@ -132,8 +138,14 @@ impl GgufSource {
         {
             return Ok(hit);
         }
-        let Some(t) = self.g.get_tensor(key) else { return Ok(None) };
-        let f = TensorFacts { ty: t.ty, rows: t.rows() as usize, inner: t.inner() as usize };
+        let Some(t) = self.g.get_tensor(key) else {
+            return Ok(None);
+        };
+        let f = TensorFacts {
+            ty: t.ty,
+            rows: t.rows() as usize,
+            inner: t.inner() as usize,
+        };
         let g = geom_of(key, &self.dims, &f, Some(sel))?.map(std::sync::Arc::new);
         self.geoms
             .lock()
@@ -148,7 +160,11 @@ impl GgufSource {
             return Ok(());
         }
         for t in &self.g.tensors {
-            let f = TensorFacts { ty: t.ty, rows: t.rows() as usize, inner: t.inner() as usize };
+            let f = TensorFacts {
+                ty: t.ty,
+                rows: t.rows() as usize,
+                inner: t.inner() as usize,
+            };
             geom_of(&t.name, &self.dims, &f, self.shard)
                 .map_err(|e| ModelError::Msg(format!("GGUF 分片几何: {e}")))?;
         }
@@ -236,7 +252,11 @@ impl GgufSource {
     /// **行映射**(目标行 i ← 源行 map[i];`None` = 恒等)
     ///
     /// 只在 `rows > 1` 时有意义;1-D 张量走元素面(见模块头 §1-D)。
-    fn row_map(&self, key: &str, rows: usize) -> Result<Option<std::sync::Arc<Vec<u32>>>, ModelError> {
+    fn row_map(
+        &self,
+        key: &str,
+        rows: usize,
+    ) -> Result<Option<std::sync::Arc<Vec<u32>>>, ModelError> {
         let xf = self.xf(key);
         let (nk, nv, hd) = match xf.row_perm {
             RowPerm::No | RowPerm::ColVHead { .. } => return Ok(None),
@@ -294,8 +314,13 @@ impl GgufSource {
             )));
         }
         let ix = self.g.index_of(key).expect("get_tensor 已过");
-        let mut v = dequant_all(t.ty, self.g.bytes(ix), t.rows() as usize, t.inner() as usize)
-            .map_err(|e| ModelError::Msg(format!("GgufSource: 键 `{key}`: {e}")))?;
+        let mut v = dequant_all(
+            t.ty,
+            self.g.bytes(ix),
+            t.rows() as usize,
+            t.inner() as usize,
+        )
+        .map_err(|e| ModelError::Msg(format!("GgufSource: 键 `{key}`: {e}")))?;
         let rows = t.rows() as usize;
         let inner = t.inner() as usize;
         let xf = self.xf(key);
@@ -315,7 +340,9 @@ impl GgufSource {
                 }
                 v = out;
             }
-        } else if let RowPerm::VHead { nk, nv, hd } | RowPerm::VSegOnly { nk, nv, hd, .. } = xf.row_perm {
+        } else if let RowPerm::VHead { nk, nv, hd } | RowPerm::VSegOnly { nk, nv, hd, .. } =
+            xf.row_perm
+        {
             // 1-D:元素置换(hd 必须为 1,否则该键的形态判断有误)
             if hd != 1 || v.len() != nv {
                 return Err(ModelError::Msg(format!(
@@ -346,9 +373,8 @@ impl GgufSource {
             if rows == 0 {
                 return Err(ModelError::Msg(format!("GgufSource: 键 `{key}` 空张量")));
             }
-            transform::col_deperm_in_place(&mut v, rows, inner, nk, nv, hd).map_err(|e| {
-                ModelError::Msg(format!("GgufSource: 键 `{key}` 列置换: {e}"))
-            })?;
+            transform::col_deperm_in_place(&mut v, rows, inner, nk, nv, hd)
+                .map_err(|e| ModelError::Msg(format!("GgufSource: 键 `{key}` 列置换: {e}")))?;
         }
         // ② 值变换
         match xf.value {
@@ -374,7 +400,6 @@ impl GgufSource {
     }
 }
 
-
 /// **grouped 序切片**(原生件的 TP 目标;见 `shard` 模块头的不变式)
 ///
 /// 输入 = 全量逆变换后的 f32 数组(grouped 行序、grouped 列序),
@@ -386,16 +411,17 @@ fn slice_grouped(
     key: &str,
 ) -> Result<Vec<f32>, ModelError> {
     match &g.shape {
-        Shape::Elem { first, len } => v
-            .get(*first..first + len)
-            .map(<[f32]>::to_vec)
-            .ok_or_else(|| {
-                ModelError::Msg(format!(
-                    "[{key}] 1-D 元素窗口 [{first}, {}) 越界(全量 {})",
-                    first + len,
-                    v.len()
-                ))
-            }),
+        Shape::Elem { first, len } => {
+            v.get(*first..first + len)
+                .map(<[f32]>::to_vec)
+                .ok_or_else(|| {
+                    ModelError::Msg(format!(
+                        "[{key}] 1-D 元素窗口 [{first}, {}) 越界(全量 {})",
+                        first + len,
+                        v.len()
+                    ))
+                })
+        }
         Shape::Mat { wins, rows } => {
             let rw = g.row_elems();
             let c0 = g.col_first;
@@ -491,7 +517,9 @@ impl GgufSource {
                 "GgufSource: 键 `{key}` 是量化件却拿到 1-D 分片几何(形态不符)"
             )));
         };
-        let Some(t) = self.g.get_tensor(key) else { return Ok(None) };
+        let Some(t) = self.g.get_tensor(key) else {
+            return Ok(None);
+        };
         let (be, bb) = t.ty.block();
         if t.ty.native_dtype().is_some() {
             return Err(ModelError::Msg(format!(
@@ -523,9 +551,10 @@ impl GgufSource {
                 dst.len()
             )));
         }
-        let ix = self.g.index_of(key).unwrap_or_else(|| {
-            unreachable!("get_tensor 已过 ⇒ 索引必在(单源)")
-        });
+        let ix = self
+            .g
+            .index_of(key)
+            .unwrap_or_else(|| unreachable!("get_tensor 已过 ⇒ 索引必在(单源)"));
         let src = self.g.bytes(ix);
         if src.len() != frows * row_file {
             return Err(ModelError::Msg(format!(
@@ -840,7 +869,6 @@ impl GgufSource {
 #[allow(dead_code)]
 type _MmapAlias = Mmap;
 
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -891,29 +919,119 @@ mod tests {
         // 因此源侧**原样**交出 `w+1`,对拍时减回来。⚠️ 若将来改回"源侧减 1",
         // 本条与 `RmsNorm::new_add_one` 的选档必须同步(单源 = 设计 §11.3)。
         let cases: &[(&str, &str, f32, bool, ColXf)] = &[
-            ("blk.0.attn_qkv.weight", "linear_attn.in_proj_qkv.weight", 1e-1, false, ColXf::None),
-            ("blk.0.attn_gate.weight", "linear_attn.in_proj_z.weight", 1e-1, false, ColXf::None),
-            ("blk.0.ssm_alpha.weight", "linear_attn.in_proj_a.weight", 1e-2, false, ColXf::None),
-            ("blk.0.ssm_beta.weight", "linear_attn.in_proj_b.weight", 1e-2, false, ColXf::None),
-            ("blk.0.ssm_dt.bias", "linear_attn.dt_bias", 1e-3, false, ColXf::None),
+            (
+                "blk.0.attn_qkv.weight",
+                "linear_attn.in_proj_qkv.weight",
+                1e-1,
+                false,
+                ColXf::None,
+            ),
+            (
+                "blk.0.attn_gate.weight",
+                "linear_attn.in_proj_z.weight",
+                1e-1,
+                false,
+                ColXf::None,
+            ),
+            (
+                "blk.0.ssm_alpha.weight",
+                "linear_attn.in_proj_a.weight",
+                1e-2,
+                false,
+                ColXf::None,
+            ),
+            (
+                "blk.0.ssm_beta.weight",
+                "linear_attn.in_proj_b.weight",
+                1e-2,
+                false,
+                ColXf::None,
+            ),
+            (
+                "blk.0.ssm_dt.bias",
+                "linear_attn.dt_bias",
+                1e-3,
+                false,
+                ColXf::None,
+            ),
             ("blk.0.ssm_a", "linear_attn.A_log", 1e-5, false, ColXf::None),
-            ("blk.0.ssm_conv1d.weight", "linear_attn.conv1d.weight", 1e-5, false, ColXf::None),
+            (
+                "blk.0.ssm_conv1d.weight",
+                "linear_attn.conv1d.weight",
+                1e-5,
+                false,
+                ColXf::None,
+            ),
             // `linear_attn.norm` **不 +1**(转换器明文例外)⇒ 直比
-            ("blk.0.ssm_norm.weight", "linear_attn.norm.weight", 1e-5, false, ColXf::None),
-            ("blk.0.attn_norm.weight", "input_layernorm.weight", 1e-5, true, ColXf::None),
-            ("blk.0.post_attention_norm.weight", "post_attention_layernorm.weight", 1e-5, true, ColXf::None),
-            ("blk.3.attn_q_norm.weight", "self_attn.q_norm.weight", 1e-5, true, ColXf::None),
-            ("blk.3.attn_k_norm.weight", "self_attn.k_norm.weight", 1e-5, true, ColXf::None),
+            (
+                "blk.0.ssm_norm.weight",
+                "linear_attn.norm.weight",
+                1e-5,
+                false,
+                ColXf::None,
+            ),
+            (
+                "blk.0.attn_norm.weight",
+                "input_layernorm.weight",
+                1e-5,
+                true,
+                ColXf::None,
+            ),
+            (
+                "blk.0.post_attention_norm.weight",
+                "post_attention_layernorm.weight",
+                1e-5,
+                true,
+                ColXf::None,
+            ),
+            (
+                "blk.3.attn_q_norm.weight",
+                "self_attn.q_norm.weight",
+                1e-5,
+                true,
+                ColXf::None,
+            ),
+            (
+                "blk.3.attn_k_norm.weight",
+                "self_attn.k_norm.weight",
+                1e-5,
+                true,
+                ColXf::None,
+            ),
             ("output_norm.weight", "norm.weight", 1e-5, true, ColXf::None),
-            ("blk.3.attn_q.weight", "self_attn.q_proj.weight", 1e-1, false, ColXf::None),
-            ("blk.3.attn_v.weight", "self_attn.v_proj.weight", 1e-1, false, ColXf::None),
-            ("blk.3.attn_output.weight", "self_attn.o_proj.weight", 1e-1, false, ColXf::None),
+            (
+                "blk.3.attn_q.weight",
+                "self_attn.q_proj.weight",
+                1e-1,
+                false,
+                ColXf::None,
+            ),
+            (
+                "blk.3.attn_v.weight",
+                "self_attn.v_proj.weight",
+                1e-1,
+                false,
+                ColXf::None,
+            ),
+            (
+                "blk.3.attn_output.weight",
+                "self_attn.o_proj.weight",
+                1e-1,
+                false,
+                ColXf::None,
+            ),
             // ★ **列(内维)反重排的**方向**钉定**(2026-10-19 刀 7f)**:
             // `ssm_out` 的内维是 v-head(ggml tiled 序)⇒ 与 HF 比较时在内维上
             // 走**与行同表**(`vhead_deperm` = g):`W_hf[:, h] = W_gguf[:, g(h)]`。
             // 这是**独立于转换器源码阅读**的实验证据:方向若反 ⇒ O(1) 相对误差
             // (整列换了),若对 ⇒ 量化噪声(1e-1 阈内)。
-            ("blk.0.ssm_out.weight", "linear_attn.out_proj.weight", 1e-1, false, ColXf::VHead),
+            (
+                "blk.0.ssm_out.weight",
+                "linear_attn.out_proj.weight",
+                1e-1,
+                false,
+                ColXf::VHead,
+            ),
         ];
         let script = crate::testkit::manifest_dir().join("src/formats/hf_probe.py");
         assert!(script.is_file(), "缺 {}", script.display());
@@ -929,9 +1047,14 @@ mod tests {
             };
             // 量化键走**字节通道**(I-3:元素面按纪律拒);原生键走元素面。
             // 两条通道的产物都是"经全部逆变换后的逻辑值" ⇒ 与 HF 可比。
-            let t = src.gguf().get_tensor(gk).unwrap_or_else(|| panic!("源缺键 {gk}"));
+            let t = src
+                .gguf()
+                .get_tensor(gk)
+                .unwrap_or_else(|| panic!("源缺键 {gk}"));
             let mut v: Vec<f32> = if t.ty.native_dtype().is_some() {
-                src.take(gk).expect("take").unwrap_or_else(|| panic!("源缺键 {gk}"))
+                src.take(gk)
+                    .expect("take")
+                    .unwrap_or_else(|| panic!("源缺键 {gk}"))
             } else {
                 let (rows, inner) = (t.rows() as usize, t.inner() as usize);
                 let (be, bb) = t.ty.block();
@@ -942,7 +1065,8 @@ mod tests {
                     .unwrap_or_else(|| panic!("源缺键 {gk}"));
                 dequant_all(t.ty, &buf, rows, inner).expect("dequant_all")
             };
-            let outp = std::env::temp_dir().join(format!("owl_hf_{}.bin", gk.replace(['.', '_'], "-")));
+            let outp =
+                std::env::temp_dir().join(format!("owl_hf_{}.bin", gk.replace(['.', '_'], "-")));
             let out = Command::new("uv")
                 .arg("run")
                 .arg("python")
@@ -963,13 +1087,25 @@ mod tests {
                 .chunks_exact(4)
                 .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
                 .collect();
-            assert_eq!(v.len(), want.len(), "[{gk}] 元素数(源 {} vs HF {})", v.len(), want.len());
+            assert_eq!(
+                v.len(),
+                want.len(),
+                "[{gk}] 元素数(源 {} vs HF {})",
+                v.len(),
+                want.len()
+            );
             // ★ 列反重排(比较侧:与行同表;见用例表注释与设计 §11.4)
             if *col == ColXf::VHead {
                 let d = src.dims();
                 let t = src.gguf().get_tensor(gk).expect("张量在场");
                 let (rows, inner) = (t.rows() as usize, t.inner() as usize);
-                assert_eq!(inner, d.nv * d.hv, "[{gk}] 内维 {inner} ≠ nv·hv = {}·{}", d.nv, d.hv);
+                assert_eq!(
+                    inner,
+                    d.nv * d.hv,
+                    "[{gk}] 内维 {inner} ≠ nv·hv = {}·{}",
+                    d.nv,
+                    d.hv
+                );
                 let map = transform::vhead_deperm(d.nk, d.nv, d.hv);
                 let prev = v.clone();
                 for r in 0..rows {
@@ -1037,7 +1173,12 @@ mod tests {
         assert!(src.elem_len("blk.999.nope").unwrap().is_none());
 
         // 字节面 vs 文件:恒等键逐字节同;行置换键按表搬;列置换键原样
-        for key in ["blk.0.attn_gate.weight", "blk.0.attn_qkv.weight", "blk.0.ssm_out.weight", "blk.0.ffn_up.weight"] {
+        for key in [
+            "blk.0.attn_gate.weight",
+            "blk.0.attn_qkv.weight",
+            "blk.0.ssm_out.weight",
+            "blk.0.ffn_up.weight",
+        ] {
             let t = src.gguf().get_tensor(key).unwrap();
             let (rows, inner) = (t.rows() as usize, t.inner() as usize);
             let (be, bb) = t.ty.block();
@@ -1055,7 +1196,11 @@ mod tests {
                 }
                 (_, Some(m)) => {
                     let s0 = m[0] as usize * row_bytes;
-                    assert_eq!(&got[..row_bytes], &file[s0..s0 + row_bytes], "[{key}] 首行未按表搬");
+                    assert_eq!(
+                        &got[..row_bytes],
+                        &file[s0..s0 + row_bytes],
+                        "[{key}] 首行未按表搬"
+                    );
                     // 表是置换 ⇒ 逐行内容集合 = 文件行内容集合
                     if m[0] == 0 {
                         let s_last = m[rows - 1] as usize * row_bytes;

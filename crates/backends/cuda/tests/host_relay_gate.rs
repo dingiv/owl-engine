@@ -436,24 +436,48 @@ async fn host_relay_parity() {
             ca.expect("A CE");
             cb.expect("B CE");
             let sig_a = ArStageCall::new(
-                pa.clone(), own0.clone(), own1.clone(), own1.clone(), 16,
-                layout.slot_bytes, 0,
-            ).to_launch();
+                pa.clone(),
+                own0.clone(),
+                own1.clone(),
+                own1.clone(),
+                16,
+                layout.slot_bytes,
+                0,
+            )
+            .to_launch();
             let sig_b = ArStageCall::new(
-                pb.clone(), p0.clone(), p1.clone(), p1.clone(), 16,
-                layout.slot_bytes, 0,
-            ).to_launch();
+                pb.clone(),
+                p0.clone(),
+                p1.clone(),
+                p1.clone(),
+                16,
+                layout.slot_bytes,
+                0,
+            )
+            .to_launch();
             let (sa, sb) = tokio::join!(a.launch(sig_a), b.launch(sig_b));
             sa.expect("A signal");
             sb.expect("B signal");
             let red_a = ArReduceCall::new(
-                pa.clone(), own0.clone(), own1.clone(), own0.clone(),
-                n_bytes as u64, layout.slot_bytes, 0,
-            ).to_launch();
+                pa.clone(),
+                own0.clone(),
+                own1.clone(),
+                own0.clone(),
+                n_bytes as u64,
+                layout.slot_bytes,
+                0,
+            )
+            .to_launch();
             let red_b = ArReduceCall::new(
-                pb.clone(), p0.clone(), p1.clone(), p0.clone(),
-                n_bytes as u64, layout.slot_bytes, 0,
-            ).to_launch();
+                pb.clone(),
+                p0.clone(),
+                p1.clone(),
+                p0.clone(),
+                n_bytes as u64,
+                layout.slot_bytes,
+                0,
+            )
+            .to_launch();
             let (ra, rb) = tokio::join!(a.launch(red_a), b.launch(red_b));
             ra.expect("A reduce");
             rb.expect("B reduce");
@@ -466,24 +490,48 @@ async fn host_relay_parity() {
             reset_payload(&mut b, &pb, &b_bytes).await.expect("reset b");
             let t = std::time::Instant::now();
             let st_a = ArStageCall::new(
-                pa.clone(), own0.clone(), own1.clone(), own1.clone(),
-                n_bytes as u64, layout.slot_bytes, 0,
-            ).to_launch();
+                pa.clone(),
+                own0.clone(),
+                own1.clone(),
+                own1.clone(),
+                n_bytes as u64,
+                layout.slot_bytes,
+                0,
+            )
+            .to_launch();
             let st_b = ArStageCall::new(
-                pb.clone(), p0.clone(), p1.clone(), p1.clone(),
-                n_bytes as u64, layout.slot_bytes, 0,
-            ).to_launch();
+                pb.clone(),
+                p0.clone(),
+                p1.clone(),
+                p1.clone(),
+                n_bytes as u64,
+                layout.slot_bytes,
+                0,
+            )
+            .to_launch();
             let (sa, sb) = tokio::join!(a.launch(st_a), b.launch(st_b));
             sa.expect("A stage");
             sb.expect("B stage");
             let red_a = ArReduceCall::new(
-                pa.clone(), own0.clone(), own1.clone(), own0.clone(),
-                n_bytes as u64, layout.slot_bytes, 0,
-            ).to_launch();
+                pa.clone(),
+                own0.clone(),
+                own1.clone(),
+                own0.clone(),
+                n_bytes as u64,
+                layout.slot_bytes,
+                0,
+            )
+            .to_launch();
             let red_b = ArReduceCall::new(
-                pb.clone(), p0.clone(), p1.clone(), p0.clone(),
-                n_bytes as u64, layout.slot_bytes, 0,
-            ).to_launch();
+                pb.clone(),
+                p0.clone(),
+                p1.clone(),
+                p0.clone(),
+                n_bytes as u64,
+                layout.slot_bytes,
+                0,
+            )
+            .to_launch();
             let (ra, rb) = tokio::join!(a.launch(red_a), b.launch(red_b));
             ra.expect("A reduce");
             rb.expect("B reduce");
@@ -493,7 +541,9 @@ async fn host_relay_parity() {
             sm_total += t.elapsed();
             eprintln!(
                 "[host-G5] round {round}: copy={:?} ce_push={:?} sm_push={:?}",
-                copy_dt, ce_total / (round + 1), sm_total / (round + 1)
+                copy_dt,
+                ce_total / (round + 1),
+                sm_total / (round + 1)
             );
         }
         eprintln!(

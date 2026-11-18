@@ -26,7 +26,6 @@ use owl_kernels::device::{DevPtr, DeviceRes, Exec, LaunchNote, ScratchBuf};
 // §1 测试资源面(最小实现;与 ln_elems_bench.rs 同款 —— 勿改语义)
 // ============================================================================
 
-
 struct TestRes {
     ctx: Arc<CudaContext>,
     stream: Arc<CudaStream>,
@@ -40,7 +39,12 @@ impl TestRes {
         let ctx = CudaContext::new(ordinal).expect("ctx");
         ctx.bind_to_thread().expect("bind");
         let stream = ctx.default_stream();
-        Some(Self { ctx, stream, blocks: HashMap::new(), next: 1 })
+        Some(Self {
+            ctx,
+            stream,
+            blocks: HashMap::new(),
+            next: 1,
+        })
     }
     fn blk(&mut self, nbytes: usize, tag: &str) -> u64 {
         match self.alloc_block(nbytes, tag) {
@@ -76,7 +80,8 @@ impl TestRes {
         }
     }
     fn ptr(&self, id: u64) -> u64 {
-        self.resolve(id).unwrap_or_else(|e| panic!("resolve(id={id}): {e:?}"))
+        self.resolve(id)
+            .unwrap_or_else(|e| panic!("resolve(id={id}): {e:?}"))
     }
     fn sync(&self) {
         self.stream.synchronize().expect("sync");
@@ -91,28 +96,35 @@ impl DeviceRes for TestRes {
         Ok(self.stream.clone())
     }
     fn resolve(&self, id: u64) -> Result<DevPtr, OpError> {
-        self.blocks.get(&id).map(|s| s.device_ptr(&self.stream).0).ok_or_else(|| OpError::Contract {
-            op: "bench".into(),
-            field: "resolve",
-            expect: "块在册".into(),
-            got: format!("id={id}"),
-        })
+        self.blocks
+            .get(&id)
+            .map(|s| s.device_ptr(&self.stream).0)
+            .ok_or_else(|| OpError::Contract {
+                op: "bench".into(),
+                field: "resolve",
+                expect: "块在册".into(),
+                got: format!("id={id}"),
+            })
     }
     fn resolve_len(&self, id: u64) -> Result<usize, OpError> {
-        self.blocks.get(&id).map(|s| s.len()).ok_or_else(|| OpError::Contract {
-            op: "bench".into(),
-            field: "resolve_len",
-            expect: "块在册".into(),
-            got: format!("id={id}"),
-        })
+        self.blocks
+            .get(&id)
+            .map(|s| s.len())
+            .ok_or_else(|| OpError::Contract {
+                op: "bench".into(),
+                field: "resolve_len",
+                expect: "块在册".into(),
+                got: format!("id={id}"),
+            })
     }
     fn alloc(&mut self, bytes: usize, _tag: &str) -> Result<ScratchBuf, OpError> {
-        let s = unsafe { self.stream.alloc::<u8>(bytes.max(1)) }.map_err(|e| OpError::Contract {
-            op: "bench".into(),
-            field: "alloc",
-            expect: "设备分配".into(),
-            got: format!("{e:?}"),
-        })?;
+        let s =
+            unsafe { self.stream.alloc::<u8>(bytes.max(1)) }.map_err(|e| OpError::Contract {
+                op: "bench".into(),
+                field: "alloc",
+                expect: "设备分配".into(),
+                got: format!("{e:?}"),
+            })?;
         let ptr = s.device_ptr(&self.stream).0;
         Ok(ScratchBuf { ptr, bytes })
     }
@@ -134,31 +146,37 @@ impl DeviceRes for TestRes {
         Ok(self.ctx.ordinal() as i32)
     }
     fn alloc_block(&mut self, bytes: usize, _tag: &str) -> Result<Bytes, OpError> {
-        let s = unsafe { self.stream.alloc::<u8>(bytes.max(1)) }.map_err(|e| OpError::Contract {
-            op: "bench".into(),
-            field: "alloc_block",
-            expect: "设备分配".into(),
-            got: format!("{e:?}"),
-        })?;
+        let s =
+            unsafe { self.stream.alloc::<u8>(bytes.max(1)) }.map_err(|e| OpError::Contract {
+                op: "bench".into(),
+                field: "alloc_block",
+                expect: "设备分配".into(),
+                got: format!("{e:?}"),
+            })?;
         let id = self.next;
         self.next += 1;
         self.blocks.insert(id, s);
         Ok(Bytes::new(id, bytes, Dtype::U8, 0))
     }
     fn upload_block(&mut self, b: &Bytes, src: &[u8]) -> Result<(), OpError> {
-        let s = self.blocks.get_mut(&b.id).ok_or_else(|| OpError::Contract {
-            op: "bench".into(),
-            field: "upload_block",
-            expect: "块在册".into(),
-            got: format!("id={}", b.id),
-        })?;
+        let s = self
+            .blocks
+            .get_mut(&b.id)
+            .ok_or_else(|| OpError::Contract {
+                op: "bench".into(),
+                field: "upload_block",
+                expect: "块在册".into(),
+                got: format!("id={}", b.id),
+            })?;
         let n = src.len().min(s.len());
-        self.stream.memcpy_htod(&src[..n], &mut *s).map_err(|e| OpError::Contract {
-            op: "bench".into(),
-            field: "upload_block",
-            expect: "htod".into(),
-            got: format!("{e:?}"),
-        })
+        self.stream
+            .memcpy_htod(&src[..n], &mut *s)
+            .map_err(|e| OpError::Contract {
+                op: "bench".into(),
+                field: "upload_block",
+                expect: "htod".into(),
+                got: format!("{e:?}"),
+            })
     }
     fn download(&mut self, src: DevPtr, dst: &mut [u8]) -> Result<(), OpError> {
         let id = self
@@ -174,17 +192,18 @@ impl DeviceRes for TestRes {
             })?;
         let s = self.blocks.get(&id).expect("刚找到");
         let mut tmp = vec![0u8; s.len()];
-        self.stream.memcpy_dtoh(s, &mut tmp).map_err(|e| OpError::Contract {
-            op: "bench".into(),
-            field: "download",
-            expect: "dtoh".into(),
-            got: format!("{e:?}"),
-        })?;
+        self.stream
+            .memcpy_dtoh(s, &mut tmp)
+            .map_err(|e| OpError::Contract {
+                op: "bench".into(),
+                field: "download",
+                expect: "dtoh".into(),
+                got: format!("{e:?}"),
+            })?;
         dst.copy_from_slice(&tmp[..dst.len()]);
         Ok(())
     }
 }
-
 
 // ============================================================================
 // §2 台
@@ -202,8 +221,16 @@ fn fire(
     smem: u32,
     vals: &[LaunchVal],
 ) {
-    if let Err(e) = exec.launch(res, OpId(owl_kernels::spec::NATIVE), f, entry, grid, block, smem, vals)
-    {
+    if let Err(e) = exec.launch(
+        res,
+        OpId(owl_kernels::spec::NATIVE),
+        f,
+        entry,
+        grid,
+        block,
+        smem,
+        vals,
+    ) {
         panic!("launch({entry}): {e:?}");
     }
 }
@@ -259,16 +286,38 @@ fn run_case(res: &mut TestRes, rows: usize, cols: usize) {
     let bw = res.blk(rows * cols * 2, "w");
     let bs = res.blk(rows * 4, "scale");
     let bq = res.blk(rows * cols, "q");
-    res.up(bw, &wb.iter().flat_map(|v| v.to_le_bytes()).collect::<Vec<u8>>());
+    res.up(
+        bw,
+        &wb.iter().flat_map(|v| v.to_le_bytes()).collect::<Vec<u8>>(),
+    );
     let (pw, ps, pq) = (res.ptr(bw), res.ptr(bs), res.ptr(bq));
 
     let mut exec = Exec::new();
     let src = "cu/load/quant_i8_row_w.cu";
-    let f_scale = exec.load_aot(res, src, "owl_quant_i8_row_w_scale_bf16", OpId(owl_kernels::spec::NATIVE)).expect("资产");
-    let f_q = exec.load_aot(res, src, "owl_quant_i8_row_w_q_bf16", OpId(owl_kernels::spec::NATIVE)).expect("资产");
+    let f_scale = exec
+        .load_aot(
+            res,
+            src,
+            "owl_quant_i8_row_w_scale_bf16",
+            OpId(owl_kernels::spec::NATIVE),
+        )
+        .expect("资产");
+    let f_q = exec
+        .load_aot(
+            res,
+            src,
+            "owl_quant_i8_row_w_q_bf16",
+            OpId(owl_kernels::spec::NATIVE),
+        )
+        .expect("资产");
     let g = owl_kernels::driver::elems::quant_i8_row_w_grid(rows);
     let (grid, block, smem) = (g.grid, g.block, g.smem);
-    let v_scale = [LaunchVal::Ptr(pw), LaunchVal::I32(rows as i32), LaunchVal::I32(cols as i32), LaunchVal::Ptr(ps)];
+    let v_scale = [
+        LaunchVal::Ptr(pw),
+        LaunchVal::I32(rows as i32),
+        LaunchVal::I32(cols as i32),
+        LaunchVal::Ptr(ps),
+    ];
     let v_q = [
         LaunchVal::Ptr(pw),
         LaunchVal::Ptr(ps),
@@ -277,8 +326,26 @@ fn run_case(res: &mut TestRes, rows: usize, cols: usize) {
         LaunchVal::Ptr(pq),
     ];
 
-    fire(res, &mut exec, &f_scale, "owl_quant_i8_row_w_scale_bf16", grid, block, smem, &v_scale);
-    fire(res, &mut exec, &f_q, "owl_quant_i8_row_w_q_bf16", grid, block, smem, &v_q);
+    fire(
+        res,
+        &mut exec,
+        &f_scale,
+        "owl_quant_i8_row_w_scale_bf16",
+        grid,
+        block,
+        smem,
+        &v_scale,
+    );
+    fire(
+        res,
+        &mut exec,
+        &f_q,
+        "owl_quant_i8_row_w_q_bf16",
+        grid,
+        block,
+        smem,
+        &v_q,
+    );
     res.sync();
 
     let mut got_sc = vec![0u8; rows * 4];
@@ -303,8 +370,26 @@ fn run_case(res: &mut TestRes, rows: usize, cols: usize) {
     // 计时(两发合计;装载期一次)
     let t0 = Instant::now();
     for _ in 0..5 {
-        fire(res, &mut exec, &f_scale, "owl_quant_i8_row_w_scale_bf16", grid, block, smem, &v_scale);
-        fire(res, &mut exec, &f_q, "owl_quant_i8_row_w_q_bf16", grid, block, smem, &v_q);
+        fire(
+            res,
+            &mut exec,
+            &f_scale,
+            "owl_quant_i8_row_w_scale_bf16",
+            grid,
+            block,
+            smem,
+            &v_scale,
+        );
+        fire(
+            res,
+            &mut exec,
+            &f_q,
+            "owl_quant_i8_row_w_q_bf16",
+            grid,
+            block,
+            smem,
+            &v_q,
+        );
     }
     res.sync();
     let us = t0.elapsed().as_secs_f64() * 1e6 / 5.0;
@@ -314,9 +399,17 @@ fn run_case(res: &mut TestRes, rows: usize, cols: usize) {
          scale 不同 {bad_sc} / {rows} · q 不同 {bad_q} / {}  {}",
         bytes / (us * 1e-6) / 1e9,
         rows * cols,
-        if bad_sc == 0 && bad_q == 0 { "⇒ 逐元素相同 ✓" } else { "⇒ ✗ 与 host RTN 不符" }
+        if bad_sc == 0 && bad_q == 0 {
+            "⇒ 逐元素相同 ✓"
+        } else {
+            "⇒ ✗ 与 host RTN 不符"
+        }
     );
-    assert_eq!((bad_sc, bad_q), (0, 0), "装载期量化与 host 参考不符(见头注两条纪律)");
+    assert_eq!(
+        (bad_sc, bad_q),
+        (0, 0),
+        "装载期量化与 host 参考不符(见头注两条纪律)"
+    );
 }
 
 #[test]

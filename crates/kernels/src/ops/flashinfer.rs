@@ -6,9 +6,11 @@
 //!
 //! 槽序权威历史 = `client::fi_sig::SIG`;现在唯一真源 = 本表。
 
-use owl_macros::kernel_tags;
 use crate::contract::{Dtype, Law};
-use crate::spec::{meta_of, CaptureEvidence, Determinism, KernelMeta, KernelSpec, Param, ShapeFamily};
+use crate::spec::{
+    meta_of, CaptureEvidence, Determinism, KernelMeta, KernelSpec, Param, ShapeFamily,
+};
+use owl_macros::kernel_tags;
 
 /// `flashinfer_prefill_paged_fp8kv` —— paged prefill(fp8 e4m3 影子池)。
 pub struct FiPrefillFp8kv;
@@ -16,7 +18,8 @@ pub struct FiPrefillFp8kv;
 #[kernel_tags("dom.flashinfer", "role.attn", "phase.prefill", "kv.main.fp8")]
 impl KernelSpec for FiPrefillFp8kv {
     /// 执行家族(声明驱动路由;见 `KernelSpec::FAMILY`)
-    const FAMILY: crate::contract::OpId = crate::contract::OpId(crate::family::flashinfer::PREFILL_FI);
+    const FAMILY: crate::contract::OpId =
+        crate::contract::OpId(crate::family::flashinfer::PREFILL_FI);
     const ENTRY: &'static str = crate::family::flashinfer::PREFILL_FI_FP8KV;
     /// foreign(预编 `.a`):无 `.cu` 源
     const SRC: &'static str = "";
@@ -47,12 +50,11 @@ impl KernelSpec for FiPrefillFp8kv {
     const LAWS: &'static [Law] = &[Law::OutputFinite];
     const CAPTURE: CaptureEvidence = CaptureEvidence::NoHostWork;
     const DETERMINISM: Determinism = Determinism::Deterministic;
-    const POOL: &'static [crate::spec::PoolAccess] =
-        &[crate::spec::PoolAccess::read(
-            crate::spec::pools::KV_MAIN,
-            crate::spec::LayoutTag::Knhd,
-            Dtype::F8E4M3,
-        )];
+    const POOL: &'static [crate::spec::PoolAccess] = &[crate::spec::PoolAccess::read(
+        crate::spec::pools::KV_MAIN,
+        crate::spec::LayoutTag::Knhd,
+        Dtype::F8E4M3,
+    )];
     const SHAPE: ShapeFamily = ShapeFamily {
         kv_dtype: Some(Dtype::F8E4M3),
         head_dim: &[256],
@@ -71,7 +73,8 @@ pub struct FiPrefillFp8mma;
 
 #[kernel_tags("dom.flashinfer", "role.attn", "phase.prefill", "kv.main.fp8")]
 impl KernelSpec for FiPrefillFp8mma {
-    const FAMILY: crate::contract::OpId = crate::contract::OpId(crate::family::flashinfer::PREFILL_FI);
+    const FAMILY: crate::contract::OpId =
+        crate::contract::OpId(crate::family::flashinfer::PREFILL_FI);
     const ENTRY: &'static str = crate::family::flashinfer::PREFILL_FI_FP8MMA;
     const SRC: &'static str = "";
     const PARAMS: &'static [Param] = &[
@@ -96,12 +99,11 @@ impl KernelSpec for FiPrefillFp8mma {
     const LAWS: &'static [Law] = &[Law::OutputFinite];
     const CAPTURE: CaptureEvidence = CaptureEvidence::NoHostWork;
     const DETERMINISM: Determinism = Determinism::Deterministic;
-    const POOL: &'static [crate::spec::PoolAccess] =
-        &[crate::spec::PoolAccess::read(
-            crate::spec::pools::KV_MAIN,
-            crate::spec::LayoutTag::Knhd,
-            Dtype::F8E4M3,
-        )];
+    const POOL: &'static [crate::spec::PoolAccess] = &[crate::spec::PoolAccess::read(
+        crate::spec::pools::KV_MAIN,
+        crate::spec::LayoutTag::Knhd,
+        Dtype::F8E4M3,
+    )];
     const SHAPE: ShapeFamily = ShapeFamily {
         kv_dtype: Some(Dtype::F8E4M3),
         head_dim: &[256],
@@ -122,7 +124,8 @@ pub struct FiPrefillF16;
 #[kernel_tags("dom.flashinfer", "role.attn", "phase.prefill", "kv.main.f16")]
 impl KernelSpec for FiPrefillF16 {
     /// 执行家族(声明驱动路由;见 `KernelSpec::FAMILY`)
-    const FAMILY: crate::contract::OpId = crate::contract::OpId(crate::family::flashinfer::PREFILL_FI);
+    const FAMILY: crate::contract::OpId =
+        crate::contract::OpId(crate::family::flashinfer::PREFILL_FI);
     const ENTRY: &'static str = crate::family::flashinfer::PREFILL_FI;
     /// foreign(预编 `.a`):无 `.cu` 源
     const SRC: &'static str = "";
@@ -149,12 +152,11 @@ impl KernelSpec for FiPrefillF16 {
     const LAWS: &'static [Law] = &[Law::OutputFinite];
     const CAPTURE: CaptureEvidence = CaptureEvidence::NoHostWork;
     const DETERMINISM: Determinism = Determinism::Deterministic;
-    const POOL: &'static [crate::spec::PoolAccess] =
-        &[crate::spec::PoolAccess::read(
-            crate::spec::pools::KV_MAIN,
-            crate::spec::LayoutTag::Knhd,
-            Dtype::F16,
-        )];
+    const POOL: &'static [crate::spec::PoolAccess] = &[crate::spec::PoolAccess::read(
+        crate::spec::pools::KV_MAIN,
+        crate::spec::LayoutTag::Knhd,
+        Dtype::F16,
+    )];
     const SHAPE: ShapeFamily = ShapeFamily {
         kv_dtype: Some(Dtype::F16),
         head_dim: &[128, 256],

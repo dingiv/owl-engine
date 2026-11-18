@@ -85,7 +85,11 @@ fn host_ref(x: &[f16], w: &[f16], st: &mut [f32], len: usize, d: usize, silu: bo
         ];
         let mut h = [0.0f32; 3];
         {
-            let st_c = if st.is_empty() { &st[0..0] } else { &st[chan * 3..chan * 3 + 3] };
+            let st_c = if st.is_empty() {
+                &st[0..0]
+            } else {
+                &st[chan * 3..chan * 3 + 3]
+            };
             for i in 0..3 {
                 h[i] = hist_at(x, st_c, d, chan, 0, 0, i);
             }
@@ -206,7 +210,8 @@ fn check_bits(tag: &str, got: &[f16], want: &[f16], exact: bool) {
         }
     }
     assert_eq!(
-        bad, 0,
+        bad,
+        0,
         "{tag}:{bad}/{} 处不符(首个 {first:?};worst={worst:.3e};exact={exact})",
         got.len()
     );
@@ -225,7 +230,12 @@ fn check_f32(tag: &str, got: &[f32], want: &[f32]) {
             }
         }
     }
-    assert_eq!(bad, 0, "{tag}:{bad}/{} 处位型不符(首个 {first:?})", got.len());
+    assert_eq!(
+        bad,
+        0,
+        "{tag}:{bad}/{} 处位型不符(首个 {first:?})",
+        got.len()
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -243,7 +253,9 @@ fn conv_fwd_single_chunk_matches_host_bitwise() {
     let module = ctx
         .load_module(cudarc::nvrtc::Ptx::from_binary(asset.bytes.to_vec()))
         .expect("fatbin 载入");
-    let f = module.load_function("owl_gdn_conv_fwd_f16").expect("load fn");
+    let f = module
+        .load_function("owl_gdn_conv_fwd_f16")
+        .expect("load fn");
 
     // (len, d, 初态非零?) —— 覆盖 tiles=1 / 多 tile / len<3 / 多通道块
     let cases: &[(usize, usize, bool)] = &[
@@ -281,7 +293,11 @@ fn conv_fwd_single_chunk_matches_host_bitwise() {
         let want1 = host_ref(&x, &w, &mut want_st1, len, d, true);
         let (got1, got_st1) = run_conv(&ctx, &f, &x, &w, &st0, &slots, &cu, 1, len, d, true);
         check_bits(&format!("len={len} d={d} silu=1 out"), &got1, &want1, false);
-        check_f32(&format!("len={len} d={d} silu=1 state"), &got_st1, &want_st1);
+        check_f32(
+            &format!("len={len} d={d} silu=1 state"),
+            &got_st1,
+            &want_st1,
+        );
     }
     eprintln!("N1 判据 1+3 绿:{} 个形状单 chunk 逐位一致", cases.len());
 }
@@ -301,7 +317,9 @@ fn conv_fwd_chunked_state_matches_whole_run() {
     let module = ctx
         .load_module(cudarc::nvrtc::Ptx::from_binary(asset.bytes.to_vec()))
         .expect("fatbin 载入");
-    let f = module.load_function("owl_gdn_conv_fwd_f16").expect("load fn");
+    let f = module
+        .load_function("owl_gdn_conv_fwd_f16")
+        .expect("load fn");
 
     let (d, total) = (512usize, 1024usize);
     let x = gen(total * d, 21);
@@ -321,8 +339,7 @@ fn conv_fwd_chunked_state_matches_whole_run() {
         // 本 chunk 的 x 切片按 [len, d] 连续给出;cu_seqlens 相对本 chunk 起点
         let xs: Vec<f16> = x[base * d..(base + len) * d].to_vec();
         let cu = vec![0.0f32, len as f32];
-        let (got, st_new) =
-            run_conv(&ctx, &f, &xs, &w, &st, &slots, &cu, 1, len, d, true);
+        let (got, st_new) = run_conv(&ctx, &f, &xs, &w, &st, &slots, &cu, 1, len, d, true);
         let seg = &want[base * d..(base + len) * d];
         check_bits(&format!("chunk{ci} len={len} out"), &got, seg, false);
         st = st_new;
@@ -347,7 +364,9 @@ fn conv_fwd_batch_and_neg_slot() {
     let module = ctx
         .load_module(cudarc::nvrtc::Ptx::from_binary(asset.bytes.to_vec()))
         .expect("fatbin 载入");
-    let f = module.load_function("owl_gdn_conv_fwd_f16").expect("load fn");
+    let f = module
+        .load_function("owl_gdn_conv_fwd_f16")
+        .expect("load fn");
 
     let (d, lens) = (256usize, [70usize, 5, 40]);
     let total: usize = lens.iter().sum();
@@ -368,9 +387,7 @@ fn conv_fwd_batch_and_neg_slot() {
         cu.push(acc as f32);
     }
 
-    let (got, got_st) = run_conv(
-        &ctx, &f, &x, &w, &st, &slots, &cu, 3, total, d, false,
-    );
+    let (got, got_st) = run_conv(&ctx, &f, &x, &w, &st, &slots, &cu, 3, total, d, false);
 
     // host 参考:逐序列(注意 x 是 varlen 拼接,序列 s 的起始行 = cu[s])
     let mut want_st = st.clone();
@@ -378,7 +395,11 @@ fn conv_fwd_batch_and_neg_slot() {
     for (s, &len) in lens.iter().enumerate() {
         let start = cu[s] as usize;
         let seg = &x[start * d..(start + len) * d];
-        let slot = if slots[s] >= 0.0 { slots[s] as usize } else { usize::MAX };
+        let slot = if slots[s] >= 0.0 {
+            slots[s] as usize
+        } else {
+            usize::MAX
+        };
         let mut local_st = if slot == usize::MAX {
             vec![]
         } else {
@@ -418,7 +439,9 @@ fn conv_fwd_latency_probe() {
     let module = ctx
         .load_module(cudarc::nvrtc::Ptx::from_binary(asset.bytes.to_vec()))
         .expect("fatbin 载入");
-    let f = module.load_function("owl_gdn_conv_fwd_f16").expect("load fn");
+    let f = module
+        .load_function("owl_gdn_conv_fwd_f16")
+        .expect("load fn");
 
     const ITERS: usize = 200;
     let (d, len) = (6144usize, 461usize);

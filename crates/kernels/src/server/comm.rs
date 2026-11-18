@@ -16,7 +16,13 @@ use std::sync::Arc;
 type K = Arc<cudarc::driver::CudaFunction>;
 
 /// 按线格式 dtype 选核(f32/f16/bf16;其余 = 结构化拒)
-fn pick<'a>(op: OpId, dt: Dtype, k32: &'a Option<K>, k16: &'a Option<K>, kbf: &'a Option<K>) -> Result<&'a K, OpError> {
+fn pick<'a>(
+    op: OpId,
+    dt: Dtype,
+    k32: &'a Option<K>,
+    k16: &'a Option<K>,
+    kbf: &'a Option<K>,
+) -> Result<&'a K, OpError> {
     let slot = match dt {
         Dtype::F32 => k32,
         Dtype::F16 => k16,
@@ -37,7 +43,13 @@ fn pick<'a>(op: OpId, dt: Dtype, k32: &'a Option<K>, k16: &'a Option<K>, kbf: &'
 }
 
 /// 块尺寸自证(payload 侧:`slab_off + bytes ≤ 账长`)
-fn check_payload_span(op: OpId, what: &'static str, len: usize, off: u64, bytes: u64) -> Result<(), OpError> {
+fn check_payload_span(
+    op: OpId,
+    what: &'static str,
+    len: usize,
+    off: u64,
+    bytes: u64,
+) -> Result<(), OpError> {
     let end = off.checked_add(bytes).ok_or_else(|| OpError::Contract {
         op: op.0.to_string(),
         field: what,
@@ -57,12 +69,14 @@ fn check_payload_span(op: OpId, what: &'static str, len: usize, off: u64, bytes:
 
 /// 块尺寸自证(staging 侧:`header + slot_bytes ≤ 账长`;slot 数据的容器)
 fn check_staging(op: OpId, what: &'static str, len: usize, slot_bytes: u64) -> Result<(), OpError> {
-    let need = asset::AR_HDR_BYTES.checked_add(slot_bytes).ok_or_else(|| OpError::Contract {
-        op: op.0.to_string(),
-        field: what,
-        expect: "header + slot_bytes 不溢出".into(),
-        got: format!("slot_bytes={slot_bytes}"),
-    })?;
+    let need = asset::AR_HDR_BYTES
+        .checked_add(slot_bytes)
+        .ok_or_else(|| OpError::Contract {
+            op: op.0.to_string(),
+            field: what,
+            expect: "header + slot_bytes 不溢出".into(),
+            got: format!("slot_bytes={slot_bytes}"),
+        })?;
     if need > len as u64 {
         return Err(OpError::Contract {
             op: op.0.to_string(),
@@ -102,7 +116,6 @@ fn ar_reduce_grid(dt: Dtype, bytes: u64) -> (u32, u32, u32) {
 /// **在飞线程总数上限**(见上注:块数×块内线程数才是那一维)。
 pub(crate) const MAX_THREADS: u64 = 32 * 256; // = 8192;块数甜点 32 × 块内 256
 
-
 /// 公共发射参数(两族同型:6 槽)
 #[allow(clippy::too_many_arguments)]
 fn launch_ar(
@@ -141,7 +154,12 @@ fn launch_ar(
 }
 
 /// **fp8 载荷档**的核选(f16/bf16 两档;§47 第二步)
-fn pick_f8<'a>(op: OpId, dt: Dtype, k16: &'a Option<K>, kbf: &'a Option<K>) -> Result<&'a K, OpError> {
+fn pick_f8<'a>(
+    op: OpId,
+    dt: Dtype,
+    k16: &'a Option<K>,
+    kbf: &'a Option<K>,
+) -> Result<&'a K, OpError> {
     let slot = match dt {
         Dtype::F16 => k16,
         Dtype::BF16 => kbf,
@@ -193,7 +211,12 @@ impl KernelFamily for CommArStageRuntime {
             k_f16: Some(exec.load_aot(res, asset::STAGE_SRC, asset::STAGE_F16, Self::ID)?),
             k_bf16: Some(exec.load_aot(res, asset::STAGE_SRC, asset::STAGE_BF16, Self::ID)?),
             k_f8_f16: Some(exec.load_aot(res, asset::STAGE_SRC, asset::STAGE_F8_F16, Self::ID)?),
-            k_f8_bf16: Some(exec.load_aot(res, asset::STAGE_SRC, asset::STAGE_F8_BF16, Self::ID)?),
+            k_f8_bf16: Some(exec.load_aot(
+                res,
+                asset::STAGE_SRC,
+                asset::STAGE_F8_BF16,
+                Self::ID,
+            )?),
         };
         Ok(FamilyGuard::boxed(me))
     }
@@ -208,9 +231,20 @@ impl KernelFamily for CommArStageRuntime {
         // **载荷档来自 client 的发射名**(§47 第二步)—— server 侧按名分派
         // (核名不再是 dtype 的纯函数:同一 dtype 有 f16/fp8 两档载荷)
         let k = if msg.kernel.name.contains("_f8_") {
-            pick_f8(Self::ID, call.local().dtype, &self.k_f8_f16, &self.k_f8_bf16)?
+            pick_f8(
+                Self::ID,
+                call.local().dtype,
+                &self.k_f8_f16,
+                &self.k_f8_bf16,
+            )?
         } else {
-            pick(Self::ID, call.local().dtype, &self.k_f32, &self.k_f16, &self.k_bf16)?
+            pick(
+                Self::ID,
+                call.local().dtype,
+                &self.k_f32,
+                &self.k_f16,
+                &self.k_bf16,
+            )?
         };
         // ── F2 尺寸自证(两块账长) ──
         let local_len = res.resolve_len(call.local().id)?;
@@ -224,8 +258,18 @@ impl KernelFamily for CommArStageRuntime {
         let peer_p = res.resolve(call.peer().id)?;
         let data_p = res.resolve(call.data().id)?;
         launch_ar(
-            Self::ID, "ar_stage", res, exec, k, local_p, own_p, peer_p, data_p, call.bytes(),
-            call.slot_bytes(), call.slab_off(),
+            Self::ID,
+            "ar_stage",
+            res,
+            exec,
+            k,
+            local_p,
+            own_p,
+            peer_p,
+            data_p,
+            call.bytes(),
+            call.slot_bytes(),
+            call.slab_off(),
             ar_reduce_grid(call.local().dtype, call.bytes()),
         )?;
         Ok(out)
@@ -263,8 +307,18 @@ impl KernelFamily for CommArReduceRuntime {
             k_f32: Some(exec.load_aot(res, asset::REDUCE_SRC, asset::REDUCE_F32, Self::ID)?),
             k_f16: Some(exec.load_aot(res, asset::REDUCE_SRC, asset::REDUCE_F16, Self::ID)?),
             k_bf16: Some(exec.load_aot(res, asset::REDUCE_SRC, asset::REDUCE_BF16, Self::ID)?),
-            k_f8_f16: Some(exec.load_aot(res, asset::REDUCE_SRC, asset::REDUCE_F8_F16, Self::ID)?),
-            k_f8_bf16: Some(exec.load_aot(res, asset::REDUCE_SRC, asset::REDUCE_F8_BF16, Self::ID)?),
+            k_f8_f16: Some(exec.load_aot(
+                res,
+                asset::REDUCE_SRC,
+                asset::REDUCE_F8_F16,
+                Self::ID,
+            )?),
+            k_f8_bf16: Some(exec.load_aot(
+                res,
+                asset::REDUCE_SRC,
+                asset::REDUCE_F8_BF16,
+                Self::ID,
+            )?),
         };
         Ok(FamilyGuard::boxed(me))
     }
@@ -279,7 +333,13 @@ impl KernelFamily for CommArReduceRuntime {
         let k = if msg.kernel.name.contains("_f8_") {
             pick_f8(Self::ID, call.out().dtype, &self.k_f8_f16, &self.k_f8_bf16)?
         } else {
-            pick(Self::ID, call.out().dtype, &self.k_f32, &self.k_f16, &self.k_bf16)?
+            pick(
+                Self::ID,
+                call.out().dtype,
+                &self.k_f32,
+                &self.k_f16,
+                &self.k_bf16,
+            )?
         };
         let out_len = res.resolve_len(call.out().id)?;
         let own_len = res.resolve_len(call.own().id)?;
@@ -292,8 +352,19 @@ impl KernelFamily for CommArReduceRuntime {
         let data_p = res.resolve(call.data().id)?;
         let grid = ar_reduce_grid(call.out().dtype, call.bytes());
         launch_ar(
-            Self::ID, "ar_reduce", res, exec, k, out_p, own_p, peer_p, data_p, call.bytes(),
-            call.slot_bytes(), call.slab_off(), grid,
+            Self::ID,
+            "ar_reduce",
+            res,
+            exec,
+            k,
+            out_p,
+            own_p,
+            peer_p,
+            data_p,
+            call.bytes(),
+            call.slot_bytes(),
+            call.slab_off(),
+            grid,
         )?;
         Ok(out)
     }
@@ -386,9 +457,21 @@ impl KernelFamily for CommArFusedRuntime {
         let (call, out) = ArFusedCall::parse(msg)?;
         let barrier = msg.kernel.name.contains("ar_barrier");
         let k = if barrier {
-            pick(Self::ID, call.payload().dtype, &self.b_f32, &self.b_f16, &self.b_bf16)?
+            pick(
+                Self::ID,
+                call.payload().dtype,
+                &self.b_f32,
+                &self.b_f16,
+                &self.b_bf16,
+            )?
         } else {
-            pick(Self::ID, call.payload().dtype, &self.k_f32, &self.k_f16, &self.k_bf16)?
+            pick(
+                Self::ID,
+                call.payload().dtype,
+                &self.k_f32,
+                &self.k_f16,
+                &self.k_bf16,
+            )?
         };
         // ── 尺寸自证(与两核同律)──
         let pl_len = res.resolve_len(call.payload().id)?;
@@ -408,7 +491,11 @@ impl KernelFamily for CommArFusedRuntime {
         // AR-2 单 block:多 block 的全局 blocks_done+单 poller 实测反而更慢
         // (2026-10-23 bench: 80KB 31.6µs vs 单 block 20.2µs);SGLang 式 per-block
         // signal plane 才是下一步,当前先固定 1 block。
-        let grid = if barrier { (1, 1, 1) } else { ar_reduce_grid(call.payload().dtype, call.bytes()) };
+        let grid = if barrier {
+            (1, 1, 1)
+        } else {
+            ar_reduce_grid(call.payload().dtype, call.bytes())
+        };
         launch_ar_fused(
             Self::ID,
             if barrier { "ar_barrier" } else { "ar_fused" },
@@ -493,9 +580,24 @@ impl KernelFamily for CommAr1StageRuntime {
         exec: &mut Exec,
     ) -> Result<Box<dyn KernelFamily>, OpError> {
         let me = CommAr1StageRuntime {
-            k_f32: Some(exec.load_aot(res, asset::ONE_STAGE_SRC, asset::ONE_STAGE_F32, Self::ID)?),
-            k_f16: Some(exec.load_aot(res, asset::ONE_STAGE_SRC, asset::ONE_STAGE_F16, Self::ID)?),
-            k_bf16: Some(exec.load_aot(res, asset::ONE_STAGE_SRC, asset::ONE_STAGE_BF16, Self::ID)?),
+            k_f32: Some(exec.load_aot(
+                res,
+                asset::ONE_STAGE_SRC,
+                asset::ONE_STAGE_F32,
+                Self::ID,
+            )?),
+            k_f16: Some(exec.load_aot(
+                res,
+                asset::ONE_STAGE_SRC,
+                asset::ONE_STAGE_F16,
+                Self::ID,
+            )?),
+            k_bf16: Some(exec.load_aot(
+                res,
+                asset::ONE_STAGE_SRC,
+                asset::ONE_STAGE_BF16,
+                Self::ID,
+            )?),
         };
         Ok(FamilyGuard::boxed(me))
     }
@@ -507,7 +609,13 @@ impl KernelFamily for CommAr1StageRuntime {
         exec: &mut Exec,
     ) -> Result<Bytes, OpError> {
         let (call, out) = Ar1StageCall::parse(msg)?;
-        let k = pick(Self::ID, call.out().dtype, &self.k_f32, &self.k_f16, &self.k_bf16)?;
+        let k = pick(
+            Self::ID,
+            call.out().dtype,
+            &self.k_f32,
+            &self.k_f16,
+            &self.k_bf16,
+        )?;
         // 尺寸自证:**槽即数据**(没有 header 偏移)⇒ 两端都必须装得下载荷
         let out_len = res.resolve_len(call.out().id)?;
         let peer_len = res.resolve_len(call.peer_data().id)?;
@@ -522,8 +630,18 @@ impl KernelFamily for CommAr1StageRuntime {
         let peer_data_p = res.resolve(call.peer_data().id)?;
         let grid = ar_reduce_grid(call.out().dtype, call.bytes());
         launch_ar_1stage(
-            Self::ID, "ar_1stage", res, exec, k, out_p, src_p, own_p, peer_p, peer_data_p,
-            call.bytes(), grid,
+            Self::ID,
+            "ar_1stage",
+            res,
+            exec,
+            k,
+            out_p,
+            src_p,
+            own_p,
+            peer_p,
+            peer_data_p,
+            call.bytes(),
+            grid,
         )?;
         Ok(out)
     }

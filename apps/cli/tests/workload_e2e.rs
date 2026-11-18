@@ -16,8 +16,8 @@ fn agent_workload_suite() {
         eprintln!("skip: OWL_E2E=1 未开(需要已启动的 owl server)");
         return;
     }
-    let url = std::env::var("OWL_SERVER_URL")
-        .unwrap_or_else(|_| "http://127.0.0.1:8135".to_string());
+    let url =
+        std::env::var("OWL_SERVER_URL").unwrap_or_else(|_| "http://127.0.0.1:8135".to_string());
     let log = std::env::var("OWL_SERVER_LOG").ok();
     let suite = std::env::var("OWL_WORKLOAD_SUITE").unwrap_or_else(|_| "core".to_string());
     let bin = env!("CARGO_BIN_EXE_cli");
@@ -29,8 +29,5 @@ fn agent_workload_suite() {
     let out = cmd.output().expect("启动 cli workload");
     eprintln!("--- stderr ---\n{}", String::from_utf8_lossy(&out.stderr));
     eprintln!("--- stdout ---\n{}", String::from_utf8_lossy(&out.stdout));
-    assert!(
-        out.status.success(),
-        "workload {suite} 失败(server {url})"
-    );
+    assert!(out.status.success(), "workload {suite} 失败(server {url})");
 }

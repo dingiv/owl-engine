@@ -11,9 +11,9 @@
 use crate::command::{Ack, Command, Waiter};
 use crate::server::GpuServer;
 use crate::state::{DeviceSelector, STREAM_COMPUTE, STREAM_H2D};
+use owl_iface::command::{BatchOutcome, Command as DeviceCommand, Outcome};
 use owl_iface::contract::{Arg, Bytes, DeviceClient, LaunchMsg};
 use owl_iface::contract::{Connector, ModelError, SwapDir, SwapPiece, VramAccount, VramSnapshot};
-use owl_iface::command::{BatchOutcome, Command as DeviceCommand, Outcome};
 use std::future::Future;
 use std::sync::mpsc;
 
@@ -60,10 +60,7 @@ struct TimedWaiter<T> {
 
 impl<T: Send + 'static> Future for TimedWaiter<T> {
     type Output = T;
-    fn poll(
-        self: std::pin::Pin<&mut Self>,
-        cx: &mut std::task::Context<'_>,
-    ) -> std::task::Poll<T> {
+    fn poll(self: std::pin::Pin<&mut Self>, cx: &mut std::task::Context<'_>) -> std::task::Poll<T> {
         // SAFETY:inner 不被移动(结构体自持,pin 投影到字段)
         let this = unsafe { self.get_unchecked_mut() };
         let inner = unsafe { std::pin::Pin::new_unchecked(&mut this.inner) };
@@ -108,7 +105,13 @@ impl GpuClient {
         sink: owl_shared::log::LogSink,
         vram: std::sync::Arc<VramAccount>,
     ) -> Self {
-        Self { tx, vram, sink, arch: std::sync::OnceLock::new(), pending: Vec::new() }
+        Self {
+            tx,
+            vram,
+            sink,
+            arch: std::sync::OnceLock::new(),
+            pending: Vec::new(),
+        }
     }
 
     /// **块账按名清单**(诊断查询面;2026-10-16 全量记名)。
@@ -117,7 +120,8 @@ impl GpuClient {
     /// 回归门用 —— "谁占着"的唯一直接答案(总量三账只能答"多满")。
     /// `top` = 列多少类名字(字节降序);未命名块单独计数并上屏。
     pub async fn ledger_report(&self, top: usize) -> Result<String, ModelError> {
-        self.submit(move |ack| Command::LedgerReport { top, ack })?.await
+        self.submit(move |ack| Command::LedgerReport { top, ack })?
+            .await
     }
 
     /// **显存现场 JSON**(块账 + 家族 scratch;OOM 落盘同一序列化器)。
@@ -140,7 +144,11 @@ impl GpuClient {
         let cmd = build(ack);
         let kind = cmd.kind();
         // ① 入队(客户端侧):锁 mpsc + 唤醒服务端线程
-        let t_tx = if self.sink.timing() { Some(std::time::Instant::now()) } else { None };
+        let t_tx = if self.sink.timing() {
+            Some(std::time::Instant::now())
+        } else {
+            None
+        };
         self.tx.send(cmd).map_err(|_| ModelError::ServerClosed)?;
         if let Some(t0) = t_tx {
             self.sink.timer(&format!("srv.tx.{kind}"), t0.elapsed());
@@ -149,7 +157,11 @@ impl GpuClient {
         //    = 回执侧的唤醒延迟)
         Ok(TimedWaiter {
             inner: waiter,
-            t0: if self.sink.timing() { Some(std::time::Instant::now()) } else { None },
+            t0: if self.sink.timing() {
+                Some(std::time::Instant::now())
+            } else {
+                None
+            },
             sink: self.sink,
             kind,
         })
@@ -174,7 +186,12 @@ impl GpuClient {
     /// thread::spawn(move || server.run());
     /// ```
     pub fn spawn(selector: DeviceSelector) -> Result<Self, String> {
-        Self::spawn_with(selector, crate::state::DiagOpts::default(), false, owl_shared::log::LogSink::none())
+        Self::spawn_with(
+            selector,
+            crate::state::DiagOpts::default(),
+            false,
+            owl_shared::log::LogSink::none(),
+        )
     }
 
     /// 带设备诊断选项组装(显式依赖律入口;engine 经 EngineKnobs 传入)
@@ -242,7 +259,8 @@ impl GpuClient {
         name: impl Into<String>,
     ) -> Result<(Bytes, Vec<u8>), ModelError> {
         let name = name.into();
-        self.submit(move |ack| Command::PeerAlloc { bytes, name, ack })?.await
+        self.submit(move |ack| Command::PeerAlloc { bytes, name, ack })?
+            .await
     }
 
     /// **对端映射**(S1):把凭据导入为本卡 VA 别名(返回别名块句柄)。
@@ -254,7 +272,8 @@ impl GpuClient {
         peer_uuid: impl Into<String>,
         name: impl Into<String>,
     ) -> Result<Bytes, ModelError> {
-        self.peer_import_ex(credential, bytes, peer_uuid, name, false).await
+        self.peer_import_ex(credential, bytes, peer_uuid, name, false)
+            .await
     }
 
     /// **导入对端分配(可写)** —— push 协议前置:本端要 `st.global` 写对端槽
@@ -267,7 +286,8 @@ impl GpuClient {
         peer_uuid: impl Into<String>,
         name: impl Into<String>,
     ) -> Result<Bytes, ModelError> {
-        self.peer_import_ex(credential, bytes, peer_uuid, name, true).await
+        self.peer_import_ex(credential, bytes, peer_uuid, name, true)
+            .await
     }
 
     async fn peer_import_ex(
@@ -279,13 +299,21 @@ impl GpuClient {
         rw: bool,
     ) -> Result<Bytes, ModelError> {
         let (peer_uuid, name) = (peer_uuid.into(), name.into());
-        self.submit(move |ack| Command::PeerImport { credential, bytes, peer_uuid, name, rw, ack })?
-            .await
+        self.submit(move |ack| Command::PeerImport {
+            credential,
+            bytes,
+            peer_uuid,
+            name,
+            rw,
+            ack,
+        })?
+        .await
     }
 
     /// **peer 资源释放**(S1;D2 = 显式释放 + Drop 兜底)。
     pub async fn peer_release(&self, ids: Vec<u64>) -> Result<(), ModelError> {
-        self.submit(move |ack| Command::PeerRelease { ids, ack })?.await
+        self.submit(move |ack| Command::PeerRelease { ids, ack })?
+            .await
     }
 
     /// **pinned host-mapped 分配**(host relay;2026-11-04)。
@@ -297,7 +325,8 @@ impl GpuClient {
         name: impl Into<String>,
     ) -> Result<(Bytes, u64), ModelError> {
         let name = name.into();
-        self.submit(move |ack| Command::HostAlloc { bytes, name, ack })?.await
+        self.submit(move |ack| Command::HostAlloc { bytes, name, ack })?
+            .await
     }
 
     /// **attach 到已有 host-mapped 段**(不拥有、不 free;同进程/UVA)。
@@ -308,12 +337,19 @@ impl GpuClient {
         name: impl Into<String>,
     ) -> Result<Bytes, ModelError> {
         let name = name.into();
-        self.submit(move |ack| Command::HostAttach { host, bytes, name, ack })?.await
+        self.submit(move |ack| Command::HostAttach {
+            host,
+            bytes,
+            name,
+            ack,
+        })?
+        .await
     }
 
     /// **host-mapped 释放**(owner free_host;attach 只销账;图租约拒收)。
     pub async fn host_release(&self, ids: Vec<u64>) -> Result<(), ModelError> {
-        self.submit(move |ack| Command::HostRelease { ids, ack })?.await
+        self.submit(move |ack| Command::HostRelease { ids, ack })?
+            .await
     }
 
     /// 优雅关机:server 进入 Closing —— 排空积压(结构化拒绝)+ 设备栅栏
@@ -333,7 +369,8 @@ impl GpuClient {
     /// **固有方法(不进 `DeviceClient` 契约)**:多流是 CUDA 后端的调度能力,
     /// CPU face 无此概念。
     pub async fn capture_route_to(&mut self, sid: u8) -> Result<(), ModelError> {
-        self.submit(move |ack| Command::CaptureRoute { sid, ack })?.await
+        self.submit(move |ack| Command::CaptureRoute { sid, ack })?
+            .await
     }
 
     /// ★ **捕获期的 join**(主链等支链;2026-10-18):当前路由流 → origin 建一条依赖边,
@@ -382,8 +419,14 @@ impl GpuClient {
         bytes: Vec<u8>,
     ) -> Result<(), ModelError> {
         let sid = sid_of(stream);
-        self.submit(move |ack| Command::HtodChunk { block, offset_bytes, data: bytes, stream: sid, ack })?
-            .await
+        self.submit(move |ack| Command::HtodChunk {
+            block,
+            offset_bytes,
+            data: bytes,
+            stream: sid,
+            ack,
+        })?
+        .await
     }
 
     /// 批量写入(落点流可选)
@@ -393,9 +436,13 @@ impl GpuClient {
         writes: Vec<(u64, usize, Vec<u8>)>,
     ) -> Result<(), ModelError> {
         let sid = sid_of(stream);
-        self.submit(move |ack| Command::HtodChunks { writes, stream: sid, ack })?.await
+        self.submit(move |ack| Command::HtodChunks {
+            writes,
+            stream: sid,
+            ack,
+        })?
+        .await
     }
-
 }
 
 impl DeviceClient for GpuClient {
@@ -454,7 +501,8 @@ impl DeviceClient for GpuClient {
                 )));
             }
         }
-        self.submit(move |ack| crate::command::envelope_of(cmd, ack))?.await
+        self.submit(move |ack| crate::command::envelope_of(cmd, ack))?
+            .await
     }
 
     /// **原生批**:整批装进**一条**信箱消息(一次入队 + 一次回执)。
@@ -493,7 +541,12 @@ impl DeviceClient for GpuClient {
         name: &str,
     ) -> Result<Box<dyn owl_iface::contract::PinnedRegion + Send>, ModelError> {
         let nm = name.to_string();
-        self.submit(move |ack| Command::AllocPinned { bytes, name: nm, ack })?.await
+        self.submit(move |ack| Command::AllocPinned {
+            bytes,
+            name: nm,
+            ack,
+        })?
+        .await
     }
 
     /// **staging 池预热**(2026-10-27):段大小与 `swap_out` 的 `STAGE_SEG` 同源。
@@ -534,8 +587,14 @@ impl DeviceClient for GpuClient {
         offset_bytes: usize,
         len_bytes: usize,
     ) -> Result<(), ModelError> {
-        self.upload_pinned_on(owl_iface::contract::UpStream::H2d, buf, dst, offset_bytes, len_bytes)
-            .await
+        self.upload_pinned_on(
+            owl_iface::contract::UpStream::H2d,
+            buf,
+            dst,
+            offset_bytes,
+            len_bytes,
+        )
+        .await
     }
 
     async fn write_block_f32_on(
@@ -592,8 +651,13 @@ impl DeviceClient for GpuClient {
         len_bytes: usize,
     ) -> Result<(), ModelError> {
         let (src, dst) = (src.id, dst.id);
-        self.submit(move |ack| {
-            Command::CopyBlock { src, src_off_bytes, dst, dst_off_bytes, len_bytes, ack }
+        self.submit(move |ack| Command::CopyBlock {
+            src,
+            src_off_bytes,
+            dst,
+            dst_off_bytes,
+            len_bytes,
+            ack,
         })?
         .await
     }
@@ -610,12 +674,19 @@ impl DeviceClient for GpuClient {
             .iter()
             .map(|(s, so, d, doff, l)| (s.id, *so, d.id, *doff, *l))
             .collect();
-        self.submit(move |ack| Command::CopyBatch { copies: flat, ack })?.await
+        self.submit(move |ack| Command::CopyBatch { copies: flat, ack })?
+            .await
     }
 
     async fn memset_zero(&mut self, dst: &Bytes, len_bytes: usize) -> Result<(), ModelError> {
         let block = dst.id;
-        self.submit(move |ack| Command::MemsetZero { block, offset_bytes: 0, len_bytes, ack })?.await
+        self.submit(move |ack| Command::MemsetZero {
+            block,
+            offset_bytes: 0,
+            len_bytes,
+            ack,
+        })?
+        .await
     }
 
     async fn memset_zero_at(
@@ -625,8 +696,11 @@ impl DeviceClient for GpuClient {
         len_bytes: usize,
     ) -> Result<(), ModelError> {
         let block = dst.id;
-        self.submit(move |ack| {
-            Command::MemsetZero { block, offset_bytes, len_bytes, ack }
+        self.submit(move |ack| Command::MemsetZero {
+            block,
+            offset_bytes,
+            len_bytes,
+            ack,
         })?
         .await
     }
@@ -636,9 +710,12 @@ impl DeviceClient for GpuClient {
         &mut self,
         pieces: &[(&Bytes, usize, usize)],
     ) -> Result<Vec<u8>, ModelError> {
-        let pieces: Vec<(u64, usize, usize)> =
-            pieces.iter().map(|(b, off, len)| (b.id, *off, *len)).collect();
-        self.submit(move |ack| Command::DtohBatch { pieces, ack })?.await
+        let pieces: Vec<(u64, usize, usize)> = pieces
+            .iter()
+            .map(|(b, off, len)| (b.id, *off, *len))
+            .collect();
+        self.submit(move |ack| Command::DtohBatch { pieces, ack })?
+            .await
     }
 
     /// 批量分块写:单命令 `HtodChunks`(字节口径;一次往返,单 ack 保序)。
@@ -646,15 +723,17 @@ impl DeviceClient for GpuClient {
     /// **落 COMPUTE 流**(2026-10-17):与 trait 默认实现同口径(那里逐段走
     /// `upload_pinned_on(Compute)`;此前本覆写硬写 H2D = 两套规范)。语义面 =
     /// 搬入的内容随后就被计算读(参数面/存储搬回),同流 FIFO 即结构性有序。
-    async fn htod_batch(
-        &mut self,
-        writes: &[(&Bytes, usize, &[u8])],
-    ) -> Result<(), ModelError> {
+    async fn htod_batch(&mut self, writes: &[(&Bytes, usize, &[u8])]) -> Result<(), ModelError> {
         let writes: Vec<(u64, usize, Vec<u8>)> = writes
             .iter()
             .map(|(b, off, data)| (b.id, *off, data.to_vec()))
             .collect();
-        self.submit(move |ack| Command::HtodChunks { writes, stream: STREAM_COMPUTE as u8, ack })?.await
+        self.submit(move |ack| Command::HtodChunks {
+            writes,
+            stream: STREAM_COMPUTE as u8,
+            ack,
+        })?
+        .await
     }
 
     /// **swap 一条命令**(设计卷 §15):N 片一次提交、一次 ack
@@ -666,7 +745,13 @@ impl DeviceClient for GpuClient {
         conn: Box<dyn Connector + Send>,
     ) -> Result<Box<dyn Connector + Send>, ModelError> {
         let pieces = pieces.to_vec();
-        self.submit(move |ack| Command::Swap { dir, pieces, conn, ack })?.await
+        self.submit(move |ack| Command::Swap {
+            dir,
+            pieces,
+            conn,
+            ack,
+        })?
+        .await
     }
 
     /// **分离式 swap**(2026-10-27):把命令投进信箱,回执句柄原样返回。
@@ -687,20 +772,27 @@ impl DeviceClient for GpuClient {
         let pieces = pieces.to_vec();
         let (ack, waiter): (Ack<_>, Waiter<_>) = Ack::pair();
         self.tx
-            .send(Command::Swap { dir, pieces, conn, ack })
+            .send(Command::Swap {
+                dir,
+                pieces,
+                conn,
+                ack,
+            })
             .map_err(|_| ModelError::ServerClosed)?;
         Ok(Box::pin(waiter))
     }
 
     async fn sm_count(&mut self) -> Result<usize, ModelError> {
-        self.submit(move |ack| Command::DeviceSmCount { ack })?.await
+        self.submit(move |ack| Command::DeviceSmCount { ack })?
+            .await
     }
 
     /// **块账本投影**(调试面;默认 trait 口"不支持" ⇒ 这里给 GPU 实现)
     async fn block_ledger_dump(
         &mut self,
     ) -> Result<Vec<owl_iface::contract::BlockLedgerRow>, ModelError> {
-        self.submit(move |ack| Command::BlockLedgerDump { ack })?.await
+        self.submit(move |ack| Command::BlockLedgerDump { ack })?
+            .await
     }
 
     /// **设备池回收**(装载收尾;默认 trait 口"不支持" ⇒ 这里给 GPU 实现)
@@ -725,8 +817,13 @@ impl DeviceClient for GpuClient {
         msg: LaunchMsg,
     ) -> Result<Bytes, ModelError> {
         let dst = dst.clone();
-        self.submit(move |ack| Command::UploadAndLaunch { dst, chunks, msg, ack })?
-            .await
+        self.submit(move |ack| Command::UploadAndLaunch {
+            dst,
+            chunks,
+            msg,
+            ack,
+        })?
+        .await
     }
 
     /// **计算并回读**:一次发射 + 一次回读(`id` 必须是本 launch 的输出块;
@@ -737,7 +834,12 @@ impl DeviceClient for GpuClient {
         id: u64,
         want_bytes: usize,
     ) -> Result<Vec<u8>, ModelError> {
-        self.submit(move |ack| Command::LaunchAndHarvest { msg, id, want_bytes, ack })?
-            .await
+        self.submit(move |ack| Command::LaunchAndHarvest {
+            msg,
+            id,
+            want_bytes,
+            ack,
+        })?
+        .await
     }
 }

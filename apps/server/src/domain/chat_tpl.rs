@@ -128,7 +128,12 @@ impl ChatTpl {
     ) -> Result<Self, TplError> {
         let template = ChatTemplate::from_str(&template)
             .map_err(|e| TplError(format!("chat 模板编译失败({source}): {e}")))?;
-        Ok(Self { template, source, defaults, special_tokens })
+        Ok(Self {
+            template,
+            source,
+            defaults,
+            special_tokens,
+        })
     }
 
     /// **从 GGUF 文件装**（`tokenizer.chat_template` KV；缺 = 拒启）。
@@ -136,22 +141,18 @@ impl ChatTpl {
     /// 与 `load_with` 同一条下游 ⇒ 渲染语义完全一致；差别只在模板**来源**。
     /// 事实自证（单测 `gguf_template_equals_hf_snapshot`）：两靶位的 GGUF 内嵌模板
     /// 与其 HF 快照的 `chat_template.jinja` **逐字节相同**。
-    pub fn load_gguf(
-        gguf_path: &Path,
-        defaults: Map<String, Json>,
-    ) -> Result<Self, TplError> {
+    pub fn load_gguf(gguf_path: &Path, defaults: Map<String, Json>) -> Result<Self, TplError> {
         let g = owl_models::formats::gguf::Gguf::open(gguf_path)
             .map_err(|e| TplError(format!("读 GGUF {}：{e}", gguf_path.display())))?;
-        let t = g
-            .kv
-            .opt_str("tokenizer.chat_template")
-            .map_err(|e| TplError(format!("GGUF 元数据：{e}")))?
-            .ok_or_else(|| {
-                TplError(format!(
-                    "GGUF {} 无 `tokenizer.chat_template`（无权渲染 prompt ⇒ 拒启）",
-                    gguf_path.display()
-                ))
-            })?;
+        let t =
+            g.kv.opt_str("tokenizer.chat_template")
+                .map_err(|e| TplError(format!("GGUF 元数据：{e}")))?
+                .ok_or_else(|| {
+                    TplError(format!(
+                        "GGUF {} 无 `tokenizer.chat_template`（无权渲染 prompt ⇒ 拒启）",
+                        gguf_path.display()
+                    ))
+                })?;
         Self::from_str(
             t.to_string(),
             format!("{}#tokenizer.chat_template", gguf_path.display()),
@@ -171,7 +172,10 @@ impl ChatTpl {
         if let Some(tools) = args.tools {
             ctx.insert("tools".into(), Json::Array(tools.to_vec()));
         }
-        ctx.insert("add_generation_prompt".into(), Json::Bool(args.add_generation_prompt));
+        ctx.insert(
+            "add_generation_prompt".into(),
+            Json::Bool(args.add_generation_prompt),
+        );
         // HF 同款顺序：tokenizer special tokens → agent 缺省 → 请求 kwargs。
         // 模板不引用这些变量时零影响；GGUF 单文件路径为空。
         for (k, v) in &self.special_tokens {
@@ -226,10 +230,15 @@ fn read_template(model_dir: &Path) -> Result<(String, String), TplError> {
         return Ok((s, format!("{}", p.display())));
     }
     let cfg = model_dir.join(TOKENIZER_CONFIG);
-    let raw = std::fs::read_to_string(&cfg)
-        .map_err(|e| TplError(format!("缺 {} 且读 {} 失败：{e}", p.display(), cfg.display())))?;
-    let v: Json = serde_json::from_str(&raw)
-        .map_err(|e| TplError(format!("解析 {}：{e}", cfg.display())))?;
+    let raw = std::fs::read_to_string(&cfg).map_err(|e| {
+        TplError(format!(
+            "缺 {} 且读 {} 失败：{e}",
+            p.display(),
+            cfg.display()
+        ))
+    })?;
+    let v: Json =
+        serde_json::from_str(&raw).map_err(|e| TplError(format!("解析 {}：{e}", cfg.display())))?;
     match v.get("chat_template").and_then(|t| t.as_str()) {
         Some(s) if !s.is_empty() => Ok((s.to_string(), format!("{}#chat_template", cfg.display()))),
         _ => Err(TplError(format!(
@@ -249,7 +258,12 @@ mod tests {
         tools: Option<&'a [Json]>,
         kw: Option<&'a Map<String, Json>>,
     ) -> RenderArgs<'a> {
-        RenderArgs { messages: msgs, tools, add_generation_prompt: true, template_kwargs: kw }
+        RenderArgs {
+            messages: msgs,
+            tools,
+            add_generation_prompt: true,
+            template_kwargs: kw,
+        }
     }
 
     fn tpl(src: &str) -> ChatTpl {
@@ -302,7 +316,10 @@ mod tests {
     fn pycompat_str_methods() {
         let t = tpl("{{ ('a,b,c'.split(',') | length) }}-{{ 'xyz'.startswith('x') }}-{{ '  s '.lstrip() }}-{{ false }}");
         let msgs: Vec<Json> = vec![];
-        assert_eq!(t.render(args(&msgs, None, None)).unwrap(), "3-True-s -False");
+        assert_eq!(
+            t.render(args(&msgs, None, None)).unwrap(),
+            "3-True-s -False"
+        );
     }
 
     /// ④ raise_exception → 结构化错误(不 panic)
@@ -321,7 +338,10 @@ mod tests {
         let msgs: Vec<Json> = vec![];
         let mut kw = Map::new();
         kw.insert("enable_thinking".into(), Json::Bool(false));
-        assert_eq!(t.render(args(&msgs, None, Some(&kw))).unwrap(), "think=False");
+        assert_eq!(
+            t.render(args(&msgs, None, Some(&kw))).unwrap(),
+            "think=False"
+        );
         // 不给 = 模板默认(true)
         assert_eq!(t.render(args(&msgs, None, None)).unwrap(), "think=True");
     }
@@ -361,8 +381,7 @@ mod tests {
             owl_shared::testkit::report::skip("tpl:default 未设(指向 27B 快照目录)");
             return;
         };
-        let fx = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("tests/fixtures/chat_tpl");
+        let fx = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/chat_tpl");
         let tpl = ChatTpl::load(std::path::Path::new(&dir)).expect("装载快照模板");
         for name in [
             "ctx1_tools",
@@ -377,10 +396,9 @@ mod tests {
         //    拿 27B 金标比 0.8B 渲染必红(本行曾因复制粘贴踩过,见 §7.2 教训)。
         if let Some(dir8) = owl_shared::testkit::resource("tpl:qwen35") {
             let t8 = ChatTpl::load(std::path::Path::new(&dir8)).expect("装载 0.8B 模板");
-            let case: Json = serde_json::from_str(
-                &std::fs::read_to_string(fx.join("ctx1_tools.json")).unwrap(),
-            )
-            .unwrap();
+            let case: Json =
+                serde_json::from_str(&std::fs::read_to_string(fx.join("ctx1_tools.json")).unwrap())
+                    .unwrap();
             let want = std::fs::read_to_string(fx.join("qwen35_0.8b_ctx1.txt")).unwrap();
             let got = render_case(&t8, &case);
             assert!(got == want, "qwen35_0.8b_ctx1 与 HF oracle 逐字节不等");
@@ -423,15 +441,24 @@ mod tests {
                 }
                 owl_models::formats::gguf::Gguf::open(gp).expect("开 GGUF")
             };
-            let from_gguf = g.kv.opt_str("tokenizer.chat_template").expect("KV 形态").expect("模板在场");
-            let hf = std::fs::read_to_string(std::path::Path::new(&hf_dir).join(TPL_FILE)).expect("HF 模板");
+            let from_gguf =
+                g.kv.opt_str("tokenizer.chat_template")
+                    .expect("KV 形态")
+                    .expect("模板在场");
+            let hf = std::fs::read_to_string(std::path::Path::new(&hf_dir).join(TPL_FILE))
+                .expect("HF 模板");
             // ① 字节等价
             assert_eq!(from_gguf, hf, "[{gk}] 内嵌模板 ≠ HF 快照模板(逐字节)");
             // ② 渲染等价(同批载荷:tools / 多轮 / 关思考 / 纯文本)
             let a = ChatTpl::load_gguf(std::path::Path::new(&gguf), Map::new()).expect("load_gguf");
             let b = ChatTpl::load(std::path::Path::new(&hf_dir)).expect("load(hf)");
             let mut cases: Vec<Json> = Vec::new();
-            for name in ["ctx1_tools", "ctx2_tools_multiturn", "ctx3_tools_notinking", "ctx4_plain_notinking"] {
+            for name in [
+                "ctx1_tools",
+                "ctx2_tools_multiturn",
+                "ctx3_tools_notinking",
+                "ctx4_plain_notinking",
+            ] {
                 let p = fx.join(format!("{name}.json"));
                 if let Ok(s) = std::fs::read_to_string(&p) {
                     cases.push(serde_json::from_str(&s).expect("fixture json"));
@@ -454,7 +481,11 @@ mod tests {
                     "[{gk}] GGUF 来源与快照来源渲染不等(载荷 {c})"
                 );
             }
-            eprintln!("[{gk}] 模板 {} B 逐字节等 ;;{} 例渲染逐字节等", from_gguf.len(), cases.len());
+            eprintln!(
+                "[{gk}] 模板 {} B 逐字节等 ;;{} 例渲染逐字节等",
+                from_gguf.len(),
+                cases.len()
+            );
             checked += 1;
         }
         if checked == 0 {
@@ -492,6 +523,9 @@ mod tests {
         let msgs: Vec<Json> = vec![serde_json::json!({"role":"user","content":"hi"})];
         let empty: Vec<Json> = vec![];
         assert_eq!(t.render(args(&msgs, None, None)).unwrap(), "[1]");
-        assert_eq!(t.render(args(&msgs, Some(&empty), None)).unwrap(), "[1]+tools(0)");
+        assert_eq!(
+            t.render(args(&msgs, Some(&empty), None)).unwrap(),
+            "[1]+tools(0)"
+        );
     }
 }

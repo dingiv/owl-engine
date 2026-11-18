@@ -27,11 +27,11 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use cudarc::driver::{CudaContext, CudaFunction, CudaSlice, CudaStream, DevicePtr};
+use owl_kernels::contract::OpId;
 use owl_kernels::contract::{Bytes, Dtype, LaunchVal, OpError};
 use owl_kernels::device::{DevPtr, DeviceRes, Exec, LaunchNote, ScratchBuf};
-use owl_kernels::driver::{DType, ROW_REDUCE_BLOCK, elems as geom_e, ln as geom_ln, ops as geom};
+use owl_kernels::driver::{elems as geom_e, ln as geom_ln, ops as geom, DType, ROW_REDUCE_BLOCK};
 use owl_kernels::ops::oracles::{f16_bits, f16_to_f32, lcg_f16};
-use owl_kernels::contract::OpId;
 
 // ============================================================================
 // §0 host 侧小工具
@@ -75,7 +75,9 @@ fn as_bytes_f32(v: &[f32]) -> &[u8] {
     unsafe { std::slice::from_raw_parts(v.as_ptr() as *const u8, v.len() * 4) }
 }
 fn f16_from_bytes(b: &[u8]) -> Vec<u16> {
-    b.chunks_exact(2).map(|c| u16::from_le_bytes([c[0], c[1]])).collect()
+    b.chunks_exact(2)
+        .map(|c| u16::from_le_bytes([c[0], c[1]]))
+        .collect()
 }
 fn f32_row(h: &[u16]) -> Vec<f32> {
     h.iter().map(|x| f16_to_f32(*x)).collect()
@@ -98,7 +100,12 @@ impl TestRes {
         let ctx = CudaContext::new(ordinal).expect("ctx");
         ctx.bind_to_thread().expect("bind");
         let stream = ctx.default_stream();
-        Some(Self { ctx, stream, blocks: HashMap::new(), next: 1 })
+        Some(Self {
+            ctx,
+            stream,
+            blocks: HashMap::new(),
+            next: 1,
+        })
     }
     fn blk(&mut self, nbytes: usize, tag: &str) -> u64 {
         match self.alloc_block(nbytes, tag) {
@@ -133,7 +140,8 @@ impl TestRes {
         }
     }
     fn ptr(&self, id: u64) -> u64 {
-        self.resolve(id).unwrap_or_else(|e| panic!("resolve(id={id}): {e:?}"))
+        self.resolve(id)
+            .unwrap_or_else(|e| panic!("resolve(id={id}): {e:?}"))
     }
     fn sync(&self) {
         self.stream.synchronize().expect("sync");
@@ -148,28 +156,35 @@ impl DeviceRes for TestRes {
         Ok(self.stream.clone())
     }
     fn resolve(&self, id: u64) -> Result<DevPtr, OpError> {
-        self.blocks.get(&id).map(|s| s.device_ptr(&self.stream).0).ok_or_else(|| OpError::Contract {
-            op: "bench".into(),
-            field: "resolve",
-            expect: "块在册".into(),
-            got: format!("id={id}"),
-        })
+        self.blocks
+            .get(&id)
+            .map(|s| s.device_ptr(&self.stream).0)
+            .ok_or_else(|| OpError::Contract {
+                op: "bench".into(),
+                field: "resolve",
+                expect: "块在册".into(),
+                got: format!("id={id}"),
+            })
     }
     fn resolve_len(&self, id: u64) -> Result<usize, OpError> {
-        self.blocks.get(&id).map(|s| s.len()).ok_or_else(|| OpError::Contract {
-            op: "bench".into(),
-            field: "resolve_len",
-            expect: "块在册".into(),
-            got: format!("id={id}"),
-        })
+        self.blocks
+            .get(&id)
+            .map(|s| s.len())
+            .ok_or_else(|| OpError::Contract {
+                op: "bench".into(),
+                field: "resolve_len",
+                expect: "块在册".into(),
+                got: format!("id={id}"),
+            })
     }
     fn alloc(&mut self, bytes: usize, _tag: &str) -> Result<ScratchBuf, OpError> {
-        let s = unsafe { self.stream.alloc::<u8>(bytes.max(1)) }.map_err(|e| OpError::Contract {
-            op: "bench".into(),
-            field: "alloc",
-            expect: "设备分配".into(),
-            got: format!("{e:?}"),
-        })?;
+        let s =
+            unsafe { self.stream.alloc::<u8>(bytes.max(1)) }.map_err(|e| OpError::Contract {
+                op: "bench".into(),
+                field: "alloc",
+                expect: "设备分配".into(),
+                got: format!("{e:?}"),
+            })?;
         let ptr = s.device_ptr(&self.stream).0;
         Ok(ScratchBuf { ptr, bytes })
     }
@@ -191,31 +206,37 @@ impl DeviceRes for TestRes {
         Ok(self.ctx.ordinal() as i32)
     }
     fn alloc_block(&mut self, bytes: usize, _tag: &str) -> Result<Bytes, OpError> {
-        let s = unsafe { self.stream.alloc::<u8>(bytes.max(1)) }.map_err(|e| OpError::Contract {
-            op: "bench".into(),
-            field: "alloc_block",
-            expect: "设备分配".into(),
-            got: format!("{e:?}"),
-        })?;
+        let s =
+            unsafe { self.stream.alloc::<u8>(bytes.max(1)) }.map_err(|e| OpError::Contract {
+                op: "bench".into(),
+                field: "alloc_block",
+                expect: "设备分配".into(),
+                got: format!("{e:?}"),
+            })?;
         let id = self.next;
         self.next += 1;
         self.blocks.insert(id, s);
         Ok(Bytes::new(id, bytes, Dtype::U8, 0))
     }
     fn upload_block(&mut self, b: &Bytes, src: &[u8]) -> Result<(), OpError> {
-        let s = self.blocks.get_mut(&b.id).ok_or_else(|| OpError::Contract {
-            op: "bench".into(),
-            field: "upload_block",
-            expect: "块在册".into(),
-            got: format!("id={}", b.id),
-        })?;
+        let s = self
+            .blocks
+            .get_mut(&b.id)
+            .ok_or_else(|| OpError::Contract {
+                op: "bench".into(),
+                field: "upload_block",
+                expect: "块在册".into(),
+                got: format!("id={}", b.id),
+            })?;
         let n = src.len().min(s.len());
-        self.stream.memcpy_htod(&src[..n], &mut *s).map_err(|e| OpError::Contract {
-            op: "bench".into(),
-            field: "upload_block",
-            expect: "htod".into(),
-            got: format!("{e:?}"),
-        })
+        self.stream
+            .memcpy_htod(&src[..n], &mut *s)
+            .map_err(|e| OpError::Contract {
+                op: "bench".into(),
+                field: "upload_block",
+                expect: "htod".into(),
+                got: format!("{e:?}"),
+            })
     }
     fn download(&mut self, src: DevPtr, dst: &mut [u8]) -> Result<(), OpError> {
         let id = self
@@ -231,12 +252,14 @@ impl DeviceRes for TestRes {
             })?;
         let s = self.blocks.get(&id).expect("刚找到");
         let mut tmp = vec![0u8; s.len()];
-        self.stream.memcpy_dtoh(s, &mut tmp).map_err(|e| OpError::Contract {
-            op: "bench".into(),
-            field: "download",
-            expect: "dtoh".into(),
-            got: format!("{e:?}"),
-        })?;
+        self.stream
+            .memcpy_dtoh(s, &mut tmp)
+            .map_err(|e| OpError::Contract {
+                op: "bench".into(),
+                field: "download",
+                expect: "dtoh".into(),
+                got: format!("{e:?}"),
+            })?;
         dst.copy_from_slice(&tmp[..dst.len()]);
         Ok(())
     }
@@ -259,8 +282,16 @@ fn fire(
     smem: u32,
     vals: &[LaunchVal],
 ) {
-    if let Err(e) = exec.launch(res, OpId(owl_kernels::spec::NATIVE), f, entry, grid, block, smem, vals)
-    {
+    if let Err(e) = exec.launch(
+        res,
+        OpId(owl_kernels::spec::NATIVE),
+        f,
+        entry,
+        grid,
+        block,
+        smem,
+        vals,
+    ) {
         panic!("launch({entry}) grid={grid:?} block={block:?}: {e:?}");
     }
 }
@@ -321,7 +352,11 @@ fn rel_worst(got: &[u16], want: &[f32]) -> (f32, usize) {
 const TOL: f32 = 1e-2; // f16 域 + 归约序差异(与 qknorm oracle 同口径)
 
 fn verdict_ok(worst: f32, at: usize) -> String {
-    if worst > TOL { format!("✗{worst:.2e}@{at}") } else { format!("✓ {worst:.1e}") }
+    if worst > TOL {
+        format!("✗{worst:.2e}@{at}")
+    } else {
+        format!("✓ {worst:.1e}")
+    }
 }
 
 // ============================================================================
@@ -332,15 +367,23 @@ fn rmsnorm_bench(res: &mut TestRes, n: usize, rows: usize) {
     let entry = "owl_rmsnorm_f16";
     let src = <owl_kernels::ops::ln::RmsnormF16 as owl_kernels::spec::KernelSpec>::SRC;
     let mut exec = Exec::new();
-    let f = exec.load_aot(res, src, entry, OpId(owl_kernels::spec::NATIVE)).expect("资产");
+    let f = exec
+        .load_aot(res, src, entry, OpId(owl_kernels::spec::NATIVE))
+        .expect("资产");
 
     // 生产几何(单源:driver;改档即改这里)
     let prod = geom::rmsnorm(DType::F16, &[vec![rows, n], vec![n]]);
     println!("\n═══ {entry}  rows={rows} n={n}");
-    println!("    生产几何(driver): grid={:?} block={:?} smem={}", prod.shape.grid, prod.shape.block, prod.shape.smem);
+    println!(
+        "    生产几何(driver): grid={:?} block={:?} smem={}",
+        prod.shape.grid, prod.shape.block, prod.shape.smem
+    );
 
     let x_h = lcg_f16(rows * n, 0xC1);
-    let w_h: Vec<u16> = lcg_f16(n, 0xC2).iter().map(|h| f16_bits(f16_to_f32(*h) * 0.25 + 1.0)).collect();
+    let w_h: Vec<u16> = lcg_f16(n, 0xC2)
+        .iter()
+        .map(|h| f16_bits(f16_to_f32(*h) * 0.25 + 1.0))
+        .collect();
     let eps = 1e-6f32;
     let w_off = 0i32;
 
@@ -387,7 +430,11 @@ fn rmsnorm_bench(res: &mut TestRes, n: usize, rows: usize) {
         let us1 = time_us(res, &mut exec, &f, entry, grid, block, smem, &vals, 200, 1);
         let us32 = time_us(res, &mut exec, &f, entry, grid, block, smem, &vals, 10, 32);
         let mark = if block == prod.shape.block { "*" } else { " " };
-        println!("  {mark}{:>21} {us1:>10.2} {us32:>10.2}  {}", format!("block={blk}"), verdict_ok(worst, at));
+        println!(
+            "  {mark}{:>21} {us1:>10.2} {us32:>10.2}  {}",
+            format!("block={blk}"),
+            verdict_ok(worst, at)
+        );
     }
 }
 
@@ -399,19 +446,31 @@ fn fused_add_rmsnorm_bench(res: &mut TestRes, n: usize, rows: usize) {
     let entry = "owl_fused_add_rmsnorm_f16";
     let src = <owl_kernels::ops::ln::FusedAddRmsnormF16 as owl_kernels::spec::KernelSpec>::SRC;
     let mut exec = Exec::new();
-    let f = exec.load_aot(res, src, entry, OpId(owl_kernels::spec::NATIVE)).expect("资产");
+    let f = exec
+        .load_aot(res, src, entry, OpId(owl_kernels::spec::NATIVE))
+        .expect("资产");
 
     let prod = geom_ln::fused_add_rmsnorm(DType::F16, rows, n);
     println!("\n═══ {entry}  rows={rows} n={n}");
-    println!("    生产几何(driver): grid={:?} block={:?} smem={}", prod.shape.grid, prod.shape.block, prod.shape.smem);
+    println!(
+        "    生产几何(driver): grid={:?} block={:?} smem={}",
+        prod.shape.grid, prod.shape.block, prod.shape.smem
+    );
 
     let m_h = lcg_f16(rows * n, 0xD1);
     let r_h = lcg_f16(rows * n, 0xD2);
-    let w_h: Vec<u16> = lcg_f16(n, 0xD3).iter().map(|h| f16_bits(f16_to_f32(*h) * 0.25 + 1.0)).collect();
+    let w_h: Vec<u16> = lcg_f16(n, 0xD3)
+        .iter()
+        .map(|h| f16_bits(f16_to_f32(*h) * 0.25 + 1.0))
+        .collect();
     let eps = 1e-6f32;
     let w_off = 0i32;
 
-    let (bm, br, bw) = (res.blk(rows * n * 2, "mixed"), res.blk(rows * n * 2, "res"), res.blk(n * 2, "w"));
+    let (bm, br, bw) = (
+        res.blk(rows * n * 2, "mixed"),
+        res.blk(rows * n * 2, "res"),
+        res.blk(n * 2, "w"),
+    );
     res.up(bm, as_bytes_f16(&m_h));
     res.up(br, as_bytes_f16(&r_h));
     res.up(bw, as_bytes_f16(&w_h));
@@ -433,11 +492,15 @@ fn fused_add_rmsnorm_bench(res: &mut TestRes, n: usize, rows: usize) {
         let inv = 1.0f32 / ((ss / n as f64) as f32 + eps).sqrt();
         for i in 0..n {
             let a = f16_to_f32(w_h[i]);
-            want[r * n + i] = f16_to_f32(want_r[r * n + i]) * inv * (if w_off != 0 { a + 1.0 } else { a });
+            want[r * n + i] =
+                f16_to_f32(want_r[r * n + i]) * inv * (if w_off != 0 { a + 1.0 } else { a });
         }
     }
 
-    println!("  {:>22} {:>10} {:>10} {:>14} {:>10}", "臂(block)", "M=1 µs", "M=32 µs", "out 数值", "residual");
+    println!(
+        "  {:>22} {:>10} {:>10} {:>14} {:>10}",
+        "臂(block)", "M=1 µs", "M=32 µs", "out 数值", "residual"
+    );
     for blk in [256u32, 512, 1024] {
         let bo = res.blk(rows * n * 2, "out");
         let po = res.ptr(bo);
@@ -461,7 +524,11 @@ fn fused_add_rmsnorm_bench(res: &mut TestRes, n: usize, rows: usize) {
         let (worst, at) = rel_worst(&f16_from_bytes(&got), &want);
         let mut gr = vec![0u8; rows * n * 2];
         res.down(br, &mut gr);
-        let nbad = f16_from_bytes(&gr).iter().zip(want_r.iter()).filter(|(g, w)| g != w).count();
+        let nbad = f16_from_bytes(&gr)
+            .iter()
+            .zip(want_r.iter())
+            .filter(|(g, w)| g != w)
+            .count();
         let us1 = time_us(res, &mut exec, &f, entry, grid, block, smem, &vals, 200, 1);
         let us32 = time_us(res, &mut exec, &f, entry, grid, block, smem, &vals, 10, 32);
         let mark = if block == prod.shape.block { "*" } else { " " };
@@ -469,7 +536,11 @@ fn fused_add_rmsnorm_bench(res: &mut TestRes, n: usize, rows: usize) {
             "  {mark}{:>21} {us1:>10.2} {us32:>10.2} {:>14} {:>10}",
             format!("block={blk}"),
             verdict_ok(worst, at),
-            if nbad == 0 { "✓ 逐位".to_string() } else { format!("✗{nbad}") }
+            if nbad == 0 {
+                "✓ 逐位".to_string()
+            } else {
+                format!("✗{nbad}")
+            }
         );
     }
 }
@@ -482,16 +553,25 @@ fn embed_bench(res: &mut TestRes, vocab: usize, d_dim: usize, tokens: usize) {
     let entry = "owl_embed_f16";
     let src = <owl_kernels::ops::elems::EmbedF16 as owl_kernels::spec::KernelSpec>::SRC;
     let mut exec = Exec::new();
-    let f = exec.load_aot(res, src, entry, OpId(owl_kernels::spec::NATIVE)).expect("资产");
+    let f = exec
+        .load_aot(res, src, entry, OpId(owl_kernels::spec::NATIVE))
+        .expect("资产");
 
     let prod = geom_e::embed(DType::F16, tokens);
-    println!("\n═══ {entry}  vocab={vocab} d={d_dim} tokens={tokens}(表 {:.2} GiB)",
-        (vocab * d_dim * 2) as f64 / (1u64 << 30) as f64);
-    println!("    生产几何(driver): grid={:?} block={:?}", prod.shape.grid, prod.shape.block);
+    println!(
+        "\n═══ {entry}  vocab={vocab} d={d_dim} tokens={tokens}(表 {:.2} GiB)",
+        (vocab * d_dim * 2) as f64 / (1u64 << 30) as f64
+    );
+    println!(
+        "    生产几何(driver): grid={:?} block={:?}",
+        prod.shape.grid, prod.shape.block
+    );
 
     let bw = res.blk(vocab * d_dim * 2, "w");
     let pw = res.ptr(bw);
-    let ids_u: Vec<u32> = (0..tokens).map(|i| ((i * 7919 + 13) % vocab) as u32).collect();
+    let ids_u: Vec<u32> = (0..tokens)
+        .map(|i| ((i * 7919 + 13) % vocab) as u32)
+        .collect();
     let ids_f: Vec<f32> = ids_u.iter().map(|&i| i as f32).collect();
     let mut want = vec![0u16; tokens * d_dim];
     for t in 0..tokens {
@@ -522,14 +602,22 @@ fn embed_bench(res: &mut TestRes, vocab: usize, d_dim: usize, tokens: usize) {
         res.sync();
         let mut got = vec![0u8; tokens * d_dim * 2];
         res.down(bo, &mut got);
-        let nbad = f16_from_bytes(&got).iter().zip(want.iter()).filter(|(g, w)| g != w).count();
+        let nbad = f16_from_bytes(&got)
+            .iter()
+            .zip(want.iter())
+            .filter(|(g, w)| g != w)
+            .count();
         let us1 = time_us(res, &mut exec, &f, entry, grid, block, 0, &vals, 200, 1);
         let us32 = time_us(res, &mut exec, &f, entry, grid, block, 0, &vals, 10, 32);
         let mark = if block == prod.shape.block { "*" } else { " " };
         println!(
             "  {mark}{:>21} {us1:>10.2} {us32:>10.2}  {}",
             format!("block={blk}"),
-            if nbad == 0 { "✓ 逐位".to_string() } else { format!("✗{nbad}") }
+            if nbad == 0 {
+                "✓ 逐位".to_string()
+            } else {
+                format!("✗{nbad}")
+            }
         );
     }
 }
@@ -542,11 +630,16 @@ fn argmax_bench(res: &mut TestRes, n: usize) {
     let entry = "owl_argmax_f32idx_f16";
     let src = <owl_kernels::ops::elems::ArgmaxF32IdxF16 as owl_kernels::spec::KernelSpec>::SRC;
     let mut exec = Exec::new();
-    let f = exec.load_aot(res, src, entry, OpId(owl_kernels::spec::NATIVE)).expect("资产");
+    let f = exec
+        .load_aot(res, src, entry, OpId(owl_kernels::spec::NATIVE))
+        .expect("资产");
 
     let prod = geom::argmax();
     println!("\n═══ {entry}  n={n}");
-    println!("    生产几何(driver): grid={:?} block={:?}", prod.shape.grid, prod.shape.block);
+    println!(
+        "    生产几何(driver): grid={:?} block={:?}",
+        prod.shape.grid, prod.shape.block
+    );
 
     let mut x_h = lcg_f16(n, 0xF1);
     // ⚠️ 期望索引必须**从上传的输入算**(不能拿"我设的"当答案):
@@ -559,7 +652,11 @@ fn argmax_bench(res: &mut TestRes, n: usize) {
         .enumerate()
         .fold((0usize, f16_to_f32(x_h[0])), |a, (i, h)| {
             let v = f16_to_f32(*h);
-            if v > a.1 { (i, v) } else { a }
+            if v > a.1 {
+                (i, v)
+            } else {
+                a
+            }
         })
         .0;
     let bx = res.blk(n * 2, "x");
@@ -596,7 +693,11 @@ fn argmax_bench(res: &mut TestRes, n: usize) {
         println!(
             "  {mark}{:>21} {us1:>10.2} {us32:>10.2}  {}",
             format!("block={blk}"),
-            if idx == want_idx as i64 { format!("✓ (期望 {want_idx})") } else { format!("✗{idx} ≠ {want_idx}") }
+            if idx == want_idx as i64 {
+                format!("✓ (期望 {want_idx})")
+            } else {
+                format!("✗{idx} ≠ {want_idx}")
+            }
         );
     }
 }
@@ -626,18 +727,29 @@ fn bf16_parity(res: &mut TestRes, n: usize, rows: usize) {
         let entry = "owl_rmsnorm_bf16";
         let src = <owl_kernels::ops::ln::RmsnormBf16 as owl_kernels::spec::KernelSpec>::SRC;
         let mut exec = Exec::new();
-        let f = exec.load_aot(res, src, entry, OpId(owl_kernels::spec::NATIVE)).expect("资产");
+        let f = exec
+            .load_aot(res, src, entry, OpId(owl_kernels::spec::NATIVE))
+            .expect("资产");
         let prod = geom::rmsnorm(DType::BF16, &[vec![rows, n], vec![n]]);
         let x_h = lcg_bf16(rows * n, 0x51);
-        let w_h: Vec<u16> =
-            lcg_bf16(n, 0x52).iter().map(|h| f32_to_bf16_rne(bf16_to_f32(*h) * 0.25 + 1.0)).collect();
-        let (bx, bw, bo) = (res.blk(rows * n * 2, "x"), res.blk(n * 2, "w"), res.blk(rows * n * 2, "o"));
+        let w_h: Vec<u16> = lcg_bf16(n, 0x52)
+            .iter()
+            .map(|h| f32_to_bf16_rne(bf16_to_f32(*h) * 0.25 + 1.0))
+            .collect();
+        let (bx, bw, bo) = (
+            res.blk(rows * n * 2, "x"),
+            res.blk(n * 2, "w"),
+            res.blk(rows * n * 2, "o"),
+        );
         res.up(bx, as_bytes_f16(&x_h));
         res.up(bw, as_bytes_f16(&w_h));
         let (px, pw, po) = (res.ptr(bx), res.ptr(bw), res.ptr(bo));
         let mut want = vec![0.0f32; rows * n];
         for r in 0..rows {
-            let row: Vec<f32> = x_h[r * n..(r + 1) * n].iter().map(|h| bf16_to_f32(*h)).collect();
+            let row: Vec<f32> = x_h[r * n..(r + 1) * n]
+                .iter()
+                .map(|h| bf16_to_f32(*h))
+                .collect();
             let ss: f64 = row.iter().map(|v| (*v as f64) * (*v as f64)).sum();
             let inv = 1.0f32 / ((ss / n as f64) as f32 + eps).sqrt();
             for i in 0..n {
@@ -652,26 +764,44 @@ fn bf16_parity(res: &mut TestRes, n: usize, rows: usize) {
             LaunchVal::F32(eps),
             LaunchVal::I32(w_off),
         ];
-        fire(res, &mut exec, &f, entry, prod.shape.grid, prod.shape.block, prod.shape.smem, &vals);
+        fire(
+            res,
+            &mut exec,
+            &f,
+            entry,
+            prod.shape.grid,
+            prod.shape.block,
+            prod.shape.smem,
+            &vals,
+        );
         res.sync();
         let mut got = vec![0u8; rows * n * 2];
         res.down(bo, &mut got);
         let (worst, at) = rel_worst_with(&f16_from_bytes(&got), &want, bf16_to_f32);
-        println!("  {entry:<32} grid={:?} block={:?} smem={} → {}", prod.shape.grid, prod.shape.block, prod.shape.smem, verdict_ok(worst, at));
+        println!(
+            "  {entry:<32} grid={:?} block={:?} smem={} → {}",
+            prod.shape.grid,
+            prod.shape.block,
+            prod.shape.smem,
+            verdict_ok(worst, at)
+        );
     }
 
     // ── fused_add_rmsnorm_bf16(含 residual 逐位)──
     {
         let entry = "owl_fused_add_rmsnorm_bf16";
-        let src =
-            <owl_kernels::ops::ln::FusedAddRmsnormBf16 as owl_kernels::spec::KernelSpec>::SRC;
+        let src = <owl_kernels::ops::ln::FusedAddRmsnormBf16 as owl_kernels::spec::KernelSpec>::SRC;
         let mut exec = Exec::new();
-        let f = exec.load_aot(res, src, entry, OpId(owl_kernels::spec::NATIVE)).expect("资产");
+        let f = exec
+            .load_aot(res, src, entry, OpId(owl_kernels::spec::NATIVE))
+            .expect("资产");
         let prod = geom_ln::fused_add_rmsnorm(DType::BF16, rows, n);
         let m_h = lcg_bf16(rows * n, 0x61);
         let r_h = lcg_bf16(rows * n, 0x62);
-        let w_h: Vec<u16> =
-            lcg_bf16(n, 0x63).iter().map(|h| f32_to_bf16_rne(bf16_to_f32(*h) * 0.25 + 1.0)).collect();
+        let w_h: Vec<u16> = lcg_bf16(n, 0x63)
+            .iter()
+            .map(|h| f32_to_bf16_rne(bf16_to_f32(*h) * 0.25 + 1.0))
+            .collect();
         let (bm, br, bw, bo) = (
             res.blk(rows * n * 2, "m"),
             res.blk(rows * n * 2, "r"),
@@ -707,21 +837,38 @@ fn bf16_parity(res: &mut TestRes, n: usize, rows: usize) {
             LaunchVal::I32(w_off),
             LaunchVal::Ptr(po),
         ];
-        fire(res, &mut exec, &f, entry, prod.shape.grid, prod.shape.block, prod.shape.smem, &vals);
+        fire(
+            res,
+            &mut exec,
+            &f,
+            entry,
+            prod.shape.grid,
+            prod.shape.block,
+            prod.shape.smem,
+            &vals,
+        );
         res.sync();
         let mut got = vec![0u8; rows * n * 2];
         res.down(bo, &mut got);
         let (worst, at) = rel_worst_with(&f16_from_bytes(&got), &want, bf16_to_f32);
         let mut gr = vec![0u8; rows * n * 2];
         res.down(br, &mut gr);
-        let nbad = f16_from_bytes(&gr).iter().zip(want_r.iter()).filter(|(g, w)| g != w).count();
+        let nbad = f16_from_bytes(&gr)
+            .iter()
+            .zip(want_r.iter())
+            .filter(|(g, w)| g != w)
+            .count();
         println!(
             "  {entry:<32} grid={:?} block={:?} smem={} → {} · residual {}",
             prod.shape.grid,
             prod.shape.block,
             prod.shape.smem,
             verdict_ok(worst, at),
-            if nbad == 0 { "✓ 逐位".to_string() } else { format!("✗{nbad}") }
+            if nbad == 0 {
+                "✓ 逐位".to_string()
+            } else {
+                format!("✗{nbad}")
+            }
         );
     }
 }
@@ -734,7 +881,9 @@ fn embed_i8_parity(res: &mut TestRes) {
     let entry = "owl_embed_i8_f16";
     let src = <owl_kernels::ops::elems::EmbedI8F16 as owl_kernels::spec::KernelSpec>::SRC;
     let mut exec = Exec::new();
-    let f = exec.load_aot(res, src, entry, OpId(owl_kernels::spec::NATIVE)).expect("资产");
+    let f = exec
+        .load_aot(res, src, entry, OpId(owl_kernels::spec::NATIVE))
+        .expect("资产");
 
     let (vocab, d_dim, tokens) = (64usize, 512usize, 3usize);
     // int8 位型(含负值);per-row scale 正数
@@ -760,7 +909,16 @@ fn embed_i8_parity(res: &mut TestRes) {
         LaunchVal::U64(d_dim as u64),
         LaunchVal::Ptr(res.ptr(bo)),
     ];
-    fire(res, &mut exec, &f, entry, geom.shape.grid, geom.shape.block, 0, &vals);
+    fire(
+        res,
+        &mut exec,
+        &f,
+        entry,
+        geom.shape.grid,
+        geom.shape.block,
+        0,
+        &vals,
+    );
     res.sync();
     let mut got = vec![0u8; tokens * d_dim * 2];
     res.down(bo, &mut got);
@@ -782,9 +940,14 @@ fn embed_i8_parity(res: &mut TestRes) {
     }
     println!(
         "  {entry:<32} grid={:?} block={:?} → {} (bad={bad}, worst={worst:e})",
-        geom.shape.grid, geom.shape.block, if bad == 0 { "✓ 逐位" } else { "✗" }
+        geom.shape.grid,
+        geom.shape.block,
+        if bad == 0 { "✓ 逐位" } else { "✗" }
     );
-    assert_eq!(bad, 0, "embed_i8 与 host f32 参考不一致(bad={bad}, worst={worst:e})");
+    assert_eq!(
+        bad, 0,
+        "embed_i8 与 host f32 参考不一致(bad={bad}, worst={worst:e})"
+    );
 }
 
 #[test]
@@ -806,7 +969,10 @@ fn small_kernel_bench_and_parity() {
         owl_shared::testkit::report::skip("需 OWL_TEST_DEVICE=<CUDA ordinal>");
         return;
     };
-    println!("[bench] CUDA ordinal = {}(`*` = 生产几何)", res.ctx.ordinal());
+    println!(
+        "[bench] CUDA ordinal = {}(`*` = 生产几何)",
+        res.ctx.ordinal()
+    );
     rmsnorm_bench(&mut res, 5120, 1);
     fused_add_rmsnorm_bench(&mut res, 5120, 1);
     bf16_parity(&mut res, 5120, 1);

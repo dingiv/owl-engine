@@ -11,7 +11,9 @@
 //!   cargo test -p owl-models --test eval_batch_bench -- --nocapture
 //! ```
 
-use owl_cuda::{test_device_ordinal_opt, Command as Envelope, DeviceSelector, GpuClient, GpuServer};
+use owl_cuda::{
+    test_device_ordinal_opt, Command as Envelope, DeviceSelector, GpuClient, GpuServer,
+};
 use owl_iface::contract::{DeviceClient, Dtype};
 use owl_iface::handle::DeviceHandle;
 use owl_models::env::{EnvProvider, InterpEnv};
@@ -52,7 +54,10 @@ async fn eval_host_cost_probe() {
         .and_then(|v| v.parse().ok())
         .unwrap_or(0);
     let env = EnvProvider {
-        interp: InterpEnv { block_pool_bytes: budget, ..Default::default() },
+        interp: InterpEnv {
+            block_pool_bytes: budget,
+            ..Default::default()
+        },
         ..Default::default()
     };
 

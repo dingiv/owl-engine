@@ -4,13 +4,13 @@
 //! cublas runtime 隔离测试(M4 cutover 验收;已知矩阵双路对拍)。
 //! 路径:CublasRuntime::run(TestRes) vs host 朴素 matmul。
 
-use owl_kernels::server::cublas::CublasRuntime;
+use cudarc::driver::{CudaSlice, DevicePtr};
 use owl_kernels::contract::{Bytes, Dtype, LaunchMsg, OpError};
 use owl_kernels::device::{DeviceRes, Exec, ScratchBuf};
 use owl_kernels::registry::KernelFamily;
+use owl_kernels::server::cublas::CublasRuntime;
 use std::collections::HashMap;
 use std::sync::Arc;
-use cudarc::driver::{CudaSlice, DevicePtr};
 
 struct TestRes {
     ctx: Arc<cudarc::driver::CudaContext>,
@@ -24,7 +24,12 @@ impl TestRes {
         let ctx = cudarc::driver::CudaContext::new(dev).expect("ctx");
         ctx.bind_to_thread().expect("bind");
         let stream = ctx.default_stream();
-        Self { ctx, stream, blocks: HashMap::new(), next_id: 1 }
+        Self {
+            ctx,
+            stream,
+            blocks: HashMap::new(),
+            next_id: 1,
+        }
     }
     fn upload(&mut self, bytes: &[u8]) -> Bytes {
         let id = self.next_id;
@@ -47,13 +52,23 @@ impl DeviceRes for TestRes {
         self.blocks
             .get(&id)
             .map(|s| s.device_ptr(&self.stream).0)
-            .ok_or_else(|| OpError::Contract { op: "t".into(), field: "resolve", expect: "在册".into(), got: id.to_string() })
+            .ok_or_else(|| OpError::Contract {
+                op: "t".into(),
+                field: "resolve",
+                expect: "在册".into(),
+                got: id.to_string(),
+            })
     }
     fn resolve_len(&self, id: u64) -> Result<usize, OpError> {
         self.blocks
             .get(&id)
             .map(|s| s.len())
-            .ok_or_else(|| OpError::Contract { op: "t".into(), field: "resolve_len", expect: "在册".into(), got: id.to_string() })
+            .ok_or_else(|| OpError::Contract {
+                op: "t".into(),
+                field: "resolve_len",
+                expect: "在册".into(),
+                got: id.to_string(),
+            })
     }
     fn alloc(&mut self, bytes: usize, _tag: &str) -> Result<ScratchBuf, OpError> {
         let d = self.stream.alloc_zeros::<u8>(bytes).expect("alloc");
@@ -77,11 +92,15 @@ impl DeviceRes for TestRes {
             .map(|(id, _)| *id);
         if let Some(id) = target {
             let view = self.blocks.get_mut(&id).expect("在册");
-            cudarc::driver::CudaStream::memcpy_htod(&self.stream, src, view)
-                .expect("htod");
+            cudarc::driver::CudaStream::memcpy_htod(&self.stream, src, view).expect("htod");
             return Ok(());
         }
-        Err(OpError::Contract { op: "t".into(), field: "upload", expect: "指针在册".into(), got: format!("{dst:#x}") })
+        Err(OpError::Contract {
+            op: "t".into(),
+            field: "upload",
+            expect: "指针在册".into(),
+            got: format!("{dst:#x}"),
+        })
     }
     fn device_ordinal(&self) -> Result<i32, OpError> {
         Ok(0)
@@ -93,20 +112,23 @@ impl DeviceRes for TestRes {
     ) -> Result<(), owl_kernels::contract::OpError> {
         // 测试面:按块 id 直查(账房即 self.blocks)
         let stream = self.stream.clone();
-        let s = self.blocks.get_mut(&b.id).ok_or_else(|| {
-            owl_kernels::contract::OpError::Contract {
+        let s =
+            self.blocks
+                .get_mut(&b.id)
+                .ok_or_else(|| owl_kernels::contract::OpError::Contract {
+                    op: "test".into(),
+                    field: "upload_block",
+                    expect: "块在册".into(),
+                    got: format!("id={}", b.id),
+                })?;
+        stream
+            .memcpy_htod(src, s)
+            .map_err(|e| owl_kernels::contract::OpError::Contract {
                 op: "test".into(),
                 field: "upload_block",
-                expect: "块在册".into(),
-                got: format!("id={}", b.id),
-            }
-        })?;
-        stream.memcpy_htod(src, s).map_err(|e| owl_kernels::contract::OpError::Contract {
-            op: "test".into(),
-            field: "upload_block",
-            expect: "htod".into(),
-            got: format!("{e:?}"),
-        })
+                expect: "htod".into(),
+                got: format!("{e:?}"),
+            })
     }
 
     fn alloc_block(
@@ -115,13 +137,14 @@ impl DeviceRes for TestRes {
         tag: &str,
     ) -> Result<owl_kernels::contract::Bytes, OpError> {
         // 测试面:走裸分配 + 在册登记(resolve 可解析)
-        let s = unsafe { self.stream.alloc::<u8>(bytes.max(1)) }
-            .map_err(|e| owl_kernels::contract::OpError::Contract {
+        let s = unsafe { self.stream.alloc::<u8>(bytes.max(1)) }.map_err(|e| {
+            owl_kernels::contract::OpError::Contract {
                 op: "test".into(),
                 field: "alloc_block",
                 expect: "-".into(),
                 got: format!("{e:?}"),
-            })?;
+            }
+        })?;
         let id = self.next_id;
         self.next_id += 1;
         self.blocks.insert(id, s);
@@ -151,8 +174,12 @@ fn cublas_runtime_matches_host_matmul() {
 
     // C[2,3] = A[2,6] × W[3,6]^T(nt=true;owl Linear 形态)
     let (t, hidden, n_out) = (2usize, 6usize, 3usize);
-    let a: Vec<f32> = (0..t * hidden).map(|i| ((i as f32 + 1.0) * 0.21).sin() * 0.5).collect();
-    let w: Vec<f32> = (0..n_out * hidden).map(|i| ((i as f32 + 4.0) * 0.17).sin() * 0.7).collect();
+    let a: Vec<f32> = (0..t * hidden)
+        .map(|i| ((i as f32 + 1.0) * 0.21).sin() * 0.5)
+        .collect();
+    let w: Vec<f32> = (0..n_out * hidden)
+        .map(|i| ((i as f32 + 4.0) * 0.17).sin() * 0.7)
+        .collect();
     let mut want = vec![0f32; t * n_out];
     for i in 0..t {
         for j in 0..n_out {
@@ -164,7 +191,9 @@ fn cublas_runtime_matches_host_matmul() {
         }
     }
     let f16b = |v: &[f32]| -> Vec<u8> {
-        v.iter().flat_map(|f| half::f16::from_f32(*f).to_le_bytes()).collect()
+        v.iter()
+            .flat_map(|f| half::f16::from_f32(*f).to_le_bytes())
+            .collect()
     };
 
     let a_b = res.upload(&f16b(&a));
@@ -190,8 +219,8 @@ fn cublas_runtime_matches_host_matmul() {
             owl_kernels::contract::Arg::block(out_b.id, out_b.dtype, out_b.rank),
             owl_kernels::contract::Arg::U64(n_out as u64), // m = n_out(权重行)
             owl_kernels::contract::Arg::U64(hidden as u64), // k
-            owl_kernels::contract::Arg::U64(t as u64), // n = tokens
-            owl_kernels::contract::Arg::U64(1),        // nt = true
+            owl_kernels::contract::Arg::U64(t as u64),     // n = tokens
+            owl_kernels::contract::Arg::U64(1),            // nt = true
         ],
         grid: (0, 0, 0),
         block: (0, 0, 0),
@@ -203,7 +232,11 @@ fn cublas_runtime_matches_host_matmul() {
 
     for (id, s) in &res.blocks {
         use cudarc::driver::DevicePtr;
-        eprintln!("[test ptr] id={id} ptr={:#x} bytes={}", s.device_ptr(&res.stream).0, s.len());
+        eprintln!(
+            "[test ptr] id={id} ptr={:#x} bytes={}",
+            s.device_ptr(&res.stream).0,
+            s.len()
+        );
     }
     // 输入完整性对照(upload 后 vs run 后)
     let a_after = res.take_bytes_f16_test(a_b.id);
@@ -214,11 +247,13 @@ fn cublas_runtime_matches_host_matmul() {
     // 对照臂:直接 OwlCublas::gemm_f16(旧 handler 同款调用)同缓冲重跑
     {
         let stream = res.stream.clone();
-        let blas = owl_kernels::family::cublas::OwlCublas::new(stream.clone()).expect("direct blas");
+        let blas =
+            owl_kernels::family::cublas::OwlCublas::new(stream.clone()).expect("direct blas");
         let a_p = res.resolve(a_b.id).expect("a");
         let b_p = res.resolve(w_b.id).expect("b");
         let o_p = res.resolve(out_b.id).expect("o");
-        blas.gemm_f16(a_p, b_p, o_p, n_out, hidden, t, true).expect("direct gemm");
+        blas.gemm_f16(a_p, b_p, o_p, n_out, hidden, t, true)
+            .expect("direct gemm");
         stream.synchronize().expect("sync");
     }
     let got_direct = res.take_bytes_f16_test(out_id);

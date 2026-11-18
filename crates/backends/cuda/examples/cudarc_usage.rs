@@ -152,7 +152,11 @@ impl Tensor {
                 depth: self.head.depth + 1,
                 op,
                 shape: shape.clone(),
-                err: self.head.err.clone().or(rhs.and_then(|r| r.head.err.clone())),
+                err: self
+                    .head
+                    .err
+                    .clone()
+                    .or(rhs.and_then(|r| r.head.err.clone())),
             },
             shape,
         }
@@ -229,7 +233,9 @@ fn demo1_chain_and_eval() {
     let x = Tensor::from_host(vec![1, 4], &[1.0, 2.0, -3.0, 4.0]);
     let eye = Tensor::from_host(
         vec![4, 4],
-        &[1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0],
+        &[
+            1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0,
+        ],
     );
     let bias = Tensor::zeros(vec![1, 4]);
     let alpha = Tensor::from_host(vec![1, 4], &[0.5; 4]);
@@ -286,7 +292,7 @@ fn demo3_value_semantics() {
 fn demo4_fork() {
     println!("== demo4:fork 多档位(底稿深拷贝进各档) ==");
     let base = Tensor::from_host(vec![4], &[1.0, 2.0, 3.0, 4.0]);
-    let tier_a = base.silu();          // 档 A:base 深拷贝 + silu
+    let tier_a = base.silu(); // 档 A:base 深拷贝 + silu
     let tier_b = base.add(&base).silu(); // 档 B:base 深拷贝 + add + silu
 
     let mut flat_a = Vec::new();
@@ -321,7 +327,7 @@ fn main() {
 
 mod gpu_exec {
     use cudarc::driver::{
-        CudaContext, CudaFunction, CudaStream, CudaSlice, LaunchConfig, PushKernelArg,
+        CudaContext, CudaFunction, CudaSlice, CudaStream, LaunchConfig, PushKernelArg,
     };
     use cudarc::nvrtc::safe::{compile_ptx_with_opts, CompileOptions};
     use std::collections::HashMap;
@@ -366,7 +372,10 @@ extern "C" __global__ void owl_matmul_f32(
             // arch 显式钉(不钉 = nvrtc 默认 target 可能高于驱动可加载档)
             let ptx = compile_ptx_with_opts(
                 KERNELS,
-                CompileOptions { arch: Some("sm_86"), ..Default::default() },
+                CompileOptions {
+                    arch: Some("sm_86"),
+                    ..Default::default()
+                },
             )?;
             let module = ctx.load_module(ptx)?;
             let mut funcs = HashMap::new();
@@ -492,7 +501,8 @@ fn eval_gpu(
         Op::Matmul => {
             let (m, n) = (step.shape[0], step.shape[1]);
             let k = ins[0].len() / m;
-            ex.matmul(&ins[0], &ins[1], m, k, n).map_err(|e| e.to_string())?
+            ex.matmul(&ins[0], &ins[1], m, k, n)
+                .map_err(|e| e.to_string())?
         }
         Op::Rmsnorm { .. } => unimplemented!("demo 未走 rmsnorm 的 GPU 分支"),
     };
@@ -510,7 +520,9 @@ fn demo5_gpu_executor() {
     let x = Tensor::from_host(vec![1, 4], &[1.0, 2.0, -3.0, 4.0]);
     let eye = Tensor::from_host(
         vec![4, 4],
-        &[1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0],
+        &[
+            1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0,
+        ],
     );
     let bias = Tensor::zeros(vec![1, 4]);
     let alpha = Tensor::from_host(vec![1, 4], &[0.5; 4]);

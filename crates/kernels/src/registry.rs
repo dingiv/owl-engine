@@ -16,8 +16,10 @@ use std::sync::atomic::{AtomicU64, Ordering};
 ///
 /// 关联函数指针(非方法调用)—— `assemble` 带 `where Self: Sized`,
 /// 不进 vtable,故 `Box<dyn KernelFamily>` 的 dyn 兼容不受影响(实测)。
-pub type FamilyFactory =
-    fn(&mut dyn crate::device::DeviceRes, &mut crate::device::Exec) -> Result<Box<dyn KernelFamily>, OpError>;
+pub type FamilyFactory = fn(
+    &mut dyn crate::device::DeviceRes,
+    &mut crate::device::Exec,
+) -> Result<Box<dyn KernelFamily>, OpError>;
 
 /// 族契约(原子单位 = 一族 runtime;每族一个 struct 实现)。
 ///
@@ -58,7 +60,6 @@ pub trait KernelFamily: Send {
         }
         v
     }
-
 
     /// **构造函数**(工厂语义)。带 `where Self: Sized` 保住 trait 的 dyn 兼容。
     fn assemble(
@@ -136,15 +137,23 @@ impl<F: KernelFamily + 'static> FamilyGuard<F> {
     /// 工厂收尾糖:把具体族擦进 dyn 守卫。
     pub fn boxed(inner: F) -> Box<dyn KernelFamily> {
         let id = inner.id();
-        Box::new(Self { inner: Some(Box::new(inner)), id, closed: false })
+        Box::new(Self {
+            inner: Some(Box::new(inner)),
+            id,
+            closed: false,
+        })
     }
 
     fn family(&self) -> &F {
-        self.inner.as_deref().expect("族已 close,不可再用(生命周期违例)")
+        self.inner
+            .as_deref()
+            .expect("族已 close,不可再用(生命周期违例)")
     }
 
     fn family_mut(&mut self) -> &mut F {
-        self.inner.as_deref_mut().expect("族已 close,不可再用(生命周期违例)")
+        self.inner
+            .as_deref_mut()
+            .expect("族已 close,不可再用(生命周期违例)")
     }
 }
 
@@ -200,7 +209,8 @@ impl<F: KernelFamily + 'static> KernelFamily for FamilyGuard<F> {
         page: usize,
         res: &mut dyn crate::device::DeviceRes,
     ) -> Result<(), OpError> {
-        self.family_mut().plan_sync(t, ctx_total, hq, hkv, hd, page, res)
+        self.family_mut()
+            .plan_sync(t, ctx_total, hq, hkv, hd, page, res)
     }
 }
 
@@ -388,7 +398,13 @@ impl OpRegistry {
         exec: &mut crate::device::Exec,
         allowed: Option<&[&str]>,
     ) -> Result<Self, OpError> {
-        Self::init_all_inner(factories, res, exec, allowed, &mut AssembleReport::default())
+        Self::init_all_inner(
+            factories,
+            res,
+            exec,
+            allowed,
+            &mut AssembleReport::default(),
+        )
     }
 
     pub fn init_all(
@@ -407,7 +423,8 @@ impl OpRegistry {
         report: &mut AssembleReport,
     ) -> Result<Self, OpError> {
         let mut names = HashSet::new();
-        let mut route: std::collections::HashMap<&'static str, usize> = std::collections::HashMap::new();
+        let mut route: std::collections::HashMap<&'static str, usize> =
+            std::collections::HashMap::new();
         let mut families: Vec<Box<dyn KernelFamily>> = Vec::with_capacity(factories.len());
         for factory in factories {
             // 装配失败路径也要收尾已建成的族(§4.4 同律:错误路径不留
@@ -532,7 +549,10 @@ impl OpRegistry {
         let undeclared = crate::ops::undeclared_symbols();
         report.declared_ops = n_declared;
         report.family_routed = n_family;
-        report.asset_symbols = crate::cu_sig::ASSET_SYMBOLS.iter().map(|(_, s)| s.len()).sum::<usize>();
+        report.asset_symbols = crate::cu_sig::ASSET_SYMBOLS
+            .iter()
+            .map(|(_, s)| s.len())
+            .sum::<usize>();
         report.undeclared = undeclared;
         // 装配期自检(设计 §5.5:独立 oracle,失败 = 拒启)。
         // 白名单在场 ⇒ 只跑生效算子(装配期成本按档位裁);否则跑全部已建表。
@@ -566,10 +586,20 @@ impl OpRegistry {
                 });
             }
         };
-        let tagged = tag_index.all().iter().filter(|m| !m.tags.is_empty()).count();
+        let tagged = tag_index
+            .all()
+            .iter()
+            .filter(|m| !m.tags.is_empty())
+            .count();
         report.tag_entries = crate::spec::KERNEL_TAG_COUNT;
         report.tagged_ops = tagged;
-        Ok(Self { families, names, route, metas, tag_index })
+        Ok(Self {
+            families,
+            names,
+            route,
+            metas,
+            tag_index,
+        })
     }
 
     /// **准入声明查询**(发射期 check 的唯一入口;未建表 = `None` = 仅引入)。
@@ -626,14 +656,15 @@ impl OpRegistry {
         res: &mut dyn crate::device::DeviceRes,
         exec: &mut crate::device::Exec,
     ) -> Result<Bytes, OpError> {
-        let idx = *self.route.get(msg.kernel.name.as_str()).ok_or_else(|| {
-            OpError::Contract {
+        let idx = *self
+            .route
+            .get(msg.kernel.name.as_str())
+            .ok_or_else(|| OpError::Contract {
                 op: msg.kernel.name.clone(),
                 field: "name",
                 expect: "已注册家族".into(),
                 got: format!("{}(未注册)", msg.kernel.name),
-            }
-        })?;
+            })?;
         self.families[idx].run(msg, res, exec)
     }
 
@@ -708,7 +739,10 @@ mod tests {
         .expect("空激活集");
         assert!(!reg.knows("anything"));
         let msg = LaunchMsg {
-            kernel: crate::contract::KernelSource { name: "anything".into(), source: String::new() },
+            kernel: crate::contract::KernelSource {
+                name: "anything".into(),
+                source: String::new(),
+            },
             args: vec![],
             grid: (0, 0, 0),
             block: (0, 0, 0),
@@ -718,7 +752,10 @@ mod tests {
         let err = reg
             .execute(&msg, &mut NopRes, &mut crate::device::Exec::new())
             .expect_err("空表必拒");
-        assert!(matches!(err, OpError::Contract { field: "name", .. }), "{err}");
+        assert!(
+            matches!(err, OpError::Contract { field: "name", .. }),
+            "{err}"
+        );
     }
 
     /// **`names()` = 族主名(id)∪ 已建表算子名**(2026-10-13 回归锁)。
@@ -765,28 +802,54 @@ mod tests {
         assert_eq!(Fake(&[]).names(), vec!["fake_family"]);
         // 部分/全量建表:主名 + 算子名(去重)
         const WITH_OP: &[&crate::spec::KernelMeta] = &[&crate::ops::xqa::XQA_VERIFY];
-        assert_eq!(
-            Fake(WITH_OP).names(),
-            vec!["fake_family", "owl_xqa_verify"]
-        );
+        assert_eq!(Fake(WITH_OP).names(), vec!["fake_family", "owl_xqa_verify"]);
     }
 
     struct NopRes;
     impl crate::device::DeviceRes for NopRes {
         fn context(&self) -> Result<std::sync::Arc<cudarc::driver::CudaContext>, OpError> {
-            Err(OpError::Contract { op: "nop".into(), field: "ctx", expect: "-".into(), got: "-".into() })
+            Err(OpError::Contract {
+                op: "nop".into(),
+                field: "ctx",
+                expect: "-".into(),
+                got: "-".into(),
+            })
         }
         fn stream(&self) -> Result<std::sync::Arc<cudarc::driver::CudaStream>, OpError> {
-            Err(OpError::Contract { op: "nop".into(), field: "stream", expect: "-".into(), got: "-".into() })
+            Err(OpError::Contract {
+                op: "nop".into(),
+                field: "stream",
+                expect: "-".into(),
+                got: "-".into(),
+            })
         }
         fn resolve(&self, _id: u64) -> Result<u64, OpError> {
-            Err(OpError::Contract { op: "nop".into(), field: "resolve", expect: "-".into(), got: "-".into() })
+            Err(OpError::Contract {
+                op: "nop".into(),
+                field: "resolve",
+                expect: "-".into(),
+                got: "-".into(),
+            })
         }
         fn resolve_len(&self, _id: u64) -> Result<usize, OpError> {
-            Err(OpError::Contract { op: "nop".into(), field: "resolve_len", expect: "-".into(), got: "-".into() })
+            Err(OpError::Contract {
+                op: "nop".into(),
+                field: "resolve_len",
+                expect: "-".into(),
+                got: "-".into(),
+            })
         }
-        fn alloc(&mut self, _bytes: usize, _tag: &str) -> Result<crate::device::ScratchBuf, OpError> {
-            Err(OpError::Contract { op: "nop".into(), field: "alloc", expect: "-".into(), got: "-".into() })
+        fn alloc(
+            &mut self,
+            _bytes: usize,
+            _tag: &str,
+        ) -> Result<crate::device::ScratchBuf, OpError> {
+            Err(OpError::Contract {
+                op: "nop".into(),
+                field: "alloc",
+                expect: "-".into(),
+                got: "-".into(),
+            })
         }
         fn capturing(&self) -> Result<bool, OpError> {
             Ok(false)
@@ -795,7 +858,12 @@ mod tests {
             Ok(())
         }
         fn upload(&mut self, _dst: u64, _src: &[u8]) -> Result<(), OpError> {
-            Err(OpError::Contract { op: "nop".into(), field: "upload", expect: "-".into(), got: "-".into() })
+            Err(OpError::Contract {
+                op: "nop".into(),
+                field: "upload",
+                expect: "-".into(),
+                got: "-".into(),
+            })
         }
         fn device_ordinal(&self) -> Result<i32, OpError> {
             Ok(0)
@@ -805,17 +873,36 @@ mod tests {
             _b: &crate::contract::Bytes,
             _src: &[u8],
         ) -> Result<(), OpError> {
-            Err(OpError::Contract { op: "nop".into(), field: "upload_block", expect: "-".into(), got: "-".into() })
+            Err(OpError::Contract {
+                op: "nop".into(),
+                field: "upload_block",
+                expect: "-".into(),
+                got: "-".into(),
+            })
         }
         fn alloc_block(
             &mut self,
             _bytes: usize,
             _tag: &str,
         ) -> Result<crate::contract::Bytes, OpError> {
-            Err(OpError::Contract { op: "nop".into(), field: "alloc_block", expect: "-".into(), got: "-".into() })
+            Err(OpError::Contract {
+                op: "nop".into(),
+                field: "alloc_block",
+                expect: "-".into(),
+                got: "-".into(),
+            })
         }
-        fn download(&mut self, _src: crate::device::DevPtr, _dst: &mut [u8]) -> Result<(), OpError> {
-            Err(OpError::Contract { op: "nop".into(), field: "download", expect: "-".into(), got: "-".into() })
+        fn download(
+            &mut self,
+            _src: crate::device::DevPtr,
+            _dst: &mut [u8],
+        ) -> Result<(), OpError> {
+            Err(OpError::Contract {
+                op: "nop".into(),
+                field: "download",
+                expect: "-".into(),
+                got: "-".into(),
+            })
         }
     }
 }

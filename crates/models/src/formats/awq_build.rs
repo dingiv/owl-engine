@@ -12,12 +12,12 @@
 //! 拆后 `awq.rs` 回千行档,物化面自带单一入口。
 //! `impl AwqSource` 第二块合法(类型可vis ⇒ 同 crate 可另起 impl;相应字段转 `pub(crate)`)。
 
-use crate::formats::awq::{is_a8_key, AwqSource, IdxKind, QuantForm, CACHE_CAP_BYTES};
 use crate::contract::ModelError;
+use crate::formats::awq::{is_a8_key, AwqSource, IdxKind, QuantForm, CACHE_CAP_BYTES};
 use crate::formats::split_merged;
 use crate::formats::util::marlin_eligible;
-use crate::module::Taken;
 use crate::formats::util::{bf16_par, i32s_le_bytes, i32s_par, u16s_le_bytes};
+use crate::module::Taken;
 use owl_kernels::family::marlin::repack::{
     marlin_fused_indices, marlin_scales_index, marlin_scales_index_a8, pack_marlin_b_fused,
     pack_marlin_b_gather_into, pack_marlin_s_idx, pack_marlin_z, unpack_zp_ct,
@@ -83,14 +83,20 @@ impl AwqSource {
 
     /// 分片建造锁(纯串行化,**无载荷**)取用口:中毒无状态可坏 ⇒ 直接取回。
     fn build_guard(&self, shard: usize) -> std::sync::MutexGuard<'_, ()> {
-        self.build_locks[shard].lock().unwrap_or_else(|p| p.into_inner())
+        self.build_locks[shard]
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
     }
 
     /// fc 列半拆物化(E5-M2b;键首触才建,双检缓存 + build_lock 同款):
     /// 读物理键 mtp.fc.weight(bf16 [out, 2h])→ 逐行 bf16→f16 + 取前/后
     /// 半 → [out, h] f16 连续。rayon 行并行(行长 2 字节对齐,安全)。
     pub(crate) fn fc_half_bytes(&self, high: bool) -> Taken<Arc<[u8]>> {
-        let vkey = if high { "mtp.fc_h.weight" } else { "mtp.fc_e.weight" };
+        let vkey = if high {
+            "mtp.fc_h.weight"
+        } else {
+            "mtp.fc_e.weight"
+        };
         {
             let cache = self.cache_guard();
             if let Some(b) = cache.0.get(vkey) {
@@ -109,13 +115,15 @@ impl AwqSource {
         {
             use rayon::prelude::*;
             let skip = if high { half * 2 } else { 0 };
-            dst.par_chunks_mut(half * 2).enumerate().for_each(|(r, row)| {
-                let base = r * din * 2 + skip;
-                crate::f16c::bf16_bytes_to_f16_bytes(
-                    &src[base..base + half * 2],
-                    &mut row[..half * 2],
-                );
-            });
+            dst.par_chunks_mut(half * 2)
+                .enumerate()
+                .for_each(|(r, row)| {
+                    let base = r * din * 2 + skip;
+                    crate::f16c::bf16_bytes_to_f16_bytes(
+                        &src[base..base + half * 2],
+                        &mut row[..half * 2],
+                    );
+                });
         }
         let b: Arc<[u8]> = dst.into();
         {
@@ -160,20 +168,21 @@ impl AwqSource {
     /// 非连续写)+ 逐 32-chunk `to_vec` perm + 独立 normalize 遍历:
     /// 27B 单键 ~65ms(150 键 ≈10s);本函数 = 一分配一路过(同 a16 的
     /// `pack_scales_bf16_into` 纪律;`bf16→f32` 零舍入展宽 ⇒ 与旧链**逐位同**)。
-    fn pack_scales_a8_bytes(
-        &self,
-        parts: &[&[u8]],
-        out: usize,
-        k: usize,
-        max: f32,
-    ) -> Vec<u8> {
+    fn pack_scales_a8_bytes(&self, parts: &[&[u8]], out: usize, k: usize, max: f32) -> Vec<u8> {
         let groups = k / 32;
         let mut dst = vec![0u8; out * groups * 2];
         if max == 0.0 {
             // 全零尺度(旧链同路:早退产全零 + 因子 0)
             return dst;
         }
-        pack_scales_a8_bf16_into(parts, out, groups, &self.scales_index_a8(out, k), max, &mut dst);
+        pack_scales_a8_bf16_into(
+            parts,
+            out,
+            groups,
+            &self.scales_index_a8(out, k),
+            max,
+            &mut dst,
+        );
         dst
     }
 
@@ -194,7 +203,7 @@ impl AwqSource {
         dst
     }
 
-/// 量化线性物化(键首触才建;qweight/scales/zeros/weight 四键共享
+    /// 量化线性物化(键首触才建;qweight/scales/zeros/weight 四键共享
     /// 一次构建)。双检缓存 + build_lock 串行(w4a16 同款)。
     pub(crate) fn linear_bytes_for(&self, base: &str, key: &str) -> Taken<Arc<[u8]>> {
         // ---- P1.5-a:int8 per-row 头(专用分支;**不经** `build_linear`)----
@@ -209,7 +218,9 @@ impl AwqSource {
                     return Ok(Some(b.clone()));
                 }
             }
-            let Some((out, k, form)) = self.linear_form(base) else { return Ok(None) };
+            let Some((out, k, form)) = self.linear_form(base) else {
+                return Ok(None);
+            };
             let QuantForm::F16 { we } = form else {
                 // 只有"未量化的 bf16 权重"才做 int8 头;Ct(packed)源不反解
                 // (从 int4 反解再压 int8 = 双重损失,响亮拒)
@@ -266,9 +277,21 @@ impl AwqSource {
         // 合法)。要求两子均 Ct 形态(cyankiwi 满足;F16 兜底混态不支持)。
         if let Some((b1, b2)) = split_merged(base) {
             let suffix = &key[base.len()..];
-            let Some((n1, k1, f1)) = self.linear_form(&b1) else { return Ok(None) };
-            let Some((n2, k2, f2)) = self.linear_form(&b2) else { return Ok(None) };
-            let (QuantForm::Ct { se: se1, ze: ze1, .. }, QuantForm::Ct { se: se2, ze: ze2, .. }) = (&f1, &f2) else {
+            let Some((n1, k1, f1)) = self.linear_form(&b1) else {
+                return Ok(None);
+            };
+            let Some((n2, k2, f2)) = self.linear_form(&b2) else {
+                return Ok(None);
+            };
+            let (
+                QuantForm::Ct {
+                    se: se1, ze: ze1, ..
+                },
+                QuantForm::Ct {
+                    se: se2, ze: ze2, ..
+                },
+            ) = (&f1, &f2)
+            else {
                 return Ok(None);
             };
             if k1 != k2 {
@@ -340,10 +363,14 @@ impl AwqSource {
                 _ => return Ok(None),
             };
             let mut cache = self.cache_guard();
-            cache.0.insert(key.to_string(), Arc::from(bytes.into_boxed_slice()));
+            cache
+                .0
+                .insert(key.to_string(), Arc::from(bytes.into_boxed_slice()));
             return Ok(cache.0.get(key).cloned());
         }
-        let Some((out, k, form)) = self.linear_form(base) else { return Ok(None) };
+        let Some((out, k, form)) = self.linear_form(base) else {
+            return Ok(None);
+        };
         {
             let cache = self.cache_guard();
             if let Some(b) = cache.0.get(key) {
@@ -426,7 +453,9 @@ impl AwqSource {
                             .chunks_exact(4)
                             .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
                             .collect(),
-                        _ => return Err(ModelError::Msg(format!("awq: {base} 裸权重 dtype 不支持"))),
+                        _ => {
+                            return Err(ModelError::Msg(format!("awq: {base} 裸权重 dtype 不支持")))
+                        }
                     };
                     self.maps[we.map_ix].dontneed(we.start, we.nbytes);
                     let scales_f32 = rtn_g32_sym_scales(&w_f32, out, k);
@@ -448,7 +477,11 @@ impl AwqSource {
                 }
             }
             let s_len = s_bytes.len();
-            inserts.push((format!("{base}.scales"), Arc::from(s_bytes.into_boxed_slice()), s_len));
+            inserts.push((
+                format!("{base}.scales"),
+                Arc::from(s_bytes.into_boxed_slice()),
+                s_len,
+            ));
             inserts.push((
                 format!("{base}.zeros"),
                 Arc::from(i32s_le_bytes(&z_buf).into_boxed_slice()),
@@ -497,7 +530,9 @@ impl AwqSource {
                             .chunks_exact(4)
                             .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
                             .collect(),
-                        _ => return Err(ModelError::Msg(format!("awq: {base} 裸权重 dtype 不支持"))),
+                        _ => {
+                            return Err(ModelError::Msg(format!("awq: {base} 裸权重 dtype 不支持")))
+                        }
                     };
                     self.maps[we.map_ix].dontneed(we.start, we.nbytes);
                     let scales_f32 = rtn_g32_sym_scales(&w_f32, out, k);
@@ -535,7 +570,9 @@ impl AwqSource {
                     .idx_guard()
                     .entry((k, out, IdxKind::Gather))
                     .or_insert_with(|| {
-                        Arc::new(owl_kernels::family::marlin::repack::marlin_gather_indices(k, out))
+                        Arc::new(owl_kernels::family::marlin::repack::marlin_gather_indices(
+                            k, out,
+                        ))
                     })
                     .clone();
                 let q = q_buf.as_ref().expect("F16 臂 q_buf 必在");
@@ -550,7 +587,11 @@ impl AwqSource {
                 b_buf.len() * 4,
             ));
             let s_len = s_bytes.len();
-            inserts.push((format!("{base}.scales"), Arc::from(s_bytes.into_boxed_slice()), s_len));
+            inserts.push((
+                format!("{base}.scales"),
+                Arc::from(s_bytes.into_boxed_slice()),
+                s_len,
+            ));
             inserts.push((
                 format!("{base}.zeros"),
                 Arc::from(i32s_le_bytes(&z_buf).into_boxed_slice()),
@@ -593,7 +634,11 @@ impl AwqSource {
         }
         drop(cache);
         // metrics:物化分相落账(Ct 重排 / F16 现场量化,直用 API 恒开)
-        let tag = if form_ct { "load.mat.ct" } else { "load.mat.f16" };
+        let tag = if form_ct {
+            "load.mat.ct"
+        } else {
+            "load.mat.f16"
+        };
         owl_shared::metrics::with_metrics_store(|s| {
             s.timer_record_tag(tag, t0.elapsed(), file!(), line!())
         });
@@ -616,7 +661,9 @@ impl AwqSource {
     /// —— B 交给 `owl_ct_repack_a8_u32`(与 a16 生产档同一条快路)。scales/zp/
     /// 因子三件恒烘(数据小,且与 B 无关)。
     fn build_linear_a8(&self, base: &str, want_b: bool) -> Result<(), ModelError> {
-        use owl_kernels::family::marlin::repack::{pack_marlin_b_a8, pack_marlin_s_a8, pack_marlin_z_a8, unpack_nibbles};
+        use owl_kernels::family::marlin::repack::{
+            pack_marlin_b_a8, pack_marlin_s_a8, pack_marlin_z_a8, unpack_nibbles,
+        };
         // ---- 刀2 虚拟合并键(in_proj_qkvz = row-stack(qkv, z))的 a8 分支 ----
         // 与 a16 臂同律:**源域行拼接**(scales/zp/nibble 均行主序 ⇒ concat 合法),
         // 拼完再进 a8 三件套 —— 全局因子取**合并后**尺度的 max(一层一个 a_scales)
@@ -632,8 +679,18 @@ impl AwqSource {
                     "awq/a8: 合并键 {base} 两子基 k 不等({k1} vs {k2})"
                 )));
             }
-            let (QuantForm::Ct { pe: pe1, se: se1, ze: ze1 }, QuantForm::Ct { pe: pe2, se: se2, ze: ze2 }) =
-                (&f1, &f2)
+            let (
+                QuantForm::Ct {
+                    pe: pe1,
+                    se: se1,
+                    ze: ze1,
+                },
+                QuantForm::Ct {
+                    pe: pe2,
+                    se: se2,
+                    ze: ze2,
+                },
+            ) = (&f1, &f2)
             else {
                 return Err(ModelError::Msg(format!(
                     "awq/a8: 合并键 {base} 要求两子均 Ct 形态(cyankiwi 满足)"
@@ -644,7 +701,11 @@ impl AwqSource {
             let groups = k / 32;
             let shard = base.bytes().map(|b| b as usize).sum::<usize>() % self.build_locks.len();
             let _g = self.build_guard(shard);
-            let guard_key = if want_b { format!("{base}.qweight_a8") } else { format!("{base}.scales_a8") };
+            let guard_key = if want_b {
+                format!("{base}.qweight_a8")
+            } else {
+                format!("{base}.scales_a8")
+            };
             {
                 let cache = self.cache_guard();
                 if cache.0.contains_key(&guard_key) {
@@ -676,7 +737,11 @@ impl AwqSource {
             let factor = max / 4096.0;
             let z_buf = pack_marlin_z_a8(&zp_u8, out, groups);
             let mut inserts: Vec<(String, Arc<[u8]>, usize)> = vec![
-                (format!("{base}.scales_a8"), Arc::from(s_a8.into_boxed_slice()), out * groups * 2),
+                (
+                    format!("{base}.scales_a8"),
+                    Arc::from(s_a8.into_boxed_slice()),
+                    out * groups * 2,
+                ),
                 (
                     format!("{base}.zeros_a8"),
                     Arc::from(i32s_le_bytes(&z_buf).into_boxed_slice()),
@@ -731,7 +796,9 @@ impl AwqSource {
             return Ok(());
         }
         let Some((out, k, form)) = self.linear_form(base) else {
-            return Err(ModelError::Msg(format!("awq/a8: {base} 形态不可解(非量化线性?)")));
+            return Err(ModelError::Msg(format!(
+                "awq/a8: {base} 形态不可解(非量化线性?)"
+            )));
         };
         if !marlin_eligible(out, k) {
             return Err(ModelError::Msg(format!(
@@ -740,7 +807,11 @@ impl AwqSource {
         }
         let shard = base.bytes().map(|b| b as usize).sum::<usize>() % self.build_locks.len();
         let _g = self.build_guard(shard);
-        let guard_key = if want_b { format!("{base}.qweight_a8") } else { format!("{base}.scales_a8") };
+        let guard_key = if want_b {
+            format!("{base}.qweight_a8")
+        } else {
+            format!("{base}.scales_a8")
+        };
         {
             let cache = self.cache_guard();
             if cache.0.contains_key(&guard_key) {
@@ -762,7 +833,11 @@ impl AwqSource {
                 self.maps[ze.map_ix].dontneed(ze.start, ze.nbytes);
                 let max = bf16_parts_max(&[sb]);
                 (
-                    if want_b { unpack_nibbles(&packed, out, k) } else { Vec::new() },
+                    if want_b {
+                        unpack_nibbles(&packed, out, k)
+                    } else {
+                        Vec::new()
+                    },
                     unpack_zp_ct(&zp_i32, out, groups),
                     self.pack_scales_a8_bytes(&[sb], out, k, max),
                     max / 4096.0,
@@ -792,7 +867,11 @@ impl AwqSource {
                 let s_f32 = rtn_g32_sym_scales(&w_f32, out, k);
                 let (s_bits, factor) = pack_marlin_s_a8(&s_f32, out, groups);
                 (
-                    if want_b { rtn_g32_sym_packed(&w_f32, out, k) } else { Vec::new() },
+                    if want_b {
+                        rtn_g32_sym_packed(&w_f32, out, k)
+                    } else {
+                        Vec::new()
+                    },
                     vec![8u8; out * groups],
                     u16s_le_bytes(&s_bits),
                     factor,
@@ -978,19 +1057,17 @@ pub(crate) fn rtn_g32_sym_packed(w: &[f32], out: usize, k: usize) -> Vec<u8> {
     use rayon::prelude::*;
     let groups = k / 32;
     let mut q = vec![0u8; out * k];
-    q.par_chunks_mut(k)
-        .enumerate()
-        .for_each(|(o, row)| {
-            for gg in 0..groups {
-                let base_w = &w[o * k + gg * 32..o * k + (gg + 1) * 32];
-                let amax = base_w.iter().fold(0f32, |m, v| m.max(v.abs())).max(1e-12);
-                let scale = amax / 7.0;
-                for (j, v) in base_w.iter().enumerate() {
-                    let qi = (v / scale).round().clamp(-8.0, 7.0) + 8.0;
-                    row[gg * 32 + j] = qi as u8;
-                }
+    q.par_chunks_mut(k).enumerate().for_each(|(o, row)| {
+        for gg in 0..groups {
+            let base_w = &w[o * k + gg * 32..o * k + (gg + 1) * 32];
+            let amax = base_w.iter().fold(0f32, |m, v| m.max(v.abs())).max(1e-12);
+            let scale = amax / 7.0;
+            for (j, v) in base_w.iter().enumerate() {
+                let qi = (v / scale).round().clamp(-8.0, 7.0) + 8.0;
+                row[gg * 32 + j] = qi as u8;
             }
-        });
+        }
+    });
     q
 }
 
@@ -1025,7 +1102,11 @@ pub(crate) fn rtn_i8_row_sym(w: &[f32], out: usize, k: usize) -> (Vec<u8>, Vec<u
         .map(|o| {
             let row = &w[o * k..(o + 1) * k];
             let amax = row.iter().fold(0f32, |m, v| m.max(v.abs()));
-            if amax > 0.0 { amax / 127.0 } else { 1.0 }
+            if amax > 0.0 {
+                amax / 127.0
+            } else {
+                1.0
+            }
         })
         .collect();
     q.par_chunks_mut(k).enumerate().for_each(|(o, dst)| {
@@ -1059,7 +1140,11 @@ pub(crate) fn rtn_i8_row_sym_bf16(bytes: &[u8], out: usize, k: usize) -> (Vec<u8
                 max_bits = max_bits.max(u16::from_le_bytes([b[0], b[1]]) & 0x7fff);
             }
             let amax = f32::from_bits((max_bits as u32) << 16);
-            if amax > 0.0 { amax / 127.0 } else { 1.0 }
+            if amax > 0.0 {
+                amax / 127.0
+            } else {
+                1.0
+            }
         })
         .collect();
     let mut q = vec![0u8; out * k];
@@ -1150,24 +1235,22 @@ pub(crate) fn dequant_u4_awq_f16_bytes(
     assert_eq!(zp_packed.len(), (out / 8) * (k / 32));
     assert_eq!(scales.len(), out * (k / 32));
     assert_eq!(dst.len(), out * k * 2);
-    dst.par_chunks_mut(k * 2)
-        .enumerate()
-        .for_each(|(o, row)| {
-            let groups = k / 32;
-            for g in 0..groups {
-                let z = ((zp_packed[(o / 8) * groups + g] as u32) >> (4 * (o % 8))) & 0xF;
-                let s = scales[o * groups + g];
-                let base = &mut row[g * 32 * 2..(g + 1) * 32 * 2];
-                for j in 0..32 {
-                    let i = g * 32 + j;
-                    let q = ((packed[o * (k / 8) + i / 8] as u32) >> (4 * (i % 8))) & 0xF;
-                    let w = (q as f32 - z as f32) * s;
-                    let h = half::f16::from_f32(w).to_le_bytes();
-                    base[j * 2] = h[0];
-                    base[j * 2 + 1] = h[1];
-                }
+    dst.par_chunks_mut(k * 2).enumerate().for_each(|(o, row)| {
+        let groups = k / 32;
+        for g in 0..groups {
+            let z = ((zp_packed[(o / 8) * groups + g] as u32) >> (4 * (o % 8))) & 0xF;
+            let s = scales[o * groups + g];
+            let base = &mut row[g * 32 * 2..(g + 1) * 32 * 2];
+            for j in 0..32 {
+                let i = g * 32 + j;
+                let q = ((packed[o * (k / 8) + i / 8] as u32) >> (4 * (i % 8))) & 0xF;
+                let w = (q as f32 - z as f32) * s;
+                let h = half::f16::from_f32(w).to_le_bytes();
+                base[j * 2] = h[0];
+                base[j * 2 + 1] = h[1];
             }
-        });
+        }
+    });
 }
 
 #[cfg(test)]
@@ -1200,13 +1283,9 @@ mod i8_row_tests {
         let (q, _) = rtn_i8_row_sym_bf16(&bf, out, k);
         for o in 0..out {
             let row = &bf[o * k * 2..(o + 1) * k * 2];
-            let amax = row
-                .chunks_exact(2)
-                .fold(0f32, |m, b| {
-                    m.max(f32::from_bits(
-                        (u16::from_le_bytes([b[0], b[1]]) as u32) << 16,
-                    ).abs())
-                });
+            let amax = row.chunks_exact(2).fold(0f32, |m, b| {
+                m.max(f32::from_bits((u16::from_le_bytes([b[0], b[1]]) as u32) << 16).abs())
+            });
             let s = if amax > 0.0 { amax / 127.0 } else { 1.0 };
             let mut want = vec![0u8; k];
             quant_i8_row_bf16_scalar(row, &mut want, s);

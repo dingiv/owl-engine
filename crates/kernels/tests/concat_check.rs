@@ -32,8 +32,12 @@ fn marlin_b_does_not_concatenate_across_n() {
 fn marlin_s_does_not_concatenate_across_n() {
     let (k, half) = (2560usize, 9216usize);
     let groups = k / 128;
-    let sg: Vec<f32> = (0..half * groups).map(|i| (i as f32 + 1.0) * 1e-3).collect();
-    let su: Vec<f32> = (0..half * groups).map(|i| (i as f32 + 2.0) * 1e-3).collect();
+    let sg: Vec<f32> = (0..half * groups)
+        .map(|i| (i as f32 + 1.0) * 1e-3)
+        .collect();
+    let su: Vec<f32> = (0..half * groups)
+        .map(|i| (i as f32 + 2.0) * 1e-3)
+        .collect();
     let pg = pack_marlin_s(&sg, half, groups);
     let pu = pack_marlin_s(&su, half, groups);
     let mut merged_s = sg.clone();
@@ -41,5 +45,8 @@ fn marlin_s_does_not_concatenate_across_n() {
     let pm = pack_marlin_s(&merged_s, half * 2, groups);
     let mut cat = pg;
     cat.extend(pu);
-    assert_ne!(cat, pm, "marlin S 竟然可以跨 N 拼接？请复核 W4A16 合并键实现");
+    assert_ne!(
+        cat, pm,
+        "marlin S 竟然可以跨 N 拼接？请复核 W4A16 合并键实现"
+    );
 }

@@ -4,11 +4,11 @@
 //! **g 语义律(E7)**:本面只产 **raw gate**;cumsum 产物是核内私有态 ——
 //! 客户端不可达(类型面 `GateRaw` 堵死 raw/cumsum 混喂)。
 
-use owl_macros::kernel_tags;
-use crate::contract::{Arg, Dtype, Law, OpError};
 use crate::bootcheck::CheckCtx;
+use crate::contract::{Arg, Dtype, Law, OpError};
 use crate::spec::check_from_params;
 use crate::spec::{meta_of, CaptureEvidence, Determinism, KernelMeta, KernelSpec, Param, ScalarTy};
+use owl_macros::kernel_tags;
 
 /// `gdn_chunked_delta_rule_fwd` —— GDN chunked 前向(六核编排入口)
 pub struct GdnChunkedDeltaRuleFwd;
@@ -16,7 +16,8 @@ pub struct GdnChunkedDeltaRuleFwd;
 #[kernel_tags("dom.gdn", "role.attn", "phase.prefill")]
 impl KernelSpec for GdnChunkedDeltaRuleFwd {
     /// 执行家族(声明驱动路由;见 `KernelSpec::FAMILY`)
-    const FAMILY: crate::contract::OpId = crate::contract::OpId(crate::family::gdn_chunked::GDN_CHUNKED_FWD);
+    const FAMILY: crate::contract::OpId =
+        crate::contract::OpId(crate::family::gdn_chunked::GDN_CHUNKED_FWD);
     const ENTRY: &'static str = crate::family::gdn_chunked::GDN_CHUNKED_FWD;
     /// foreign(预编 cubin 编排):无单一 `.cu` 源
     const SRC: &'static str = "";
@@ -42,8 +43,10 @@ impl KernelSpec for GdnChunkedDeltaRuleFwd {
         // 块数 nt = ceil(t_real / BT)(P-6b;网格与 scratch 定尺都吃它)
         Param::sz("nt"),
     ];
-    const POOL: &'static [crate::spec::PoolAccess] =
-        &[crate::spec::PoolAccess::rw(crate::spec::pools::GDN_STATE, Dtype::F32)];
+    const POOL: &'static [crate::spec::PoolAccess] = &[crate::spec::PoolAccess::rw(
+        crate::spec::pools::GDN_STATE,
+        Dtype::F32,
+    )];
     const LAWS: &'static [Law] = &[Law::OutputFinite];
     const CAPTURE: CaptureEvidence = CaptureEvidence::NoHostWork;
     const DETERMINISM: Determinism = Determinism::Deterministic;
@@ -58,14 +61,15 @@ impl KernelSpec for GdnChunkedDeltaRuleFwd {
     fn check(ctx: &CheckCtx<'_>) -> Result<(), OpError> {
         check_from_params(Self::ENTRY, Self::PARAMS, ctx)?;
         let idx = |name: &'static str| -> Result<usize, OpError> {
-            Self::PARAMS.iter().position(|p| p.name == name).ok_or_else(|| {
-                OpError::Contract {
+            Self::PARAMS
+                .iter()
+                .position(|p| p.name == name)
+                .ok_or_else(|| OpError::Contract {
                     op: Self::ENTRY.into(),
                     field: "PARAMS",
                     expect: "槽名在声明表".into(),
                     got: name.to_string(),
-                }
-            })
+                })
         };
         let sz = |name: &'static str| -> Result<u64, OpError> {
             let i = idx(name)?;
@@ -80,12 +84,14 @@ impl KernelSpec for GdnChunkedDeltaRuleFwd {
                 }),
             }
         };
-        let n = ctx.arg_len(idx("state")?).ok_or_else(|| OpError::Contract {
-            op: Self::ENTRY.into(),
-            field: "state",
-            expect: "状态块在账本(可查账长)".into(),
-            got: "未知块/不在账本".into(),
-        })?;
+        let n = ctx
+            .arg_len(idx("state")?)
+            .ok_or_else(|| OpError::Contract {
+                op: Self::ENTRY.into(),
+                field: "state",
+                expect: "状态块在账本(可查账长)".into(),
+                got: "未知块/不在账本".into(),
+            })?;
         let (nv, kd) = (sz("nv")?, sz("kd")?);
         let stride = nv
             .checked_mul(kd)
@@ -121,11 +127,10 @@ impl KernelSpec for GdnChunkedDeltaRuleFwd {
 
 pub static GDN_CHUNKED_FWD: KernelMeta = meta_of::<GdnChunkedDeltaRuleFwd>();
 
-
 #[cfg(test)]
 mod tests {
-    use crate::family::gdn_chunked::GDN_CHUNKED_FWD as ENTRY;
     use super::*;
+    use crate::family::gdn_chunked::GDN_CHUNKED_FWD as ENTRY;
     use crate::spec::meta_of;
 
     /// 与权威串(`client::gdn_chunked::SIG`)逐字一致 —— **P-6b 后 +1 表块(T)
@@ -179,7 +184,12 @@ mod tests {
         let probe = |id: u64| if id == 6 { Some(8 * STRIDE) } else { Some(64) };
         for slot in [0u64, 7] {
             let args = args_with_slot(slot);
-            let c = CheckCtx { op: ENTRY, args: &args, geom: &GEOM, len: &probe };
+            let c = CheckCtx {
+                op: ENTRY,
+                args: &args,
+                geom: &GEOM,
+                len: &probe,
+            };
             let r = GdnChunkedDeltaRuleFwd::check(&c);
             assert!(r.is_ok(), "slot={slot} 应过:{:?}", r.unwrap_err());
         }
@@ -190,7 +200,12 @@ mod tests {
     fn slot_check_rejects_out_of_range() {
         let probe = |id: u64| if id == 6 { Some(8 * STRIDE) } else { Some(64) };
         let args = args_with_slot(8);
-        let c = CheckCtx { op: ENTRY, args: &args, geom: &GEOM, len: &probe };
+        let c = CheckCtx {
+            op: ENTRY,
+            args: &args,
+            geom: &GEOM,
+            len: &probe,
+        };
         let e = GdnChunkedDeltaRuleFwd::check(&c).unwrap_err().to_string();
         assert!(e.contains("slot") && e.contains("stride"), "{e}");
     }
@@ -200,7 +215,12 @@ mod tests {
     fn slot_check_rejects_unknown_state_block() {
         let probe = |id: u64| if id == 6 { None } else { Some(64) };
         let args = args_with_slot(0);
-        let c = CheckCtx { op: ENTRY, args: &args, geom: &GEOM, len: &probe };
+        let c = CheckCtx {
+            op: ENTRY,
+            args: &args,
+            geom: &GEOM,
+            len: &probe,
+        };
         let e = GdnChunkedDeltaRuleFwd::check(&c).unwrap_err().to_string();
         assert!(e.contains("state"), "{e}");
     }

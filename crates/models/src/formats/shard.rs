@@ -70,7 +70,8 @@ fn inflate(
     let mut full = shape.to_vec();
     let w = plan.world();
     let mul = |v: usize| -> Result<usize, String> {
-        v.checked_mul(w).ok_or_else(|| "inflate: 维溢出".to_string())
+        v.checked_mul(w)
+            .ok_or_else(|| "inflate: 维溢出".to_string())
     };
     // 规则 → want 自身坐标系的维度(与 `plan_span` 同一套映射)
     let dim_of_out = if axis == WantAxis::KMajor { 1 } else { 0 };
@@ -158,19 +159,15 @@ pub fn build_shard_pass(
             )));
         }
         // ① 分片形状 → 源全量形状(段长同为分片口径 ⇒ 每段 × shard)
-        let full_shape = inflate(&w.shape, rule, plan, shard_segs, axis).map_err(ModelError::Msg)?;
+        let full_shape =
+            inflate(&w.shape, rule, plan, shard_segs, axis).map_err(ModelError::Msg)?;
         let mut full_segs: Vec<usize> = shard_segs.iter().map(|s| s * plan.world()).collect();
         // ①b **段长单位换算**(层侧逻辑单位 → 键自身维单位;唯一实现见
         //    `plan::span::segments_in_key_units`;2026-10-17 定谳)
         if matches!(rule, WeightRule::SegmentedCol(_)) {
             let dim = if axis == WantAxis::KMajor { 1 } else { 0 };
-            full_segs = segments_in_key_units(
-                &full_segs,
-                full_shape[dim],
-                &w.key,
-                dim,
-            )
-            .map_err(ModelError::Msg)?;
+            full_segs = segments_in_key_units(&full_segs, full_shape[dim], &w.key, dim)
+                .map_err(ModelError::Msg)?;
         }
         // ② 全量形状 → 读计划 + 期望分片形状
         let (span, expect_shard) = plan_span(rule, &full_shape, plan, &full_segs, axis)
@@ -217,11 +214,21 @@ pub fn build_shard_pass(
                     w.key, w.shape
                 )));
             }
-            w.layout = Layout::DeviceRearrange { op, rows: w.shape[0], cols: w.shape[1] };
+            w.layout = Layout::DeviceRearrange {
+                op,
+                rows: w.shape[0],
+                cols: w.shape[1],
+            };
         }
         spans.insert(
             w.key.clone(),
-            SpanEntry { span, src_row_width: src_rw, tgt_row_width: tgt_rw, src_elems, tgt_elems },
+            SpanEntry {
+                span,
+                src_row_width: src_rw,
+                tgt_row_width: tgt_rw,
+                src_elems,
+                tgt_elems,
+            },
         );
     }
     Ok(spans)
@@ -251,7 +258,11 @@ const FULL_CACHE_CAP: usize = 256 << 20;
 
 impl<'a, S: WeightSource + ?Sized> ShardedSource<'a, S> {
     pub fn new(inner: &'a S, spans: HashMap<String, SpanEntry>) -> Self {
-        Self { inner, spans, full: std::sync::Mutex::new(None) }
+        Self {
+            inner,
+            spans,
+            full: std::sync::Mutex::new(None),
+        }
     }
 
     /// 取全键字节(缓存未命中则整读一次;`dtype` 变了要重读)
@@ -345,7 +356,8 @@ impl<S: WeightSource + ?Sized> WeightSource for ShardedSource<'_, S> {
             if b1 > dst.len() {
                 return Ok(None);
             }
-            self.inner.copy_native_into(key, src_off, n, &mut dst[b0..b1])?;
+            self.inner
+                .copy_native_into(key, src_off, n, &mut dst[b0..b1])?;
             tgt_elem += n;
         }
         Ok(Some(()))
@@ -435,10 +447,10 @@ impl<S: WeightSource + ?Sized> WeightSource for ShardedSource<'_, S> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::module::Want;
     use crate::module::Taken;
+    use crate::module::Want;
     use crate::plan::rules::rule_of; // 键表默认对照（声明规则覆盖的判据面）
-use crate::plan::rules::WeightRule;
+    use crate::plan::rules::WeightRule;
 
     /// 内存源(全量 f32;`Vec` 值域即"源坐标系")
     struct MemSource {
@@ -455,7 +467,11 @@ use crate::plan::rules::WeightRule;
             Ok(self.data.get(key).cloned())
         }
         fn take_range(&self, key: &str, off: usize, len: usize) -> Taken<Vec<f32>> {
-            Ok(self.data.get(key).and_then(|v| v.get(off..off + len)).map(<[f32]>::to_vec))
+            Ok(self
+                .data
+                .get(key)
+                .and_then(|v| v.get(off..off + len))
+                .map(<[f32]>::to_vec))
         }
         fn elem_len(&self, key: &str) -> Taken<usize> {
             Ok(self.data.get(key).map(Vec::len))
@@ -499,20 +515,33 @@ use crate::plan::rules::WeightRule;
                 WeightRule::UniformCol | WeightRule::PerHead => s[0] /= shard,
                 WeightRule::UniformRow => s[1] /= shard,
                 WeightRule::SegmentedCol(_) => {
-                    s[0] = full_segs.as_ref().expect("融合权重需段长").iter().sum::<usize>() / shard
+                    s[0] = full_segs
+                        .as_ref()
+                        .expect("融合权重需段长")
+                        .iter()
+                        .sum::<usize>()
+                        / shard
                 }
                 WeightRule::Replicate => {}
             }
             s
         };
-        let shard_segs: Option<Vec<usize>> =
-            full_segs.as_ref().map(|v| v.iter().map(|s| s / shard).collect());
+        let shard_segs: Option<Vec<usize>> = full_segs
+            .as_ref()
+            .map(|v| v.iter().map(|s| s / shard).collect());
         let mut w = want(key, shard_shape.clone());
         w.segments = shard_segs;
         let mut ops = LoaderOps::want(w);
-        let mut src = MemSource { data: HashMap::new() };
+        let mut src = MemSource {
+            data: HashMap::new(),
+        };
         src.data.insert(key.to_string(), full.to_vec());
-        let ctx = LoaderCtx { dtype: Dtype::F32, shard, slice_id, ..Default::default() };
+        let ctx = LoaderCtx {
+            dtype: Dtype::F32,
+            shard,
+            slice_id,
+            ..Default::default()
+        };
         let spans = build_shard_pass(&mut ops, &ctx).expect("pass");
         let sharded = ShardedSource::new(&src, spans);
         // 分片后的目标:逐元素读回(经 take_range 分块,验证跨行/跨段拼接)
@@ -555,7 +584,10 @@ use crate::plan::rules::WeightRule;
             }
             WeightRule::Replicate => full.to_vec(),
         };
-        assert_eq!(got, want_ref, "{key}(slice {slice_id}/{shard}): 分片读 ≠ 先全量后切");
+        assert_eq!(
+            got, want_ref,
+            "{key}(slice {slice_id}/{shard}): 分片读 ≠ 先全量后切"
+        );
     }
 
     /// **P1.5-a 派生键 × 层声明规则**:`lm_head.i8q`/`.i8s` 的切分完全靠
@@ -582,10 +614,16 @@ use crate::plan::rules::WeightRule;
                 // 层侧覆盖(生产唯一入口 = `Embedding::layout_lm_head`)
                 w.rule = Some(WeightRule::UniformCol);
                 let mut ops = LoaderOps::want(w);
-                let ctx =
-                    LoaderCtx { dtype: Dtype::F32, shard: 2, slice_id, ..Default::default() };
+                let ctx = LoaderCtx {
+                    dtype: Dtype::F32,
+                    shard: 2,
+                    slice_id,
+                    ..Default::default()
+                };
                 let spans = build_shard_pass(&mut ops, &ctx).expect("pass");
-                let mut src = MemSource { data: HashMap::new() };
+                let mut src = MemSource {
+                    data: HashMap::new(),
+                };
                 src.data.insert(key.to_string(), fullv.clone());
                 let sharded = ShardedSource::new(&src, spans);
                 let n = t(sharded.elem_len(key));
@@ -593,10 +631,16 @@ use crate::plan::rules::WeightRule;
                 let rows = vocab / 2;
                 let wantv: Vec<f32> =
                     fullv[slice_id * rows * row_w..(slice_id + 1) * rows * row_w].to_vec();
-                assert_eq!(got, wantv, "{key} slice{slice_id}: 分片读 ≠ 本 rank 的行区间");
+                assert_eq!(
+                    got, wantv,
+                    "{key} slice{slice_id}: 分片读 ≠ 本 rank 的行区间"
+                );
                 seen.push(got);
             }
-            assert_ne!(seen[0], seen[1], "{key}: 两 rank 读到同一段(高半 = 低半复制)");
+            assert_ne!(
+                seen[0], seen[1],
+                "{key}: 两 rank 读到同一段(高半 = 低半复制)"
+            );
         }
         // 剥后缀表必须认识这两件(否则 `rule_of` 回落 Replicate ⇒ 上面的覆盖失效)
         assert_eq!(crate::plan::rules::base_key("lm_head.i8q"), "lm_head");
@@ -609,7 +653,14 @@ use crate::plan::rules::WeightRule;
         let shape = vec![8usize, 6];
         let full: Vec<f32> = (0..48).map(|i| i as f32 * 0.5).collect();
         for slice in 0..2 {
-            assert_bytes_equal("model.layers.0.mlp.gate_proj.weight", shape.clone(), None, &full, slice, 2);
+            assert_bytes_equal(
+                "model.layers.0.mlp.gate_proj.weight",
+                shape.clone(),
+                None,
+                &full,
+                slice,
+                2,
+            );
         }
     }
 
@@ -619,7 +670,14 @@ use crate::plan::rules::WeightRule;
         let shape = vec![4usize, 8];
         let full: Vec<f32> = (0..32).map(|i| i as f32).collect();
         for slice in 0..2 {
-            assert_bytes_equal("model.layers.0.mlp.down_proj.weight", shape.clone(), None, &full, slice, 2);
+            assert_bytes_equal(
+                "model.layers.0.mlp.down_proj.weight",
+                shape.clone(),
+                None,
+                &full,
+                slice,
+                2,
+            );
         }
     }
 
@@ -647,12 +705,22 @@ use crate::plan::rules::WeightRule;
     fn replicate_passes_through() {
         let key = "model.layers.0.input_layernorm.weight";
         let mut ops = LoaderOps::want(want(key, vec![8]));
-        let src = MemSource { data: HashMap::from([(key.to_string(), (0..8).map(|i| i as f32).collect())]) };
-        let ctx = LoaderCtx { dtype: Dtype::F32, shard: 2, slice_id: 1, ..Default::default() };
+        let src = MemSource {
+            data: HashMap::from([(key.to_string(), (0..8).map(|i| i as f32).collect())]),
+        };
+        let ctx = LoaderCtx {
+            dtype: Dtype::F32,
+            shard: 2,
+            slice_id: 1,
+            ..Default::default()
+        };
         let spans = build_shard_pass(&mut ops, &ctx).unwrap();
         assert!(spans.is_empty(), "Replicate 不进表");
         let sharded = ShardedSource::new(&src, spans);
-        assert_eq!(t(sharded.take(key)), (0..8).map(|i| i as f32).collect::<Vec<_>>());
+        assert_eq!(
+            t(sharded.take(key)),
+            (0..8).map(|i| i as f32).collect::<Vec<_>>()
+        );
         assert_eq!(t(sharded.elem_len(key)), 8, "全量元素数不变");
     }
 
@@ -660,7 +728,12 @@ use crate::plan::rules::WeightRule;
     #[test]
     fn single_slice_is_free() {
         let mut ops = LoaderOps::want(want("model.layers.0.mlp.down_proj.weight", vec![4, 8]));
-        let ctx = LoaderCtx { dtype: Dtype::F32, shard: 1, slice_id: 0, ..Default::default() };
+        let ctx = LoaderCtx {
+            dtype: Dtype::F32,
+            shard: 1,
+            slice_id: 0,
+            ..Default::default()
+        };
         let spans = build_shard_pass(&mut ops, &ctx).unwrap();
         assert!(spans.is_empty());
     }
@@ -673,19 +746,31 @@ use crate::plan::rules::WeightRule;
         let key = "lm_head.weight";
         assert_eq!(rule_of(key), WeightRule::Replicate, "键表默认 = Replicate");
         let full: Vec<f32> = (0..40).map(|i| i as f32 + 1.0).collect(); // [8, 5]
-        // 对照臂:无声明 ⇒ 直通
+                                                                        // 对照臂:无声明 ⇒ 直通
         {
             let mut ops = LoaderOps::want(want(key, vec![8, 5]));
-            let ctx = LoaderCtx { dtype: Dtype::F32, shard: 2, slice_id: 0, ..Default::default() };
+            let ctx = LoaderCtx {
+                dtype: Dtype::F32,
+                shard: 2,
+                slice_id: 0,
+                ..Default::default()
+            };
             let spans = build_shard_pass(&mut ops, &ctx).unwrap();
             assert!(spans.is_empty(), "无声明 + 键表 Replicate ⇒ 不进表");
         }
         // 覆盖臂:声明 UniformCol ⇒ 按 out 维切(rank0 = 低半,rank1 = 高半)
         for slice in 0..2usize {
             let mut ops = LoaderOps::want(want(key, vec![4, 5])).with_rule(WeightRule::UniformCol);
-            let mut src = MemSource { data: HashMap::new() };
+            let mut src = MemSource {
+                data: HashMap::new(),
+            };
             src.data.insert(key.to_string(), full.clone());
-            let ctx = LoaderCtx { dtype: Dtype::F32, shard: 2, slice_id: slice, ..Default::default() };
+            let ctx = LoaderCtx {
+                dtype: Dtype::F32,
+                shard: 2,
+                slice_id: slice,
+                ..Default::default()
+            };
             let spans = build_shard_pass(&mut ops, &ctx).expect("声明规则档应切");
             let sharded = ShardedSource::new(&src, spans);
             let n = t(sharded.elem_len(key));
@@ -696,7 +781,11 @@ use crate::plan::rules::WeightRule;
                 got.extend(t(sharded.take_range(key, off, len)));
             }
             let base = slice * 4 * 5;
-            assert_eq!(got, full[base..base + 20].to_vec(), "lm_head 分片读(slice {slice})");
+            assert_eq!(
+                got,
+                full[base..base + 20].to_vec(),
+                "lm_head 分片读(slice {slice})"
+            );
         }
     }
 }

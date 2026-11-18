@@ -11,8 +11,8 @@
 //! 数值口径(two-pass,与 torch 同序):mean = Σx/n;var = Σ(x−mean)²/n(biased);
 //! y = (x−mean)·rsqrt(var+eps)·w + b。
 
-use crate::module::{Loadable, LoaderCtx, LoaderOps, Weight};
 use crate::module::{ForwardCtx, Module};
+use crate::module::{Loadable, LoaderCtx, LoaderOps, Weight};
 use crate::TensorOps;
 
 pub struct LayerNorm {
@@ -26,7 +26,11 @@ pub struct LayerNorm {
 impl LayerNorm {
     /// 准备容器(`w_key`/`b_key` = 数据源槽键;零数据零副作用)
     pub fn new(w_key: &'static str, b_key: &'static str, n: usize, eps: f32) -> LayerNorm {
-        LayerNorm { w: Weight::new(w_key, vec![n]), b: Weight::new(b_key, vec![n]), eps }
+        LayerNorm {
+            w: Weight::new(w_key, vec![n]),
+            b: Weight::new(b_key, vec![n]),
+            eps,
+        }
     }
 
     /// 装载完备性
@@ -68,7 +72,10 @@ impl Loadable for LayerNorm {
 mod tests {
     use super::*;
     use crate::tensor::Dtype;
-    use crate::testkit::{assert_close, f32b, harvest, hf_python, parity_enabled, skip_note, st_read, st_write, tmp_path, Src};
+    use crate::testkit::{
+        assert_close, f32b, harvest, hf_python, parity_enabled, skip_note, st_read, st_write,
+        tmp_path, Src,
+    };
 
     /// host 手算锚(two-pass;不依赖 python —— 平时 cron 跑的就这一条)
     #[tokio::test]
@@ -96,7 +103,11 @@ mod tests {
             let inv = 1.0 / (var + eps).sqrt();
             for c in 0..n {
                 let want = (row[c] - mean) * inv * w[c] + b[c];
-                assert!((got[r * n + c] - want).abs() < 1e-5, "[{r},{c}] {} vs {want}", got[r * n + c]);
+                assert!(
+                    (got[r * n + c] - want).abs() < 1e-5,
+                    "[{r},{c}] {} vs {want}",
+                    got[r * n + c]
+                );
             }
         }
     }
@@ -112,19 +123,34 @@ mod tests {
         let eps = 1e-6f32;
         let w: Vec<f32> = (0..n).map(|i| (i as f32 * 0.11) - 0.8).collect();
         let b: Vec<f32> = (0..n).map(|i| (i as f32 * 0.07) - 0.3).collect();
-        let x: Vec<f32> = (0..rows * n).map(|i| ((i as f32 * 0.29) - 2.0).sin()).collect();
+        let x: Vec<f32> = (0..rows * n)
+            .map(|i| ((i as f32 * 0.29) - 2.0).sin())
+            .collect();
 
         let inp = tmp_path("layernorm_in");
         let outp = tmp_path("layernorm_out");
-        st_write(&inp, &[("x", &x, vec![rows, n]), ("weight", &w, vec![n]), ("bias", &b, vec![n])]);
+        st_write(
+            &inp,
+            &[
+                ("x", &x, vec![rows, n]),
+                ("weight", &w, vec![n]),
+                ("bias", &b, vec![n]),
+            ],
+        );
         let contract = format!(r#"{{"eps": {eps}}}"#);
-        let manifest = hf_python("layernorm.py", &[inp.to_str().unwrap(), outp.to_str().unwrap(), &contract]);
+        let manifest = hf_python(
+            "layernorm.py",
+            &[inp.to_str().unwrap(), outp.to_str().unwrap(), &contract],
+        );
         eprintln!("[hf manifest] layernorm: {manifest}");
         let want = st_read(&outp, "y");
 
         let mut face = owl_cpu::CpuFace::new();
         let ln = LayerNorm::new("weight", "bias", n, eps);
-        let src = Src::from([("weight".to_string(), w.clone()), ("bias".to_string(), b.clone())]);
+        let src = Src::from([
+            ("weight".to_string(), w.clone()),
+            ("bias".to_string(), b.clone()),
+        ]);
         crate::interpreters::eval_load(&ln, &mut face, &src, &Default::default())
             .await
             .expect("eval_load");

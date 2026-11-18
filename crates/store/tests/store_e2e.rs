@@ -20,8 +20,8 @@ use owl_cpu::CpuFace;
 use owl_iface::contract::{DeviceClient, Dtype, HeapRegion, PinnedRegion, SwapDir};
 use owl_store::{
     commit_offload, commit_onload, plan_capacity, plan_offload, plan_offload_blocks, plan_onload,
-    reclaim_slot_table, BlockClass, BlockLeg, ChainHash, EvictOut, LegConfig, LruPolicy, Room,
-    Need, NeedWhy, PieceSpec, PoolLayout, Sink, SkipWhy, StateStore, StoreResult,
+    reclaim_slot_table, BlockClass, BlockLeg, ChainHash, EvictOut, LegConfig, LruPolicy, Need,
+    NeedWhy, PieceSpec, PoolLayout, Room, Sink, SkipWhy, StateStore, StoreResult,
 };
 
 const PIECE_ELEMS: usize = 64;
@@ -48,7 +48,9 @@ async fn engine_offload(
         Ok(c) => c,
         Err(e) => {
             owl_store::abort_offload(leg, &blocks); // 内容已丢 ⇒ 条目一并删
-            return Err(owl_store::StoreError::Invariant(format!("swap(Out) 失败:{e}")));
+            return Err(owl_store::StoreError::Invariant(format!(
+                "swap(Out) 失败:{e}"
+            )));
         }
     };
     let table = reclaim_slot_table(conn)?;
@@ -69,7 +71,9 @@ async fn engine_onload(
         Ok(c) => c,
         Err(e) => {
             owl_store::abort_onload(leg, &cs, &slots); // 槽归还 + 条目删
-            return Err(owl_store::StoreError::Invariant(format!("swap(In) 失败:{e}")));
+            return Err(owl_store::StoreError::Invariant(format!(
+                "swap(In) 失败:{e}"
+            )));
         }
     };
     let table = reclaim_slot_table(conn)?;
@@ -82,8 +86,14 @@ async fn engine_onload(
 async fn pieces(face: &mut CpuFace, slots: usize) -> Vec<PieceSpec> {
     let mut out = Vec::new();
     for _ in 0..2 {
-        let b = face.alloc(Dtype::F32, PIECE_ELEMS * slots, "t").await.expect("池块");
-        out.push(PieceSpec { buf: b, stride_bytes: PIECE_BYTES });
+        let b = face
+            .alloc(Dtype::F32, PIECE_ELEMS * slots, "t")
+            .await
+            .expect("池块");
+        out.push(PieceSpec {
+            buf: b,
+            stride_bytes: PIECE_BYTES,
+        });
     }
     out
 }
@@ -118,11 +128,18 @@ fn plan_kv(l: &BlockLeg, need: Need) -> owl_store::Verdict {
 
 async fn seed(face: &mut CpuFace, ps: &[PieceSpec], slot: u32, seed: u8) {
     for p in ps {
-        let pat: Vec<u8> = (0..p.stride_bytes).map(|i| seed.wrapping_add(i as u8)).collect();
+        let pat: Vec<u8> = (0..p.stride_bytes)
+            .map(|i| seed.wrapping_add(i as u8))
+            .collect();
         let lease: Box<dyn PinnedRegion + Send> = Box::new(HeapRegion(pat));
-        face.upload_pinned(lease, &p.buf, slot as usize * p.stride_bytes, p.stride_bytes)
-            .await
-            .expect("seed");
+        face.upload_pinned(
+            lease,
+            &p.buf,
+            slot as usize * p.stride_bytes,
+            p.stride_bytes,
+        )
+        .await
+        .expect("seed");
     }
 }
 
@@ -130,7 +147,9 @@ async fn read_slot(face: &mut CpuFace, ps: &[PieceSpec], slot: u32) -> Vec<u8> {
     let mut out = Vec::new();
     for p in ps {
         let mut d = vec![0u8; p.stride_bytes];
-        face.dtoh_at(&p.buf, slot as usize * p.stride_bytes, &mut d).await.expect("读槽");
+        face.dtoh_at(&p.buf, slot as usize * p.stride_bytes, &mut d)
+            .await
+            .expect("读槽");
         out.extend_from_slice(&d);
     }
     out
@@ -151,8 +170,12 @@ async fn offload_and_batch_reload_without_gpu() {
     let mut face = CpuFace::new();
     let ps = pieces(&mut face, 6).await;
     let mut l = leg(6);
-    l.attach_pool(PoolLayout { class: BlockClass::KvPage, epoch: 1, pieces: ps.clone() })
-        .expect("注册布局");
+    l.attach_pool(PoolLayout {
+        class: BlockClass::KvPage,
+        epoch: 1,
+        pieces: ps.clone(),
+    })
+    .expect("注册布局");
 
     // ── 轮 1/2:两条热链(各 3 块)⇒ 池满(6 槽)
     let a_tokens: Vec<u32> = (0..96).collect(); // 96 tok = 3 块
@@ -176,13 +199,22 @@ async fn offload_and_batch_reload_without_gpu() {
     // ── 轮 3:新需求(池满 ⇒ 钩子判:链级整条沉最冷的链 A)
     let need = Need::kv(2, NeedWhy::Admit);
     let verdict = plan_kv(&l, need);
-    assert!(!verdict.out.is_empty(), "池满 + 新需求 ⇒ 必须出单(下沉/驱逐)");
+    assert!(
+        !verdict.out.is_empty(),
+        "池满 + 新需求 ⇒ 必须出单(下沉/驱逐)"
+    );
     // engine 式执行:逐条取计划 → swap → 记账
     let mut offloaded = 0usize;
     for item in &verdict.out {
-        let EvictOut::Kv { chain, sink, span } = item else { continue };
+        let EvictOut::Kv { chain, sink, span } = item else {
+            continue;
+        };
         match sink {
-            Sink::Host => offloaded += engine_offload(&mut l, &mut face, *chain).await.expect("换出"),
+            Sink::Host => {
+                offloaded += engine_offload(&mut l, &mut face, *chain)
+                    .await
+                    .expect("换出")
+            }
             Sink::Drop => {
                 let n = l.prune_branch(*chain, (*span).max(1)).expect("驱逐");
                 assert!(n >= 1, "整枝票至少丢一块");
@@ -192,20 +224,35 @@ async fn offload_and_batch_reload_without_gpu() {
     }
     assert!(offloaded > 0, "需求驱动下沉:应真搬(而非驱逐)");
     let rep = l.report();
-    assert!(rep.ops.offloads > 0 && rep.ops.offload_batches > 0, "换出门①:{:?}", rep.ops);
+    assert!(
+        rep.ops.offloads > 0 && rep.ops.offload_batches > 0,
+        "换出门①:{:?}",
+        rep.ops
+    );
     assert!(rep.host_bytes > 0, "宿主层应有驻留");
-    assert_eq!(rep.ops.ensure_evicted, 0, "全程不得依赖 `ensure_for_len` 的同步驱逐");
+    assert_eq!(
+        rep.ops.ensure_evicted, 0,
+        "全程不得依赖 `ensure_for_len` 的同步驱逐"
+    );
 
     // ── 轮 4:命中 A ⇒ 命中面落在宿主 ⇒ **一条命令**批量回灌
     let hit = l.match_prefix(&a_tokens).expect("二次命中");
     let pending = hit.pending_host();
-    assert!(!pending.is_empty(), "A 已被整条沉到宿主 ⇒ 命中面应有待回灌块(A 的链头段也在)");
+    assert!(
+        !pending.is_empty(),
+        "A 已被整条沉到宿主 ⇒ 命中面应有待回灌块(A 的链头段也在)"
+    );
     assert!(!hit.all_resident(), "整条链沉 ⇒ 命中面不全驻留");
-    let slots = engine_onload(&mut l, &mut face, &pending).await.expect("批量回灌");
+    let slots = engine_onload(&mut l, &mut face, &pending)
+        .await
+        .expect("批量回灌");
     assert_eq!(slots.len(), pending.len(), "同序返回槽");
     let rep2 = l.report();
     assert_eq!(rep2.ops.onloads as usize, pending.len(), "回灌计数 = 块数");
-    assert_eq!(rep2.ops.onload_batches, 1, "§15 批面:多块回灌必须**一条命令**");
+    assert_eq!(
+        rep2.ops.onload_batches, 1,
+        "§15 批面:多块回灌必须**一条命令**"
+    );
     assert_eq!(rep2.ops.ensure_evicted, 0, "回灌路径同样不得依赖同步驱逐");
 
     // ── 门③:内容逐字节恒等(回灌后的新槽 vs 沉之前的旧内容)
@@ -222,8 +269,12 @@ async fn chain_offload_moves_head_to_tail_and_batch_reloads() {
     let mut face = CpuFace::new();
     let ps = pieces(&mut face, 4).await;
     let mut l = leg(4);
-    l.attach_pool(PoolLayout { class: BlockClass::KvPage, epoch: 1, pieces: ps.clone() })
-        .expect("注册布局");
+    l.attach_pool(PoolLayout {
+        class: BlockClass::KvPage,
+        epoch: 1,
+        pieces: ps.clone(),
+    })
+    .expect("注册布局");
 
     let tokens: Vec<u32> = (0..96).collect();
     let chain = build_chain(&mut l, &tokens).await;
@@ -235,13 +286,24 @@ async fn chain_offload_moves_head_to_tail_and_batch_reloads() {
     assert_eq!((cands[0].tail, cands[0].head), (tail, head));
     assert_eq!(cands[0].dev_blocks, 3);
 
-    assert_eq!(engine_offload(&mut l, &mut face, tail).await.expect("整条沉"), 3);
+    assert_eq!(
+        engine_offload(&mut l, &mut face, tail)
+            .await
+            .expect("整条沉"),
+        3
+    );
     for (i, h) in chain.iter().enumerate() {
-        assert_eq!(l.carrier_of(*h).expect("在账"), owl_store::Carrier::Host, "第 {i} 块应在宿主");
+        assert_eq!(
+            l.carrier_of(*h).expect("在账"),
+            owl_store::Carrier::Host,
+            "第 {i} 块应在宿主"
+        );
     }
     let hit = l.match_prefix(&tokens).expect("宿主格仍命中");
     assert_eq!(hit.pending_host().len(), 3, "三段全待回灌(链头段在内)");
-    let n = engine_onload(&mut l, &mut face, &hit.pending_host()).await.expect("批量回灌");
+    let n = engine_onload(&mut l, &mut face, &hit.pending_host())
+        .await
+        .expect("批量回灌");
     assert_eq!(n.len(), 3);
 
     let rep = l.report();
@@ -272,7 +334,9 @@ async fn engine_offload_blocks(
         Ok(c) => c,
         Err(e) => {
             owl_store::abort_offload(leg, &blocks);
-            return Err(owl_store::StoreError::Invariant(format!("swap(Out) 失败:{e}")));
+            return Err(owl_store::StoreError::Invariant(format!(
+                "swap(Out) 失败:{e}"
+            )));
         }
     };
     let table = reclaim_slot_table(conn)?;
@@ -285,8 +349,12 @@ async fn per_block_offload_skips_live_block_without_vetoing_others() {
     let mut face = CpuFace::new();
     let ps = pieces(&mut face, 6).await;
     let mut l = leg(6);
-    l.attach_pool(PoolLayout { class: BlockClass::KvPage, epoch: 1, pieces: ps.clone() })
-        .expect("注册布局");
+    l.attach_pool(PoolLayout {
+        class: BlockClass::KvPage,
+        epoch: 1,
+        pieces: ps.clone(),
+    })
+    .expect("注册布局");
 
     // 链 A = 3 块;归一还会话引用后再**重新持一块**(块 1)= 模拟"会话表仍持有它"
     let a_tokens: Vec<u32> = (0..96).collect();
@@ -308,20 +376,29 @@ async fn per_block_offload_skips_live_block_without_vetoing_others() {
         "[b3e-2] 池 {} 槽/自由 {} · 链 A = {:?}(槽 0/1/2)其中**槽 1 被会话持有**",
         l.report().slots_total,
         l.report().slots_free,
-        a.iter().map(|h| format!("{:?}", h).chars().take(6).collect::<String>()).collect::<Vec<_>>()
+        a.iter()
+            .map(|h| format!("{:?}", h).chars().take(6).collect::<String>())
+            .collect::<Vec<_>>()
     );
     // ── 对照:链级票此时**整链 Busy**(一块活跃 ⇒ 整条链不出票)
     assert!(
-        matches!(plan_offload(&mut l, *a.last().expect("尾")), Err(owl_store::StoreError::Busy(_))),
+        matches!(
+            plan_offload(&mut l, *a.last().expect("尾")),
+            Err(owl_store::StoreError::Busy(_))
+        ),
         "链级票的粗化:一块活跃 ⇒ 整链否决(本测试要证的正是它的反面)"
     );
 
     // ── 逐块票:请求 [块0, 块1(活跃), 块2] ⇒ 只有 0/2 有票,块 1 记 `LiveRefs`
-    let (n, skipped) = engine_offload_blocks(&mut l, &mut face, &a).await.expect("逐块下沉");
+    let (n, skipped) = engine_offload_blocks(&mut l, &mut face, &a)
+        .await
+        .expect("逐块下沉");
     let why = plan_offload_blocks(&mut l, &[a[0], a[1], a[2]])
         .map(|p| p.skipped.len())
         .unwrap_or(0);
-    eprintln!("[b3e-2] 逐块票:下沉 {n} 块 · 跳过 {skipped} 块(活跃块记 LiveRefs;复询 skipped={why})");
+    eprintln!(
+        "[b3e-2] 逐块票:下沉 {n} 块 · 跳过 {skipped} 块(活跃块记 LiveRefs;复询 skipped={why})"
+    );
     assert_eq!(n, 2, "两块应真沉");
     assert_eq!(skipped, 1, "活跃块应被跳过(不是连坐)");
     let rep = l.report();
@@ -335,14 +412,25 @@ async fn per_block_offload_skips_live_block_without_vetoing_others() {
         owl_store::Carrier::Device(live_slot),
         "活跃块不沉"
     );
-    assert_eq!(l.carrier_of(a[0]).expect("块0载体"), owl_store::Carrier::Host, "冷块应沉");
-    assert_eq!(l.carrier_of(a[2]).expect("块2载体"), owl_store::Carrier::Host, "冷块应沉");
+    assert_eq!(
+        l.carrier_of(a[0]).expect("块0载体"),
+        owl_store::Carrier::Host,
+        "冷块应沉"
+    );
+    assert_eq!(
+        l.carrier_of(a[2]).expect("块2载体"),
+        owl_store::Carrier::Host,
+        "冷块应沉"
+    );
 
     // ── 幂等(趁块还在宿主):重复请求全 `AlreadyHost`,零搬运、不借台
     let again = plan_offload_blocks(&mut l, &[a[0], a[2]]).expect("重复请求");
     assert!(again.is_empty(), "已在宿主 ⇒ 无票(不借台、零副作用)");
     assert!(
-        again.skipped.iter().all(|(_, why)| *why == SkipWhy::AlreadyHost),
+        again
+            .skipped
+            .iter()
+            .all(|(_, why)| *why == SkipWhy::AlreadyHost),
         "重复请求应记 AlreadyHost:{:?}",
         again.skipped
     );
@@ -353,7 +441,12 @@ async fn per_block_offload_skips_live_block_without_vetoing_others() {
     assert_eq!(slots.len(), 2);
     for (i, slot) in slots.iter().enumerate() {
         let after = read_slot(&mut face, &ps, *slot).await;
-        assert_eq!(after, before[[0usize, 2][i]], "块 {:?} 沉→回灌必须逐字节一致", sunk[i]);
+        assert_eq!(
+            after,
+            before[[0usize, 2][i]],
+            "块 {:?} 沉→回灌必须逐字节一致",
+            sunk[i]
+        );
     }
 
     // ── 回灌后它们又回到设备(载体查询可证)⇒ 再请求就又有票(幂等只对"已在宿主"成立)
@@ -375,8 +468,12 @@ async fn pressure_offloads_without_deficit_and_prefers_host() {
     let mut face = CpuFace::new();
     let ps = pieces(&mut face, 6).await;
     let mut l = leg(6);
-    l.attach_pool(PoolLayout { class: BlockClass::KvPage, epoch: 1, pieces: ps.clone() })
-        .expect("注册布局");
+    l.attach_pool(PoolLayout {
+        class: BlockClass::KvPage,
+        epoch: 1,
+        pieces: ps.clone(),
+    })
+    .expect("注册布局");
     // 填 2 条链 × 3 块 = 池满;归还会话引用 ⇒ 缓存独占(可下沉)
     let a_tokens: Vec<u32> = (0..PAGE_TOKENS as u32 * 3).collect();
     let _a = build_chain(&mut l, &a_tokens).await;
@@ -395,12 +492,19 @@ async fn pressure_offloads_without_deficit_and_prefers_host() {
         "宿主要位 ⇒ 首选下沉(内容不丢):{:?}",
         v.out.iter().map(|o| o.sink()).collect::<Vec<_>>()
     );
-    assert_eq!(v.out.iter().map(|o| o.kv_span()).sum::<usize>(), 3, "整链下沉凑满目标");
+    assert_eq!(
+        v.out.iter().map(|o| o.kv_span()).sum::<usize>(),
+        3,
+        "整链下沉凑满目标"
+    );
     // **H5 空转整理**(步 4 入档):与 Pressure 同语义(零缺口也搬),只是 why 不同 ——
     // 空转期只动缓存面(冷链),绝不碰活跃面。
     let idle = plan_kv(&l, Need::kv(3, NeedWhy::Idle));
     assert!(!idle.out.is_empty(), "H5 空转整理必须出单(零缺口也搬)");
-    assert!(idle.out.iter().all(|o| o.sink() == Sink::Host), "空转整理同样先下沉");
+    assert!(
+        idle.out.iter().all(|o| o.sink() == Sink::Host),
+        "空转整理同样先下沉"
+    );
     assert!(idle.deny.is_none(), "有可搬面 ⇒ 不拒");
 }
 /// **`Need::kv` 的单位 = "我想要多少空闲槽"**（不是"已扣 free 的差额"）。
@@ -413,8 +517,12 @@ async fn grow_need_is_absolute_free_slots_not_deficit() {
     let mut face = CpuFace::new();
     let ps = pieces(&mut face, 6).await;
     let mut l = leg(6);
-    l.attach_pool(PoolLayout { class: BlockClass::KvPage, epoch: 1, pieces: ps })
-        .expect("注册布局");
+    l.attach_pool(PoolLayout {
+        class: BlockClass::KvPage,
+        epoch: 1,
+        pieces: ps,
+    })
+    .expect("注册布局");
     // 4 条单块链 ⇒ 6 槽池里 free = 2（缓存独占，可下沉）。
     for k in 0..4u32 {
         let base = k * 1000;
@@ -460,8 +568,12 @@ async fn host_room_between_goal_and_chain_span_prunes_host_first() {
         label: "host-room",
     })
     .expect("开腿");
-    l.attach_pool(PoolLayout { class: BlockClass::KvPage, epoch: 1, pieces: ps })
-        .expect("注册布局");
+    l.attach_pool(PoolLayout {
+        class: BlockClass::KvPage,
+        epoch: 1,
+        pieces: ps,
+    })
+    .expect("注册布局");
 
     let toks = |base: u32, blocks: u32| -> Vec<u32> {
         (base..base + blocks * PAGE_TOKENS as u32).collect()
@@ -511,8 +623,12 @@ async fn no_disk_tier_collapses_chain_that_cannot_fit_host() {
         label: "no-disk",
     })
     .expect("开腿");
-    l.attach_pool(PoolLayout { class: BlockClass::KvPage, epoch: 1, pieces: ps })
-        .expect("注册布局");
+    l.attach_pool(PoolLayout {
+        class: BlockClass::KvPage,
+        epoch: 1,
+        pieces: ps,
+    })
+    .expect("注册布局");
 
     let toks = |base: u32, blocks: u32| -> Vec<u32> {
         (base..base + blocks * PAGE_TOKENS as u32).collect()
@@ -537,7 +653,11 @@ async fn no_disk_tier_collapses_chain_that_cannot_fit_host() {
         .map(|o| o.kv_span())
         .max()
         .unwrap_or(0);
-    assert_eq!(max_drop, 3, "一张整枝票 span=3（旧行为是每链 1 块 ⇒ 短 1）：{:?}", v.out);
+    assert_eq!(
+        max_drop, 3,
+        "一张整枝票 span=3（旧行为是每链 1 块 ⇒ 短 1）：{:?}",
+        v.out
+    );
 }
 
 /// **宿主腾位必须一张票跨多块**（旧实现一链一票只丢 1 块）。
@@ -560,8 +680,12 @@ async fn host_prune_uses_multi_block_span() {
         label: "host-span",
     })
     .expect("开腿");
-    l.attach_pool(PoolLayout { class: BlockClass::KvPage, epoch: 1, pieces: ps })
-        .expect("注册布局");
+    l.attach_pool(PoolLayout {
+        class: BlockClass::KvPage,
+        epoch: 1,
+        pieces: ps,
+    })
+    .expect("注册布局");
 
     let toks = |base: u32, blocks: u32| -> Vec<u32> {
         (base..base + blocks * PAGE_TOKENS as u32).collect()
@@ -595,7 +719,12 @@ async fn host_prune_uses_multi_block_span() {
     assert_eq!(drops, vec![2], "宿主腾位一张票跨 2 块：{:?}", v.out);
     let mut drop_chains: Vec<(ChainHash, usize)> = Vec::new();
     for o in &v.out {
-        if let EvictOut::Kv { chain, sink: Sink::Drop, span } = o {
+        if let EvictOut::Kv {
+            chain,
+            sink: Sink::Drop,
+            span,
+        } = o
+        {
             drop_chains.push((*chain, *span));
         }
     }
@@ -611,18 +740,31 @@ async fn host_prune_uses_multi_block_span() {
     // 宿主腾位票必须真删宿主副本并腾出槽，随后整链下沉才能拿到位。
     for o in &v.out {
         match o {
-            EvictOut::Kv { chain, sink: Sink::Drop, span } => {
+            EvictOut::Kv {
+                chain,
+                sink: Sink::Drop,
+                span,
+            } => {
                 let n = l.prune_branch(*chain, (*span).max(1)).expect("宿主逐出");
                 assert_eq!(n, *span, "一张宿主票应删满 span 块：{:?}", v.out);
             }
-            EvictOut::Kv { chain, sink: Sink::Host, .. } => {
-                engine_offload(&mut l, &mut face, *chain).await.expect("整链下沉");
+            EvictOut::Kv {
+                chain,
+                sink: Sink::Host,
+                ..
+            } => {
+                engine_offload(&mut l, &mut face, *chain)
+                    .await
+                    .expect("整链下沉");
             }
             other => panic!("本档不应出别的票：{other:?}"),
         }
     }
     let a_tail = *a_cs.last().expect("A 链尾");
-    assert_eq!(l.carrier_of(a_tail).expect("A 在账"), owl_store::Carrier::Host);
+    assert_eq!(
+        l.carrier_of(a_tail).expect("A 在账"),
+        owl_store::Carrier::Host
+    );
     assert!(
         l.carrier_of(*h_cs.last().expect("H 链尾")).is_err(),
         "宿主最冷的 2 块必须真删"
@@ -648,8 +790,12 @@ async fn host_room_target_sums_the_lru_prefix() {
         label: "host-sum",
     })
     .expect("开腿");
-    l.attach_pool(PoolLayout { class: BlockClass::KvPage, epoch: 1, pieces: ps })
-        .expect("注册布局");
+    l.attach_pool(PoolLayout {
+        class: BlockClass::KvPage,
+        epoch: 1,
+        pieces: ps,
+    })
+    .expect("注册布局");
 
     let toks = |base: u32, blocks: u32| -> Vec<u32> {
         (base..base + blocks * PAGE_TOKENS as u32).collect()
@@ -677,7 +823,12 @@ async fn host_room_target_sums_the_lru_prefix() {
     // 唯一一张 Drop 必须是**宿主链 H**（腾宿主位），设备链 A/C 都下沉（内容留）。
     let mut drop_chains: Vec<(ChainHash, usize)> = Vec::new();
     for o in &v.out {
-        if let EvictOut::Kv { chain, sink: Sink::Drop, span } = o {
+        if let EvictOut::Kv {
+            chain,
+            sink: Sink::Drop,
+            span,
+        } = o
+        {
             drop_chains.push((*chain, *span));
         }
     }
@@ -701,8 +852,12 @@ async fn busy_shared_prefix_collapses_unshared_tail_in_one_ticket() {
     let mut face = CpuFace::new();
     let ps = pieces(&mut face, 8).await;
     let mut l = leg(8);
-    l.attach_pool(PoolLayout { class: BlockClass::KvPage, epoch: 1, pieces: ps })
-        .expect("注册布局");
+    l.attach_pool(PoolLayout {
+        class: BlockClass::KvPage,
+        epoch: 1,
+        pieces: ps,
+    })
+    .expect("注册布局");
     let pg = PAGE_TOKENS as u32;
     let shared: Vec<u32> = (0..pg).collect();
     // A = 共享 1 块 + 独有 1 块；表**留着**（模拟活跃 turn 持着共享前缀）。
@@ -740,7 +895,12 @@ async fn busy_shared_prefix_collapses_unshared_tail_in_one_ticket() {
     assert!(v.deny.is_none(), "独有尾能覆盖缺口 ⇒ 不拒：{:?}", v.deny);
     assert_eq!(v.out.len(), 1, "应是一张整枝票：{:?}", v.out);
     assert_eq!(v.out[0].sink(), Sink::Drop, "搬不走 ⇒ 只能丢：{:?}", v.out);
-    assert_eq!(v.out[0].kv_span(), 2, "塌缩到本拍目标（不是整链 3）：{:?}", v.out);
+    assert_eq!(
+        v.out[0].kv_span(),
+        2,
+        "塌缩到本拍目标（不是整链 3）：{:?}",
+        v.out
+    );
 }
 
 // ───────────────── 生产路径回归:重算重绑不得留宿主幽灵 ─────────────────
@@ -813,8 +973,12 @@ async fn single_session_offload_and_reload_roundtrip() {
     let mut face = CpuFace::new();
     let ps = pieces(&mut face, 6).await;
     let mut l = leg(6);
-    l.attach_pool(PoolLayout { class: BlockClass::KvPage, epoch: 1, pieces: ps.clone() })
-        .expect("注册布局");
+    l.attach_pool(PoolLayout {
+        class: BlockClass::KvPage,
+        epoch: 1,
+        pieces: ps.clone(),
+    })
+    .expect("注册布局");
 
     let tokens: Vec<u32> = (0..192).collect(); // 6 块
     let chain = build_chain(&mut l, &tokens).await;
@@ -828,7 +992,9 @@ async fn single_session_offload_and_reload_roundtrip() {
     }
 
     let tail = *chain.last().expect("尾块");
-    let moved = engine_offload(&mut l, &mut face, tail).await.expect("整链下沉");
+    let moved = engine_offload(&mut l, &mut face, tail)
+        .await
+        .expect("整链下沉");
     assert_eq!(moved, 6, "单会话整链沉 6 块");
     assert_eq!(l.report().host_blocks, 6, "宿主应持 6 块");
     assert_eq!(l.report().slots_free, 6, "下沉后池应全空");
@@ -841,7 +1007,9 @@ async fn single_session_offload_and_reload_roundtrip() {
     let hit = l.match_prefix(&tokens).expect("宿主命中");
     let pending = hit.pending_host();
     assert_eq!(pending.len(), 6, "单会话回灌面 = 6 块");
-    let slots = engine_onload(&mut l, &mut face, &pending).await.expect("整链回灌");
+    let slots = engine_onload(&mut l, &mut face, &pending)
+        .await
+        .expect("整链回灌");
     assert_eq!(slots.len(), 6);
     for (i, slot) in slots.iter().enumerate() {
         let after = read_slot(&mut face, &ps, *slot).await;
@@ -862,8 +1030,12 @@ async fn two_sessions_alternate_offload_and_reload_roundtrip() {
     let mut face = CpuFace::new();
     let ps = pieces(&mut face, 6).await;
     let mut l = leg(6);
-    l.attach_pool(PoolLayout { class: BlockClass::KvPage, epoch: 1, pieces: ps.clone() })
-        .expect("注册布局");
+    l.attach_pool(PoolLayout {
+        class: BlockClass::KvPage,
+        epoch: 1,
+        pieces: ps.clone(),
+    })
+    .expect("注册布局");
 
     let a_tokens: Vec<u32> = (0..96).collect();
     let b_tokens: Vec<u32> = (1000..1096).collect();
@@ -885,7 +1057,12 @@ async fn two_sessions_alternate_offload_and_reload_roundtrip() {
     }
 
     // A 轮换出去;B 仍在设备。
-    assert_eq!(engine_offload(&mut l, &mut face, *a.last().unwrap()).await.expect("A 下沉"), 3);
+    assert_eq!(
+        engine_offload(&mut l, &mut face, *a.last().unwrap())
+            .await
+            .expect("A 下沉"),
+        3
+    );
     assert_eq!(l.report().host_blocks, 3, "A 在宿主");
     assert_eq!(l.report().slots_free, 3, "A 腾出 3 槽");
     eprintln!(
@@ -900,9 +1077,15 @@ async fn two_sessions_alternate_offload_and_reload_roundtrip() {
     // A 回灌;B 仍在设备。
     let a_pending = l.match_prefix(&a_tokens).expect("A 命中").pending_host();
     assert_eq!(a_pending.len(), 3, "A 回灌面 = 3 块");
-    let a_slots = engine_onload(&mut l, &mut face, &a_pending).await.expect("A 回灌");
+    let a_slots = engine_onload(&mut l, &mut face, &a_pending)
+        .await
+        .expect("A 回灌");
     for (i, slot) in a_slots.iter().enumerate() {
-        assert_eq!(read_slot(&mut face, &ps, *slot).await, a_before[i], "A 第 {i} 块");
+        assert_eq!(
+            read_slot(&mut face, &ps, *slot).await,
+            a_before[i],
+            "A 第 {i} 块"
+        );
     }
     assert_eq!(l.report().slots_free, 0, "A 回灌后池再次满");
     eprintln!(
@@ -913,7 +1096,12 @@ async fn two_sessions_alternate_offload_and_reload_roundtrip() {
     );
 
     // B 轮换出去;A 仍在设备。
-    assert_eq!(engine_offload(&mut l, &mut face, *b.last().unwrap()).await.expect("B 下沉"), 3);
+    assert_eq!(
+        engine_offload(&mut l, &mut face, *b.last().unwrap())
+            .await
+            .expect("B 下沉"),
+        3
+    );
     assert_eq!(l.report().host_blocks, 3, "B 在宿主");
     assert_eq!(l.report().slots_free, 3, "B 腾出 3 槽");
     eprintln!(
@@ -925,9 +1113,15 @@ async fn two_sessions_alternate_offload_and_reload_roundtrip() {
     // B 回灌;A 仍在设备,内容不得互串。
     let b_pending = l.match_prefix(&b_tokens).expect("B 命中").pending_host();
     assert_eq!(b_pending.len(), 3, "B 回灌面 = 3 块");
-    let b_slots = engine_onload(&mut l, &mut face, &b_pending).await.expect("B 回灌");
+    let b_slots = engine_onload(&mut l, &mut face, &b_pending)
+        .await
+        .expect("B 回灌");
     for (i, slot) in b_slots.iter().enumerate() {
-        assert_eq!(read_slot(&mut face, &ps, *slot).await, b_before[i], "B 第 {i} 块");
+        assert_eq!(
+            read_slot(&mut face, &ps, *slot).await,
+            b_before[i],
+            "B 第 {i} 块"
+        );
     }
     assert_eq!(l.report().host_blocks, 0, "轮换结束宿主无残留");
     assert_eq!(l.report().slots_free, 0, "轮换结束池仍由 A+B 占满");
@@ -946,8 +1140,12 @@ async fn two_active_sessions_block_migration_until_one_rotates_out() {
     let mut face = CpuFace::new();
     let ps = pieces(&mut face, 6).await;
     let mut l = leg(6);
-    l.attach_pool(PoolLayout { class: BlockClass::KvPage, epoch: 1, pieces: ps.clone() })
-        .expect("注册布局");
+    l.attach_pool(PoolLayout {
+        class: BlockClass::KvPage,
+        epoch: 1,
+        pieces: ps.clone(),
+    })
+    .expect("注册布局");
 
     let a_tokens: Vec<u32> = (0..96).collect();
     let b_tokens: Vec<u32> = (1000..1096).collect();
@@ -955,8 +1153,10 @@ async fn two_active_sessions_block_migration_until_one_rotates_out() {
     let (a_table, b_table) = {
         let mut a_table = Vec::new();
         let mut b_table = Vec::new();
-        l.ensure_for_len(&mut a_table, a_tokens.len()).expect("A 表");
-        l.ensure_for_len(&mut b_table, b_tokens.len()).expect("B 表");
+        l.ensure_for_len(&mut a_table, a_tokens.len())
+            .expect("A 表");
+        l.ensure_for_len(&mut b_table, b_tokens.len())
+            .expect("B 表");
         l.register_chain(&a_tokens, &a_table).expect("A 登记");
         l.register_chain(&b_tokens, &b_table).expect("B 登记");
         (a_table, b_table)
@@ -994,13 +1194,21 @@ async fn two_active_sessions_block_migration_until_one_rotates_out() {
         verdict.out.iter().all(|o| o.sink() != Sink::Drop),
         "活跃链不得出 Drop 票:{verdict:?}"
     );
-    assert!(verdict.deny.is_some(), "无缓存可动 ⇒ 必须响亮 deny:{verdict:?}");
+    assert!(
+        verdict.deny.is_some(),
+        "无缓存可动 ⇒ 必须响亮 deny:{verdict:?}"
+    );
     eprintln!("[active] both active tickets={:?}", verdict.out);
 
     // A 轮换出去(释放表引用)→ 可整链下沉。
     let mut a_table = a_table;
     l.release_table(&mut a_table).expect("A 表归还");
-    assert_eq!(engine_offload(&mut l, &mut face, a_tail).await.expect("A 下沉"), 3);
+    assert_eq!(
+        engine_offload(&mut l, &mut face, a_tail)
+            .await
+            .expect("A 下沉"),
+        3
+    );
     assert_eq!(l.report().host_blocks, 3, "A 在宿主");
     eprintln!(
         "[active] A rotates out: host_blocks={} slots_free={}",
@@ -1008,13 +1216,28 @@ async fn two_active_sessions_block_migration_until_one_rotates_out() {
         l.report().slots_free
     );
     // B 仍然活跃:回灌 A 不能影响 B 的内容。
-    let a_pending = l.match_prefix(&a_tokens).expect("A 宿主命中").pending_host();
+    let a_pending = l
+        .match_prefix(&a_tokens)
+        .expect("A 宿主命中")
+        .pending_host();
     assert_eq!(a_pending.len(), 3);
-    let a_slots = engine_onload(&mut l, &mut face, &a_pending).await.expect("A 回灌");
+    let a_slots = engine_onload(&mut l, &mut face, &a_pending)
+        .await
+        .expect("A 回灌");
     for (i, slot) in a_slots.iter().enumerate() {
-        assert_eq!(read_slot(&mut face, &ps, *slot).await, a_before[i], "A 第 {i} 块");
+        assert_eq!(
+            read_slot(&mut face, &ps, *slot).await,
+            a_before[i],
+            "A 第 {i} 块"
+        );
     }
-    for (i, h) in l.match_prefix(&b_tokens).expect("B 仍命中").hashes.iter().enumerate() {
+    for (i, h) in l
+        .match_prefix(&b_tokens)
+        .expect("B 仍命中")
+        .hashes
+        .iter()
+        .enumerate()
+    {
         // B 的表引用还在,命中面应全驻留。
         let _ = (i, h);
     }
@@ -1023,12 +1246,26 @@ async fn two_active_sessions_block_migration_until_one_rotates_out() {
     // B 轮换出去 → 下沉/回灌,验证 A 的内容不被串。
     let mut b_table = b_table;
     l.release_table(&mut b_table).expect("B 表归还");
-    assert_eq!(engine_offload(&mut l, &mut face, b_tail).await.expect("B 下沉"), 3);
-    let b_pending = l.match_prefix(&b_tokens).expect("B 宿主命中").pending_host();
+    assert_eq!(
+        engine_offload(&mut l, &mut face, b_tail)
+            .await
+            .expect("B 下沉"),
+        3
+    );
+    let b_pending = l
+        .match_prefix(&b_tokens)
+        .expect("B 宿主命中")
+        .pending_host();
     assert_eq!(b_pending.len(), 3);
-    let b_slots = engine_onload(&mut l, &mut face, &b_pending).await.expect("B 回灌");
+    let b_slots = engine_onload(&mut l, &mut face, &b_pending)
+        .await
+        .expect("B 回灌");
     for (i, slot) in b_slots.iter().enumerate() {
-        assert_eq!(read_slot(&mut face, &ps, *slot).await, b_before[i], "B 第 {i} 块");
+        assert_eq!(
+            read_slot(&mut face, &ps, *slot).await,
+            b_before[i],
+            "B 第 {i} 块"
+        );
     }
     assert_eq!(l.report().host_blocks, 0, "轮换结束无宿主残留");
 }
@@ -1055,8 +1292,12 @@ async fn gpu_only_planner_drops_without_lower_tier() {
         label: "gpu-only",
     })
     .expect("开腿");
-    l.attach_pool(PoolLayout { class: BlockClass::KvPage, epoch: 1, pieces: ps })
-        .expect("注册布局");
+    l.attach_pool(PoolLayout {
+        class: BlockClass::KvPage,
+        epoch: 1,
+        pieces: ps,
+    })
+    .expect("注册布局");
 
     let toks = |base: u32| -> Vec<u32> { (base..base + 3 * PAGE_TOKENS as u32).collect() };
     let _a = build_chain(&mut l, &toks(0)).await;
@@ -1113,8 +1354,12 @@ async fn three_pool_planner_spills_host_to_disk_before_dropping_device() {
         label: "gpu-host-disk",
     })
     .expect("开腿");
-    l.attach_pool(PoolLayout { class: BlockClass::KvPage, epoch: 1, pieces: ps })
-        .expect("注册布局");
+    l.attach_pool(PoolLayout {
+        class: BlockClass::KvPage,
+        epoch: 1,
+        pieces: ps,
+    })
+    .expect("注册布局");
 
     let toks = |base: u32| -> Vec<u32> { (base..base + 3 * PAGE_TOKENS as u32).collect() };
     // H 整链沉宿主 ⇒ 宿主 3/3 满，设备空 6 槽。
@@ -1169,12 +1414,16 @@ async fn three_pool_planner_spills_host_to_disk_before_dropping_device() {
     let h_tail = *h.last().expect("H 链尾");
     let a_tail = *a.last().expect("A 链尾");
     assert!(
-        v.out.iter().any(|o| matches!(o, EvictOut::Kv { chain, sink: Sink::Disk, span: 3 } if *chain == h_tail)),
+        v.out.iter().any(
+            |o| matches!(o, EvictOut::Kv { chain, sink: Sink::Disk, span: 3 } if *chain == h_tail)
+        ),
         "盘票应是 H 整链：{:?}",
         v.out
     );
     assert!(
-        v.out.iter().any(|o| matches!(o, EvictOut::Kv { chain, sink: Sink::Host, span: 3 } if *chain == a_tail)),
+        v.out.iter().any(
+            |o| matches!(o, EvictOut::Kv { chain, sink: Sink::Host, span: 3 } if *chain == a_tail)
+        ),
         "Host 票应是 A 整链：{:?}",
         v.out
     );
@@ -1244,7 +1493,9 @@ fn snapshot_cascade_spills_host_before_dropping_gpu() {
     );
 
     // 下一拍：宿主快照已在盘上 ⇒ 设备快照下沉到刚腾出的宿主位。
-    state.set_tier(host_key, owl_store::Tier::Disk).expect("模拟溢盘落账");
+    state
+        .set_tier(host_key, owl_store::Tier::Disk)
+        .expect("模拟溢盘落账");
     let room = Room {
         host_enabled: true,
         host_kv_slots: 0,
@@ -1271,7 +1522,9 @@ fn snapshot_cascade_spills_host_before_dropping_gpu() {
     );
     assert!(v2.deny.is_none(), "第二拍应可满足：{:?}", v2.deny);
     assert!(
-        v2.out.iter().any(|o| matches!(o, EvictOut::Snap { key, sink: Sink::Host } if *key == gpu_key)),
+        v2.out
+            .iter()
+            .any(|o| matches!(o, EvictOut::Snap { key, sink: Sink::Host } if *key == gpu_key)),
         "第二拍应把设备快照下沉：{:?}",
         v2.out
     );
@@ -1334,23 +1587,23 @@ fn two_tier_host_snapshot_relief_respects_role() {
     );
     assert!(v.deny.is_none(), "应可满足：{:?}", v.deny);
     assert!(
-        v.out.iter().any(
-            |o| matches!(o, EvictOut::Snap { key, sink: Sink::Drop } if *key == host_key)
-        ),
+        v.out
+            .iter()
+            .any(|o| matches!(o, EvictOut::Snap { key, sink: Sink::Drop } if *key == host_key)),
         "必须先 Drop 更冷的宿主 History：{:?}",
         v.out
     );
     assert!(
-        v.out.iter().any(
-            |o| matches!(o, EvictOut::Snap { key, sink: Sink::Host } if *key == gpu_key)
-        ),
+        v.out
+            .iter()
+            .any(|o| matches!(o, EvictOut::Snap { key, sink: Sink::Host } if *key == gpu_key)),
         "再让设备 Tail 下沉：{:?}",
         v.out
     );
     assert!(
-        v.out.iter().all(
-            |o| !matches!(o, EvictOut::Snap { key, sink: Sink::Drop } if *key == gpu_key)
-        ),
+        v.out
+            .iter()
+            .all(|o| !matches!(o, EvictOut::Snap { key, sink: Sink::Drop } if *key == gpu_key)),
         "设备 Tail 不得被 Drop：{:?}",
         v.out
     );
@@ -1392,16 +1645,16 @@ fn two_tier_host_snapshot_relief_respects_role() {
     );
     assert!(v.deny.is_none(), "应可满足：{:?}", v.deny);
     assert!(
-        v.out.iter().all(
-            |o| !matches!(o, EvictOut::Snap { key, sink: Sink::Drop } if *key == host_key)
-        ),
+        v.out
+            .iter()
+            .all(|o| !matches!(o, EvictOut::Snap { key, sink: Sink::Drop } if *key == host_key)),
         "宿主 Tail 不得为设备 History 让位：{:?}",
         v.out
     );
     assert!(
-        v.out.iter().any(
-            |o| matches!(o, EvictOut::Snap { key, sink: Sink::Drop } if *key == gpu_key)
-        ),
+        v.out
+            .iter()
+            .any(|o| matches!(o, EvictOut::Snap { key, sink: Sink::Drop } if *key == gpu_key)),
         "设备 History 应被 Drop：{:?}",
         v.out
     );

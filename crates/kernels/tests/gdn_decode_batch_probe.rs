@@ -12,8 +12,8 @@
 //!
 //! 无 GPU 跳过(OWL_TEST_DEVICE)。
 
-use owl_macros::owl_test;
 use cudarc::driver::{CudaContext, DevicePtr, LaunchConfig, PushKernelArg};
+use owl_macros::owl_test;
 
 const NK: usize = 16;
 const NV: usize = 48;
@@ -55,14 +55,19 @@ fn bundle(b: usize, seed: u32) -> Bundle {
         z: (0..b * V).map(|i| lcg_f16_bits(seed + 3, i)).collect(),
         b_gate: (0..b * HV).map(|i| lcg_f16_bits(seed + 4, i)).collect(),
         a_gate: (0..b * HV).map(|i| lcg_f16_bits(seed + 5, i)).collect(),
-        w: (0..CONV_DIM * 4).map(|i| lcg_f16_bits(seed + 6, i)).collect(),
+        w: (0..CONV_DIM * 4)
+            .map(|i| lcg_f16_bits(seed + 6, i))
+            .collect(),
         a_log: (0..HV).map(|i| lcg_f16_bits(seed + 7, i)).collect(),
         dt_bias: (0..HV).map(|i| lcg_f16_bits(seed + 8, i)).collect(),
         norm_w: (0..VD).map(|i| lcg_f16_bits(seed + 9, i)).collect(),
     }
 }
 
-fn dev_u16(s: &std::sync::Arc<cudarc::driver::CudaStream>, n: usize) -> cudarc::driver::CudaSlice<u16> {
+fn dev_u16(
+    s: &std::sync::Arc<cudarc::driver::CudaStream>,
+    n: usize,
+) -> cudarc::driver::CudaSlice<u16> {
     unsafe { s.alloc::<u16>(n) }.unwrap()
 }
 
@@ -74,7 +79,10 @@ fn gdn_decode_step_batch2_equals_serial() {
     let stream = ctx.default_stream();
     // nvrtc 懒编译(源 = text/gdn.cu;自足,仅 <cuda_fp16.h> 系统头)
     let ptx = cudarc::nvrtc::compile_ptx_with_opts(
-        owl_kernels::cu_sig::cu_text(owl_kernels::ops::source("owl_gdn_recurrence_varlen_gqa_f16")).as_str(),
+        owl_kernels::cu_sig::cu_text(owl_kernels::ops::source(
+            "owl_gdn_recurrence_varlen_gqa_f16",
+        ))
+        .as_str(),
         cudarc::nvrtc::CompileOptions {
             arch: Some("compute_86"),
             include_paths: vec!["/usr/local/cuda/include".into()],
@@ -228,7 +236,11 @@ fn gdn_decode_step_batch2_equals_serial() {
         "padding 行写穿 rec 状态"
     );
     // 行 0/1 与串行一致(前两槽)
-    assert_eq!(cp[..2 * V * 3], cs[..2 * V * 3], "padding 批行 0/1 ≠ 串行(conv)");
+    assert_eq!(
+        cp[..2 * V * 3],
+        cs[..2 * V * 3],
+        "padding 批行 0/1 ≠ 串行(conv)"
+    );
     assert_eq!(
         rp[..2 * HV * KD * VD],
         rs[..2 * HV * KD * VD],

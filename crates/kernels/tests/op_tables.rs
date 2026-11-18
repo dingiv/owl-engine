@@ -29,14 +29,16 @@ fn op_tables_match_cu_signatures() {
         assert!(
             text.contains("extern \"C\" __global__"),
             "{}: 资产 {} 不是核源码(拿错文件?)",
-            m.entry, m.src
+            m.entry,
+            m.src
         );
         let actual = owl_kernels::cu_sig::parse_cu_sig(&text, m.entry)
             .unwrap_or_else(|| panic!("{}: 源码里找不到同名入口", m.entry));
         // 线槽序里 `O`(输出角色)在 `.cu` 里就是一个指针位 ⇒ 归一 T 后比对
         let normalized = m.args_str().replace('O', "T");
         assert_eq!(
-            normalized, actual,
+            normalized,
+            actual,
             "{}: 参数表派生的槽序与 .cu 实签名不符\n  表: {}\n  cu: {}",
             m.entry,
             m.args_str(),
@@ -94,7 +96,11 @@ fn foreign_tables_declare_slots_without_source() {
             continue;
         }
         assert!(!m.params.is_empty(), "{}: foreign 表无参数声明", m.entry);
-        assert!(m.args_str().contains('O'), "{}: foreign 表未标输出槽", m.entry);
+        assert!(
+            m.args_str().contains('O'),
+            "{}: foreign 表未标输出槽",
+            m.entry
+        );
         n += 1;
     }
     assert!(n >= 3, "foreign 建表数异常(仅 {n})");
@@ -108,7 +114,12 @@ fn param_table_is_self_consistent() {
             match p.ty {
                 owl_kernels::spec::ParamType::Tensor { .. } => {}
                 owl_kernels::spec::ParamType::Scalar(_) => {
-                    assert!(p.align.is_none(), "{}: 标量槽 {} 不应有对齐要求", m.entry, p.name);
+                    assert!(
+                        p.align.is_none(),
+                        "{}: 标量槽 {} 不应有对齐要求",
+                        m.entry,
+                        p.name
+                    );
                 }
             }
             assert!(!p.name.is_empty(), "{}: 参数名缺失", m.entry);
@@ -145,9 +156,18 @@ fn meta_of_matches_direct_trait_const() {
 fn production_picks_carry_admission_meta() {
     use owl_kernels::driver::{self, DType, Hw, OpEnv};
 
-    let env = OpEnv { hw: Hw { arch: owl_kernels::Arch::Sm86 }, page: 32, head_dim: 256, grp: 6 };
+    let env = OpEnv {
+        hw: Hw {
+            arch: owl_kernels::Arch::Sm86,
+        },
+        page: 32,
+        head_dim: 256,
+        grp: 6,
+    };
     let env_sm89 = OpEnv {
-        hw: Hw { arch: owl_kernels::Arch::Sm89 },
+        hw: Hw {
+            arch: owl_kernels::Arch::Sm89,
+        },
         page: 32,
         head_dim: 256,
         grp: 6,
@@ -188,9 +208,18 @@ fn production_picks_carry_admission_meta() {
             driver::attn::paged_prefill_fp8_knhd(&env, DType::F16, 256, 4, 24, 2540),
         ),
         ("fi prefill fp8", driver::attn::fi_prefill(&env, true)),
-        ("fi prefill fp8 native", driver::attn::fi_prefill(&env_sm89, true)),
-        ("norm rope f16", driver::attn::norm_rope(DType::F16, 8, 24, 256)),
-        ("norm rope bf16", driver::attn::norm_rope(DType::BF16, 8, 24, 256)),
+        (
+            "fi prefill fp8 native",
+            driver::attn::fi_prefill(&env_sm89, true),
+        ),
+        (
+            "norm rope f16",
+            driver::attn::norm_rope(DType::F16, 8, 24, 256),
+        ),
+        (
+            "norm rope bf16",
+            driver::attn::norm_rope(DType::BF16, 8, 24, 256),
+        ),
         (
             "naive nc v2",
             driver::attn::naive_nc(DType::BF16, false, &nc_shapes, &nc_scalars),
@@ -203,13 +232,16 @@ fn production_picks_carry_admission_meta() {
         ("gdn chunked", driver::gdn::chunked_delta()),
         ("gdn gating_g", driver::gdn::gating_g(DType::F16)),
         ("gdn l2norm", driver::gdn::l2norm(DType::F16, 8)),
-        ("gdn norm_act", driver::gdn::norm_act(DType::F16, 8, 128, 128)),
-        // N1(2026-10-14):t 维并行 ⇒ 形状取 tokens/batch(此处取生产 chunk 形)
-        ("gdn conv_fwd", driver::gdn::conv_fwd(DType::F16, 6144, 512, 1)),
         (
-            "gdn conv_upd_dual",
-            driver::gdn::conv_upd_dual(DType::F16),
+            "gdn norm_act",
+            driver::gdn::norm_act(DType::F16, 8, 128, 128),
         ),
+        // N1(2026-10-14):t 维并行 ⇒ 形状取 tokens/batch(此处取生产 chunk 形)
+        (
+            "gdn conv_fwd",
+            driver::gdn::conv_fwd(DType::F16, 6144, 512, 1),
+        ),
+        ("gdn conv_upd_dual", driver::gdn::conv_upd_dual(DType::F16)),
         (
             "gdn decode_step_v2",
             driver::gdn::decode_step_v2(DType::F16, 1, 16, 128, 128),
@@ -254,7 +286,9 @@ fn production_picks_carry_admission_meta() {
     ];
     let n = picks.len();
     for (label, p) in picks {
-        let m = p.meta().unwrap_or_else(|| panic!("{label}: 拾取名 {} 无准入声明", p.name));
+        let m = p
+            .meta()
+            .unwrap_or_else(|| panic!("{label}: 拾取名 {} 无准入声明", p.name));
         assert_eq!(m.entry, p.name, "{label}: 拾取名与元数据入口名不一致");
     }
     eprintln!("[op-tables] {n} 个生产臂均携带准入声明 ✓");
@@ -304,7 +338,9 @@ fn non_family_out_slot_is_last_tensor() {
         if m.is_family() {
             continue;
         }
-        let pos = m.out_pos().unwrap_or_else(|| panic!("{}: 非族算子无 Out 槽", m.entry));
+        let pos = m
+            .out_pos()
+            .unwrap_or_else(|| panic!("{}: 非族算子无 Out 槽", m.entry));
         let last = m
             .params
             .iter()
@@ -351,8 +387,7 @@ fn pool_writers_have_a_carrying_slot() {
                 AccessMode::ReadWrite => assert!(
                     has_inout,
                     "{}: 声明读写池 {} 但无 InOut 槽(原地语义缺槽)",
-                    m.entry,
-                    pa.pool
+                    m.entry, pa.pool
                 ),
                 AccessMode::Read => {}
             }
@@ -360,14 +395,18 @@ fn pool_writers_have_a_carrying_slot() {
     }
 }
 
-
 /// **KernelPick 必须按运行期 GPU 代际选 FP8 prefill 臂**（不是编译 feature）：
 /// Ada/SM89 → 原生 e4m3 MMA；Ampere/SM86 → 旧 dequant 臂。
 #[test]
 fn fi_pick_uses_runtime_arch() {
     use owl_kernels::driver::{self, Hw, OpEnv};
 
-    let env = |arch| OpEnv { hw: Hw { arch }, page: 32, head_dim: 256, grp: 6 };
+    let env = |arch| OpEnv {
+        hw: Hw { arch },
+        page: 32,
+        head_dim: 256,
+        grp: 6,
+    };
     let sm86 = env(owl_kernels::Arch::Sm86);
     let sm89 = env(owl_kernels::Arch::Sm89);
     let sm120 = env(owl_kernels::Arch::Sm120);

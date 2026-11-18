@@ -36,11 +36,15 @@ mod tests {
         let keys = GgufConvention::new();
         let plan = GgufPlan::new(&g);
         let src = PlanSource::keyed(&plan, &keys, SourceFacts::GGUF);
-        let model = Model::new(&spec, GgufConvention::new(), src, src).expect("Model::new(键面全覆盖)");
+        let model =
+            Model::new(&spec, GgufConvention::new(), src, src).expect("Model::new(键面全覆盖)");
         assert!(plan.take_unresolved().is_empty(), "计划表仍有未解析键");
 
         // 声明数(装载前的事实面)
-        let ctx = LoaderCtx { dtype: Dtype::F16, ..Default::default() };
+        let ctx = LoaderCtx {
+            dtype: Dtype::F16,
+            ..Default::default()
+        };
         let n_want = model.layout(&ctx).wants().len();
 
         let mut gpu = crate::testkit::gpu_client().await;
@@ -51,7 +55,11 @@ mod tests {
         let entries = manifest.entries();
 
         // ④ 条目数 == 声明数(每个 want 都落地)
-        assert_eq!(entries.len(), n_want, "装载条目数 ≠ 声明数(有键被静默跳过?)");
+        assert_eq!(
+            entries.len(),
+            n_want,
+            "装载条目数 ≠ 声明数(有键被静默跳过?)"
+        );
 
         // ① ② 逐键字节账
         let mut quant_bytes = 0usize;
@@ -60,7 +68,8 @@ mod tests {
         let mut native_n = 0usize;
         let mut perm_n = 0usize;
         // 期望的列序表(与源同源:同一公式单一产地)
-        let exp_perm = crate::formats::gguf::transform::vhead_q8_blocks(16, 32, 128).expect("列序表");
+        let exp_perm =
+            crate::formats::gguf::transform::vhead_q8_blocks(16, 32, 128).expect("列序表");
         for e in entries {
             // **虚拟键**(源生成,文件里没有):`blk.N.ssm_out.perm` —— 列序表
             // (A2 落点的伴随件;内容与 `vhead_q8_blocks` 逐字相同 = 端到端验证
@@ -105,7 +114,8 @@ mod tests {
                     e.dtype
                 );
                 assert_eq!(
-                    got, ti.nbytes as usize,
+                    got,
+                    ti.nbytes as usize,
                     "`{}`({}) 槽字节 {got} ≠ 文件 nbytes {}(I-5 块布局零重排)",
                     e.key,
                     ti.ty.name(),
@@ -132,7 +142,10 @@ mod tests {
         // ③ 总账:压缩驻留 ⇒ 设备字节**低于**文件大小(原生 F32 转 f16 减半)
         let file_bytes = std::fs::metadata(&path).expect("stat").len() as usize;
         let total = quant_bytes + native_bytes;
-        assert!(perm_n > 0, "一个 `ssm_out.perm` 虚拟键都没装载 —— A2 列序表没接线?");
+        assert!(
+            perm_n > 0,
+            "一个 `ssm_out.perm` 虚拟键都没装载 —— A2 列序表没接线?"
+        );
         eprintln!(
             "[gguf-load] 4B 装载绿:{} 条(量化 {quant_n} = {:.2} GiB / 原生 {native_n} = {:.2} GiB / 列序表 {perm_n} 张 = {:.1} KiB)\n\
              [gguf-load] 设备总账 {:.2} GiB vs 文件 {:.2} GiB(比 {:.3})",
@@ -162,6 +175,9 @@ mod tests {
         assert_eq!(embed.dtype, Dtype::U8, "tied 量化表必须走 U8 块槽(§11.5 ②)");
         // 源侧事实:同一份文件二次打开一致(反变换描述符一致;零 I/O 病)
         let src2 = GgufSource::open(&path).expect("二次 open");
-        assert_eq!(src2.dims(), GgufSource::open(&path).expect("三次 open").dims());
+        assert_eq!(
+            src2.dims(),
+            GgufSource::open(&path).expect("三次 open").dims()
+        );
     }
 }

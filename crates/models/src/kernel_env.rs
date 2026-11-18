@@ -15,7 +15,7 @@
 use crate::contract::Dtype;
 use crate::env::{EnvProvider, HwEnv, KvQuant};
 use crate::module::QuantPlan;
-use owl_kernels::driver::{Hw, KernelPick, OpEnv, OpId, OpReq, resolve};
+use owl_kernels::driver::{resolve, Hw, KernelPick, OpEnv, OpId, OpReq};
 use owl_kernels::spec::KernelTag;
 use owl_kernels::tag_filter::TagFilter;
 use owl_kernels::Arch;
@@ -107,7 +107,10 @@ impl KernelSelectionEnv {
         if features.tag_wildcard {
             return Some(Self {
                 hw: HwCaps { arch },
-                quant: QuantCaps { plan: env.quant, act: env.kv.dtype },
+                quant: QuantCaps {
+                    plan: env.quant,
+                    act: env.kv.dtype,
+                },
                 kv: KvCaps::from_env(env),
                 features,
                 tag_filter: TagFilter::wildcard(),
@@ -138,17 +141,33 @@ impl KernelSelectionEnv {
         let kv_tag = |kv: KvCaps, main: bool| -> KernelTag {
             match kv.quant {
                 KvQuant::Fp8E4M3 | KvQuant::Fp8E5M2 => {
-                    if main { KernelTag::KV_MAIN_FP8 } else { KernelTag::KV_DRAFT_FP8 }
+                    if main {
+                        KernelTag::KV_MAIN_FP8
+                    } else {
+                        KernelTag::KV_DRAFT_FP8
+                    }
                 }
                 KvQuant::Int8 => {
-                    if main { KernelTag::KV_MAIN_INT8 } else { KernelTag::KV_DRAFT_FP8 }
+                    if main {
+                        KernelTag::KV_MAIN_INT8
+                    } else {
+                        KernelTag::KV_DRAFT_FP8
+                    }
                 }
                 KvQuant::None => match kv.dtype {
                     Dtype::BF16 => {
-                        if main { KernelTag::KV_MAIN_BF16 } else { KernelTag::KV_DRAFT_BF16 }
+                        if main {
+                            KernelTag::KV_MAIN_BF16
+                        } else {
+                            KernelTag::KV_DRAFT_BF16
+                        }
                     }
                     _ => {
-                        if main { KernelTag::KV_MAIN_F16 } else { KernelTag::KV_DRAFT_F16 }
+                        if main {
+                            KernelTag::KV_MAIN_F16
+                        } else {
+                            KernelTag::KV_DRAFT_F16
+                        }
                     }
                 },
             }
@@ -217,9 +236,12 @@ impl KernelSelectionEnv {
             aux: spec.aux,
             scalars: spec.scalars,
         });
-        let meta = pick.meta().ok_or_else(|| crate::contract::ModelError::Msg(format!(
-            "算子 `{}` 未建表 —— 无法做 tag 过滤(生产档拒)", pick.name
-        )))?;
+        let meta = pick.meta().ok_or_else(|| {
+            crate::contract::ModelError::Msg(format!(
+                "算子 `{}` 未建表 —— 无法做 tag 过滤(生产档拒)",
+                pick.name
+            ))
+        })?;
         if let Some(facet) = self.tag_filter.denied_facet(meta) {
             return Err(crate::contract::ModelError::Msg(format!(
                 "算子 `{}` 被 tag filter 拒绝(facet={facet}; allowed=[{}]; tags={:?})",
@@ -300,7 +322,13 @@ mod tests {
             },
             ..EnvProvider::default()
         };
-        let features = FeatureCaps { vision: true, spec_depth: 7, tp_ranks: 2, head_int8: true, ..FeatureCaps::default() };
+        let features = FeatureCaps {
+            vision: true,
+            spec_depth: 7,
+            tp_ranks: 2,
+            head_int8: true,
+            ..FeatureCaps::default()
+        };
         let k = KernelSelectionEnv::from_env(&env, features).expect("CUDA");
         assert_eq!(k.hw.arch, Arch::Sm86);
         assert_eq!(k.quant.plan, env.quant);
@@ -323,15 +351,42 @@ mod tests {
         };
         let k = KernelSelectionEnv::from_env(
             &env,
-            FeatureCaps { vision: true, ..FeatureCaps::default() },
+            FeatureCaps {
+                vision: true,
+                ..FeatureCaps::default()
+            },
         )
         .expect("CUDA");
         let s = [vec![128usize, 1152usize]];
         let specs = [
-            OpSpec { op: "vis.layernorm", dt: Dtype::F16, shapes: &s, aux: &[], scalars: &[] },
-            OpSpec { op: "vis.bias_add", dt: Dtype::F16, shapes: &s, aux: &[], scalars: &[] },
-            OpSpec { op: "vis.gelu_tanh", dt: Dtype::F16, shapes: &s, aux: &[], scalars: &[] },
-            OpSpec { op: "vis.gelu_erf", dt: Dtype::F16, shapes: &s, aux: &[], scalars: &[] },
+            OpSpec {
+                op: "vis.layernorm",
+                dt: Dtype::F16,
+                shapes: &s,
+                aux: &[],
+                scalars: &[],
+            },
+            OpSpec {
+                op: "vis.bias_add",
+                dt: Dtype::F16,
+                shapes: &s,
+                aux: &[],
+                scalars: &[],
+            },
+            OpSpec {
+                op: "vis.gelu_tanh",
+                dt: Dtype::F16,
+                shapes: &s,
+                aux: &[],
+                scalars: &[],
+            },
+            OpSpec {
+                op: "vis.gelu_erf",
+                dt: Dtype::F16,
+                shapes: &s,
+                aux: &[],
+                scalars: &[],
+            },
         ];
         let got = k.collect_ops(&specs).expect("collect");
         for want in [
@@ -361,7 +416,13 @@ mod tests {
         };
         let k = KernelSelectionEnv::from_env(
             &env,
-            FeatureCaps { vision: true, spec_depth: 7, tp_ranks: 2, head_int8: true, ..FeatureCaps::default() },
+            FeatureCaps {
+                vision: true,
+                spec_depth: 7,
+                tp_ranks: 2,
+                head_int8: true,
+                ..FeatureCaps::default()
+            },
         )
         .expect("CUDA");
         let allow = |entry: &str| {
@@ -387,7 +448,10 @@ mod tests {
         };
         let k = KernelSelectionEnv::from_env(
             &env,
-            FeatureCaps { head_int4: true, ..FeatureCaps::default() },
+            FeatureCaps {
+                head_int4: true,
+                ..FeatureCaps::default()
+            },
         )
         .expect("CUDA");
         let allow = |entry: &str| {
@@ -396,7 +460,10 @@ mod tests {
         };
         assert!(allow("marlin_gemm_w4a8_awq"), "主干 W4A8 必须放行");
         assert!(allow("marlin_gemm_w4a16_awq"), "int4 头 W4A16 必须放行");
-        assert!(allow("marlin_gemm_w4a16_bf16"), "DFlash2 草稿 W4A16 必须放行");
+        assert!(
+            allow("marlin_gemm_w4a16_bf16"),
+            "DFlash2 草稿 W4A16 必须放行"
+        );
         assert!(!allow("owl_gguf_gemm_q4k"), "GGUF 仍应拒");
     }
 
@@ -404,7 +471,11 @@ mod tests {
     fn legacy_non_paged_page_is_zero() {
         let env = EnvProvider {
             hw: HwEnv::Cuda(Arch::Sm86),
-            kv: KvEnv { paged: false, page: 64, ..KvEnv::default() },
+            kv: KvEnv {
+                paged: false,
+                page: 64,
+                ..KvEnv::default()
+            },
             ..EnvProvider::default()
         };
         let k = KernelSelectionEnv::from_env(&env, FeatureCaps::default()).expect("CUDA");

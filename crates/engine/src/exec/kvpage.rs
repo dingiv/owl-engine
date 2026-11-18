@@ -325,9 +325,13 @@ mod tests {
         let codec = KvPageFormat::F16.codec();
         let scale = KvRowScale::empty();
         let mut out = [0.0f32; 4];
-        codec.k_row(&bytes, &scale, 1, 0, hkv, hd, &mut out).unwrap();
+        codec
+            .k_row(&bytes, &scale, 1, 0, hkv, hd, &mut out)
+            .unwrap();
         assert_eq!(out, [9.0, -1.5, 0.25, -64.0]);
-        codec.k_row(&bytes, &scale, 0, 1, hkv, hd, &mut out).unwrap();
+        codec
+            .k_row(&bytes, &scale, 0, 1, hkv, hd, &mut out)
+            .unwrap();
         assert_eq!(out, [100.0, -0.0, 3.0, -7.5]);
     }
 
@@ -335,20 +339,24 @@ mod tests {
     fn fp8行解码与kernels参考同源() {
         let (hkv, hd) = (2, 4);
         let codes: [u8; 16] = [
-            0x00, 0x38, 0xB8, 0x30, 0x7E, 0x80, 0x40, 0xC1, 0x01, 0x7F, 0xFF, 0x08, 0x48,
-            0x88, 0x20, 0x60,
+            0x00, 0x38, 0xB8, 0x30, 0x7E, 0x80, 0x40, 0xC1, 0x01, 0x7F, 0xFF, 0x08, 0x48, 0x88,
+            0x20, 0x60,
         ];
         let codec = KvPageFormat::Fp8E4M3.codec();
         let scale = KvRowScale::empty();
         let mut out = [0.0f32; 4];
-        codec.k_row(&codes, &scale, 1, 0, hkv, hd, &mut out).unwrap();
+        codec
+            .k_row(&codes, &scale, 1, 0, hkv, hd, &mut out)
+            .unwrap();
         for (i, c) in codes[8..12].iter().enumerate() {
             assert_eq!(
                 out[i].to_bits(),
                 owl_models::kernel::e4m3_decode(*c).to_bits()
             );
         }
-        codec.k_row(&codes, &scale, 0, 1, hkv, hd, &mut out).unwrap();
+        codec
+            .k_row(&codes, &scale, 0, 1, hkv, hd, &mut out)
+            .unwrap();
         for (i, c) in codes[4..8].iter().enumerate() {
             assert_eq!(
                 out[i].to_bits(),
@@ -366,17 +374,15 @@ mod tests {
             bytes.push(c as u8);
         }
         let ks = [
-            0.5f32, 0.25, 2.0, 4.0, 1.0, 1.5, 2.5, 3.5, 9.0, 9.0, 9.0, 9.0, 9.0, 9.0, 9.0,
-            9.0,
+            0.5f32, 0.25, 2.0, 4.0, 1.0, 1.5, 2.5, 3.5, 9.0, 9.0, 9.0, 9.0, 9.0, 9.0, 9.0, 9.0,
         ];
-        let scale = KvRowScale {
-            k: &ks,
-            v: &[],
-        };
+        let scale = KvRowScale { k: &ks, v: &[] };
         let codec = KvPageFormat::Int8.codec();
         assert_eq!(codec.k_scale_elems(page, hkv), 16);
         let mut out = [0.0f32; 4];
-        codec.k_row(&bytes, &scale, 1, 0, hkv, hd, &mut out).unwrap();
+        codec
+            .k_row(&bytes, &scale, 1, 0, hkv, hd, &mut out)
+            .unwrap();
         assert_eq!(out, [45.0, -54.0, 63.0, -72.0]);
     }
 
@@ -392,10 +398,7 @@ mod tests {
             }
         }
         let vs = [0.5f32, 1.0, 2.0, 4.0];
-        let scale = KvRowScale {
-            k: &[],
-            v: &vs,
-        };
+        let scale = KvRowScale { k: &[], v: &vs };
         let codec = KvPageFormat::Int8.codec();
         assert_eq!(codec.v_scale_elems(page, hkv), 4);
         let mut out = [0.0f32; 2];

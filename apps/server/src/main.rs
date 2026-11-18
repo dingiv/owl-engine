@@ -92,7 +92,9 @@ async fn async_main(workers: usize) -> std::process::ExitCode {
     // 裸 eprintln:此刻 logger 还没初始化(`log_info!` 会被丢弃;与其它 boot 早期行同款)
     eprintln!(
         "[boot] tokio HTTP runtime:worker={workers}(nproc={}, 上限 {MAX_HTTP_WORKERS})",
-        std::thread::available_parallelism().map(|n| n.get()).unwrap_or(0)
+        std::thread::available_parallelism()
+            .map(|n| n.get())
+            .unwrap_or(0)
     );
     // CLI:唯一参数面(-p <profile_path> + 显式覆盖;手写解析,未知参数拒启)
     let args = match crate::config::CliArgs::parse(std::env::args().skip(1)) {

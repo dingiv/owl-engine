@@ -153,11 +153,7 @@ impl StoreHook {
         Self::Acquire(Acquire::Capacity { need })
     }
 
-    pub(crate) fn load(
-        session: u64,
-        turn: u64,
-        blocks: Vec<(usize, ChainHash)>,
-    ) -> Self {
+    pub(crate) fn load(session: u64, turn: u64, blocks: Vec<(usize, ChainHash)>) -> Self {
         Self::Acquire(Acquire::Load(LoadRequest {
             session,
             turn,
@@ -185,12 +181,7 @@ impl StoreHook {
 
     /// 弃置。`publish` = 会话账是否已被本 turn 的"已写入前缀"覆盖
     /// (客户端中断 = true;引擎错误 = false)。
-    pub(crate) fn abort(
-        turn: u64,
-        session: u64,
-        gdn_slot: usize,
-        publish: bool,
-    ) -> Self {
+    pub(crate) fn abort(turn: u64, session: u64, gdn_slot: usize, publish: bool) -> Self {
         Self::Release(Release {
             kind: ReleaseKind::Abort,
             publish,
@@ -209,7 +200,10 @@ impl StoreHook {
     }
 
     pub(crate) fn host_pressure(kv_slots: usize, snap_slots: usize) -> Self {
-        Self::Maintain(Maintain::HostPressure { kv_slots, snap_slots })
+        Self::Maintain(Maintain::HostPressure {
+            kv_slots,
+            snap_slots,
+        })
     }
 
     /// 指标标签（`store.hook.<label>`）。
@@ -263,10 +257,7 @@ mod label_tests {
         let key = SnapKey::at_boundary(ChainHash::new(0xA1));
         assert_eq!(StoreHook::state(key).label(), "acquire.state.resident");
         assert_eq!(StoreHook::state_slot(key).label(), "acquire.state.slot");
-        assert_eq!(
-            StoreHook::turn_end(1, 2, 0).label(),
-            "release.turn_end"
-        );
+        assert_eq!(StoreHook::turn_end(1, 2, 0).label(), "release.turn_end");
         assert_eq!(StoreHook::abort(1, 2, 0, true).label(), "release.abort");
         assert_eq!(StoreHook::idle(1).label(), "maintain.idle");
         assert_eq!(

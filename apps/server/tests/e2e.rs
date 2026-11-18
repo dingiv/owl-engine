@@ -60,13 +60,15 @@ impl Drop for ServerGuard {
 /// `ss` 不可用 = **无法完成这项校验** → 显式报错(不许静默当作"端口空闲",
 /// 那正是假绿的来源 —— 律 #1)。
 fn port_occupant(port: u16) -> Result<Option<String>, String> {
-    let out = Command::new("ss")
-        .args(["-tlnp"])
-        .output()
-        .map_err(|e| format!("探测端口占用失败(ss 不可用): {e};请装 iproute2 或手工确认 {port} 空闲"))?;
+    let out = Command::new("ss").args(["-tlnp"]).output().map_err(|e| {
+        format!("探测端口占用失败(ss 不可用): {e};请装 iproute2 或手工确认 {port} 空闲")
+    })?;
     let text = String::from_utf8_lossy(&out.stdout);
     let needle = format!(":{port} ");
-    Ok(text.lines().find(|l| l.contains(&needle)).map(|l| l.trim().to_string()))
+    Ok(text
+        .lines()
+        .find(|l| l.contains(&needle))
+        .map(|l| l.trim().to_string()))
 }
 
 /// 起 server(可失败 → `Result`;占用/写配置/启动任一失败都上报)
@@ -157,9 +159,11 @@ fn http_post(path: &str, body: &str) -> Result<(u16, String), String> {
         "POST {path} HTTP/1.1\r\nHost: 127.0.0.1:{PORT}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
         body.len()
     );
-    s.write_all(req.as_bytes()).map_err(|e| format!("写请求: {e}"))?;
+    s.write_all(req.as_bytes())
+        .map_err(|e| format!("写请求: {e}"))?;
     let mut buf = String::new();
-    s.read_to_string(&mut buf).map_err(|e| format!("读响应: {e}"))?;
+    s.read_to_string(&mut buf)
+        .map_err(|e| format!("读响应: {e}"))?;
     // 解析失败**不静默**:下面 ok_or_else 会把失败上报(丢掉的是 parse 细节)
     let status: u16 = buf
         .split_whitespace()
@@ -188,7 +192,8 @@ fn http_post_sse(path: &str, body: &str) -> Result<(u16, String), String> {
         "POST {path} HTTP/1.1\r\nHost: 127.0.0.1:{PORT}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
         body.len()
     );
-    s.write_all(req.as_bytes()).map_err(|e| format!("写请求: {e}"))?;
+    s.write_all(req.as_bytes())
+        .map_err(|e| format!("写请求: {e}"))?;
     // 字节级累积(不再逐读 from_utf8_lossy:多字节字符跨读边界会被截成替换符 ——
     // chunk 体里的中文一旦被截,后面的 chunked 解帧就跟着错位)
     let mut raw: Vec<u8> = Vec::new();
@@ -207,8 +212,11 @@ fn http_post_sse(path: &str, body: &str) -> Result<(u16, String), String> {
                 return Err(format!(
                     "流式读失败({e});已收到 {} 字节: {}",
                     raw.len(),
-                    String::from_utf8_lossy(&raw).chars().take(200).collect::<String>()
-                ))
+                    String::from_utf8_lossy(&raw)
+                        .chars()
+                        .take(200)
+                        .collect::<String>()
+                ));
             }
         }
     }
@@ -231,7 +239,10 @@ fn http_post_sse(path: &str, body: &str) -> Result<(u16, String), String> {
         Some((h, b)) => (h.to_string(), b.to_string()),
         None => (out.clone(), String::new()),
     };
-    let body = if head.to_ascii_lowercase().contains("transfer-encoding: chunked") {
+    let body = if head
+        .to_ascii_lowercase()
+        .contains("transfer-encoding: chunked")
+    {
         dechunk(&body)?
     } else {
         body
@@ -246,7 +257,10 @@ fn dechunk(raw: &str) -> Result<String, String> {
     let mut rest = raw;
     loop {
         let (line, after) = rest.split_once("\r\n").ok_or_else(|| {
-            format!("chunk 头缺 CRLF:{}", rest.chars().take(60).collect::<String>())
+            format!(
+                "chunk 头缺 CRLF:{}",
+                rest.chars().take(60).collect::<String>()
+            )
         })?;
         let n = usize::from_str_radix(line.split(';').next().unwrap_or("").trim(), 16)
             .map_err(|e| format!("chunk 长度非法({line:?}): {e}"))?;
@@ -273,8 +287,8 @@ fn chat(session: &str, prompt: &str, max_tokens: u32) -> Result<(u16, serde_json
         "session": session,
     });
     let (status, resp) = http_post("/v1/chat/completions", &body.to_string())?;
-    let v: serde_json::Value = serde_json::from_str(&resp)
-        .map_err(|e| format!("响应非法 JSON({status}): {e}: {resp}"))?;
+    let v: serde_json::Value =
+        serde_json::from_str(&resp).map_err(|e| format!("响应非法 JSON({status}): {e}: {resp}"))?;
     Ok((status, v))
 }
 
@@ -334,18 +348,18 @@ fn e2e_server_suite() {
 
     // 算术:2+2 —— 已知问题记录(§三十三):短 prompt 下 think 混乱
     // ("Wait, no, they're asking…"),不含答案 4;修复后转 assert。
-    let (_, v) = chatx("e2e-l2-arith", "What is 2 + 2? Answer with just the number.", 256);
+    let (_, v) = chatx(
+        "e2e-l2-arith",
+        "What is 2 + 2? Answer with just the number.",
+        256,
+    );
     let c = content_of(&v);
     assert!(c.contains('4'), "算术 2+2 content 应含 4:{c}");
     println!("[L2] 算术 2+2 PASS");
 
     // ============ 多轮(agent 式,self-contained 上下文,同 session 续)============
     // 轮 1:告知名字
-    let (st1, v) = chatx(
-        "e2e-mt",
-        "My name is Alex. Nice to meet you.",
-        256,
-    );
+    let (st1, v) = chatx("e2e-mt", "My name is Alex. Nice to meet you.", 256);
     assert_eq!(st1, 200, "多轮 轮1 HTTP 200");
     assert!(!content_of(&v).is_empty(), "多轮 轮1 非空");
     // 轮 2:询问(self-contained 提示:历史由客户端拼,naive 渲染现状)
@@ -449,11 +463,7 @@ fn e2e_server_suite() {
         ca.to_lowercase().contains("purple"),
         "隔离 A 应答 PURPLE:{ca}"
     );
-    let (st, v) = chatx(
-        "e2e-iso-b",
-        "The magic word is ORANGE. Say READY.",
-        64,
-    );
+    let (st, v) = chatx("e2e-iso-b", "The magic word is ORANGE. Say READY.", 64);
     assert_eq!(st, 200, "隔离 B 轮1 200");
     assert!(!content_of(&v).is_empty(), "隔离 B 轮1 非空");
     // 轮 2:契约姿势 —— 全量历史重发(assistant 段原样回填轮 1 应答,
@@ -617,10 +627,7 @@ fn e2e_server_suite() {
     );
     assert!(sse.contains("data: [DONE]"), "流式以 [DONE] 收尾");
     let before_done = sse.split("data: [DONE]").next().unwrap_or("");
-    let last_frame = before_done
-        .rsplit("data: ")
-        .next()
-        .unwrap_or("");
+    let last_frame = before_done.rsplit("data: ").next().unwrap_or("");
     let uv: serde_json::Value = serde_json::from_str(last_frame.trim())
         .unwrap_or_else(|e| panic!("usage 帧非法 JSON({e}): {last_frame}"));
     assert_eq!(
@@ -628,19 +635,30 @@ fn e2e_server_suite() {
         Some(0),
         "I2:usage 帧 choices 必须为空数组:{uv}"
     );
-    assert!(uv["usage"]["prompt_tokens_details"]["cached_tokens"].is_u64(),
-        "AGT-12:cached_tokens 必须透出:{uv}");
+    assert!(
+        uv["usage"]["prompt_tokens_details"]["cached_tokens"].is_u64(),
+        "AGT-12:cached_tokens 必须透出:{uv}"
+    );
     // G5:思考相位真账(两形态单源;reasoning ≤ completion 恒成立)
     let rt = uv["usage"]["completion_tokens_details"]["reasoning_tokens"]
         .as_u64()
         .unwrap_or_else(|| panic!("G5:reasoning_tokens 必须透出:{uv}"));
     let ct = uv["usage"]["completion_tokens"].as_u64().unwrap_or(0);
-    assert!(rt <= ct, "reasoning_tokens({rt}) 不得超过 completion_tokens({ct}):{uv}");
-    assert!(sse.contains("\"reasoning_content\"") || sse.contains("\"content\""),
-        "三通道至少一路有内容");
+    assert!(
+        rt <= ct,
+        "reasoning_tokens({rt}) 不得超过 completion_tokens({ct}):{uv}"
+    );
+    assert!(
+        sse.contains("\"reasoning_content\"") || sse.contains("\"content\""),
+        "三通道至少一路有内容"
+    );
     println!(
         "[agent] SSE 不变式 PASS(finish_reason×1 / usage 帧 choices=[] / cached_tokens 透出){}",
-        if sse.contains("\"reasoning_content\"") { ";think 通道在" } else { ";本轮无 think 段(非判据)" }
+        if sse.contains("\"reasoning_content\"") {
+            ";think 通道在"
+        } else {
+            ";本轮无 think 段(非判据)"
+        }
     );
 
     // ④ stop 串真生效(AGT-06):受控 A/B —— 用**贪心必复读**的提示词
@@ -649,7 +667,8 @@ fn e2e_server_suite() {
     //    engine 侧 holdback 另有单测。
     // 判据用**单词** "BANANA"(不依赖复读的间隔形态 —— 实测 split/非 split 档
     // 下间隔不同,用 "BANANA BANANA" 会让门变脆):控制臂必含它,stop 臂必无它。
-    let rep_prompt = "Print the word BANANA separated by spaces, over and over, forever. Do not stop.";
+    let rep_prompt =
+        "Print the word BANANA separated by spaces, over and over, forever. Do not stop.";
     let (_, v0) = chatx("e2e-agent-nostop", rep_prompt, 64);
     let c0 = content_of(&v0);
     let with_stop = serde_json::json!({
@@ -672,7 +691,12 @@ fn e2e_server_suite() {
             "stop 命中 ⇒ finish_reason=stop(实得 {:?})",
             v1["choices"][0]["finish_reason"]
         );
-        assert!(c1.len() <= c0.len(), "截断后不得变长({} vs {})", c1.len(), c0.len());
+        assert!(
+            c1.len() <= c0.len(),
+            "截断后不得变长({} vs {})",
+            c1.len(),
+            c0.len()
+        );
         println!("[agent] stop 串 PASS(对照 {:?} / 带 stop {:?})", c0, c1);
     } else {
         println!(
@@ -682,23 +706,40 @@ fn e2e_server_suite() {
 
     // ⑤ 400 面(不静默):未支持关键字段 / 坏 arguments / 坏 stop / n>1
     for (name, body) in [
-        ("n>1", serde_json::json!({"messages":[{"role":"user","content":"x"}],"n":4})),
-        ("坏 arguments", serde_json::json!({"messages":[
+        (
+            "n>1",
+            serde_json::json!({"messages":[{"role":"user","content":"x"}],"n":4}),
+        ),
+        (
+            "坏 arguments",
+            serde_json::json!({"messages":[
             {"role":"user","content":"x"},
             {"role":"assistant","content":"","tool_calls":[{"id":"c","type":"function",
-              "function":{"name":"bash","arguments":"{oops"}}]}],"max_tokens":8})),
-        ("坏 stop", serde_json::json!({"messages":[{"role":"user","content":"x"}],"stop":[17]})),
-        ("logprobs", serde_json::json!({"messages":[{"role":"user","content":"x"}],"logprobs":true})),
-        ("非 function 工具历史", serde_json::json!({"messages":[
+              "function":{"name":"bash","arguments":"{oops"}}]}],"max_tokens":8}),
+        ),
+        (
+            "坏 stop",
+            serde_json::json!({"messages":[{"role":"user","content":"x"}],"stop":[17]}),
+        ),
+        (
+            "logprobs",
+            serde_json::json!({"messages":[{"role":"user","content":"x"}],"logprobs":true}),
+        ),
+        (
+            "非 function 工具历史",
+            serde_json::json!({"messages":[
             {"role":"user","content":"x"},
             {"role":"assistant","content":"","tool_calls":[{"id":"c","type":"custom",
-              "function":{"name":"bash","arguments":{}}}]}],"max_tokens":8})),
+              "function":{"name":"bash","arguments":{}}}]}],"max_tokens":8}),
+        ),
     ] {
         let (st, resp) = post("/v1/chat/completions", &body.to_string());
         assert_eq!(st, 400, "{name} 应结构化拒(400),实得 {st}:{resp}");
         let e: serde_json::Value = serde_json::from_str(&resp).expect("错误体 JSON");
         assert!(
-            e["error"]["message"].as_str().is_some_and(|m| !m.is_empty()),
+            e["error"]["message"]
+                .as_str()
+                .is_some_and(|m| !m.is_empty()),
             "{name}:错误消息非空:{e}"
         );
     }
@@ -737,8 +778,8 @@ fn e2e_server_suite() {
         "stream_options": {"include_usage": true},
         "session": "e2e-agent-loop"
     });
-    let (st, sse) = http_post_sse("/v1/chat/completions", &tool_req.to_string())
-        .expect("工具闭环请求");
+    let (st, sse) =
+        http_post_sse("/v1/chat/completions", &tool_req.to_string()).expect("工具闭环请求");
     assert_eq!(st, 200, "工具闭环 turn1 HTTP 200");
     if sse.contains("\"tool_calls\"") {
         assert!(
@@ -752,8 +793,12 @@ fn e2e_server_suite() {
         // 只在"模型没发工具"时被跳过,一旦真发就假红 —— 测试自身缺陷,非引擎问题)。
         let mut args = String::new();
         for line in sse.lines() {
-            let Some(payload) = line.strip_prefix("data: ") else { continue };
-            let Ok(v) = serde_json::from_str::<serde_json::Value>(payload) else { continue };
+            let Some(payload) = line.strip_prefix("data: ") else {
+                continue;
+            };
+            let Ok(v) = serde_json::from_str::<serde_json::Value>(payload) else {
+                continue;
+            };
             for d in v["choices"].as_array().into_iter().flatten() {
                 for tc in d["delta"]["tool_calls"].as_array().into_iter().flatten() {
                     if let Some(a) = tc["function"]["arguments"].as_str() {
@@ -762,7 +807,10 @@ fn e2e_server_suite() {
                 }
             }
         }
-        assert!(!args.is_empty(), "I4:有 tool_calls 却没拿到 arguments delta");
+        assert!(
+            !args.is_empty(),
+            "I4:有 tool_calls 却没拿到 arguments delta"
+        );
         let av: serde_json::Value = serde_json::from_str(&args)
             .unwrap_or_else(|e| panic!("I4:arguments 必须是合法 JSON 串({e}):{args:?}"));
         assert!(av.is_object(), "I4:arguments 应为对象:{av}");
@@ -785,7 +833,12 @@ fn e2e_server_suite() {
         assert_eq!(st, 200, "工具闭环 turn2 HTTP 200:{resp}");
         let v: serde_json::Value = serde_json::from_str(&resp).expect("turn2 JSON");
         assert!(
-            v["choices"][0]["finish_reason"].as_str().is_some_and(|f| ["stop", "length", "tool_calls"].contains(&f)),
+            v["choices"][0]["finish_reason"].as_str().is_some_and(|f| [
+                "stop",
+                "length",
+                "tool_calls"
+            ]
+            .contains(&f)),
             "turn2 finish_reason 合法:{v}"
         );
         println!(

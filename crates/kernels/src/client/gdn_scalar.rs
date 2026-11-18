@@ -14,7 +14,19 @@ pub const SIG: &str = "T,T,T,T,T,T,O,sz,sz,sz,sz,sz,sz,sz";
 /// **ns/hv/nk/kd** —— 2026-10-15 F3 修正,旧表曾错标为 nv/nk/kd/vd) ——
 /// F3 成对律,`client::tests::parse_slots_are_exactly_declared` 逐字锁死。
 pub const PARSE_SLOTS: &[&str] = &[
-    "q", "k", "v", "beta", "gate", "state", "out", "t", "slot", "ns", "nv", "nk", "kd",
+    "q",
+    "k",
+    "v",
+    "beta",
+    "gate",
+    "state",
+    "out",
+    "t",
+    "slot",
+    "ns",
+    "nv",
+    "nk",
+    "kd",
     "scale_bits",
 ];
 
@@ -47,7 +59,12 @@ pub struct GdnScalarCall {
 
 impl GdnScalarCall {
     pub fn builder(shape: GdnScalarShape) -> GdnScalarCallBuilder {
-        GdnScalarCallBuilder { shape, f: [None, None, None, None, None], state: None, slot: None }
+        GdnScalarCallBuilder {
+            shape,
+            f: [None, None, None, None, None],
+            state: None,
+            slot: None,
+        }
     }
 
     /// 输入槽(6 Block;q/k/v/g/beta/state;f32 直入)
@@ -115,7 +132,10 @@ impl GdnScalarCall {
             args.push(Arg::U64(v));
         }
         LaunchMsg {
-            kernel: crate::contract::KernelSource { name: GDN_SCALAR.to_string(), source: String::new() },
+            kernel: crate::contract::KernelSource {
+                name: GDN_SCALAR.to_string(),
+                source: String::new(),
+            },
             args,
             grid: (0, 0, 0),
             block: (0, 0, 0),
@@ -124,18 +144,39 @@ impl GdnScalarCall {
         }
     }
 
-    pub fn q(&self) -> &Bytes { &self.q }
-    pub fn k(&self) -> &Bytes { &self.k }
-    pub fn v(&self) -> &Bytes { &self.v }
-    pub fn g(&self) -> &Bytes { &self.g }
-    pub fn beta(&self) -> &Bytes { &self.beta }
-    pub fn state(&self) -> &Bytes { &self.state }
-    pub fn slot(&self) -> u32 { self.slot }
-    pub fn shape(&self) -> GdnScalarShape { self.shape }
+    pub fn q(&self) -> &Bytes {
+        &self.q
+    }
+    pub fn k(&self) -> &Bytes {
+        &self.k
+    }
+    pub fn v(&self) -> &Bytes {
+        &self.v
+    }
+    pub fn g(&self) -> &Bytes {
+        &self.g
+    }
+    pub fn beta(&self) -> &Bytes {
+        &self.beta
+    }
+    pub fn state(&self) -> &Bytes {
+        &self.state
+    }
+    pub fn slot(&self) -> u32 {
+        self.slot
+    }
+    pub fn shape(&self) -> GdnScalarShape {
+        self.shape
+    }
 }
 
 fn contract(field: &'static str, expect: &str, got: &str) -> OpError {
-    OpError::Contract { op: GDN_SCALAR.to_string(), field, expect: expect.into(), got: got.into() }
+    OpError::Contract {
+        op: GDN_SCALAR.to_string(),
+        field,
+        expect: expect.into(),
+        got: got.into(),
+    }
 }
 
 pub struct GdnScalarCallBuilder {
@@ -150,22 +191,38 @@ impl GdnScalarCallBuilder {
         // 全局硬律 numel > 0(零长形状 ⇒ 结构化拒,带槽名 + 块 id)
         crate::contract::require_numel(want, field, GDN_SCALAR, b.id)?;
         if b.len != 0 && b.len != want {
-            return Err(contract(field, &format!("{want} elems"), &format!("块 id={} len={}", b.id, b.len)));
+            return Err(contract(
+                field,
+                &format!("{want} elems"),
+                &format!("块 id={} len={}", b.id, b.len),
+            ));
         }
         Ok(())
     }
     pub fn q(mut self, b: &Bytes) -> Result<Self, OpError> {
-        self.check(b, self.shape.t as usize * self.shape.nk as usize * self.shape.kd as usize, "q")?;
+        self.check(
+            b,
+            self.shape.t as usize * self.shape.nk as usize * self.shape.kd as usize,
+            "q",
+        )?;
         self.f[0] = Some(b.clone());
         Ok(self)
     }
     pub fn k(mut self, b: &Bytes) -> Result<Self, OpError> {
-        self.check(b, self.shape.t as usize * self.shape.nk as usize * self.shape.kd as usize, "k")?;
+        self.check(
+            b,
+            self.shape.t as usize * self.shape.nk as usize * self.shape.kd as usize,
+            "k",
+        )?;
         self.f[1] = Some(b.clone());
         Ok(self)
     }
     pub fn v(mut self, b: &Bytes) -> Result<Self, OpError> {
-        self.check(b, self.shape.t as usize * self.shape.nv as usize * self.shape.kd as usize, "v")?;
+        self.check(
+            b,
+            self.shape.t as usize * self.shape.nv as usize * self.shape.kd as usize,
+            "v",
+        )?;
         self.f[2] = Some(b.clone());
         Ok(self)
     }
@@ -194,8 +251,19 @@ impl GdnScalarCallBuilder {
             g.ok_or_else(|| contract("builder", "g", "缺"))?,
             beta.ok_or_else(|| contract("builder", "beta", "缺"))?,
         );
-        let state = self.state.ok_or_else(|| contract("builder", "state", "缺"))?;
+        let state = self
+            .state
+            .ok_or_else(|| contract("builder", "state", "缺"))?;
         let slot = self.slot.ok_or_else(|| contract("builder", "slot", "缺"))?;
-        Ok(GdnScalarCall { q, k, v, g, beta, state, slot, shape: self.shape })
+        Ok(GdnScalarCall {
+            q,
+            k,
+            v,
+            g,
+            beta,
+            state,
+            slot,
+            shape: self.shape,
+        })
     }
 }

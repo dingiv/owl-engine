@@ -33,12 +33,12 @@ pub mod preprocess;
 use std::sync::Arc;
 
 use crate::contract::{Dtype, ModelError};
+use crate::formats::gguf::{mmproj_vision_cfg, rope_facts, token_id, Gguf};
+use crate::formats::qwen35::Qwen35Convention;
 use crate::layers::mrope::{split_video_frames, token_types, MropeCfg};
 use crate::layers::vision::{GridThw, VisionCfg, VisionInputs, VisionTables, VisionTower};
 use crate::model::{Model, ModelSpec};
 use crate::module::{ForwardCtx, Loadable, LoaderCtx, LoaderOps, Module, PlanSource, QuantPlan};
-use crate::formats::gguf::{mmproj_vision_cfg, rope_facts, token_id, Gguf};
-use crate::formats::qwen35::Qwen35Convention;
 use crate::TensorOps;
 
 /// **一张图的预处理结果**(服务面 → 引擎的显式输入;值全为 host f32)。
@@ -107,9 +107,7 @@ impl VlmCfg {
                 a.iter()
                     .map(|x| {
                         x.as_u64().map(|v| v as usize).ok_or_else(|| {
-                            ModelError::Msg(format!(
-                                "mrope_section 元素须为非负整数,实得 {x}"
-                            ))
+                            ModelError::Msg(format!("mrope_section 元素须为非负整数,实得 {x}"))
                         })
                     })
                     .collect::<Result<Vec<usize>, ModelError>>()
@@ -173,7 +171,11 @@ impl VlmCfg {
             hidden,
             inter: g("intermediate_size")?,
             dtype: Dtype::F16,
-            full_heads: (g("num_attention_heads")?, g("num_key_value_heads")?, head_dim),
+            full_heads: (
+                g("num_attention_heads")?,
+                g("num_key_value_heads")?,
+                head_dim,
+            ),
             gdn_heads: (
                 g("linear_num_key_heads")?,
                 g("linear_key_head_dim")?,
@@ -181,7 +183,9 @@ impl VlmCfg {
                 g("linear_value_head_dim")?,
             ),
             eps: gp("rms_norm_eps").unwrap_or_else(|_| {
-                text.get("rms_norm_eps").and_then(|x| x.as_f64()).unwrap_or(1e-6) as f32
+                text.get("rms_norm_eps")
+                    .and_then(|x| x.as_f64())
+                    .unwrap_or(1e-6) as f32
             }),
             layer_types,
             // FIXME(M5 服务面):chat 注入文本需按 4B 的 `chat_template.jinja`
@@ -349,9 +353,7 @@ impl VlmInputs {
         // `chunk_tables` 的 cos/sin 是 `[n, half]` 行表，核按 `pos[t]` 取行；
         // 若 pos 仍传全局 `base+t`，第二个 chunk 起会越出本 chunk 表
         // （首 chunk 恰好 base=0 而正确，多 chunk 全错）。
-        let pos_bytes: Vec<u8> = (0..n)
-            .flat_map(|i| (i as f32).to_le_bytes())
-            .collect();
+        let pos_bytes: Vec<u8> = (0..n).flat_map(|i| (i as f32).to_le_bytes()).collect();
         (
             TensorOps::from_host(self.dtype, vec![n, self.half], &pack(cos)),
             TensorOps::from_host(self.dtype, vec![n, self.half], &pack(sin)),
@@ -441,7 +443,21 @@ impl Vlm {
         face: &mut D,
         dtype: Dtype,
     ) -> Result<Vlm, ModelError> {
-        Self::load_ctx(dir, face, LoaderCtx { dtype, shard: 1, slice_id: 0, device_repack: false, verify: false, debug_tap: false, staging_mb: 128, dump: false }).await
+        Self::load_ctx(
+            dir,
+            face,
+            LoaderCtx {
+                dtype,
+                shard: 1,
+                slice_id: 0,
+                device_repack: false,
+                verify: false,
+                debug_tap: false,
+                staging_mb: 128,
+                dump: false,
+            },
+        )
+        .await
     }
 
     /// 同上,装载 ctx 外给(分相探针 / 校验 / 分片调试面)
@@ -490,7 +506,12 @@ impl Vlm {
 
     /// 塔叶(前向输入;`px` = [rows, patch_flat] host f32)。塔的 interp /
     /// axial rope / cu 三张 host 表由 [`VisionTables::build`] 按网格现算。
-    pub fn tower_inputs(&self, grids: &[GridThw], px: &[f32], dtype: Dtype) -> Result<VisionInputs, ModelError> {
+    pub fn tower_inputs(
+        &self,
+        grids: &[GridThw],
+        px: &[f32],
+        dtype: Dtype,
+    ) -> Result<VisionInputs, ModelError> {
         VisionTables::build(grids, self.cfg.vision)?.inputs(px, dtype)
     }
 
@@ -554,7 +575,11 @@ impl Vlm {
     /// prefill 一步(根 = logits [L, vocab])。
     ///
     /// **响亮拒**:ctx 缺任一面注入 ⇒ 拒发(而不是静默走纯文本)。
-    pub fn prefill_logits(&self, ids: &TensorOps, ctx: &ForwardCtx<'_>) -> Result<TensorOps, ModelError> {
+    pub fn prefill_logits(
+        &self,
+        ids: &TensorOps,
+        ctx: &ForwardCtx<'_>,
+    ) -> Result<TensorOps, ModelError> {
         if ctx.vlm_rope.is_none() {
             return Err(ModelError::Msg(
                 "Vlm::prefill_logits: ctx 缺 VLM 注入(需 VlmRequest::bind;宁拒不错)".into(),
@@ -607,7 +632,12 @@ impl Vlm {
             .iter()
             .map(|p| [p[0] as i64, p[1] as i64, p[2] as i64])
             .collect();
-        let max_pos = pos.iter().flat_map(|p| p.iter()).copied().max().unwrap_or(0);
+        let max_pos = pos
+            .iter()
+            .flat_map(|p| p.iter())
+            .copied()
+            .max()
+            .unwrap_or(0);
         let delta = max_pos + 1 - ids.len() as i64;
         self.inputs_from_positions(ids, grids, video_grids, dtype, pos, delta)
     }
@@ -658,7 +688,10 @@ impl Vlm {
         let pack = |v: &[f32]| -> Vec<u8> {
             match dtype {
                 Dtype::F32 => v.iter().flat_map(|x| x.to_le_bytes()).collect(),
-                Dtype::F16 => v.iter().flat_map(|x| half::f16::from_f32(*x).to_le_bytes()).collect(),
+                Dtype::F16 => v
+                    .iter()
+                    .flat_map(|x| half::f16::from_f32(*x).to_le_bytes())
+                    .collect(),
                 other => unreachable!("Vlm::inputs: dtype {other:?}(塔只走 f32/f16)"),
             }
         };
@@ -762,7 +795,10 @@ mod tests {
             .expect("27B config.json");
         let cfg = VlmCfg::from_json(&raw).expect("VlmCfg::from_json");
         assert_eq!(cfg.hidden, 5120, "文本 hidden");
-        assert_eq!(cfg.vision.out_hidden, 5120, "塔 out_hidden 必须 = 文本 hidden");
+        assert_eq!(
+            cfg.vision.out_hidden, 5120,
+            "塔 out_hidden 必须 = 文本 hidden"
+        );
         assert_eq!(cfg.image_token, 248056, "image_token_id");
     }
     use crate::testkit::{f32b, harvest};
@@ -770,8 +806,9 @@ mod tests {
     /// 4B 档模型目录(config.json 单源;可 `ckpt:qwen35-4b` 改指)
     fn ckpt_dir() -> std::path::PathBuf {
         std::path::PathBuf::from(
-            owl_shared::testkit::resource("ckpt:qwen35-4b")
-                .unwrap_or_else(|| concat!(env!("CARGO_MANIFEST_DIR"), "/../../models/Qwen/Qwen3.5-4B").into()),
+            owl_shared::testkit::resource("ckpt:qwen35-4b").unwrap_or_else(|| {
+                concat!(env!("CARGO_MANIFEST_DIR"), "/../../models/Qwen/Qwen3.5-4B").into()
+            }),
         )
     }
 
@@ -789,7 +826,10 @@ mod tests {
         assert_eq!(c.layers, 32);
         assert_eq!(c.image_token, 248056);
         assert_eq!(c.video_token, Some(248057));
-        assert_eq!((c.vision.depth, c.vision.hidden, c.vision.out_hidden), (24, 1024, 2560));
+        assert_eq!(
+            (c.vision.depth, c.vision.hidden, c.vision.out_hidden),
+            (24, 1024, 2560)
+        );
         assert_eq!(c.mrope.half(), 32, "rotary_dim 64 → half 32");
         let s = &c.text_spec;
         assert_eq!(s.vocab, 248320);
@@ -798,7 +838,11 @@ mod tests {
         assert_eq!(s.full_heads, (16, 4, 256));
         assert_eq!(s.gdn_heads, (16, 128, 32, 128));
         assert_eq!(s.layer_types.len(), 32);
-        assert_eq!(s.layer_types.iter().filter(|&&f| f).count(), 8, "8 FA + 24 GDN");
+        assert_eq!(
+            s.layer_types.iter().filter(|&&f| f).count(),
+            8,
+            "8 FA + 24 GDN"
+        );
         assert!(s.tied, "4B tie_word_embeddings = true");
     }
 
@@ -827,8 +871,15 @@ mod tests {
         assert_eq!(ins.delta, -3, "delta = max+1-L = 7+1-11");
         // 占位 token 数 ≠ 网格展开 ⇒ 响亮拒(HF 在 masked_scatter 静默错位)
         let short = vec![248056u32; 5];
-        assert!(vlm.inputs(&short, &[(1, 4, 6)], &[], Dtype::F16).is_err(), "占位 5 ≠ 6 应拒");
-        assert!(vlm.inputs(&ids, &[(1, 4, 6), (1, 2, 2)], &[], Dtype::F16).is_err(), "多给网格应拒");
+        assert!(
+            vlm.inputs(&short, &[(1, 4, 6)], &[], Dtype::F16).is_err(),
+            "占位 5 ≠ 6 应拒"
+        );
+        assert!(
+            vlm.inputs(&ids, &[(1, 4, 6), (1, 2, 2)], &[], Dtype::F16)
+                .is_err(),
+            "多给网格应拒"
+        );
     }
 
     /// **相邻多图**:占位 token → 塔行号连续;m-RoPE 两张图分别推进。
@@ -871,7 +922,9 @@ mod tests {
         let bad = TensorOps::from_host(Dtype::F32, vec![l], &f32b(&[-1.0, 2.0, -1.0, -1.0, -1.0]));
         let out = ht.image_scatter(&mt, &bad);
         assert!(
-            crate::interpreters::eval_ops(out.step(), &mut face).await.is_err(),
+            crate::interpreters::eval_ops(out.step(), &mut face)
+                .await
+                .is_err(),
             "行号 2 ≥ merged 行数 2 ⇒ 应拒"
         );
     }
@@ -887,7 +940,10 @@ mod tests {
         c: &VlmCfg,
         nb: usize,
         slots_n: usize,
-    ) -> (Vec<crate::module::KvBuffers>, Vec<crate::layers::gdn::GdnBuffers>) {
+    ) -> (
+        Vec<crate::module::KvBuffers>,
+        Vec<crate::layers::gdn::GdnBuffers>,
+    ) {
         use crate::layers::gdn::GdnBuffers;
         use crate::module::KvBuffers;
         let (hq, hkv, hd) = c.text_spec.full_heads;
@@ -908,7 +964,12 @@ mod tests {
         let mut kvs = Vec::new();
         for _ in 0..n_full {
             kvs.push(KvBuffers {
-                k_cache: zero_f16(gpu, nb * hkv * (hd / 8) * 32 * 8, vec![nb, hkv, hd / 8, 32, 8]).await,
+                k_cache: zero_f16(
+                    gpu,
+                    nb * hkv * (hd / 8) * 32 * 8,
+                    vec![nb, hkv, hd / 8, 32, 8],
+                )
+                .await,
                 v_cache: zero_f16(gpu, nb * hkv * hd * 32, vec![nb, hkv, hd, 32]).await,
                 slots: TensorOps::from_host(Dtype::F32, vec![1], &f32b(&[0.0])),
                 kv_lens: TensorOps::from_host(Dtype::F32, vec![1], &f32b(&[1.0])),
@@ -923,7 +984,12 @@ mod tests {
                 conv_q: zero_f32(gpu, slots_n * key_dim * 3, vec![slots_n, key_dim, 3]).await,
                 conv_k: zero_f32(gpu, slots_n * key_dim * 3, vec![slots_n, key_dim, 3]).await,
                 conv_v: zero_f32(gpu, slots_n * value_dim * 3, vec![slots_n, value_dim, 3]).await,
-                rec: zero_f32(gpu, slots_n * nv * hk_dim * hv_dim, vec![slots_n, nv, hk_dim, hv_dim]).await,
+                rec: zero_f32(
+                    gpu,
+                    slots_n * nv * hk_dim * hv_dim,
+                    vec![slots_n, nv, hk_dim, hv_dim],
+                )
+                .await,
                 slots: TensorOps::from_host(Dtype::F32, vec![1], &f32b(&[0.0])),
             });
         }
@@ -989,18 +1055,36 @@ mod tests {
             // 分相账本需要 store 上线(测试进程默认未装)
             let _ = owl_shared::metrics::init_metrics(owl_shared::metrics::MetricsStore::new());
         }
-        let vlm = Vlm::load_ctx(&dir, &mut gpu, crate::module::LoaderCtx {
-            dtype: Dtype::F16, shard: 1, slice_id: 0, device_repack: false, verify: false, debug_tap: dbg,
-            staging_mb: 128,
-            dump: false,
-        }).await.expect("Vlm::load(4B)");
+        let vlm = Vlm::load_ctx(
+            &dir,
+            &mut gpu,
+            crate::module::LoaderCtx {
+                dtype: Dtype::F16,
+                shard: 1,
+                slice_id: 0,
+                device_repack: false,
+                verify: false,
+                debug_tap: dbg,
+                staging_mb: 128,
+                dump: false,
+            },
+        )
+        .await
+        .expect("Vlm::load(4B)");
         eprintln!("[vlm] 4B 整装 {:.1}s", t0.elapsed().as_secs_f64());
         if dbg {
             let reps = owl_shared::metrics::collect_metrics(
                 &owl_shared::metrics::MetricsFilter::new().limit(4096),
             );
-            for r in reps.iter().filter(|r| r.tag.starts_with("srv.") || r.tag.starts_with("load.") || r.tag.starts_with("loadv.")) {
-                eprintln!("[metrics] {:<28} n={:<8} total={:?}", r.tag, r.count, r.total);
+            for r in reps.iter().filter(|r| {
+                r.tag.starts_with("srv.")
+                    || r.tag.starts_with("load.")
+                    || r.tag.starts_with("loadv.")
+            }) {
+                eprintln!(
+                    "[metrics] {:<28} n={:<8} total={:?}",
+                    r.tag, r.count, r.total
+                );
             }
         }
 
@@ -1011,7 +1095,16 @@ mod tests {
             &rp,
             &mut gpu,
             &rp.tables(),
-            &crate::module::LoaderCtx { dtype: Dtype::F16, shard: 1, slice_id: 0, device_repack: false, verify: false, debug_tap: false, staging_mb: 128, dump: false },
+            &crate::module::LoaderCtx {
+                dtype: Dtype::F16,
+                shard: 1,
+                slice_id: 0,
+                device_repack: false,
+                verify: false,
+                debug_tap: false,
+                staging_mb: 128,
+                dump: false,
+            },
         )
         .await
         .expect("rope 表(f16)");
@@ -1021,21 +1114,59 @@ mod tests {
         let l = prompt.len();
         let nb = l.div_ceil(32);
         let (kvs, gdns) = real_bufs(&mut gpu, c, nb, 8).await;
-        let ids = TensorOps::from_host(Dtype::F32, vec![l], &f32b(&prompt.iter().map(|&x| x as f32).collect::<Vec<f32>>()));
+        let ids = TensorOps::from_host(
+            Dtype::F32,
+            vec![l],
+            &f32b(&prompt.iter().map(|&x| x as f32).collect::<Vec<f32>>()),
+        );
         // VLM host 表(纯文本:无网格 ⇒ 行号全 -1;m-RoPE 退化为 1D)
-        let req = vlm.prepare(&prompt, &[], &[], &[]).expect("prepare(纯文本)");
+        let req = vlm
+            .prepare(&prompt, &[], &[], &[])
+            .expect("prepare(纯文本)");
         assert!(req.merged.is_none(), "纯文本不进塔");
         assert!(req.ins.idx_host.iter().all(|&x| x < 0.0), "纯文本无注入行");
-        let slots = TensorOps::from_host(Dtype::F32, vec![l], &f32b(&(0..l).map(|t| t as f32).collect::<Vec<f32>>()));
-        let lens = TensorOps::from_host(Dtype::F32, vec![l], &f32b(&(0..l).map(|t| (t + 1) as f32).collect::<Vec<f32>>()));
+        let slots = TensorOps::from_host(
+            Dtype::F32,
+            vec![l],
+            &f32b(&(0..l).map(|t| t as f32).collect::<Vec<f32>>()),
+        );
+        let lens = TensorOps::from_host(
+            Dtype::F32,
+            vec![l],
+            &f32b(&(0..l).map(|t| (t + 1) as f32).collect::<Vec<f32>>()),
+        );
         let gdn_slot = TensorOps::from_host(Dtype::F32, vec![1], &f32b(&[0.0]));
-        let base = ForwardCtx::model_prefill(l, &req.ins.pos, &kvs, &rp, &gdns, &slots, &lens, &gdn_slot, None, 0, None);
+        let base = ForwardCtx::model_prefill(
+            l,
+            &req.ins.pos,
+            &kvs,
+            &rp,
+            &gdns,
+            &slots,
+            &lens,
+            &gdn_slot,
+            None,
+            0,
+            None,
+        );
         let ctx = req.bind(base);
         let logits = vlm.prefill_logits(&ids, &ctx).expect("prefill(须带注入面)");
         let row = crate::testkit::harvest_f16(&mut gpu, &logits).await;
         let last = &row[(l - 1) * c.text_spec.vocab..l * c.text_spec.vocab];
-        let (arg, maxv) = last.iter().enumerate().fold((0usize, f32::NEG_INFINITY), |a, (i, v)| if *v > a.1 { (i, *v) } else { a });
-        assert!(last.iter().all(|v| v.is_finite()), "logits 必须有限(不许毒值/NaN)");
+        let (arg, maxv) = last
+            .iter()
+            .enumerate()
+            .fold((0usize, f32::NEG_INFINITY), |a, (i, v)| {
+                if *v > a.1 {
+                    (i, *v)
+                } else {
+                    a
+                }
+            });
+        assert!(
+            last.iter().all(|v| v.is_finite()),
+            "logits 必须有限(不许毒值/NaN)"
+        );
         eprintln!("[vlm] 文本 prefill 冒烟:argmax = {arg}, max logit = {maxv:.3}");
         assert!(arg < c.text_spec.vocab, "argmax 落词表内");
 
@@ -1047,30 +1178,50 @@ mod tests {
             gen.push(next);
             let t = l + step;
             let ids1 = TensorOps::from_host(Dtype::F32, vec![1], &f32b(&[next as f32]));
-            let pos1 = TensorOps::from_host(Dtype::F32, vec![1], &f32b(&[(t as i64 + req.ins.delta) as f32]));
-            let kvs_step: Vec<crate::module::KvBuffers> = kvs.iter().map(|kv| crate::module::KvBuffers {
-                k_cache: kv.k_cache.clone(),
-                v_cache: kv.v_cache.clone(),
-                slots: TensorOps::from_host(Dtype::F32, vec![1], &f32b(&[t as f32])),
-                kv_lens: TensorOps::from_host(Dtype::F32, vec![1], &f32b(&[(t + 1) as f32])),
-                block_tables: kv.block_tables.clone(),
+            let pos1 = TensorOps::from_host(
+                Dtype::F32,
+                vec![1],
+                &f32b(&[(t as i64 + req.ins.delta) as f32]),
+            );
+            let kvs_step: Vec<crate::module::KvBuffers> = kvs
+                .iter()
+                .map(|kv| crate::module::KvBuffers {
+                    k_cache: kv.k_cache.clone(),
+                    v_cache: kv.v_cache.clone(),
+                    slots: TensorOps::from_host(Dtype::F32, vec![1], &f32b(&[t as f32])),
+                    kv_lens: TensorOps::from_host(Dtype::F32, vec![1], &f32b(&[(t + 1) as f32])),
+                    block_tables: kv.block_tables.clone(),
 
-                int8: None,
-            }).collect();
-            let gdns_step: Vec<crate::layers::gdn::GdnBuffers> = gdns.iter().map(|g| crate::layers::gdn::GdnBuffers {
-                conv_q: g.conv_q.clone(),
-                conv_k: g.conv_k.clone(),
-                conv_v: g.conv_v.clone(),
-                rec: g.rec.clone(),
-                slots: TensorOps::from_host(Dtype::F32, vec![1], &f32b(&[0.0])),
-            }).collect();
+                    int8: None,
+                })
+                .collect();
+            let gdns_step: Vec<crate::layers::gdn::GdnBuffers> = gdns
+                .iter()
+                .map(|g| crate::layers::gdn::GdnBuffers {
+                    conv_q: g.conv_q.clone(),
+                    conv_k: g.conv_k.clone(),
+                    conv_v: g.conv_v.clone(),
+                    rec: g.rec.clone(),
+                    slots: TensorOps::from_host(Dtype::F32, vec![1], &f32b(&[0.0])),
+                })
+                .collect();
             let mut ctx = ForwardCtx::model_decode(1, &pos1, &kvs_step, &rp, &gdns_step);
             ctx.attn_v2 = Some(scratch.clone());
             ctx.env.attn.qkv_fuse = true;
             let logits = vlm.text_logits(&ids1, &ctx);
             let row = crate::testkit::harvest_f16(&mut gpu, &logits).await;
             assert!(row.iter().all(|v| v.is_finite()), "decode logits 必须有限");
-            next = row.iter().enumerate().fold((0usize, f32::NEG_INFINITY), |a, (i, v)| if *v > a.1 { (i, *v) } else { a }).0 as u32;
+            next = row
+                .iter()
+                .enumerate()
+                .fold((0usize, f32::NEG_INFINITY), |a, (i, v)| {
+                    if *v > a.1 {
+                        (i, *v)
+                    } else {
+                        a
+                    }
+                })
+                .0 as u32;
         }
         eprintln!("[vlm] decode 两步 id = {gen:?} → {next}");
         gpu.close().await.expect("关机");
@@ -1096,15 +1247,21 @@ mod tests {
             skip_note();
             return;
         }
-        let golden = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../testdata/vlm_e2e.safetensors");
+        let golden = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../testdata/vlm_e2e.safetensors");
         if !golden.exists() {
-            owl_shared::testkit::report::skip(format_args!("{} 不在(先跑 tools/vlm_e2e_golden.py)", golden.display()));
+            owl_shared::testkit::report::skip(format_args!(
+                "{} 不在(先跑 tools/vlm_e2e_golden.py)",
+                golden.display()
+            ));
             return;
         }
         let dir = ckpt_dir();
         let mut gpu = gpu_client().await;
         let t0 = std::time::Instant::now();
-        let vlm = Vlm::load(&dir, &mut gpu, Dtype::F16).await.expect("Vlm::load(4B)");
+        let vlm = Vlm::load(&dir, &mut gpu, Dtype::F16)
+            .await
+            .expect("Vlm::load(4B)");
         eprintln!("[e2e] 4B 整装 {:.1}s", t0.elapsed().as_secs_f64());
         let c = vlm.cfg();
         let vocab = c.text_spec.vocab;
@@ -1114,13 +1271,24 @@ mod tests {
             &rp,
             &mut gpu,
             &rp.tables(),
-            &crate::module::LoaderCtx { dtype: Dtype::F16, shard: 1, slice_id: 0, device_repack: false, verify: false, debug_tap: false, staging_mb: 128, dump: false },
+            &crate::module::LoaderCtx {
+                dtype: Dtype::F16,
+                shard: 1,
+                slice_id: 0,
+                device_repack: false,
+                verify: false,
+                debug_tap: false,
+                staging_mb: 128,
+                dump: false,
+            },
         )
         .await
         .expect("rope 表(f16)");
-        let tok = crate::formats::qwen35::load_tokenizer(&dir, &c.text_spec.tokenizer).expect("tokenizer");
+        let tok = crate::formats::qwen35::load_tokenizer(&dir, &c.text_spec.tokenizer)
+            .expect("tokenizer");
 
-        let json = std::fs::read_to_string(golden.with_extension("json")).expect("金标 sidecar json");
+        let json =
+            std::fs::read_to_string(golden.with_extension("json")).expect("金标 sidecar json");
         let meta: serde_json::Value = serde_json::from_str(&json).expect("sidecar 解析");
         let tags: Vec<String> = meta["images"]
             .as_object()
@@ -1139,15 +1307,14 @@ mod tests {
             let want_top = st_read(&golden, &format!("hf.{tag}.top_idx"));
             let ids: Vec<u32> = ids_h.iter().map(|&x| x as u32).collect();
             let l = ids.len();
-            let grids = vec![(
-                grid_h[0] as usize,
-                grid_h[1] as usize,
-                grid_h[2] as usize,
-            )];
+            let grids = vec![(grid_h[0] as usize, grid_h[1] as usize, grid_h[2] as usize)];
 
             // ① m-RoPE 位置号 vs HF 真模型(整数逐元素)
             let tt = crate::layers::mrope::token_types(&ids, c.image_token, c.video_token);
-            let index = c.mrope.rope_index(&ids, &tt, &grids, &[]).expect("rope_index");
+            let index = c
+                .mrope
+                .rope_index(&ids, &tt, &grids, &[])
+                .expect("rope_index");
             assert_eq!(index.pos.len(), l, "[{tag}] 位置号长");
             let mut pos_ok = 0usize;
             for t in 0..l {
@@ -1160,30 +1327,72 @@ mod tests {
                     pos_ok += 1;
                 }
             }
-            eprintln!("[e2e/{tag}] ① 位置号 {pos_ok} 个整数逐元素 == HF 真模型 ✓(delta={})", index.delta);
+            eprintln!(
+                "[e2e/{tag}] ① 位置号 {pos_ok} 个整数逐元素 == HF 真模型 ✓(delta={})",
+                index.delta
+            );
 
             // ② prefill(塔 + 文本)
             let req = vlm.prepare(&ids, &grids, &[], &px).expect("prepare(真图)");
             assert!(req.merged.is_some(), "[{tag}] 有图 ⇒ 必须出塔");
             let nb = (l + want_gen.len()).div_ceil(32);
             let (kvs, gdns) = real_bufs(&mut gpu, c, nb, 8).await;
-            let ids_t = TensorOps::from_host(Dtype::F32, vec![l], &f32b(&ids.iter().map(|&x| x as f32).collect::<Vec<f32>>()));
-            let slots = TensorOps::from_host(Dtype::F32, vec![l], &f32b(&(0..l).map(|t| t as f32).collect::<Vec<f32>>()));
-            let lens = TensorOps::from_host(Dtype::F32, vec![l], &f32b(&(0..l).map(|t| (t + 1) as f32).collect::<Vec<f32>>()));
+            let ids_t = TensorOps::from_host(
+                Dtype::F32,
+                vec![l],
+                &f32b(&ids.iter().map(|&x| x as f32).collect::<Vec<f32>>()),
+            );
+            let slots = TensorOps::from_host(
+                Dtype::F32,
+                vec![l],
+                &f32b(&(0..l).map(|t| t as f32).collect::<Vec<f32>>()),
+            );
+            let lens = TensorOps::from_host(
+                Dtype::F32,
+                vec![l],
+                &f32b(&(0..l).map(|t| (t + 1) as f32).collect::<Vec<f32>>()),
+            );
             let gdn_slot = TensorOps::from_host(Dtype::F32, vec![1], &f32b(&[0.0]));
-            let base = ForwardCtx::model_prefill(l, &req.ins.pos, &kvs, &rp, &gdns, &slots, &lens, &gdn_slot, None, 0, None);
+            let base = ForwardCtx::model_prefill(
+                l,
+                &req.ins.pos,
+                &kvs,
+                &rp,
+                &gdns,
+                &slots,
+                &lens,
+                &gdn_slot,
+                None,
+                0,
+                None,
+            );
             let ctx = req.bind(base);
             let logits = vlm.prefill_logits(&ids_t, &ctx).expect("prefill");
             let row_all = crate::testkit::harvest_f16(&mut gpu, &logits).await;
             let last = &row_all[(l - 1) * vocab..l * vocab];
             assert!(last.iter().all(|v| v.is_finite()), "[{tag}] logits 有限");
-            let (arg, _) = last.iter().enumerate().fold((0usize, f32::NEG_INFINITY), |a, (i, v)| if *v > a.1 { (i, *v) } else { a });
+            let (arg, _) =
+                last.iter()
+                    .enumerate()
+                    .fold((0usize, f32::NEG_INFINITY), |a, (i, v)| {
+                        if *v > a.1 {
+                            (i, *v)
+                        } else {
+                            a
+                        }
+                    });
             let want_first = want_gen[0] as usize;
             // top-10 交叠(数值面:不苛求逐位,但集合要重合)
-            let mut mine: Vec<(usize, f32)> = last.iter().enumerate().map(|(i, &v)| (i, v)).collect();
+            let mut mine: Vec<(usize, f32)> =
+                last.iter().enumerate().map(|(i, &v)| (i, v)).collect();
             mine.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap());
-            let hit = mine[..10].iter().filter(|(i, _)| want_top.iter().any(|&w| w as usize == *i)).count();
-            eprintln!("[e2e/{tag}] ② prefill 末位 top-1 = {arg}(HF {want_first});top-10 交叠 {hit}/10");
+            let hit = mine[..10]
+                .iter()
+                .filter(|(i, _)| want_top.iter().any(|&w| w as usize == *i))
+                .count();
+            eprintln!(
+                "[e2e/{tag}] ② prefill 末位 top-1 = {arg}(HF {want_first});top-10 交叠 {hit}/10"
+            );
             assert_eq!(arg, want_first, "[{tag}] 首 token argmax 必须 == HF");
 
             // ③ 贪心解码(生产 decode 面)
@@ -1193,35 +1402,67 @@ mod tests {
                 let t = l + step - 1;
                 let prev = gen[step - 1];
                 let ids1 = TensorOps::from_host(Dtype::F32, vec![1], &f32b(&[prev as f32]));
-                let pos1 = TensorOps::from_host(Dtype::F32, vec![1], &f32b(&[(t as i64 + index.delta) as f32]));
-                let kvs_step: Vec<crate::module::KvBuffers> = kvs.iter().map(|kv| crate::module::KvBuffers {
-                    k_cache: kv.k_cache.clone(),
-                    v_cache: kv.v_cache.clone(),
-                    slots: TensorOps::from_host(Dtype::F32, vec![1], &f32b(&[t as f32])),
-                    kv_lens: TensorOps::from_host(Dtype::F32, vec![1], &f32b(&[(t + 1) as f32])),
-                    block_tables: kv.block_tables.clone(),
+                let pos1 = TensorOps::from_host(
+                    Dtype::F32,
+                    vec![1],
+                    &f32b(&[(t as i64 + index.delta) as f32]),
+                );
+                let kvs_step: Vec<crate::module::KvBuffers> = kvs
+                    .iter()
+                    .map(|kv| crate::module::KvBuffers {
+                        k_cache: kv.k_cache.clone(),
+                        v_cache: kv.v_cache.clone(),
+                        slots: TensorOps::from_host(Dtype::F32, vec![1], &f32b(&[t as f32])),
+                        kv_lens: TensorOps::from_host(
+                            Dtype::F32,
+                            vec![1],
+                            &f32b(&[(t + 1) as f32]),
+                        ),
+                        block_tables: kv.block_tables.clone(),
 
-                    int8: None,
-                }).collect();
-                let gdns_step: Vec<crate::layers::gdn::GdnBuffers> = gdns.iter().map(|g| crate::layers::gdn::GdnBuffers {
-                    conv_q: g.conv_q.clone(),
-                    conv_k: g.conv_k.clone(),
-                    conv_v: g.conv_v.clone(),
-                    rec: g.rec.clone(),
-                    slots: TensorOps::from_host(Dtype::F32, vec![1], &f32b(&[0.0])),
-                }).collect();
+                        int8: None,
+                    })
+                    .collect();
+                let gdns_step: Vec<crate::layers::gdn::GdnBuffers> = gdns
+                    .iter()
+                    .map(|g| crate::layers::gdn::GdnBuffers {
+                        conv_q: g.conv_q.clone(),
+                        conv_k: g.conv_k.clone(),
+                        conv_v: g.conv_v.clone(),
+                        rec: g.rec.clone(),
+                        slots: TensorOps::from_host(Dtype::F32, vec![1], &f32b(&[0.0])),
+                    })
+                    .collect();
                 let mut dctx = ForwardCtx::model_decode(1, &pos1, &kvs_step, &rp, &gdns_step);
                 dctx.attn_v2 = Some(scratch.clone());
                 dctx.env.attn.qkv_fuse = true;
-                let row = crate::testkit::harvest_f16(&mut gpu, &vlm.text_logits(&ids1, &dctx)).await;
-                assert!(row.iter().all(|v| v.is_finite()), "[{tag}] decode logits 有限");
-                let next = row.iter().enumerate().fold((0usize, f32::NEG_INFINITY), |a, (i, v)| if *v > a.1 { (i, *v) } else { a }).0 as u32;
+                let row =
+                    crate::testkit::harvest_f16(&mut gpu, &vlm.text_logits(&ids1, &dctx)).await;
+                assert!(
+                    row.iter().all(|v| v.is_finite()),
+                    "[{tag}] decode logits 有限"
+                );
+                let next = row
+                    .iter()
+                    .enumerate()
+                    .fold((0usize, f32::NEG_INFINITY), |a, (i, v)| {
+                        if *v > a.1 {
+                            (i, *v)
+                        } else {
+                            a
+                        }
+                    })
+                    .0 as u32;
                 gen.push(next);
             }
             let want_ids: Vec<u32> = want_gen.iter().map(|&x| x as u32).collect();
             let owl_ans = tok.decode(&gen);
             eprintln!("[e2e/{tag}] ③ owl 贪心: {:?}({} tok)", owl_ans, gen.len());
-            let same = gen.iter().zip(&want_ids).take_while(|(a, b)| a == b).count();
+            let same = gen
+                .iter()
+                .zip(&want_ids)
+                .take_while(|(a, b)| a == b)
+                .count();
             eprintln!(
                 "[e2e/{tag}] ③ 与 HF 逐 token 前缀一致 {same}/{};HF: {:?}",
                 want_ids.len(),
@@ -1275,10 +1516,15 @@ mod tests {
             let reps = 3;
             let t0 = std::time::Instant::now();
             for _ in 0..reps {
-                src.convert_chunk_into_bytes(k, 0, n, &mut buf, Dtype::F16).expect("源").expect("convert");
+                src.convert_chunk_into_bytes(k, 0, n, &mut buf, Dtype::F16)
+                    .expect("源")
+                    .expect("convert");
             }
             let dt = t0.elapsed().as_secs_f64();
-            eprintln!("[bench] ① convert {n:>9} elem: {:.2} GB/s", n as f64 * 2.0 * reps as f64 / 1e9 / dt);
+            eprintln!(
+                "[bench] ① convert {n:>9} elem: {:.2} GB/s",
+                n as f64 * 2.0 * reps as f64 / 1e9 / dt
+            );
         }
 
         // ② host 读(mmap 在页缓存 → Vec):raw 路径的拷贝下限
@@ -1292,7 +1538,10 @@ mod tests {
             raw_gb += n as f64 * 2.0 / 1e9;
             raw_s += t0.elapsed().as_secs_f64();
         }
-        eprintln!("[bench] ② take_range(含转换)F32 面: {:.2} GB/s", raw_gb / raw_s);
+        eprintln!(
+            "[bench] ② take_range(含转换)F32 面: {:.2} GB/s",
+            raw_gb / raw_s
+        );
 
         // ②' pinned 租约往返(热池):alloc + drop ×200 —— 摘掉 DMA 看纯命令延迟
         {
@@ -1303,11 +1552,16 @@ mod tests {
             drop(leases); // 先放 4 个回池(池命中路径)
             let t0 = std::time::Instant::now();
             for _ in 0..200 {
-                let l = owl_iface::alloc_pinned!(gpu, 64 << 20).await.expect("pinned");
+                let l = owl_iface::alloc_pinned!(gpu, 64 << 20)
+                    .await
+                    .expect("pinned");
                 drop(l);
             }
             let dt = t0.elapsed().as_secs_f64();
-            eprintln!("[bench] ②' alloc_pinned 往返(64MB,热池 ×200): {:.3} ms/次", dt * 1e3 / 200.0);
+            eprintln!(
+                "[bench] ②' alloc_pinned 往返(64MB,热池 ×200): {:.3} ms/次",
+                dt * 1e3 / 200.0
+            );
         }
 
         // ③ pinned → device DMA:单发大块(1GB)与多路并发(4 面)
@@ -1316,7 +1570,9 @@ mod tests {
         for (i, c) in big.chunks_exact_mut(4096).enumerate() {
             c.fill((i & 0xff) as u8);
         }
-        let blk = owl_iface::client_alloc!(gpu, Dtype::F16, n_big).await.expect("1GB 设备块");
+        let blk = owl_iface::client_alloc!(gpu, Dtype::F16, n_big)
+            .await
+            .expect("1GB 设备块");
         // 单发 1GB(分块 128MB)+ 尾 sync
         for reps in [1usize, 3] {
             let t0 = std::time::Instant::now();
@@ -1324,15 +1580,23 @@ mod tests {
                 let mut off = 0usize;
                 while off < n_big {
                     let len = (64usize << 20).min(n_big - off);
-                    let mut lease = owl_iface::alloc_pinned!(gpu, len * 2).await.expect("pinned");
-                    lease.slice_bytes_mut()[..len * 2].copy_from_slice(&big[off * 2..(off + len) * 2]);
-                    gpu.upload_pinned(lease, &blk, off * 2, len * 2).await.expect("upload");
+                    let mut lease = owl_iface::alloc_pinned!(gpu, len * 2)
+                        .await
+                        .expect("pinned");
+                    lease.slice_bytes_mut()[..len * 2]
+                        .copy_from_slice(&big[off * 2..(off + len) * 2]);
+                    gpu.upload_pinned(lease, &blk, off * 2, len * 2)
+                        .await
+                        .expect("upload");
                     off += len;
                 }
                 gpu.sync().await.expect("sync");
             }
             let dt = t0.elapsed().as_secs_f64();
-            eprintln!("[bench] ③ DMA 1GB/64MB 块 ×{reps}: {:.2} GB/s({dt:.2}s)", 1.0 * reps as f64 / dt);
+            eprintln!(
+                "[bench] ③ DMA 1GB/64MB 块 ×{reps}: {:.2} GB/s({dt:.2}s)",
+                1.0 * reps as f64 / dt
+            );
         }
         // 4 面并发(装载工件同款:每面各自 256MB)
         let faces: Vec<_> = gpu.loader_faces(4).expect("并发面");
@@ -1340,15 +1604,20 @@ mod tests {
         let t0 = std::time::Instant::now();
         let mut futs = Vec::new();
         for (fi, mut f) in faces.into_iter().enumerate() {
-            let blk = owl_iface::client_alloc!(f, Dtype::F16, per).await.expect("分块");
+            let blk = owl_iface::client_alloc!(f, Dtype::F16, per)
+                .await
+                .expect("分块");
             let src = big[..per * 2].to_vec();
             futs.push(async move {
                 let mut off = 0usize;
                 while off < per {
                     let len = (16usize << 20).min(per - off);
                     let mut lease = owl_iface::alloc_pinned!(f, len * 2).await.expect("pinned");
-                    lease.slice_bytes_mut()[..len * 2].copy_from_slice(&src[off * 2..(off + len) * 2]);
-                    f.upload_pinned(lease, &blk, off * 2, len * 2).await.expect("upload");
+                    lease.slice_bytes_mut()[..len * 2]
+                        .copy_from_slice(&src[off * 2..(off + len) * 2]);
+                    f.upload_pinned(lease, &blk, off * 2, len * 2)
+                        .await
+                        .expect("upload");
                     off += len;
                 }
                 f.sync().await.expect("sync");
@@ -1357,7 +1626,10 @@ mod tests {
         }
         futures_util::future::join_all(futs).await;
         let dt = t0.elapsed().as_secs_f64();
-        eprintln!("[bench] ③ DMA 4 面并发(每面 256MB,16MB 块): {:.2} GB/s({dt:.2}s)", 0.25 * 4.0 / dt);
+        eprintln!(
+            "[bench] ③ DMA 4 面并发(每面 256MB,16MB 块): {:.2} GB/s({dt:.2}s)",
+            0.25 * 4.0 / dt
+        );
         gpu.close().await.expect("关机");
     }
 }

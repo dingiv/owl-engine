@@ -250,12 +250,7 @@ impl Rel {
     }
 
     /// 临时工作区票（调用方给槽/字节；turn 生命周期或调用方显式归还）。
-    pub fn reserve_temp(
-        &mut self,
-        turn: u64,
-        slots: usize,
-        bytes: usize,
-    ) -> StoreResult<Grant> {
+    pub fn reserve_temp(&mut self, turn: u64, slots: usize, bytes: usize) -> StoreResult<Grant> {
         self.reserve_direct(turn, ReservationKind::Temp, slots, bytes, slots, bytes)
     }
 
@@ -304,10 +299,7 @@ impl Rel {
     ///
     /// 这种条目只可能来自"start 半态"（`finish_turn` 没跑到）。引擎在
     /// `abandon` 拿不到归属 turn 时调它 —— 保证泄漏能自愈，而不是永久占天花板。
-    pub fn finish_orphan_turns(
-        &mut self,
-        live: &[u64],
-    ) -> StoreResult<Vec<(u64, TurnRelease)>> {
+    pub fn finish_orphan_turns(&mut self, live: &[u64]) -> StoreResult<Vec<(u64, TurnRelease)>> {
         let orphans: Vec<u64> = self
             .admission
             .active_ids()
@@ -367,12 +359,74 @@ impl Rel {
         need: crate::hooks::Need,
         protect: &Protected,
     ) -> crate::hooks::Verdict {
+        // **共享池的容量视图**（2026-11-18）：两腿看到的是同一本余量。
+        // `plan_capacity` 仍按“KV 槽 / 快照条”两个单位出票，所以这里按需求
+        // 字节把总余量**保守切分**（份额之和 ≤ 总余量；不会双算）。
+        let host_only = need.host_kv_slots > 0 || need.host_snap_slots > 0;
+        let kv_slot = self.leg.host_slot_bytes().max(1);
+        let snap_slot = self.snap_file_bytes().max(1);
+        let kv_demand = need
+            .host_kv_slots
+            .saturating_mul(kv_slot)
+            .saturating_add(if host_only {
+                0
+            } else {
+                need.slots.saturating_mul(kv_slot)
+            });
+        let snap_demand = need
+            .host_snap_slots
+            .saturating_mul(snap_slot)
+            .saturating_add(need.snap_bytes);
+        let (host_kv_slots, host_snap_slots) = match self.leg.shared_host_budget() {
+            Some(b) => {
+                let free = b.lock().ok().map(|g| g.available_bytes()).unwrap_or(0);
+                let (kv_bytes, snap_bytes) = split_shared_bytes(free, kv_demand, snap_demand);
+                (kv_bytes / kv_slot, snap_bytes / snap_slot)
+            }
+            None => (self.leg.host_free_slots(), self.snap_host_free_slots()),
+        };
+        let disk_kv_block = self
+            .disk
+            .as_ref()
+            .map(|d| d.block_bytes())
+            .unwrap_or(1)
+            .max(1);
+        let disk_snap_block = self
+            .snap_disk
+            .as_ref()
+            .map(|d| d.block_bytes())
+            .unwrap_or(1)
+            .max(1);
+        let disk_kv_demand = need
+            .host_kv_slots
+            .saturating_mul(disk_kv_block)
+            .saturating_add(if host_only {
+                0
+            } else {
+                need.slots.saturating_mul(disk_kv_block)
+            });
+        let disk_snap_demand = need
+            .host_snap_slots
+            .saturating_mul(disk_snap_block)
+            .saturating_add(need.snap_bytes);
+        let (disk_kv_slots, disk_snap_slots) = match self.disk.as_ref() {
+            Some(d) => {
+                let free = d
+                    .shared_budget()
+                    .and_then(|b| b.lock().ok().map(|g| g.available_bytes()))
+                    .unwrap_or_else(|| d.budget_bytes().saturating_sub(d.used_bytes()));
+                let (kv_bytes, snap_bytes) =
+                    split_shared_bytes(free, disk_kv_demand, disk_snap_demand);
+                (kv_bytes / disk_kv_block, snap_bytes / disk_snap_block)
+            }
+            None => (0, 0),
+        };
         let room = crate::hooks::Room {
             host_enabled: self.leg.host_enabled() || self.snap_host_budget() > 0,
-            host_kv_slots: self.leg.host_free_slots(),
-            host_snap_slots: self.snap_host_free_slots(),
-            disk_kv_slots: self.disk.as_ref().map(|d| d.free_slots()).unwrap_or(0),
-            disk_snap_slots: self.snap_disk.as_ref().map(|d| d.free_slots()).unwrap_or(0),
+            host_kv_slots,
+            host_snap_slots,
+            disk_kv_slots,
+            disk_snap_slots,
             disk_enabled: self.disk.is_some() || self.snap_disk.is_some(),
             bulk_drop_when_tier_full: self.bulk_drop_when_tier_full,
         };
@@ -386,4 +440,23 @@ impl Rel {
             room,
         )
     }
+}
+
+/// 按需求字节把共享余量切成两份（份额之和 ≤ `free`）。
+///
+/// 目的不是“公平”，而是**不超发**：`plan_capacity` 的两条腿槽位单位不同，
+/// 若各自都拿总余量就会双算。需求为零的一侧拿 0；两侧都有需求时按字节比例。
+fn split_shared_bytes(free: usize, a: usize, b: usize) -> (usize, usize) {
+    if a == 0 && b == 0 {
+        return (0, 0);
+    }
+    if a == 0 {
+        return (0, free);
+    }
+    if b == 0 {
+        return (free, 0);
+    }
+    let total = a as u128 + b as u128;
+    let a_share = (free as u128 * a as u128 / total) as usize;
+    (a_share.min(free), free - a_share.min(free))
 }

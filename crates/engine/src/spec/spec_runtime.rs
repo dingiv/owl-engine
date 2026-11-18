@@ -429,7 +429,10 @@ pub(crate) async fn load_spec_runtime<D: DeviceClient + 'static>(
                 } else if inp.dumb {
                     SpecMode::Dumb
                 } else {
-                    owl_shared::log_info!("boot", "spec.depth>0 但无草稿器(非 mtp/dflash2 检查点)→ C7 回落 DecodeBatch");
+                    owl_shared::log_info!(
+                        "boot",
+                        "spec.depth>0 但无草稿器(非 mtp/dflash2 检查点)→ C7 回落 DecodeBatch"
+                    );
                     SpecMode::Off
                 }
             }
@@ -439,7 +442,11 @@ pub(crate) async fn load_spec_runtime<D: DeviceClient + 'static>(
     // MTP `min(3)`),MTP 因此只能跑 3 步 —— 而实测第 4~7 步接受率仍 70~80%
     // (depth 7 比 3 在 8k 上快 ~10%、512 上快 ~21%)。上限由 `[spec] depth`
     // 的校验面统一挡(`SPEC_DEPTH_MAX`,结构性行容量),此处不再截断。
-    let depth = if mode == SpecMode::Off { 0 } else { inp.depth_raw };
+    let depth = if mode == SpecMode::Off {
+        0
+    } else {
+        inp.depth_raw
+    };
     // **MTP 窗口只服务 MTP**(2026-10-21):非 MTP/Off 写非 0 = boot 拒,
     // 不静默忽略;window=0 时 sink 无消费者(允许缺省 64)。
     let mtp_window = MtpWindowCfg {
@@ -587,7 +594,9 @@ pub(crate) async fn load_spec_runtime<D: DeviceClient + 'static>(
         );
     }
     if mode != SpecMode::Off {
-        owl_shared::log_info!("boot", "spec 模式 = {:?} depth={depth}(注:spec 轮恒 greedy,采样 parity 挂 D4 device accept)",
+        owl_shared::log_info!(
+            "boot",
+            "spec 模式 = {:?} depth={depth}(注:spec 轮恒 greedy,采样 parity 挂 D4 device accept)",
             mode
         );
     }
@@ -643,7 +652,9 @@ pub(crate) async fn load_spec_runtime<D: DeviceClient + 'static>(
     let mut draft_geom_raw: Option<(usize, usize, usize, usize, usize)> = None;
     let drafter = match mode {
         SpecMode::Mtp => {
-            let dir = inp.mtp_dir.ok_or_else(|| ModelError::EngineInvariant { what: "Mtp 模式缺 mtp_dir(模式裁决与输入不一致)".into() })?;
+            let dir = inp.mtp_dir.ok_or_else(|| ModelError::EngineInvariant {
+                what: "Mtp 模式缺 mtp_dir(模式裁决与输入不一致)".into(),
+            })?;
             // MTP 头 = 检查点内 BF16 权重 / GGUF Q6_K 块,经装载源归一到 F16;
             // 草稿池也按目标模型 dtype(F16)分配。**不是** BF16 草稿池。
             draft_dt = owl_models::contract::Dtype::F16;
@@ -710,7 +721,8 @@ pub(crate) async fn load_spec_runtime<D: DeviceClient + 'static>(
                     false,
                 )
             };
-            let mut opts = draft_load_opts(face, owl_models::contract::Dtype::F16, inp.tp, &inp.load)?;
+            let mut opts =
+                draft_load_opts(face, owl_models::contract::Dtype::F16, inp.tp, &inp.load)?;
             // 原生块路径:源直接给压缩块字节(槽 U8),不再走 host 解量化
             opts.gguf_dequant = is_gguf && !native_blocks;
             owl_models::formats::load::load_from_dir(dir, face, &mtp, opts).await?;
@@ -724,7 +736,9 @@ pub(crate) async fn load_spec_runtime<D: DeviceClient + 'static>(
         }
         SpecMode::DFlash2 => {
             // (draft_dt 在外层声明:下面按检查点事实改写)
-            let dir = inp.dflash2_dir.ok_or_else(|| ModelError::EngineInvariant { what: "DFlash2 模式缺 dflash2_dir(模式裁决与输入不一致)".into() })?;
+            let dir = inp.dflash2_dir.ok_or_else(|| ModelError::EngineInvariant {
+                what: "DFlash2 模式缺 dflash2_dir(模式裁决与输入不一致)".into(),
+            })?;
             let t_draft = std::time::Instant::now();
             // 草稿装载 dtype = **草稿执行 dtype 单源**(恒 BF16;F16 路在
             // propose 残差流上溢出 —— 定谳见 `qwen35::draft_exec_dt` 注)
@@ -749,8 +763,17 @@ pub(crate) async fn load_spec_runtime<D: DeviceClient + 'static>(
                     "GGUF 草稿:{} · {} 层 {}H/{}KV/{}D · taps {:?}(GGUF 1-based 原值已归一) · \
                      block {} / conv {}·{} / selector rank {} top {} · mask {}",
                     path.display(),
-                    gs.layers, gs.hq, gs.hkv, gs.hd, gs.tap_ids,
-                    gs.block, gs.conv_taps, gs.conv_group, gs.rank, gs.top_k, gs.mask_token
+                    gs.layers,
+                    gs.hq,
+                    gs.hkv,
+                    gs.hd,
+                    gs.tap_ids,
+                    gs.block,
+                    gs.conv_taps,
+                    gs.conv_group,
+                    gs.rank,
+                    gs.top_k,
+                    gs.mask_token
                 );
                 let d2 = boot.draft(draft_dt, inp.draft_kv_dt)?;
                 let opts = draft_load_opts(face, draft_dt, inp.tp, &inp.load)?;
@@ -759,8 +782,14 @@ pub(crate) async fn load_spec_runtime<D: DeviceClient + 'static>(
                 dflash_tap_ids = std::sync::Arc::new(gs.tap_ids.clone());
                 dflash_mask_token = gs.mask_token;
                 draft_rope_facts = Some((gs.rope_max_pos, gs.hd, gs.rope_theta));
-                draft_geom_raw = Some((gs.layers, gs.hkv, gs.hd, gs.hq,
-                    gs.sliding_window.unwrap_or(owl_models::layers::dflash2::NC_WINDOW)));
+                draft_geom_raw = Some((
+                    gs.layers,
+                    gs.hkv,
+                    gs.hd,
+                    gs.hq,
+                    gs.sliding_window
+                        .unwrap_or(owl_models::layers::dflash2::NC_WINDOW),
+                ));
                 owl_shared::log_info!(
                     "boot",
                     "DFlash2 GGUF 草稿装载(depth={depth};块字节驻留 + 码本反量化) {:.2}s",
@@ -774,7 +803,11 @@ pub(crate) async fn load_spec_runtime<D: DeviceClient + 'static>(
                 // 装载走通用入口(BF16 全程;设备重排 = 能力自述裁决)
                 let d2 = match inp.tp {
                     Some(tp) if !tp.is_single() => {
-                        owl_models::formats::qwen35::dflash2_draft_sharded(path, inp.draft_kv_dt, tp)?
+                        owl_models::formats::qwen35::dflash2_draft_sharded(
+                            path,
+                            inp.draft_kv_dt,
+                            tp,
+                        )?
                     }
                     _ => owl_models::formats::qwen35::dflash2_draft(path, inp.draft_kv_dt)?,
                 };
@@ -785,7 +818,11 @@ pub(crate) async fn load_spec_runtime<D: DeviceClient + 'static>(
                 dflash_tap_ids =
                     std::sync::Arc::new(owl_models::layers::dflash2::DRAFT_TAP_IDS.to_vec());
                 dflash_mask_token = owl_models::layers::dflash2::MASK_TOKEN_ID;
-                owl_shared::log_info!("boot", "DFlash2 草稿装载(depth={depth};1.92B BF16 激活,sglang 对齐) {:.2}s", t_draft.elapsed().as_secs_f32());
+                owl_shared::log_info!(
+                    "boot",
+                    "DFlash2 草稿装载(depth={depth};1.92B BF16 激活,sglang 对齐) {:.2}s",
+                    t_draft.elapsed().as_secs_f32()
+                );
                 Some(Drafter::DFlash2(Arc::new(
                     d2.with_ring_cap(dflash_ring_cap).with_block_size(depth + 1),
                 )))
@@ -866,12 +903,16 @@ pub(crate) async fn load_spec_runtime<D: DeviceClient + 'static>(
         Some(SpecMode::DFlash2) => {
             // GGUF 草稿:几何已在开箱时定(不重开容器);HF:从 config + 本 rank 计划算
             let g = match draft_geom_raw {
-                Some((layers, hkv, hd, hq, window)) => {
-                    owl_models::formats::qwen35::DraftGeom { layers, hq, hkv, hd, window }
-                }
+                Some((layers, hkv, hd, hq, window)) => owl_models::formats::qwen35::DraftGeom {
+                    layers,
+                    hq,
+                    hkv,
+                    hd,
+                    window,
+                },
                 None => {
-                    let dir = inp.dflash2_dir.ok_or_else(|| {
-                        ModelError::EngineInvariant { what: "DFlash2 模式缺 dflash2_dir".into() }
+                    let dir = inp.dflash2_dir.ok_or_else(|| ModelError::EngineInvariant {
+                        what: "DFlash2 模式缺 dflash2_dir".into(),
                     })?;
                     let tp = inp.tp.unwrap_or_else(owl_models::plan::tp::TpPlan::single);
                     owl_models::formats::qwen35::dflash2_draft_geom(std::path::Path::new(dir), tp)?
@@ -897,15 +938,18 @@ pub(crate) async fn load_spec_runtime<D: DeviceClient + 'static>(
             let dir = inp.dflash2_dir.ok_or_else(|| ModelError::EngineInvariant {
                 what: "DFlash2 模式缺 dflash2_dir(draft env 构造)".into(),
             })?;
-            env.quant = if owl_models::formats::qwen35::draft_is_quantized(
-                std::path::Path::new(dir),
-            )? {
-                owl_models::module::QuantPlan::W4A16
-            } else {
-                owl_models::module::QuantPlan::F16
-            };
+            env.quant =
+                if owl_models::formats::qwen35::draft_is_quantized(std::path::Path::new(dir))? {
+                    owl_models::module::QuantPlan::W4A16
+                } else {
+                    owl_models::module::QuantPlan::F16
+                };
             // 环窗口:配置覆盖优先(0=auto=检查点);当前 NC 核只实例化 2048
-            let window = if inp.draft_window > 0 { inp.draft_window } else { g.window };
+            let window = if inp.draft_window > 0 {
+                inp.draft_window
+            } else {
+                g.window
+            };
             let cap = owl_models::layers::dflash2::NC_WINDOW;
             if window != cap {
                 return Err(ModelError::Msg(format!(
@@ -954,12 +998,11 @@ pub(crate) async fn load_spec_runtime<D: DeviceClient + 'static>(
         // B4 分母跨 turn 保鲜(初值 0 = 未采样,首窗口用保守兜底线)
         carry_ms: 0.0,
         carry_ctx: 0,
-            q_cfg_warned: false,
+        q_cfg_warned: false,
         last_round_ms: 0.0,
         walk_warned: false,
     })
 }
-
 
 /// **草稿装载 opts**(P2.1-a):与 [`LoadOpts::new`] 同律,只把分片协议换成
 /// 本 rank 的(`tp = None`/单卡 ⇒ 与旧路径逐字节同物)。
@@ -995,7 +1038,6 @@ fn shard_draft_plan(
     }
 }
 
-
 #[cfg(test)]
 mod q_knob_tests {
     use super::*;
@@ -1004,8 +1046,16 @@ mod q_knob_tests {
     #[test]
     fn q_knobs_validate_value_and_family() {
         // 缺省(q_host=true)在任何模式都合法
-        for m in [SpecMode::Off, SpecMode::Mtp, SpecMode::DFlash2, SpecMode::Dumb] {
-            assert!(check_q_knobs(m, 1.0, 0.0, true, "").is_ok(), "{m:?} 缺省应放行");
+        for m in [
+            SpecMode::Off,
+            SpecMode::Mtp,
+            SpecMode::DFlash2,
+            SpecMode::Dumb,
+        ] {
+            assert!(
+                check_q_knobs(m, 1.0, 0.0, true, "").is_ok(),
+                "{m:?} 缺省应放行"
+            );
         }
         // 值域
         assert!(check_q_knobs(SpecMode::DFlash2, 0.0, 0.0, true, "").is_err());

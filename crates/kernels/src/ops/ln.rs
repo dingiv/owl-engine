@@ -1,8 +1,8 @@
 //! Norm / MLP 门控 生产算子元数据。
 
-use owl_macros::kernel_tags;
 use crate::contract::{Dtype, Law};
 use crate::spec::{meta_of, CaptureEvidence, Determinism, KernelMeta, KernelSpec, Param};
+use owl_macros::kernel_tags;
 
 /// `owl_rmsnorm_f16` —— RMSNorm(宏实例化;alpha 权重 + `w_off` 半段偏移)
 pub struct RmsnormF16;

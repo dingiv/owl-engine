@@ -187,12 +187,12 @@ server --profile awq27b-3090-max --site ~/owl-site.toml \
 | `spec=dflash` | `depth=7`；`model.dflash2_dir=draft_dir`；草稿池账 +20KiB/token | ctx 重新求解 |
 | `kv=fp8` | `pool.kv_fp8=true`；白名单 fp8 族 | 关 = f16 族 |
 | `kvmem=off` | `select_decode/select_partial/index/pool_overcommit=false`；host/disk 腿=0 | 单键替四键 |
-| `kvmem=overcommit` | 四键全开 + `ram_pool_size/snap_host_mb/disk_*` 必要腿 | 需虚拟化两扇门 |
+| `kvmem=overcommit` | 四键全开 + `ram_pool_size/disk_pool_size` 共享总池 | 需虚拟化两扇门 |
 | `graphs=auto` | `no_graph=false`；`fi_cuda_graph=true`；`fi_plan_bake=0`；`fi_plan_restore=false`；`decode_fi/verify_fi=true`；`verify_v2=false`（有 spec） | 需 `kv=fp8` + 单卡 + 非 select_decode；否则自动降级并**打印原因** |
 | `graphs=off` | `no_graph=true`；FI 臂 off | 诊断/对照 |
-| `reuse=off` | `prefix_cache=false`；`snap_max=0`；`snap_host_mb=0` | 单会话最大 ctx 的默认 |
-| `reuse=session` | `prefix_cache=true`；`snap_max=1`；`snap_host_mb=1GiB`（可选） | 同会话续写 |
-| `reuse=global` | `prefix_cache=true`；`snap_max=4`；`snap_host_mb=3GiB` | 跨会话前缀 |
+| `reuse=off` | `prefix_cache=false`；`snap_max=0`；`ram_pool_size=0` | 单会话最大 ctx 的默认 |
+| `reuse=session` | `prefix_cache=true`；`snap_max=1`；`ram_pool_size=1GiB`（可选） | 同会话续写 |
+| `reuse=global` | `prefix_cache=true`；`snap_max=4`；`ram_pool_size=7GiB` | 跨会话前缀 |
 
 **不派生、必须显式/高级**：`allowed_ops`（改为派生，见 §8）、`cuda.*` 诊断、
 `probes.*`、`tp_*`（TP 另案）、`log.*`、`agent.*`、`load.*`。

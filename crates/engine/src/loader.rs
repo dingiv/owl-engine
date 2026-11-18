@@ -288,7 +288,11 @@ impl<D: DeviceClient + 'static> ModelLoader<'_, D> {
         let model = Arc::new(built.model);
 
         let tok = src.tokenizer()?;
-        let rope = src.rope(&self.rope, self.max_context_length, self.rope_pos_cap.max(self.max_context_length))?;
+        let rope = src.rope(
+            &self.rope,
+            self.max_context_length,
+            self.rope_pos_cap.max(self.max_context_length),
+        )?;
         src.log_facts(&rope, tok.n_tokens, &self.rope);
         let ctx = self.shard_ctx(spec.dtype);
         owl_models::interpreters::eval_load(&rope, self.face, &rope.tables(), &ctx).await?;

@@ -1,8 +1,11 @@
 //! 融合核域生产算子(norm/rope/池插三发合一)。
 
-use owl_macros::kernel_tags;
 use crate::contract::{Dtype, Law};
-use crate::spec::{meta_of, pools, CaptureEvidence, Determinism, KernelMeta, KernelSpec, LayoutTag, Param, PoolAccess};
+use crate::spec::{
+    meta_of, pools, CaptureEvidence, Determinism, KernelMeta, KernelSpec, LayoutTag, Param,
+    PoolAccess,
+};
+use owl_macros::kernel_tags;
 
 /// `owl_qknorm_rope_kv_insert_f16_fp8kv_knhd` —— qk-norm + rotate-half rope + KV 散写(主池 e4m3/kNHD)三发合一。
 ///
@@ -11,7 +14,14 @@ use crate::spec::{meta_of, pools, CaptureEvidence, Determinism, KernelMeta, Kern
 /// 声明(装配期写集穷举审计,P4)。
 pub struct QknormRopeKvInsertF16Fp8Knhd;
 
-#[kernel_tags("dom.fused", "role.norm", "role.rope", "role.kv_write", "phase.prefill", "kv.main.fp8")]
+#[kernel_tags(
+    "dom.fused",
+    "role.norm",
+    "role.rope",
+    "role.kv_write",
+    "phase.prefill",
+    "kv.main.fp8"
+)]
 impl KernelSpec for QknormRopeKvInsertF16Fp8Knhd {
     const ENTRY: &'static str = "owl_qknorm_rope_kv_insert_f16_fp8kv_knhd";
     const SRC: &'static str = "cu/fused/qknorm_insert.cu";
@@ -36,7 +46,11 @@ impl KernelSpec for QknormRopeKvInsertF16Fp8Knhd {
         Param::i32("w_off"),
         Param::t_out("q_out", Dtype::F16, 2),
     ];
-    const POOL: &'static [PoolAccess] = &[PoolAccess::write(pools::KV_MAIN, LayoutTag::Knhd, Dtype::F8E4M3)];
+    const POOL: &'static [PoolAccess] = &[PoolAccess::write(
+        pools::KV_MAIN,
+        LayoutTag::Knhd,
+        Dtype::F8E4M3,
+    )];
     const SELFCHECK: Option<&'static dyn crate::bootcheck::BootCheck> =
         Some(&crate::ops::oracles::qknorm_insert::QknormInsertOracle);
     const LAWS: &'static [Law] = &[Law::OutputFinite];
@@ -55,7 +69,15 @@ impl KernelSpec for QknormRopeKvInsertF16Fp8Knhd {
 /// 变体同 ABI,只有池寻址不同)。classic 池档的融合插池写者。
 pub struct QknormRopeKvInsertF16Fp8;
 
-#[kernel_tags("dom.fused", "role.norm", "role.rope", "role.kv_write", "phase.prefill", "kv.main.fp8", "kv.draft.fp8")]
+#[kernel_tags(
+    "dom.fused",
+    "role.norm",
+    "role.rope",
+    "role.kv_write",
+    "phase.prefill",
+    "kv.main.fp8",
+    "kv.draft.fp8"
+)]
 impl KernelSpec for QknormRopeKvInsertF16Fp8 {
     const ENTRY: &'static str = "owl_qknorm_rope_kv_insert_f16_fp8kv";
     const SRC: &'static str = "cu/fused/qknorm_insert.cu";
@@ -94,7 +116,8 @@ impl KernelSpec for QknormRopeKvInsertF16Fp8 {
     };
 }
 
-pub static QKNORM_ROPE_KV_INSERT_F16_FP8_KNHD: KernelMeta = meta_of::<QknormRopeKvInsertF16Fp8Knhd>();
+pub static QKNORM_ROPE_KV_INSERT_F16_FP8_KNHD: KernelMeta =
+    meta_of::<QknormRopeKvInsertF16Fp8Knhd>();
 pub static QKNORM_ROPE_KV_INSERT_F16_FP8: KernelMeta = meta_of::<QknormRopeKvInsertF16Fp8>();
 
 // ----------------------------------------------------------------------------
@@ -104,7 +127,15 @@ pub static QKNORM_ROPE_KV_INSERT_F16_FP8: KernelMeta = meta_of::<QknormRopeKvIns
 /// `owl_qknorm_rope_kv_insert_f16` —— 经典池 f16 插池(classic 布局,主池+草稿池双写)
 pub struct QknormRopeKvInsertF16;
 
-#[kernel_tags("dom.fused", "role.norm", "role.rope", "role.kv_write", "phase.prefill", "kv.main.f16", "kv.draft.f16")]
+#[kernel_tags(
+    "dom.fused",
+    "role.norm",
+    "role.rope",
+    "role.kv_write",
+    "phase.prefill",
+    "kv.main.f16",
+    "kv.draft.f16"
+)]
 impl KernelSpec for QknormRopeKvInsertF16 {
     const ENTRY: &'static str = "owl_qknorm_rope_kv_insert_f16";
     const SRC: &'static str = "cu/fused/qknorm_insert.cu";
@@ -151,7 +182,14 @@ impl KernelSpec for QknormRopeKvInsertF16 {
 /// `owl_qknorm_rope_kv_insert_f16_knhd` —— kNHD 单布局 f16 插池(主池 f16)
 pub struct QknormRopeKvInsertF16Knhd;
 
-#[kernel_tags("dom.fused", "role.norm", "role.rope", "role.kv_write", "phase.prefill", "kv.main.f16")]
+#[kernel_tags(
+    "dom.fused",
+    "role.norm",
+    "role.rope",
+    "role.kv_write",
+    "phase.prefill",
+    "kv.main.f16"
+)]
 impl KernelSpec for QknormRopeKvInsertF16Knhd {
     const ENTRY: &'static str = "owl_qknorm_rope_kv_insert_f16_knhd";
     const SRC: &'static str = "cu/fused/qknorm_insert.cu";
@@ -179,8 +217,11 @@ impl KernelSpec for QknormRopeKvInsertF16Knhd {
         Param::i32("w_off"),
         Param::t_out("q_out", Dtype::F16, 2),
     ];
-    const POOL: &'static [PoolAccess] =
-        &[PoolAccess::write(pools::KV_MAIN, LayoutTag::Knhd, Dtype::F16)];
+    const POOL: &'static [PoolAccess] = &[PoolAccess::write(
+        pools::KV_MAIN,
+        LayoutTag::Knhd,
+        Dtype::F16,
+    )];
     const SHAPE: crate::spec::ShapeFamily = crate::spec::ShapeFamily {
         kv_dtype: Some(Dtype::F16),
         head_dim: &[256],
@@ -195,7 +236,6 @@ impl KernelSpec for QknormRopeKvInsertF16Knhd {
 
 pub static QKNORM_ROPE_KV_INSERT_F16: KernelMeta = meta_of::<QknormRopeKvInsertF16>();
 pub static QKNORM_ROPE_KV_INSERT_F16_KNHD: KernelMeta = meta_of::<QknormRopeKvInsertF16Knhd>();
-
 
 #[cfg(test)]
 mod tests {
@@ -213,6 +253,9 @@ mod tests {
     /// 输出槽位置由 `ParamRole::Out` 决定,不靠"末位约定"猜
     #[test]
     fn out_pos_comes_from_role() {
-        assert_eq!(meta_of::<QknormRopeKvInsertF16Fp8Knhd>().out_pos(), Some(16));
+        assert_eq!(
+            meta_of::<QknormRopeKvInsertF16Fp8Knhd>().out_pos(),
+            Some(16)
+        );
     }
 }

@@ -102,7 +102,11 @@ pub async fn run<D: DeviceClient>(
                 owl_shared::log_info!(
                     "executor",
                     "停服信号({})⇒ 本拍不推进，收摊",
-                    if *stop.borrow() { "watch/SIGTERM" } else { "请求通道关闭" }
+                    if *stop.borrow() {
+                        "watch/SIGTERM"
+                    } else {
+                        "请求通道关闭"
+                    }
                 );
                 return ServiceExit::Normal;
             }
@@ -163,7 +167,10 @@ pub async fn run<D: DeviceClient>(
                                 if let Some(sink) = sinks.get(&t) {
                                     deliver(
                                         sink,
-                                        StreamEvent::CachedTokens { turn: t, cached_tokens: cached },
+                                        StreamEvent::CachedTokens {
+                                            turn: t,
+                                            cached_tokens: cached,
+                                        },
                                     )
                                     .await;
                                 }
@@ -283,23 +290,51 @@ async fn ttft_gate<D: DeviceClient>(
     running: &mut RunningEngine<D>,
     sinks: &mut HashMap<u64, mpsc::Sender<StreamEvent>>,
 ) {
+    use owl_shared::config::TtftOnExpire;
+    let action = running.boot.cfg.knobs.ttft_on_expire;
+    // 缺省 = 静默：不扫、不打印、不停止（零热路径成本）。
+    if action == TtftOnExpire::Ignore {
+        return;
+    }
     for e in running.ttft_expired(crate::running::now_ms()) {
-        owl_shared::log_warn!(
-            "ttft",
-            "turn {} 首 token 超时: 起跑后 {}ms > 预算 {}ms（prompt={} cached={} new={} tok）⇒ 强制停止",
-            e.turn,
-            e.waited_ms,
-            e.budget_ms,
-            e.prompt_tokens,
-            e.cached_tokens,
-            e.new_tokens
-        );
-        let Some(ev) = running.cancel_turn_reason(e.turn, "TTFT 超时").await else {
-            continue;
-        };
-        let tid = event_turn(&ev).unwrap_or(e.turn);
-        if let Some(sink) = sinks.remove(&tid) {
-            let _ = deliver(&sink, StreamEvent::Turn(ev)).await;
+        match action {
+            TtftOnExpire::Ignore => {}
+            TtftOnExpire::Warn => {
+                // 每个 turn 只警告一次，避免泵每拍刷屏；不取消。
+                if e.warned {
+                    continue;
+                }
+                owl_shared::log_warn!(
+                    "ttft",
+                    "turn {} 首 token 超期: 起跑后 {}ms > 预算 {}ms（prompt={} cached={} new={} tok）⇒ 仅警告，继续等待首 token",
+                    e.turn,
+                    e.waited_ms,
+                    e.budget_ms,
+                    e.prompt_tokens,
+                    e.cached_tokens,
+                    e.new_tokens
+                );
+                let _ = running.mark_ttft_warned(e.turn);
+            }
+            TtftOnExpire::Stop => {
+                owl_shared::log_warn!(
+                    "ttft",
+                    "turn {} 首 token 超时: 起跑后 {}ms > 预算 {}ms（prompt={} cached={} new={} tok）⇒ 强制停止",
+                    e.turn,
+                    e.waited_ms,
+                    e.budget_ms,
+                    e.prompt_tokens,
+                    e.cached_tokens,
+                    e.new_tokens
+                );
+                let Some(ev) = running.cancel_turn_reason(e.turn, "TTFT 超时").await else {
+                    continue;
+                };
+                let tid = event_turn(&ev).unwrap_or(e.turn);
+                if let Some(sink) = sinks.remove(&tid) {
+                    let _ = deliver(&sink, StreamEvent::Turn(ev)).await;
+                }
+            }
         }
     }
 }
@@ -363,7 +398,11 @@ async fn handle_req<D: DeviceClient>(
                 owl_shared::log_debug!("executor", "abort 回执投递失败(请求方已断开)");
             }
         }
-        Request::Tokenize { text, chat_wrap, reply } => {
+        Request::Tokenize {
+            text,
+            chat_wrap,
+            reply,
+        } => {
             let out = running.tokenize(&text, chat_wrap);
             if reply.send(out).is_err() {
                 owl_shared::log_debug!("executor", "tokenize 应答投递失败(请求方已断开)");
@@ -397,7 +436,14 @@ async fn accept<D: DeviceClient>(
     sinks: &mut HashMap<u64, mpsc::Sender<StreamEvent>>,
     req: Request,
 ) {
-    let Request::Chat { session, prompt, max_new, opts, sink } = req else {
+    let Request::Chat {
+        session,
+        prompt,
+        max_new,
+        opts,
+        sink,
+    } = req
+    else {
         owl_shared::log_warn!("executor", "accept 收到非 Chat 请求(内部错误)");
         return;
     };
@@ -422,7 +468,13 @@ async fn accept<D: DeviceClient>(
             .await;
         }
         Err(e) => {
-            deliver(&sink, StreamEvent::Rejected { err: e.into_turn_error() }).await;
+            deliver(
+                &sink,
+                StreamEvent::Rejected {
+                    err: e.into_turn_error(),
+                },
+            )
+            .await;
         }
     }
 }

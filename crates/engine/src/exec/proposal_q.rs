@@ -181,7 +181,12 @@ pub(crate) fn walk_matches_device(
     dev_tokens: &[u32],
     depth: usize,
 ) -> Result<bool, ModelError> {
-    let idx = walk_greedy(scores, unary, depth, owl_shared::config::DflashWalk::Conditional)?;
+    let idx = walk_greedy(
+        scores,
+        unary,
+        depth,
+        owl_shared::config::DflashWalk::Conditional,
+    )?;
     Ok(idx.len() == dev_tokens.len()
         && idx
             .iter()
@@ -362,16 +367,17 @@ impl DraftQ {
         let mut hit = 0usize;
         for e in 0..n {
             if current[e] != self.drafts[e] {
-                self.one_hot[e] = Some(OneHot { token: current[e], prob: 1.0 });
+                self.one_hot[e] = Some(OneHot {
+                    token: current[e],
+                    prob: 1.0,
+                });
                 self.drafts[e] = current[e];
                 hit += 1;
             }
         }
         hit
     }
-
 }
-
 
 /// 请求的 top-k/top-p 从**这一步的草稿边分**里砍掉的质量（C3 记账）。
 ///
@@ -392,7 +398,11 @@ fn truncated_mass(row: &[f32], cfg: &crate::sampler::SamplerCfg, kept: &[u32]) -
     let mut ps = [0f32; CAND];
     let mut sum = 0f32;
     for (c, &v) in row.iter().enumerate().take(CAND) {
-        let p = if v.is_finite() { ((v - mx) / cfg.temp).exp() } else { 0.0 };
+        let p = if v.is_finite() {
+            ((v - mx) / cfg.temp).exp()
+        } else {
+            0.0
+        };
         ps[c] = p;
         sum += p;
     }
@@ -443,7 +453,11 @@ pub(crate) fn accept_rejection(
         let mut scratch = logits[i * vocab..(i + 1) * vocab].to_vec();
         let p = crate::sampler::distribution(&mut scratch, cfg, hist);
         let d = drafts[i];
-        let pd = p.iter().find(|(t, _)| *t == d).map(|(_, p)| *p).unwrap_or(0.0);
+        let pd = p
+            .iter()
+            .find(|(t, _)| *t == d)
+            .map(|(_, p)| *p)
+            .unwrap_or(0.0);
         let qd = q.q_of(i, d);
         if !(qd.is_finite() && qd > 0.0) {
             return Err(ModelError::Msg(format!(
@@ -534,11 +548,18 @@ mod tests {
 
     /// 无截断的请求档（temp=1 / top-k 覆盖 16 候选 / top-p 关）
     fn cfg_plain() -> crate::sampler::SamplerCfg {
-        crate::sampler::SamplerCfg { temp: 1.0, topk: 32, topp: 1.0, rep_penalty: 1.0 }
+        crate::sampler::SamplerCfg {
+            temp: 1.0,
+            topk: 32,
+            topp: 1.0,
+            rep_penalty: 1.0,
+        }
     }
 
     fn scores(depth: usize) -> Vec<f32> {
-        (0..depth * CAND * CAND).map(|i| ((i * 17) % 29) as f32 / 4.0).collect()
+        (0..depth * CAND * CAND)
+            .map(|i| ((i * 17) % 29) as f32 / 4.0)
+            .collect()
     }
 
     /// 采样走格的输入包（缺省 `conditional` = 生产律）
@@ -592,8 +613,14 @@ mod tests {
         unary[5] = 1.0;
         unary[CAND + 9] = 1.0;
 
-        assert_eq!(walk_greedy(&sc, &unary, 2, W::Conditional).unwrap(), vec![3, 7]);
-        assert_eq!(walk_greedy(&sc, &unary, 2, W::FixedPred).unwrap(), vec![3, 11]);
+        assert_eq!(
+            walk_greedy(&sc, &unary, 2, W::Conditional).unwrap(),
+            vec![3, 7]
+        );
+        assert_eq!(
+            walk_greedy(&sc, &unary, 2, W::FixedPred).unwrap(),
+            vec![3, 11]
+        );
         assert_eq!(walk_greedy(&sc, &unary, 2, W::Unary).unwrap(), vec![5, 9]);
     }
 
@@ -602,7 +629,10 @@ mod tests {
     fn walk_ties_take_min_index() {
         use owl_shared::config::DflashWalk as W;
         let sc = vec![0.0f32; 3 * CAND * CAND];
-        assert_eq!(walk_greedy(&sc, &[], 3, W::Conditional).unwrap(), vec![0, 0, 0]);
+        assert_eq!(
+            walk_greedy(&sc, &[], 3, W::Conditional).unwrap(),
+            vec![0, 0, 0]
+        );
     }
 
     /// `unary` 臂缺边际表 ⇒ 响亮拒（不静默退成条件格）。
@@ -694,7 +724,12 @@ mod tests {
         let mut unary = vec![0f32; depth * CAND];
         unary[5] = 3.0;
         unary[CAND + 9] = 4.0;
-        let cfg = crate::sampler::SamplerCfg { temp: 0.0, topk: 20, topp: 0.95, rep_penalty: 1.0 };
+        let cfg = crate::sampler::SamplerCfg {
+            temp: 0.0,
+            topk: 20,
+            topp: 0.95,
+            rep_penalty: 1.0,
+        };
         let q = DraftQ::from_scores(QInput {
             scores: &sc,
             cand: &cand,
@@ -715,7 +750,8 @@ mod tests {
     fn q_normalizes_and_walk_is_consistent() {
         let depth = 7;
         let cand: Vec<u32> = (0..depth * CAND).map(|i| 100 + i as u32).collect();
-        let q = DraftQ::from_scores(qi(&scores(depth), &cand, depth, &cfg_plain(), 42, 1000)).unwrap();
+        let q =
+            DraftQ::from_scores(qi(&scores(depth), &cand, depth, &cfg_plain(), 42, 1000)).unwrap();
         for e in 0..depth {
             let s: f32 = (0..CAND).map(|c| q.q_of(e, cand[e * CAND + c])).sum();
             assert!((s - 1.0).abs() < 1e-5, "e={e} sum={s}");
@@ -730,7 +766,8 @@ mod tests {
         // 现在回退到按 p 抽 —— 任何数值情形下都要有合法输出。
         let depth = 1;
         let cand: Vec<u32> = (0..depth * CAND).map(|i| 500 + i as u32).collect();
-        let mut q = DraftQ::from_scores(qi(&scores(depth), &cand, depth, &cfg_plain(), 3, 0)).unwrap();
+        let mut q =
+            DraftQ::from_scores(qi(&scores(depth), &cand, depth, &cfg_plain(), 3, 0)).unwrap();
         let t0 = cand[0];
         q.force_one_hot(0, t0); // q = δ(t0)
         let p = vec![(t0, 1.0f32)]; // p 也是 δ(t0) ⇒ 残差全 0
@@ -757,7 +794,12 @@ mod tests {
         qlog[3] = 0.0;
         qlog[4] = -1000.0;
         let cand: Vec<u32> = (0..CAND as u32).collect();
-        let cfg = crate::sampler::SamplerCfg { temp: 1.0, topk: 16, topp: 1.0, rep_penalty: 1.0 };
+        let cfg = crate::sampler::SamplerCfg {
+            temp: 1.0,
+            topk: 16,
+            topp: 1.0,
+            rep_penalty: 1.0,
+        };
         let mut cnt = [0usize; 4];
         let n = 20_000usize;
         for s in 0..n {
@@ -765,7 +807,16 @@ mod tests {
             // proposal_q 每轮按 seed 重新抽签 ⇒ draft ~ q（不是固定单点）。
             let q = DraftQ::from_scores(qi(&qlog, &cand, depth, &cfg, s as u64, 0)).unwrap();
             let (_, emitted, _) = accept_rejection(
-                &logits, vocab, 2, q.drafts(), depth, &q, &cfg, &mut hist, s as u64, 0,
+                &logits,
+                vocab,
+                2,
+                q.drafts(),
+                depth,
+                &q,
+                &cfg,
+                &mut hist,
+                s as u64,
+                0,
             )
             .unwrap();
             let t = emitted[0];
@@ -777,7 +828,10 @@ mod tests {
         for i in 0..4 {
             let want = (logits[i] - 2.0).exp() / z;
             let got = cnt[i] as f32 / n as f32;
-            assert!((got - want).abs() < 0.025, "token {i}: got {got:.4} want {want:.4}");
+            assert!(
+                (got - want).abs() < 0.025,
+                "token {i}: got {got:.4} want {want:.4}"
+            );
         }
     }
 
@@ -786,11 +840,21 @@ mod tests {
     fn q_honours_request_topk() {
         let depth = 3usize;
         let cand: Vec<u32> = (0..depth * CAND).map(|i| 100 + i as u32).collect();
-        let cfg = crate::sampler::SamplerCfg { temp: 0.7, topk: 4, topp: 1.0, rep_penalty: 1.0 };
+        let cfg = crate::sampler::SamplerCfg {
+            temp: 0.7,
+            topk: 4,
+            topp: 1.0,
+            rep_penalty: 1.0,
+        };
         let q = DraftQ::from_scores(qi(&scores(depth), &cand, depth, &cfg, 5, 0)).unwrap();
         for e in 0..depth {
-            let support = (0..CAND).filter(|c| q.q_of(e, cand[e * CAND + c]) > 0.0).count();
-            assert!(support <= 4, "e={e} 支撑 {support} > 请求 top_k=4(q 未走请求变换)");
+            let support = (0..CAND)
+                .filter(|c| q.q_of(e, cand[e * CAND + c]) > 0.0)
+                .count();
+            assert!(
+                support <= 4,
+                "e={e} 支撑 {support} > 请求 top_k=4(q 未走请求变换)"
+            );
             let sum: f32 = (0..CAND).map(|c| q.q_of(e, cand[e * CAND + c])).sum();
             assert!((sum - 1.0).abs() < 1e-5, "e={e} Σq={sum}");
         }
@@ -814,14 +878,23 @@ mod tests {
         let depth = 2usize;
         let cand: Vec<u32> = (0..depth * CAND).map(|i| 100 + i as u32).collect();
         let sc = scores(depth);
-        let cfg = crate::sampler::SamplerCfg { temp: 0.0, topk: 20, topp: 0.95, rep_penalty: 1.0 };
+        let cfg = crate::sampler::SamplerCfg {
+            temp: 0.0,
+            topk: 20,
+            topp: 0.95,
+            rep_penalty: 1.0,
+        };
         let q = DraftQ::from_scores(qi(&sc, &cand, depth, &cfg, 9, 0)).unwrap();
         // 第 0 步 argmax(row0)
         let row0 = &sc[..CAND];
         let best = row0
             .iter()
             .enumerate()
-            .max_by(|a, b| a.1.partial_cmp(b.1).unwrap_or(std::cmp::Ordering::Equal).then(b.0.cmp(&a.0)))
+            .max_by(|a, b| {
+                a.1.partial_cmp(b.1)
+                    .unwrap_or(std::cmp::Ordering::Equal)
+                    .then(b.0.cmp(&a.0))
+            })
             .map(|(c, _)| c)
             .unwrap();
         assert_eq!(q.q_of(0, cand[best]), 1.0, "temp=0 ⇒ one-hot(argmax)");
@@ -837,10 +910,18 @@ mod tests {
         let depth = 1usize; // 单步:prev 恒 0 ⇒ 行 = scores[..CAND]
         let cand: Vec<u32> = (0..depth * CAND).map(|i| 100 + i as u32).collect();
         let sc = scores(depth);
-        let cfg = crate::sampler::SamplerCfg { temp: 0.8, topk: 6, topp: 0.9, rep_penalty: 1.0 };
+        let cfg = crate::sampler::SamplerCfg {
+            temp: 0.8,
+            topk: 6,
+            topp: 0.9,
+            rep_penalty: 1.0,
+        };
         let q = DraftQ::from_scores(qi(&sc, &cand, depth, &cfg, 3, 0)).unwrap();
-        let row_cands: Vec<(f32, u32)> =
-            sc[..CAND].iter().enumerate().map(|(c, &v)| (v, cand[c])).collect();
+        let row_cands: Vec<(f32, u32)> = sc[..CAND]
+            .iter()
+            .enumerate()
+            .map(|(c, &v)| (v, cand[c]))
+            .collect();
         let p = distribution_of_cands(&row_cands, &cfg);
         let mut want: Vec<(u32, f32)> = p.clone();
         let mut got: Vec<(u32, f32)> = cand[..CAND]
@@ -854,7 +935,13 @@ mod tests {
         assert_eq!(want.len(), got.len(), "支撑大小不同:q={got:?} p={want:?}");
         for (w, g) in want.iter().zip(got.iter()) {
             assert_eq!(w.0, g.0, "支撑集不同");
-            assert!((w.1 - g.1).abs() < 1e-6, "token {} 概率不同:{} vs {}", w.0, w.1, g.1);
+            assert!(
+                (w.1 - g.1).abs() < 1e-6,
+                "token {} 概率不同:{} vs {}",
+                w.0,
+                w.1,
+                g.1
+            );
         }
     }
 
@@ -862,7 +949,8 @@ mod tests {
     fn one_hot_reconcile() {
         let depth = 3;
         let cand: Vec<u32> = (0..depth * CAND).map(|i| 100 + i as u32).collect();
-        let mut q = DraftQ::from_scores(qi(&scores(depth), &cand, depth, &cfg_plain(), 7, 0)).unwrap();
+        let mut q =
+            DraftQ::from_scores(qi(&scores(depth), &cand, depth, &cfg_plain(), 7, 0)).unwrap();
         let mut cur = q.drafts().to_vec();
         cur[1] = 999;
         assert_eq!(q.reconcile(&cur), 1);
@@ -909,7 +997,11 @@ pub(crate) fn accept_rejection_sparse(
     let mut emitted: Vec<u32> = Vec::with_capacity(depth + 1);
     for (i, p) in p_rows.iter().enumerate().take(depth) {
         let d = drafts[i];
-        let pd = p.iter().find(|(t, _)| *t == d).map(|(_, p)| *p).unwrap_or(0.0);
+        let pd = p
+            .iter()
+            .find(|(t, _)| *t == d)
+            .map(|(_, p)| *p)
+            .unwrap_or(0.0);
         let qd = q.q_of(i, d);
         if !(qd.is_finite() && qd > 0.0) {
             return Err(ModelError::Msg(format!(
@@ -947,7 +1039,12 @@ mod sparse_equivalence {
     const VOCAB: usize = 256;
 
     fn cfg() -> SamplerCfg {
-        SamplerCfg { temp: 0.7, topk: 20, topp: 0.95, rep_penalty: 1.0 }
+        SamplerCfg {
+            temp: 0.7,
+            topk: 20,
+            topp: 0.95,
+            rep_penalty: 1.0,
+        }
     }
 
     /// 采样走格的输入包（本模块只用生产缺省 `conditional`）
@@ -996,8 +1093,7 @@ mod sparse_equivalence {
                 .then(a.cmp(&b))
         });
         idx.truncate(32);
-        let mut v: Vec<(f32, u32)> =
-            idx.into_iter().map(|i| (logits[i], i as u32)).collect();
+        let mut v: Vec<(f32, u32)> = idx.into_iter().map(|i| (logits[i], i as u32)).collect();
         v.sort_unstable_by_key(|&(_, id)| id);
         v
     }
@@ -1035,14 +1131,31 @@ mod sparse_equivalence {
                 let flat: Vec<f32> = rows.iter().flatten().copied().collect();
                 let mut h_full = Vec::new();
                 let a = accept_rejection(
-                    &flat, VOCAB, depth + 1, q.drafts(), depth, &q, &cfg, &mut h_full, seed as u64, pos,
+                    &flat,
+                    VOCAB,
+                    depth + 1,
+                    q.drafts(),
+                    depth,
+                    &q,
+                    &cfg,
+                    &mut h_full,
+                    seed as u64,
+                    pos,
                 );
                 // 稀疏版
-                let p_rows: Vec<Vec<(u32, f32)>> =
-                    rows.iter().map(|r| distribution_of_cands(&top32(r), &cfg)).collect();
+                let p_rows: Vec<Vec<(u32, f32)>> = rows
+                    .iter()
+                    .map(|r| distribution_of_cands(&top32(r), &cfg))
+                    .collect();
                 let mut h_sp = Vec::new();
                 let b = accept_rejection_sparse(
-                    &p_rows, q.drafts(), depth, &q, &mut h_sp, seed as u64, pos,
+                    &p_rows,
+                    q.drafts(),
+                    depth,
+                    &q,
+                    &mut h_sp,
+                    seed as u64,
+                    pos,
                 );
                 let a = a.expect("整行版");
                 let b = b.expect("稀疏版");

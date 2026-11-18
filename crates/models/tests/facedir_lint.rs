@@ -18,13 +18,16 @@ const FORBIDDEN_IN_MODELS: &[&str] = &[
 ];
 
 fn walk_rs(dir: &Path, hits: &mut Vec<String>) {
-    let entries = std::fs::read_dir(dir).unwrap_or_else(|e| panic!("read_dir {}: {e}", dir.display()));
+    let entries =
+        std::fs::read_dir(dir).unwrap_or_else(|e| panic!("read_dir {}: {e}", dir.display()));
     for e in entries.flatten() {
         let p = e.path();
         if p.is_dir() {
             walk_rs(&p, hits);
         } else if p.extension().is_some_and(|x| x == "rs") {
-            let Ok(src) = std::fs::read_to_string(&p) else { continue };
+            let Ok(src) = std::fs::read_to_string(&p) else {
+                continue;
+            };
             for bad in FORBIDDEN_IN_MODELS {
                 if src.contains(bad) {
                     hits.push(format!("{}: 引用服务端面 `{bad}`", p.display()));
@@ -65,13 +68,16 @@ fn layers_shall_not_touch_kernels() {
 }
 
 fn walk_literal(dir: &Path, literal: &str, hits: &mut Vec<String>) {
-    let entries = std::fs::read_dir(dir).unwrap_or_else(|e| panic!("read_dir {}: {e}", dir.display()));
+    let entries =
+        std::fs::read_dir(dir).unwrap_or_else(|e| panic!("read_dir {}: {e}", dir.display()));
     for e in entries.flatten() {
         let p = e.path();
         if p.is_dir() {
             walk_literal(&p, literal, hits);
         } else if p.extension().is_some_and(|x| x == "rs") {
-            let Ok(src) = std::fs::read_to_string(&p) else { continue };
+            let Ok(src) = std::fs::read_to_string(&p) else {
+                continue;
+            };
             if src.contains(literal) {
                 hits.push(format!("{}: 含 `{literal}`", p.display()));
             }

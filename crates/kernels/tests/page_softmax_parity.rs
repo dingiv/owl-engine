@@ -95,13 +95,18 @@ fn compile(ctx: &Arc<CudaContext>, name: &str) -> cudarc::driver::CudaFunction {
         },
     )
     .unwrap_or_else(|e| panic!("nvrtc({name}): {e:?}"));
-    let m = ctx.load_module(ptx).unwrap_or_else(|e| panic!("module({name}): {e:?}"));
-    m.load_function(name).unwrap_or_else(|e| panic!("fn({name}): {e:?}"))
+    let m = ctx
+        .load_module(ptx)
+        .unwrap_or_else(|e| panic!("module({name}): {e:?}"));
+    m.load_function(name)
+        .unwrap_or_else(|e| panic!("fn({name}): {e:?}"))
 }
 
 fn run(ctx: &Arc<CudaContext>, stream: &Arc<CudaStream>) -> Vec<f32> {
     // 设备缓冲：q / mk / gqa / z / ms / out
-    let q_bits: Vec<u16> = (0..W * HQ * HD).map(|i| f16_bits(host_q(i / (HQ * HD), (i / HD) % HQ, i % HD))).collect();
+    let q_bits: Vec<u16> = (0..W * HQ * HD)
+        .map(|i| f16_bits(host_q(i / (HQ * HD), (i / HD) % HQ, i % HD)))
+        .collect();
     let mut d_q = unsafe { stream.alloc::<u16>(q_bits.len()) }.unwrap();
     stream.memcpy_htod(&q_bits, &mut d_q).unwrap();
 
@@ -137,9 +142,16 @@ fn run(ctx: &Arc<CudaContext>, stream: &Arc<CudaStream>) -> Vec<f32> {
         let (w, hq, hkv, hd, nb) = (W as i32, HQ as i32, HKV as i32, HD as i32, NB as i32);
         let scale = 1.0f32 / (HD as f32).sqrt();
         let mut b = stream.launch_builder(&f_logits);
-        b.arg(&qp).arg(&mkp).arg(&gp)
-            .arg(&w).arg(&hq).arg(&hkv).arg(&hd).arg(&nb)
-            .arg(&scale).arg(&zp);
+        b.arg(&qp)
+            .arg(&mkp)
+            .arg(&gp)
+            .arg(&w)
+            .arg(&hq)
+            .arg(&hkv)
+            .arg(&hd)
+            .arg(&nb)
+            .arg(&scale)
+            .arg(&zp);
         unsafe {
             b.launch(LaunchConfig {
                 grid_dim: (NB.div_ceil(BT) as u32, HKV as u32, 1),
@@ -162,7 +174,13 @@ fn run(ctx: &Arc<CudaContext>, stream: &Arc<CudaStream>) -> Vec<f32> {
 
         let layers_i = LAYERS as i32;
         let mut b = stream.launch_builder(&f_acc);
-        b.arg(&zp).arg(&msp).arg(&w).arg(&hq).arg(&nb).arg(&layers_i).arg(&op);
+        b.arg(&zp)
+            .arg(&msp)
+            .arg(&w)
+            .arg(&hq)
+            .arg(&nb)
+            .arg(&layers_i)
+            .arg(&op);
         unsafe {
             b.launch(LaunchConfig {
                 grid_dim: (NB.div_ceil(BT) as u32, 4, 1),
@@ -275,9 +293,16 @@ fn page_softmax_bench_production_shape() {
             let (w, hq, hkv, hd, nb) =
                 (BW_ as i32, BHQ as i32, BHKV as i32, BHD as i32, BNB as i32);
             let mut b = stream.launch_builder(&f_logits);
-            b.arg(&qp).arg(&mkp).arg(&gp)
-                .arg(&w).arg(&hq).arg(&hkv).arg(&hd).arg(&nb)
-                .arg(&scale).arg(&zp);
+            b.arg(&qp)
+                .arg(&mkp)
+                .arg(&gp)
+                .arg(&w)
+                .arg(&hq)
+                .arg(&hkv)
+                .arg(&hd)
+                .arg(&nb)
+                .arg(&scale)
+                .arg(&zp);
             unsafe {
                 b.launch(LaunchConfig {
                     grid_dim: (BNB.div_ceil(BT) as u32, BHKV as u32, 1),
@@ -297,7 +322,13 @@ fn page_softmax_bench_production_shape() {
             }
             .unwrap();
             let mut b = stream.launch_builder(&f_acc);
-            b.arg(&zp).arg(&msp).arg(&w).arg(&hq).arg(&nb).arg(&layers_i).arg(&op);
+            b.arg(&zp)
+                .arg(&msp)
+                .arg(&w)
+                .arg(&hq)
+                .arg(&nb)
+                .arg(&layers_i)
+                .arg(&op);
             unsafe {
                 b.launch(LaunchConfig {
                     grid_dim: (BNB.div_ceil(BT) as u32, 8, 1),
@@ -323,18 +354,52 @@ fn page_softmax_bench_production_shape() {
         for _ in 0..BL {
             if which == 1 {
                 let mut b = stream.launch_builder(&f_logits);
-                b.arg(&qp).arg(&mkp).arg(&gp)
-                    .arg(&w).arg(&hq).arg(&hkv).arg(&hd).arg(&nb)
-                    .arg(&scale).arg(&zp);
-                unsafe { b.launch(LaunchConfig { grid_dim: (BNB.div_ceil(BT) as u32, BW_ as u32, 1), block_dim: (128,1,1), shared_mem_bytes: ((BHQ*BHD + BT*BHD)*2) as u32 }) }.unwrap();
+                b.arg(&qp)
+                    .arg(&mkp)
+                    .arg(&gp)
+                    .arg(&w)
+                    .arg(&hq)
+                    .arg(&hkv)
+                    .arg(&hd)
+                    .arg(&nb)
+                    .arg(&scale)
+                    .arg(&zp);
+                unsafe {
+                    b.launch(LaunchConfig {
+                        grid_dim: (BNB.div_ceil(BT) as u32, BW_ as u32, 1),
+                        block_dim: (128, 1, 1),
+                        shared_mem_bytes: ((BHQ * BHD + BT * BHD) * 2) as u32,
+                    })
+                }
+                .unwrap();
             } else if which == 2 {
                 let mut b = stream.launch_builder(&f_maxsum);
                 b.arg(&zp).arg(&w).arg(&hq).arg(&nb).arg(&msp);
-                unsafe { b.launch(LaunchConfig { grid_dim: (BW_ as u32, BHQ as u32, 1), block_dim: (256,1,1), shared_mem_bytes: 0 }) }.unwrap();
+                unsafe {
+                    b.launch(LaunchConfig {
+                        grid_dim: (BW_ as u32, BHQ as u32, 1),
+                        block_dim: (256, 1, 1),
+                        shared_mem_bytes: 0,
+                    })
+                }
+                .unwrap();
             } else {
                 let mut b = stream.launch_builder(&f_acc);
-                b.arg(&zp).arg(&msp).arg(&w).arg(&hq).arg(&nb).arg(&layers_i).arg(&op);
-                unsafe { b.launch(LaunchConfig { grid_dim: (BNB.div_ceil(BT) as u32, 8, 1), block_dim: (128,1,1), shared_mem_bytes: 0 }) }.unwrap();
+                b.arg(&zp)
+                    .arg(&msp)
+                    .arg(&w)
+                    .arg(&hq)
+                    .arg(&nb)
+                    .arg(&layers_i)
+                    .arg(&op);
+                unsafe {
+                    b.launch(LaunchConfig {
+                        grid_dim: (BNB.div_ceil(BT) as u32, 8, 1),
+                        block_dim: (128, 1, 1),
+                        shared_mem_bytes: 0,
+                    })
+                }
+                .unwrap();
             }
         }
         stream.synchronize().unwrap();
@@ -342,12 +407,20 @@ fn page_softmax_bench_production_shape() {
     for which in 1..=3u8 {
         only(which);
         let t = std::time::Instant::now();
-        for _ in 0..REPS { only(which); }
-        eprintln!("[page-softmax bench] 段 ①②③ 之 {which} = {:.2} ms", t.elapsed().as_secs_f64()*1000.0/REPS as f64);
+        for _ in 0..REPS {
+            only(which);
+        }
+        eprintln!(
+            "[page-softmax bench] 段 ①②③ 之 {which} = {:.2} ms",
+            t.elapsed().as_secs_f64() * 1000.0 / REPS as f64
+        );
     }
     eprintln!(
         "[page-softmax bench] nb={BNB} W={BW_} L={BL} hq={BHQ} hkv={BHKV} hd={BHD} ⇒ **{ms:.2} ms/边界**(整 16 层)"
     );
     // 验收线：≤ 20 ms（host 同几何 ≈ 4.4 s ⇒ 200× 以上即可装机）
-    assert!(ms <= 20.0, "GPU page-softmax 太慢:{ms:.2} ms > 20 ms(装机线)");
+    assert!(
+        ms <= 20.0,
+        "GPU page-softmax 太慢:{ms:.2} ms > 20 ms(装机线)"
+    );
 }

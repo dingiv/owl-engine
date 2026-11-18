@@ -6,8 +6,8 @@
 use crate::contract::{Bytes, InvariantBox, LaunchMsg, OpError, OpId};
 use crate::device::ScratchBuf;
 
-use crate::family::gdn_scalar::asset;
 use crate::client::gdn_scalar::{GdnScalarCall, GDN_SCALAR};
+use crate::family::gdn_scalar::asset;
 use crate::registry::{FamilyGuard, KernelFamily};
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -36,7 +36,6 @@ impl KernelFamily for GdnScalarRuntime {
         Self::ID
     }
 
-
     /// 构造函数:单核 cubin + cast nvrtc + soff 预钉
     fn assemble(
         res: &mut dyn crate::device::DeviceRes,
@@ -56,18 +55,26 @@ impl KernelFamily for GdnScalarRuntime {
         Ok(FamilyGuard::boxed(me))
     }
 
-    fn run(&mut self, msg: &LaunchMsg, res: &mut dyn crate::device::DeviceRes, exec: &mut crate::device::Exec) -> Result<Bytes, OpError> {
+    fn run(
+        &mut self,
+        msg: &LaunchMsg,
+        res: &mut dyn crate::device::DeviceRes,
+        exec: &mut crate::device::Exec,
+    ) -> Result<Bytes, OpError> {
         let (call, out) = GdnScalarCall::parse(msg)?;
         // 拆借置顶(res/exec 之后全走局部;env 不再触碰)
         let shape = call.shape();
         let t = shape.t as usize;
         let hv = shape.nv as usize;
         let kd = shape.kd as usize;
-        let k = self.k.as_ref().ok_or_else(|| OpError::Asset { op: OP.0.to_string(), detail: "未装载".into() })?;
-        let cast = self
-            .cast_f32_f16
-            .as_ref()
-            .ok_or_else(|| OpError::Asset { op: OP.0.to_string(), detail: "cast 未装载".into() })?;
+        let k = self.k.as_ref().ok_or_else(|| OpError::Asset {
+            op: OP.0.to_string(),
+            detail: "未装载".into(),
+        })?;
+        let cast = self.cast_f32_f16.as_ref().ok_or_else(|| OpError::Asset {
+            op: OP.0.to_string(),
+            detail: "cast 未装载".into(),
+        })?;
 
         // ── o_f32 容量(扩容 = 坟场,A1.7)──
         if t > self.t_cap {
@@ -82,12 +89,14 @@ impl KernelFamily for GdnScalarRuntime {
 
         // ── soff:按 T 键不变盒 + upload(捕获窗 async 节点,回放恒读盒)──
         let soff = self.soff.as_ref().unwrap().ptr;
-        let box_ = self
-            .soff_boxes
-            .entry(t)
-            .or_insert_with(|| {
-                InvariantBox::freeze([0i32, t as i32].iter().flat_map(|v| v.to_le_bytes()).collect())
-            });
+        let box_ = self.soff_boxes.entry(t).or_insert_with(|| {
+            InvariantBox::freeze(
+                [0i32, t as i32]
+                    .iter()
+                    .flat_map(|v| v.to_le_bytes())
+                    .collect(),
+            )
+        });
         // 不变盒 API(非裸切片):捕获窗内合规 —— 回放重放 memcpy 时源恒为
         // 这份冻结盒,与发射时序无关(设计 §4.3e 三条正路之②)
         res.upload_invariant(soff, box_)?;
@@ -123,10 +132,18 @@ impl KernelFamily for GdnScalarRuntime {
         let out_p = res.resolve(out.id)?;
         let n_out = t * hv * kd;
         exec.launch(
-            res, OP, cast, "cast_out", (n_out.div_ceil(256) as u32, 1, 1), (256, 1, 1), 0,
-            &[crate::device::LaunchVal::Ptr(o32),
-              crate::device::LaunchVal::I32(n_out as i32),
-              crate::device::LaunchVal::Ptr(out_p)],
+            res,
+            OP,
+            cast,
+            "cast_out",
+            (n_out.div_ceil(256) as u32, 1, 1),
+            (256, 1, 1),
+            0,
+            &[
+                crate::device::LaunchVal::Ptr(o32),
+                crate::device::LaunchVal::I32(n_out as i32),
+                crate::device::LaunchVal::Ptr(out_p),
+            ],
         )?;
         Ok(out)
     }

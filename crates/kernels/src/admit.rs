@@ -76,9 +76,7 @@ Turing(sm_75) 上跑不了,请换 f16 基线或换卡",
                     );
                 }
                 if matches!(self, Self::MarlinW4A8) && !caps.int8_mma {
-                    return Admit::Deny(
-                        "W4A8 需要 int8 张量核(sm_75+ 才有)",
-                    );
+                    return Admit::Deny("W4A8 需要 int8 张量核(sm_75+ 才有)");
                 }
                 Admit::Ok
             }
@@ -87,9 +85,7 @@ Turing(sm_75) 上跑不了,请换 f16 基线或换卡",
                 if caps.int8_mma {
                     Admit::Ok
                 } else {
-                    Admit::Deny(
-                        "GGUF MMQ 需要 int8 张量核(sm_75+)",
-                    )
+                    Admit::Deny("GGUF MMQ 需要 int8 张量核(sm_75+)")
                 }
             }
             // NVFP4 是 arch-specific('a')指令集:除 FP4 张量核外还要求 compute_120a 目标
@@ -106,9 +102,7 @@ Turing(sm_75) 上跑不了,请换 f16 基线或换卡",
                 if caps.cp_async {
                     Admit::Ok
                 } else {
-                    Admit::Deny(
-                        "该注意力核依赖 cp.async(sm_80+)",
-                    )
+                    Admit::Deny("该注意力核依赖 cp.async(sm_80+)")
                 }
             }
             // **实测硬门(2026-10-28 证伪并调转)**:sm_120 上跑坏的是**标量臂**,不是 chunked。
@@ -120,9 +114,7 @@ Turing(sm_75) 上跑不了,请换 f16 基线或换卡",
             // 标量臂只在 verify(T>1) 形状坏:T=1 decode 与 prefill 都正常。
             Self::GdnChunked => {
                 if !caps.cp_async {
-                    return Admit::Deny(
-                        "GDN chunked 依赖 cp.async(sm_80+)",
-                    );
+                    return Admit::Deny("GDN chunked 依赖 cp.async(sm_80+)");
                 }
                 Admit::Ok
             }
@@ -153,7 +145,10 @@ pub struct AdmitCtx {
 
 impl AdmitCtx {
     pub fn of(arch: Arch) -> Self {
-        Self { arch, spec_depth: 0 }
+        Self {
+            arch,
+            spec_depth: 0,
+        }
     }
     pub fn with_spec(mut self, depth: usize) -> Self {
         self.spec_depth = depth;

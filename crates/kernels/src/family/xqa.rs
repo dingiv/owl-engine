@@ -43,24 +43,20 @@ pub const PREFILL_XQA: &str = "owl_xqa_prefill";
 ///   sz q_scale_bits, sz sm_count, sz stride_page, sz stride_token,
 ///   sz stride_head]`
 /// q_scale 以 `f32::to_bits` 过线(= attn_scale·sqrt(hd);核内再除 sqrt(hd))。
-pub const VERIFY_XQA_SLOTS: &str =
-    "[T q, T k_cache, T v_cache, T page_table, T seq_lens, T mask, \
+pub const VERIFY_XQA_SLOTS: &str = "[T q, T k_cache, T v_cache, T page_table, T seq_lens, T mask, \
      T semaphores, T scratch, T wr, O out, sz q_seq_len, sz hkv, sz hd, sz page, \
      sz max_context_length_len, sz q_scale_bits, sz sm_count, sz stride_page, \
      sz stride_token, sz stride_head]";
 /// **线槽序权威**(plain type-list;`lower_kernel`/`foreign_sig` 消费,
 /// 必须与层侧 `.arg` 链同序:9 入参 T + O 输出 + 10 sz)
-pub const VERIFY_XQA_SIG: &str =
-    "T,T,T,T,T,T,T,T,T,O,sz,sz,sz,sz,sz,sz,sz,sz,sz,sz";
+pub const VERIFY_XQA_SIG: &str = "T,T,T,T,T,T,T,T,T,O,sz,sz,sz,sz,sz,sz,sz,sz,sz,sz";
 /// **decode 臂线槽序**:与 verify **逐字同型**(两份实例化签名一致,q=1 时
 /// mask 仍走 SPEC_DEC 掩码路径 —— 只需 bit0=1)。分列常量只为"臂/名成对律"
 /// 与将来若真分叉时留单点改口。
-pub const DECODE_XQA_SIG: &str =
-    "T,T,T,T,T,T,T,T,T,O,sz,sz,sz,sz,sz,sz,sz,sz,sz,sz";
+pub const DECODE_XQA_SIG: &str = "T,T,T,T,T,T,T,T,T,O,sz,sz,sz,sz,sz,sz,sz,sz,sz,sz";
 /// **prefill 臂线槽序**:与 verify/decode **逐字同型**(第三份"臂"共用同一份
 /// 实例化与资产 —— 差别只在 host 侧几何(prefill 强制单块)与表件来源)。
-pub const PREFILL_XQA_SIG: &str =
-    "T,T,T,T,T,T,T,T,T,O,sz,sz,sz,sz,sz,sz,sz,sz,sz,sz";
+pub const PREFILL_XQA_SIG: &str = "T,T,T,T,T,T,T,T,T,O,sz,sz,sz,sz,sz,sz,sz,sz,sz,sz";
 /// XQA 工作区(参考实现给 256MiB;持久复用)
 pub const XQA_SCRATCH_BYTES: usize = 256 * 1024 * 1024;
 
@@ -92,7 +88,10 @@ mod tests {
     #[test]
     fn scratch_floor_is_a_floor() {
         assert!(scratch_size_check(XQA_SCRATCH_FLOOR_BYTES).is_ok());
-        assert!(scratch_size_check(32 << 20).is_ok(), "生产定档 32MiB 应放行");
+        assert!(
+            scratch_size_check(32 << 20).is_ok(),
+            "生产定档 32MiB 应放行"
+        );
         let e = scratch_size_check(XQA_SCRATCH_FLOOR_BYTES - 1).unwrap_err();
         assert!(e.contains("scratch 块账长"), "拒语须指名槽位与账长: {e}");
         assert!(scratch_size_check(4).is_err(), "零容量/1 word 块应拒");
@@ -224,7 +223,9 @@ impl XqaConsts {
             1
         } else {
             let by_sm = (sm_count / (batch.max(1) * nb_k_heads.max(1))).max(1);
-            by_sm.min(div_up(max_context_length_len, self.cta_tile_x)).min(nsub_cap.max(1))
+            by_sm
+                .min(div_up(max_context_length_len, self.cta_tile_x))
+                .min(nsub_cap.max(1))
         };
         self.geometry(nb_sub_seq, nb_k_heads, q_seq_len)
     }
@@ -247,7 +248,7 @@ impl XqaConsts {
         self.geometry(nb_sub_seq, nb_k_heads, q_seq_len)
     }
 
-/// **单块几何**(KV-split 关;prefill 臂契约;自 `feat/prefill-graph` 合入)。
+    /// **单块几何**(KV-split 关;prefill 臂契约;自 `feat/prefill-graph` 合入)。
     ///
     /// 为什么 prefill 不要 KV-split:prefill 的 `grid.y` =
     /// `nbKHeads · ceil(q·headGrp / rowsPerBlock)` 已经把 SM 喂饱
@@ -289,7 +290,11 @@ impl XqaConsts {
             .saturating_mul(self.head_grp.max(1))
             .div_ceil(self.rows_per_block.max(1));
         let block = (self.cta_x, self.cta_y, self.cta_z);
-        ((nb_sub_seq, nb_k_heads * nb_token_blocks, 1), block, self.smem)
+        (
+            (nb_sub_seq, nb_k_heads * nb_token_blocks, 1),
+            block,
+            self.smem,
+        )
     }
     /// `maxNbPagesPerSeq = maxSeqLen / tokensPerPage`(exactDiv)
     pub fn max_nb_pages_per_seq(&self, max_context_length_len: u32) -> u32 {
@@ -321,7 +326,9 @@ impl KVCacheList {
     pub fn as_launch_val(&self) -> crate::contract::LaunchVal {
         let p = self as *const Self as *const u8;
         // SAFETY: size_of == 40 已由上面的 const 断言锁死;只读
-        crate::contract::LaunchVal::blob(unsafe { std::slice::from_raw_parts(p, std::mem::size_of::<Self>()) })
+        crate::contract::LaunchVal::blob(unsafe {
+            std::slice::from_raw_parts(p, std::mem::size_of::<Self>())
+        })
     }
 }
 /// 一次发射的全部实参(与 `kernel_mha` 形参逐位对位;`SPEC_DEC=1` 实例化)
@@ -395,34 +402,59 @@ pub fn load_for_probe(
     ctx: &std::sync::Arc<cudarc::driver::CudaContext>,
     variant: &str,
 ) -> Result<(cudarc::driver::CudaFunction, XqaConsts), crate::contract::OpError> {
-    let bytes = crate::family::cubins::xqa_asset(variant).ok_or_else(|| crate::contract::OpError::Asset {
-        op: "xqa".into(),
-        detail: format!("资产 {variant} 不存在(feature `xqa`?)"),
+    let bytes = crate::family::cubins::xqa_asset(variant).ok_or_else(|| {
+        crate::contract::OpError::Asset {
+            op: "xqa".into(),
+            detail: format!("资产 {variant} 不存在(feature `xqa`?)"),
+        }
     })?;
     let module = ctx
         .load_module(cudarc::nvrtc::Ptx::from_binary(bytes.to_vec()))
-        .map_err(|e| crate::contract::OpError::Asset { op: "xqa".into(), detail: format!("load {variant}: {e:?}") })?;
+        .map_err(|e| crate::contract::OpError::Asset {
+            op: "xqa".into(),
+            detail: format!("load {variant}: {e:?}"),
+        })?;
     let probe = module
         .load_function(SYM_CONSTS)
-        .map_err(|e| crate::contract::OpError::Asset { op: "xqa".into(), detail: format!("{SYM_CONSTS}: {e:?}") })?;
+        .map_err(|e| crate::contract::OpError::Asset {
+            op: "xqa".into(),
+            detail: format!("{SYM_CONSTS}: {e:?}"),
+        })?;
     let stream = ctx.default_stream();
-    let d = stream.alloc_zeros::<u32>(CONSTS_SLOTS).map_err(|e| crate::contract::OpError::Asset {
-        op: "xqa".into(),
-        detail: format!("consts alloc: {e:?}"),
-    })?;
+    let d =
+        stream
+            .alloc_zeros::<u32>(CONSTS_SLOTS)
+            .map_err(|e| crate::contract::OpError::Asset {
+                op: "xqa".into(),
+                detail: format!("consts alloc: {e:?}"),
+            })?;
     let (p, _g) = cudarc::driver::DevicePtr::device_ptr(&d, &stream);
     let vals = [crate::contract::LaunchVal::Ptr(p)];
-    crate::device::launch_vals(&stream, &probe, (1, 1, 1), (32, 1, 1), 0, &vals)
-        .map_err(|e| crate::contract::OpError::Asset { op: "xqa".into(), detail: format!("consts probe: {e:?}") })?;
-    stream.synchronize().map_err(|e| crate::contract::OpError::Asset { op: "xqa".into(), detail: format!("sync: {e:?}") })?;
-    let slots: Vec<u32> = stream.clone_dtoh(&d).map_err(|e| crate::contract::OpError::Asset {
-        op: "xqa".into(),
-        detail: format!("consts d2h: {e:?}"),
+    crate::device::launch_vals(&stream, &probe, (1, 1, 1), (32, 1, 1), 0, &vals).map_err(|e| {
+        crate::contract::OpError::Asset {
+            op: "xqa".into(),
+            detail: format!("consts probe: {e:?}"),
+        }
     })?;
+    stream
+        .synchronize()
+        .map_err(|e| crate::contract::OpError::Asset {
+            op: "xqa".into(),
+            detail: format!("sync: {e:?}"),
+        })?;
+    let slots: Vec<u32> = stream
+        .clone_dtoh(&d)
+        .map_err(|e| crate::contract::OpError::Asset {
+            op: "xqa".into(),
+            detail: format!("consts d2h: {e:?}"),
+        })?;
     let consts = XqaConsts::from_slots(&slots)?;
     let kernel = module
         .load_function(SYM_KERNEL)
-        .map_err(|e| crate::contract::OpError::Asset { op: "xqa".into(), detail: format!("{SYM_KERNEL}: {e:?}") })?;
+        .map_err(|e| crate::contract::OpError::Asset {
+            op: "xqa".into(),
+            detail: format!("{SYM_KERNEL}: {e:?}"),
+        })?;
     crate::device::Exec::set_shared_limit(&kernel, consts.smem)?;
     Ok((kernel, consts))
 }
@@ -443,12 +475,18 @@ pub fn launch_on_stream(
         args.cache.max_nb_pages_per_seq * consts.tokens_per_page,
         args.q_seq_len,
     );
-    crate::device::launch_vals(stream, kernel, grid, block, smem, &args.vals(consts.head_grp)).map_err(|e| {
-        crate::contract::OpError::Launch {
-            op: "xqa".into(),
-            stage: crate::contract::Stage::Compute,
-            detail: format!("{e:?}"),
-        }
+    crate::device::launch_vals(
+        stream,
+        kernel,
+        grid,
+        block,
+        smem,
+        &args.vals(consts.head_grp),
+    )
+    .map_err(|e| crate::contract::OpError::Launch {
+        op: "xqa".into(),
+        stage: crate::contract::Stage::Compute,
+        detail: format!("{e:?}"),
     })
 }
 
@@ -467,11 +505,17 @@ pub fn launch_on_stream_subseq(
     nb_sub_seq: u32,
 ) -> Result<(), crate::contract::OpError> {
     let (grid, block, smem) = consts.geometry_pub(nb_sub_seq, args.nb_k_heads, args.q_seq_len);
-    crate::device::launch_vals(stream, kernel, grid, block, smem, &args.vals(consts.head_grp)).map_err(|e| {
-        crate::contract::OpError::Launch {
-            op: "xqa".into(),
-            stage: crate::contract::Stage::Compute,
-            detail: format!("{e:?}"),
-        }
+    crate::device::launch_vals(
+        stream,
+        kernel,
+        grid,
+        block,
+        smem,
+        &args.vals(consts.head_grp),
+    )
+    .map_err(|e| crate::contract::OpError::Launch {
+        op: "xqa".into(),
+        stage: crate::contract::Stage::Compute,
+        detail: format!("{e:?}"),
     })
 }

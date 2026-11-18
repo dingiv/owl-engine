@@ -168,7 +168,10 @@ impl Transform for NvFp4Pack {
         // 1) 源 → f16 主缓冲(**按行带解码**,把 f32 中间量钉在 ~32MB:
         //    4B 的最大单键 2.5 亿参数级,整键 f32 副本会平白多占数百 MB)
         let mut b16 = vec![0u8; elems * 2];
-        let band = (32usize << 20).checked_div(self.cols.max(1)).unwrap_or(1).max(1);
+        let band = (32usize << 20)
+            .checked_div(self.cols.max(1))
+            .unwrap_or(1)
+            .max(1);
         let mut f32_band = vec![0f32; band.min(self.rows) * self.cols];
         let rows_per_band = (f32_band.len() / self.cols.max(1)).max(1);
         for r0 in (0..self.rows).step_by(rows_per_band) {

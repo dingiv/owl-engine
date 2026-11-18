@@ -110,12 +110,20 @@ pub struct OutputSlot {
 
 impl OutputSlot {
     pub fn f32(name: &'static str, shape: &[usize]) -> Self {
-        Self { name: name.to_string(), shape: shape.to_vec(), dtype: Dtype::F32 }
+        Self {
+            name: name.to_string(),
+            shape: shape.to_vec(),
+            dtype: Dtype::F32,
+        }
     }
 
     /// f16 输出(F5 整模切换;read_output_f32 自动解码回 f32)
     pub fn f16(name: &'static str, shape: &[usize]) -> Self {
-        Self { name: name.to_string(), shape: shape.to_vec(), dtype: Dtype::F16 }
+        Self {
+            name: name.to_string(),
+            shape: shape.to_vec(),
+            dtype: Dtype::F16,
+        }
     }
 }
 
@@ -194,7 +202,6 @@ impl PlanCtx {
         Ok(self.inputs.get(name).cloned())
     }
 
-
     /// 输出登记:该声明树即本步输出(解释器归约;块生命周期归会话)。
     /// E5-M4:String 名(verify 图的 fold 记录槽 = 每层 × 8 动态名)
     pub fn output(&self, name: impl Into<String>, t: &TensorOps) -> Result<()> {
@@ -206,7 +213,6 @@ impl PlanCtx {
     fn take_outputs(&self) -> Vec<(String, TensorOps)> {
         self.outputs.borrow_mut().split_off(0)
     }
-
 }
 
 // ============================================================================
@@ -288,7 +294,9 @@ impl<D: DeviceClient> GraphPlan<D> {
             init.resize(i.len, 0.0);
             // U32 位型槽:init 值按 `f32::to_bits` 语义承载(F32 槽同字节)
             let bytes: Vec<u8> = if i.dtype == Dtype::U32 {
-                init.iter().flat_map(|v| v.to_bits().to_le_bytes()).collect()
+                init.iter()
+                    .flat_map(|v| v.to_bits().to_le_bytes())
+                    .collect()
             } else {
                 f32b(&init)
             };
@@ -415,7 +423,11 @@ impl<D: DeviceClient> GraphPlan<D> {
                 owl_shared::log_info!(
                     "graph-plan",
                     "slab 定尺({}):峰值 {}MiB / 总和 {}MiB ‖ 引擎 live={}MiB",
-                    if desc.reclaim_capture { "锚回收·峰值" } else { "plain·总和" },
+                    if desc.reclaim_capture {
+                        "锚回收·峰值"
+                    } else {
+                        "plain·总和"
+                    },
                     peak >> 20,
                     metered >> 20,
                     owl_shared::vram::live_bytes() >> 20
@@ -460,7 +472,8 @@ impl<D: DeviceClient> GraphPlan<D> {
 
     /// 每步执行:装填输入(write_block 原位)→ 回放或 eager 直发。
     /// 未提到的输入槽保持上步内容(典型:常量槽)。
-    pub async fn step(&mut self, inputs: &[(&str, &[f32])]) -> Result<()> {        self.fill_slots(inputs).await?;
+    pub async fn step(&mut self, inputs: &[(&str, &[f32])]) -> Result<()> {
+        self.fill_slots(inputs).await?;
         // 诊断:槽回读(desc.debug_probe;取证每步标量是否真落烘焙槽 ——
         // 复读病理立案的仪表盘)
         if self.debug_probe {
@@ -468,8 +481,10 @@ impl<D: DeviceClient> GraphPlan<D> {
                 if let Some(slot) = self.inputs.iter().find(|s| s.name == *name) {
                     let mut buf = vec![0u8; vals.len() * 4];
                     self.face.dtoh(&slot.block, &mut buf).await?;
-                    let back: Vec<f32> =
-                        buf.chunks_exact(4).map(|c| f32::from_le_bytes(c.try_into().unwrap())).collect();
+                    let back: Vec<f32> = buf
+                        .chunks_exact(4)
+                        .map(|c| f32::from_le_bytes(c.try_into().unwrap()))
+                        .collect();
                     owl_shared::log_debug!("slot-dump", "{name} = {back:?}");
                 }
             }
@@ -480,7 +495,6 @@ impl<D: DeviceClient> GraphPlan<D> {
         }
         Ok(())
     }
-
 
     /// 裸回放(E5-DF4 性能判别:不装填输入,纯 launch + 同步由调用方;
     /// 用于测量图独占 GPU 时间 —— 队列排水污染排查)
@@ -655,7 +669,10 @@ impl<D: DeviceClient> GraphPlan<D> {
                 TensorOps::of_block(s.block.id, s.dtype, s.shape.clone()),
             );
         }
-        let ctx = PlanCtx { inputs, outputs: RefCell::new(Vec::new()) };
+        let ctx = PlanCtx {
+            inputs,
+            outputs: RefCell::new(Vec::new()),
+        };
         (self.forward)(&ctx)?;
         let outs = ctx.take_outputs();
         for (name, _) in &outs {
@@ -699,7 +716,8 @@ impl<D: DeviceClient> GraphPlan<D> {
         // 路径补修;捕获窗 eval_ops_multi 早已正确)
         let outs = self.declare_outputs()?;
         let trees: Vec<&TensorOps> = outs.iter().map(|(_, t)| t).collect();
-        let results = eval_ops_multi_scoped_env(&trees, &mut self.face, self.env, self.tp.as_ref()).await?;
+        let results =
+            eval_ops_multi_scoped_env(&trees, &mut self.face, self.env, self.tp.as_ref()).await?;
         for ((name, _), block) in outs.iter().zip(results) {
             let want = self.out_specs[name];
             if block.len != 0 && block.len != want {
@@ -709,7 +727,14 @@ impl<D: DeviceClient> GraphPlan<D> {
                 )));
             }
             let dtype = self.out_dt[name];
-            self.last.insert(name.clone(), OutVal { block, len: want, dtype });
+            self.last.insert(
+                name.clone(),
+                OutVal {
+                    block,
+                    len: want,
+                    dtype,
+                },
+            );
         }
         Ok(())
     }
@@ -720,7 +745,9 @@ impl<D: DeviceClient> GraphPlan<D> {
         // 预检 1:树审计 —— Htod 捕获期禁(运行期装填已全部 write_block)
         let outs = self.declare_outputs()?;
         if outs.iter().any(|(_, t)| {
-            t.flatten().iter().any(|n| matches!(n.op(), Op::Htod { .. }))
+            t.flatten()
+                .iter()
+                .any(|n| matches!(n.op(), Op::Htod { .. }))
         }) {
             return Ok(fallback("输出树含 Htod(捕获期禁)"));
         }
@@ -852,7 +879,9 @@ impl<D: DeviceClient> GraphPlan<D> {
 }
 
 fn fallback(reason: &str) -> PlanOutcome {
-    PlanOutcome::EagerFallback { reason: reason.to_string() }
+    PlanOutcome::EagerFallback {
+        reason: reason.to_string(),
+    }
 }
 
 pub(crate) fn f32b(v: &[f32]) -> Vec<u8> {
@@ -867,9 +896,8 @@ pub(crate) fn f32b(v: &[f32]) -> Vec<u8> {
 mod tests {
     use super::*;
     use owl_cpu::CpuFace;
-    use owl_models::interpreters::eval_ops;
     use owl_macros::owl_test;
-
+    use owl_models::interpreters::eval_ops;
 
     fn ones_w() -> TensorOps {
         let bytes: Vec<u8> = [1.0f32; 16].iter().flat_map(|f| f.to_le_bytes()).collect();
@@ -911,11 +939,19 @@ mod tests {
         assert!(matches!(outcome, PlanOutcome::EagerFallback { .. }));
 
         // 业务步:y 未装填 → 保持 init 内容(常量槽语义)
-        sess.step(&[("x", &[1.0, 2.0, 3.0, 4.0])]).await.expect("step");
+        sess.step(&[("x", &[1.0, 2.0, 3.0, 4.0])])
+            .await
+            .expect("step");
         let s = sess.read_output_f32("s").await.expect("read");
-        assert_eq!(s, vec![110.0; 4], "(x+y)=[11,22,33,44] × 全 1 阵 = 行和 110");
+        assert_eq!(
+            s,
+            vec![110.0; 4],
+            "(x+y)=[11,22,33,44] × 全 1 阵 = 行和 110"
+        );
 
-        sess.step(&[("x", &[0.0; 4]), ("y", &[1.0; 4])]).await.expect("step2");
+        sess.step(&[("x", &[0.0; 4]), ("y", &[1.0; 4])])
+            .await
+            .expect("step2");
         let s = sess.read_output_f32("s").await.expect("read2");
         assert_eq!(s, vec![4.0; 4]);
     }
@@ -932,10 +968,16 @@ mod tests {
             warmup: false,
             ..Default::default()
         };
-        let r = GraphPlan::plan(face, owl_models::env::EnvProvider::default(), None, desc, |sc: &PlanCtx| {
-            let x = sc.input("x")?;
-            sc.output("s", &x)
-        })
+        let r = GraphPlan::plan(
+            face,
+            owl_models::env::EnvProvider::default(),
+            None,
+            desc,
+            |sc: &PlanCtx| {
+                let x = sc.input("x")?;
+                sc.output("s", &x)
+            },
+        )
         .await;
         let e = match r {
             Err(e) => e,
@@ -992,12 +1034,18 @@ mod tests {
             reclaim_capture: false,
             warmup: true,
         };
-        let r = GraphPlan::plan(face, owl_models::env::EnvProvider::default(), None, desc, |sc: &PlanCtx| -> Result<()> {
-            let a = sc.input("a")?;
-            let b = sc.input("b")?;
-            sc.output("s", &a.add(&b))?;
-            Ok(())
-        })
+        let r = GraphPlan::plan(
+            face,
+            owl_models::env::EnvProvider::default(),
+            None,
+            desc,
+            |sc: &PlanCtx| -> Result<()> {
+                let a = sc.input("a")?;
+                let b = sc.input("b")?;
+                sc.output("s", &a.add(&b))?;
+                Ok(())
+            },
+        )
         .await;
         let err = match r {
             Ok(_) => panic!("warmup 应拦截毒值声明"),
@@ -1012,9 +1060,12 @@ mod tests {
         // W 块化(否则被预检 1 的 Htod 审计先拦,测不到能力预检)
         let mut face = CpuFace::new();
         let w_bytes: Vec<u8> = [1.0f32; 16].iter().flat_map(|f| f.to_le_bytes()).collect();
-        let w_b = eval_ops(TensorOps::from_host(Dtype::F32, vec![4, 4], &w_bytes).step(), &mut face)
-            .await
-            .expect("W 块化");
+        let w_b = eval_ops(
+            TensorOps::from_host(Dtype::F32, vec![4, 4], &w_bytes).step(),
+            &mut face,
+        )
+        .await
+        .expect("W 块化");
         let w = TensorOps::of_block(w_b.id, Dtype::F32, vec![4, 4]);
         let desc = GraphPlanDesc {
             inputs: vec![InputSlot::f32("x", 4)],
@@ -1043,8 +1094,13 @@ mod tests {
             matches!(outcome, PlanOutcome::EagerFallback { ref reason } if reason.contains("图能力")),
             "CPU 应因无图能力降级,得 {outcome:?}"
         );
-        sess.step(&[("x", &[1.0, 2.0, 3.0, 4.0])]).await.expect("step");
-        assert_eq!(sess.read_output_f32("s").await.expect("read"), vec![10.0; 4]);
+        sess.step(&[("x", &[1.0, 2.0, 3.0, 4.0])])
+            .await
+            .expect("step");
+        assert_eq!(
+            sess.read_output_f32("s").await.expect("read"),
+            vec![10.0; 4]
+        );
     }
 
     /// GPU 门控:回放 == eager 数值对拍(捕获正确性的直接证据)。
@@ -1062,9 +1118,12 @@ mod tests {
         let w_bytes: Vec<u8> = (0..16)
             .flat_map(|i| ((i % 5) as f32 - 2.0).to_le_bytes())
             .collect();
-        let w_b = eval_ops(TensorOps::from_host(Dtype::F32, vec![4, 4], &w_bytes).step(), &mut f_cap)
-            .await
-            .expect("W 块化");
+        let w_b = eval_ops(
+            TensorOps::from_host(Dtype::F32, vec![4, 4], &w_bytes).step(),
+            &mut f_cap,
+        )
+        .await
+        .expect("W 块化");
         let w_cap = TensorOps::of_block(w_b.id, Dtype::F32, vec![4, 4]);
         let w_eager = TensorOps::from_host(Dtype::F32, vec![4, 4], &w_bytes);
 
@@ -1081,24 +1140,39 @@ mod tests {
 
         // eager 锚
         let w1 = w_eager.clone();
-        let (mut s_eager, o_e) = GraphPlan::plan(f_eager, owl_models::env::EnvProvider::default(), None, desc(false), move |sc: &PlanCtx| -> Result<()> {
-            let x = sc.input("x")?;
-            let y = sc.input("y")?;
-            sc.output("s", &x.add(&y).matmul(&w1))
-        })
+        let (mut s_eager, o_e) = GraphPlan::plan(
+            f_eager,
+            owl_models::env::EnvProvider::default(),
+            None,
+            desc(false),
+            move |sc: &PlanCtx| -> Result<()> {
+                let x = sc.input("x")?;
+                let y = sc.input("y")?;
+                sc.output("s", &x.add(&y).matmul(&w1))
+            },
+        )
         .await
         .expect("eager plan");
         assert!(matches!(o_e, PlanOutcome::EagerFallback { .. }));
 
         // 捕获线
-        let (mut s_cap, o_c) = GraphPlan::plan(f_cap, owl_models::env::EnvProvider::default(), None, desc(true), move |sc: &PlanCtx| -> Result<()> {
-            let x = sc.input("x")?;
-            let y = sc.input("y")?;
-            sc.output("s", &x.add(&y).matmul(&w_cap))
-        })
+        let (mut s_cap, o_c) = GraphPlan::plan(
+            f_cap,
+            owl_models::env::EnvProvider::default(),
+            None,
+            desc(true),
+            move |sc: &PlanCtx| -> Result<()> {
+                let x = sc.input("x")?;
+                let y = sc.input("y")?;
+                sc.output("s", &x.add(&y).matmul(&w_cap))
+            },
+        )
         .await
         .expect("capture plan");
-        assert!(matches!(o_c, PlanOutcome::Captured), "捕获应成功,得 {o_c:?}");
+        assert!(
+            matches!(o_c, PlanOutcome::Captured),
+            "捕获应成功,得 {o_c:?}"
+        );
 
         // 两步异构数据,逐步对拍
         for (step, (x, y)) in [
@@ -1108,13 +1182,19 @@ mod tests {
         .into_iter()
         .enumerate()
         {
-            s_eager.step(&[("x", x), ("y", y)]).await.expect("eager step");
+            s_eager
+                .step(&[("x", x), ("y", y)])
+                .await
+                .expect("eager step");
             s_cap.step(&[("x", x), ("y", y)]).await.expect("cap step");
             let a = s_eager.read_output_f32("s").await.expect("read eager");
             let b = s_cap.read_output_f32("s").await.expect("read cap");
             assert_eq!(a.len(), b.len());
             for (i, (u, v)) in a.iter().zip(&b).enumerate() {
-                assert!((u - v).abs() < 1e-5, "step{step}[{i}]: eager {u} vs 回放 {v}");
+                assert!(
+                    (u - v).abs() < 1e-5,
+                    "step{step}[{i}]: eager {u} vs 回放 {v}"
+                );
             }
         }
     }
@@ -1140,9 +1220,12 @@ mod tests {
         let w_bytes: Vec<u8> = (0..16)
             .flat_map(|i| ((i % 5) as f32 - 2.0).to_le_bytes())
             .collect();
-        let w_b = eval_ops(TensorOps::from_host(Dtype::F32, vec![4, 4], &w_bytes).step(), &mut f_cap)
-            .await
-            .expect("W 块化");
+        let w_b = eval_ops(
+            TensorOps::from_host(Dtype::F32, vec![4, 4], &w_bytes).step(),
+            &mut f_cap,
+        )
+        .await
+        .expect("W 块化");
         let w_cap = TensorOps::of_block(w_b.id, Dtype::F32, vec![4, 4]);
         let w_eager = TensorOps::from_host(Dtype::F32, vec![4, 4], &w_bytes);
 
@@ -1184,7 +1267,10 @@ mod tests {
         )
         .await
         .expect("capture plan");
-        assert!(matches!(o_c, PlanOutcome::Captured), "锚回收档捕获应成功,得 {o_c:?}");
+        assert!(
+            matches!(o_c, PlanOutcome::Captured),
+            "锚回收档捕获应成功,得 {o_c:?}"
+        );
 
         for (step, (x, y)) in [
             (&[1.0f32, 2.0, 3.0, 4.0], &[0.5f32, -1.0, 2.0, 0.25]),
@@ -1193,12 +1279,18 @@ mod tests {
         .into_iter()
         .enumerate()
         {
-            s_eager.step(&[("x", x), ("y", y)]).await.expect("eager step");
+            s_eager
+                .step(&[("x", x), ("y", y)])
+                .await
+                .expect("eager step");
             s_cap.step(&[("x", x), ("y", y)]).await.expect("cap step");
             let a = s_eager.read_output_f32("s").await.expect("read eager");
             let b = s_cap.read_output_f32("s").await.expect("read cap");
             for (i, (u, v)) in a.iter().zip(&b).enumerate() {
-                assert!((u - v).abs() < 1e-5, "reclaim step{step}[{i}]: eager {u} vs 回放 {v}");
+                assert!(
+                    (u - v).abs() < 1e-5,
+                    "reclaim step{step}[{i}]: eager {u} vs 回放 {v}"
+                );
             }
         }
     }

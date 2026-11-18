@@ -23,8 +23,7 @@ use crate::module::{KvPagedPolicy, QuantPlan};
 use owl_kernels::Arch;
 
 /// 硬件环境(被动律:不供给 = [`HwEnv::Cpu`],Call op 结构化拒绝)
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-#[derive(Default)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
 pub enum HwEnv {
     #[default]
     Cpu,
@@ -62,8 +61,18 @@ mod kvquant_tests {
 
         // f16 / fp8:全臂在场
         for (q, k0, prefill, v2) in [
-            (KvQuant::None, K::K0WriteKnhd, K::PagedPrefillKnhd, K::PagedDecodeV2Knhd),
-            (KvQuant::Fp8E4M3, K::K0WriteFp8Knhd, K::PagedPrefillFp8Knhd, K::PagedDecodeV2Fp8Knhd),
+            (
+                KvQuant::None,
+                K::K0WriteKnhd,
+                K::PagedPrefillKnhd,
+                K::PagedDecodeV2Knhd,
+            ),
+            (
+                KvQuant::Fp8E4M3,
+                K::K0WriteFp8Knhd,
+                K::PagedPrefillFp8Knhd,
+                K::PagedDecodeV2Fp8Knhd,
+            ),
         ] {
             let k = q.kernels().expect("f16/fp8 有核臂");
             assert_eq!(k.k0_write, k0, "{q:?} k0");
@@ -87,12 +96,29 @@ mod kvquant_tests {
         assert!(KvQuant::Fp8E5M2.kernels().is_err(), "e5m2 必须响亮缺臂");
 
         // 能力谓词 = 表里那一格(is_some),与表恒等
-        for q in [KvQuant::None, KvQuant::Fp8E4M3, KvQuant::Int8, KvQuant::Fp8E5M2] {
-            let env = KvEnv { quant: q, ..KvEnv::f16_paged() };
+        for q in [
+            KvQuant::None,
+            KvQuant::Fp8E4M3,
+            KvQuant::Int8,
+            KvQuant::Fp8E5M2,
+        ] {
+            let env = KvEnv {
+                quant: q,
+                ..KvEnv::f16_paged()
+            };
             let tbl = q.kernels().ok();
-            assert_eq!(env.supports_fused_insert(), tbl.map(|t| t.fused_insert.is_some()).unwrap_or(false));
-            assert_eq!(env.supports_v2_seq(), tbl.map(|t| t.decode_v2_seq.is_some()).unwrap_or(false));
-            assert_eq!(env.supports_fi_prefill(), tbl.map(|t| t.fi_prefill.is_some()).unwrap_or(false));
+            assert_eq!(
+                env.supports_fused_insert(),
+                tbl.map(|t| t.fused_insert.is_some()).unwrap_or(false)
+            );
+            assert_eq!(
+                env.supports_v2_seq(),
+                tbl.map(|t| t.decode_v2_seq.is_some()).unwrap_or(false)
+            );
+            assert_eq!(
+                env.supports_fi_prefill(),
+                tbl.map(|t| t.fi_prefill.is_some()).unwrap_or(false)
+            );
         }
     }
 
@@ -196,7 +222,9 @@ impl KvQuant {
                 fi_prefill: Some(fi::PREFILL_FI_FP8KV),
             }),
             // e5m2:类型体系能表达,**核臂全缺** ⇒ 统一在这里拒(不再是 7 处文案)
-            KvQuant::Fp8E5M2 => Err("fp8-e5m2 暂无核臂(本仓只有 e4m3);请改 [store.kv] kv_dtype = \"fp8\""),
+            KvQuant::Fp8E5M2 => {
+                Err("fp8-e5m2 暂无核臂(本仓只有 e4m3);请改 [store.kv] kv_dtype = \"fp8\"")
+            }
             // int8:K int8 + V token-major + 两张 scale —— 没有 FP8/FI 系列臂,
             // 也没有 split(走整块 Int8PrefillPaged);verify 走专用 GQA-TC 臂。
             KvQuant::Int8 => Ok(KvKernels {
@@ -303,7 +331,6 @@ impl KvEnv {
         self.quant.kernels_or_loud().prefill_paged
     }
 
-
     /// v2 分页 decode 打分
     pub fn decode_v2_op(&self) -> crate::ops::SemanticKernel {
         self.quant.kernels_or_loud().decode_v2
@@ -352,15 +379,24 @@ impl KvEnv {
 
     /// 有 decode 融合插池臂?
     pub fn supports_fused_insert(&self) -> bool {
-        self.quant.kernels().map(|k| k.fused_insert.is_some()).unwrap_or(false)
+        self.quant
+            .kernels()
+            .map(|k| k.fused_insert.is_some())
+            .unwrap_or(false)
     }
     /// 有通用 v2 verify 伪序列臂?
     pub fn supports_v2_seq(&self) -> bool {
-        self.quant.kernels().map(|k| k.decode_v2_seq.is_some()).unwrap_or(false)
+        self.quant
+            .kernels()
+            .map(|k| k.decode_v2_seq.is_some())
+            .unwrap_or(false)
     }
     /// 走 FlashInfer prefill 路径?
     pub fn supports_fi_prefill(&self) -> bool {
-        self.quant.kernels().map(|k| k.fi_prefill.is_some()).unwrap_or(false)
+        self.quant
+            .kernels()
+            .map(|k| k.fi_prefill.is_some())
+            .unwrap_or(false)
     }
 
     /// 主池是否 e4m3 字节承载(池账/几何消费;非内核选择)
@@ -378,7 +414,10 @@ impl KvEnv {
         if !self.paged {
             return None;
         }
-        Some(KvPagedPolicy { page: self.page, x: self.x })
+        Some(KvPagedPolicy {
+            page: self.page,
+            x: self.x,
+        })
     }
 }
 
@@ -545,7 +584,10 @@ impl Default for KvEnv {
 impl EnvProvider {
     /// GPU 环境快捷构造(生产基线 + 指定 arch)
     pub fn gpu(arch: Arch) -> Self {
-        Self { hw: HwEnv::Cuda(arch), ..Self::default() }
+        Self {
+            hw: HwEnv::Cuda(arch),
+            ..Self::default()
+        }
     }
 
     /// **入口侧组装器**:自全量配置对象显式组装(唯一构造口)
@@ -656,7 +698,11 @@ mod kv_geometry_tests {
             for &(h, d) in &[(0usize, 0usize), (1, 7), (3, hd - 1)] {
                 // 池内偏移 = 块内偏移(块号×块 stride)+ 页序×页内 stride + 头/维偏移
                 let expect = b * (hkv * hd * page) + p * (hkv * hd) + h * hd + d;
-                assert_eq!(knhd_offset(slot, h, d, hkv, hd), expect, "slot{slot} h{h} d{d}");
+                assert_eq!(
+                    knhd_offset(slot, h, d, hkv, hd),
+                    expect,
+                    "slot{slot} h{h} d{d}"
+                );
             }
         }
     }

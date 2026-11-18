@@ -48,7 +48,10 @@ fn dir_of() -> PathBuf {
 }
 
 fn topn_of() -> usize {
-    std::env::var("OWL_G8B_TOPN").ok().and_then(|s| s.parse().ok()).unwrap_or(5)
+    std::env::var("OWL_G8B_TOPN")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(5)
 }
 
 /// 测试档通信通道(生产走 `[parallel] tp_comm`;测试允许 env 显式选臂)
@@ -87,7 +90,11 @@ fn pf_map(prefix: &str) -> std::collections::BTreeMap<String, u64> {
     for r in owl_shared::metrics::query_metrics(
         &owl_shared::metrics::MetricsFilter::new().tag_prefix(prefix),
     ) {
-        let key = r.tag.split_once('.').map(|(_, k)| k.to_string()).unwrap_or_else(|| r.tag.clone());
+        let key = r
+            .tag
+            .split_once('.')
+            .map(|(_, k)| k.to_string())
+            .unwrap_or_else(|| r.tag.clone());
         m.insert(key, r.counter);
     }
     m
@@ -185,13 +192,18 @@ fn topn(v: &[f32], n: usize) -> Vec<u32> {
 }
 
 fn max_abs(a: &[f32], b: &[f32]) -> f32 {
-    a.iter().zip(b).map(|(x, y)| (x - y).abs()).fold(0f32, f32::max)
+    a.iter()
+        .zip(b)
+        .map(|(x, y)| (x - y).abs())
+        .fold(0f32, f32::max)
 }
 
 #[test]
 fn tp_g8_gate() {
     let (Some(oa), Some(ob)) = (dev("OWL_TP_TEST_DEV_A"), dev("OWL_TP_TEST_DEV_B")) else {
-        owl_shared::testkit::report::skip("需 OWL_TP_TEST_DEV_A / OWL_TP_TEST_DEV_B(两张空闲卡的 CUDA ordinal)");
+        owl_shared::testkit::report::skip(
+            "需 OWL_TP_TEST_DEV_A / OWL_TP_TEST_DEV_B(两张空闲卡的 CUDA ordinal)",
+        );
         return;
     };
     assert_ne!(oa, ob, "A/B 必须是两张不同卡");
@@ -219,7 +231,10 @@ async fn body(ref_dev: usize, oa: usize, ob: usize, dir: PathBuf) {
     // ★ **词表切档（P1.1）**：本模型（Qwen3.5-0.8B）`tie_word_embeddings = true`
     // ⇒ lm_head 复用 embed 全量表 ⇒ 词表切**无据可依** ⇒ 装载必须**响亮拒**。
     // 本档只验证这条拒（正判据在 27B 门：那里是 untied 检查点）。
-    if matches!(std::env::var("OWL_TP_VOCAB_SPLIT").as_deref(), Ok("1") | Ok("true")) {
+    if matches!(
+        std::env::var("OWL_TP_VOCAB_SPLIT").as_deref(),
+        Ok("1") | Ok("true")
+    ) {
         let mut e = Engine::new(cfg_of(oa)).expect("engine(tied 拒判据)");
         let r = e
             .loader()
@@ -243,9 +258,15 @@ async fn body(ref_dev: usize, oa: usize, ob: usize, dir: PathBuf) {
         let mut e = Engine::new(cfg_of(ref_dev)).expect("engine(TP1)");
         let loaded = e.loader().load_qwen35_0_8b(&dir).await.expect("TP1 装载");
         let mut r = e.run(loaded).await.expect("TP1 装配");
-        let s = run_turn_steps(&mut r, 1, PROMPT, MAX_NEW).await.expect("TP1 turn");
+        let s = run_turn_steps(&mut r, 1, PROMPT, MAX_NEW)
+            .await
+            .expect("TP1 turn");
         let pf = pf_map("b1.pf.");
-        let last = r.read_output_f32("logits").await.expect("TP1 logits").expect("logits 槽");
+        let last = r
+            .read_output_f32("logits")
+            .await
+            .expect("TP1 logits")
+            .expect("logits 槽");
         eprintln!(
             "[g8b] TP1(单卡 ordinal {ref_dev}):{} tok;逐步 logits {} 条;末步 {} 项",
             s.gen.len(),
@@ -254,17 +275,37 @@ async fn body(ref_dev: usize, oa: usize, ob: usize, dir: PathBuf) {
         );
         (s, pf)
     };
-    let Steps { gen: tp1_gen, logits: tp1_logits } = tp1;
+    let Steps {
+        gen: tp1_gen,
+        logits: tp1_logits,
+    } = tp1;
 
     // ── ② TP2:两 rank 分片装载 + 装配 + 执行 ───────────────────────
     let mut e0 = Engine::new(cfg_of(oa)).expect("engine(TP2 rank0)");
-    let l0 = e0.loader().slice(0, 2).load_qwen35_0_8b(&dir).await.expect("rank0 分片装载");
-    let mut e1 = Engine::new_with_ledger(cfg_of(ob), e0.ledger_cell(), 1).expect("engine(TP2 rank1)");
-    let l1 = e1.loader().slice(1, 2).load_qwen35_0_8b(&dir).await.expect("rank1 分片装载");
+    let l0 = e0
+        .loader()
+        .slice(0, 2)
+        .load_qwen35_0_8b(&dir)
+        .await
+        .expect("rank0 分片装载");
+    let mut e1 =
+        Engine::new_with_ledger(cfg_of(ob), e0.ledger_cell(), 1).expect("engine(TP2 rank1)");
+    let l1 = e1
+        .loader()
+        .slice(1, 2)
+        .load_qwen35_0_8b(&dir)
+        .await
+        .expect("rank1 分片装载");
     // ★ 测试例外:AR 档位从 env 显式取(owl 纪律:行为开关走配置,测试例外)。
     // 2026-10-27:push / 1-stage 两档已退役,只剩 fp8 载荷 + 融合 + AR-2。
-    let ar_f8 = matches!(std::env::var("OWL_TP_AR_F8").as_deref(), Ok("1") | Ok("true"));
-    let ar_fused = matches!(std::env::var("OWL_TP_AR_FUSED").as_deref(), Ok("1") | Ok("true"));
+    let ar_f8 = matches!(
+        std::env::var("OWL_TP_AR_F8").as_deref(),
+        Ok("1") | Ok("true")
+    );
+    let ar_fused = matches!(
+        std::env::var("OWL_TP_AR_FUSED").as_deref(),
+        Ok("1") | Ok("true")
+    );
     let ar2 = matches!(std::env::var("OWL_TP_AR2").as_deref(), Ok("1") | Ok("true"));
     let tp = TpEngine::assemble_with(
         vec![e0, e1],
@@ -277,8 +318,8 @@ async fn body(ref_dev: usize, oa: usize, ob: usize, dir: PathBuf) {
             comm: tp_comm(),
         },
     )
-        .await
-        .expect("TP2 装配");
+    .await
+    .expect("TP2 装配");
     let mut r = tp.run().expect("TP2 进执行态");
     assert!(r.has_peer(), "TP2 执行态必须带 peer 束");
     // ★ **路径存在性判据**(纪律⑮/§35.5;2026-10-18):门全绿证明不了新路径被执行。
@@ -303,12 +344,11 @@ async fn body(ref_dev: usize, oa: usize, ob: usize, dir: PathBuf) {
         .await
         .expect("TP2 turn");
     let cnt = |t: &str| -> u64 {
-        let now: u64 = owl_shared::metrics::query_metrics(
-            &owl_shared::metrics::MetricsFilter::new().tag(t),
-        )
-        .iter()
-        .map(|x| x.counter)
-        .sum();
+        let now: u64 =
+            owl_shared::metrics::query_metrics(&owl_shared::metrics::MetricsFilter::new().tag(t))
+                .iter()
+                .map(|x| x.counter)
+                .sum();
         let i = match t {
             "tp.ar.v1" => 0,
             "tp.ar.fused" => 1,
@@ -341,14 +381,30 @@ async fn body(ref_dev: usize, oa: usize, ob: usize, dir: PathBuf) {
     } else {
         assert!(n_v1 > 0, "v1 档应有 tp.ar.v1 > 0");
     }
-    eprintln!("[g8b] TP2(双 rank {oa}/{ob}):{} tok;逐步 logits {} 条", tp2_gen.len(), tp2_logits.len());
+    eprintln!(
+        "[g8b] TP2(双 rank {oa}/{ob}):{} tok;逐步 logits {} 条",
+        tp2_gen.len(),
+        tp2_logits.len()
+    );
 
     // ── ③ L1(接线):两 rank **同一个采样步**的 logits 逐位相同 ─────
     // 逐位检查放末步即可(接线错会在任何一步都错;逐步全查 = 16×1MB 读数不划算)
-    let l0_last = r.read_output_f32("logits").await.expect("rank0 logits").expect("logits 槽");
-    let l1_last = r.read_peer_output_f32("logits").await.expect("rank1 logits").expect("logits 槽");
+    let l0_last = r
+        .read_output_f32("logits")
+        .await
+        .expect("rank0 logits")
+        .expect("logits 槽");
+    let l1_last = r
+        .read_peer_output_f32("logits")
+        .await
+        .expect("rank1 logits")
+        .expect("logits 槽");
     assert_eq!(l0_last.len(), l1_last.len(), "两 rank logits 长度不一致");
-    let nbit = l0_last.iter().zip(&l1_last).filter(|(a, b)| a.to_bits() != b.to_bits()).count();
+    let nbit = l0_last
+        .iter()
+        .zip(&l1_last)
+        .filter(|(a, b)| a.to_bits() != b.to_bits())
+        .count();
     let mx01 = max_abs(&l0_last, &l1_last);
     eprintln!("[g8b] L1 接线:rank0 vs rank1 末步 logits:{nbit} 项不同, max|Δ| = {mx01:.6}");
     assert_eq!(nbit, 0, "两 rank logits 应逐位相同(AR 接线/协议错?)");
@@ -369,9 +425,20 @@ async fn body(ref_dev: usize, oa: usize, ob: usize, dir: PathBuf) {
     }
     let worst = per_step_max.iter().cloned().fold(0f32, f32::max);
     let mean = per_step_max.iter().sum::<f32>() / steps as f32;
-    eprintln!("[g8b] L3 数值面:逐步 max|Δ| —— 首步 {:.6}, 末步 {:.6}, 全程最大 {:.6}, 均值 {:.6}",
-        per_step_max[0], per_step_max[steps - 1], worst, mean);
-    eprintln!("[g8b] 逐步 max|Δ| 全序列 = {:?}", per_step_max.iter().map(|v| (v * 1000.0).round() / 1000.0).collect::<Vec<_>>());
+    eprintln!(
+        "[g8b] L3 数值面:逐步 max|Δ| —— 首步 {:.6}, 末步 {:.6}, 全程最大 {:.6}, 均值 {:.6}",
+        per_step_max[0],
+        per_step_max[steps - 1],
+        worst,
+        mean
+    );
+    eprintln!(
+        "[g8b] 逐步 max|Δ| 全序列 = {:?}",
+        per_step_max
+            .iter()
+            .map(|v| (v * 1000.0).round() / 1000.0)
+            .collect::<Vec<_>>()
+    );
 
     let mut divergences = 0usize;
     let mut first_div: Option<usize> = None;
@@ -383,7 +450,9 @@ async fn body(ref_dev: usize, oa: usize, ob: usize, dir: PathBuf) {
     for i in 0..steps.min(3) {
         let am1 = topn(&tp1_logits[i], 1)[0];
         let am2 = topn(&tp2_logits[i], 1)[0];
-        let r1 = topn(&tp1_logits[i], 64).iter().position(|&x| x == tp1_gen[i]);
+        let r1 = topn(&tp1_logits[i], 64)
+            .iter()
+            .position(|&x| x == tp1_gen[i]);
         let nxt = tp1_gen.get(i + 1).copied().unwrap_or(u32::MAX);
         eprintln!(
             "[diag] step {i}: TP1 gen={} argmax(logits)={} rank64(gen)={r1:?} next_gen={nxt};TP2 gen={} argmax={}",
@@ -437,7 +506,8 @@ async fn body(ref_dev: usize, oa: usize, ob: usize, dir: PathBuf) {
     );
 
     // 附:全量 spec 自证(world = 2 整除前提;CPU 侧读 config,零 GPU)
-    let (full, _) = ModelSpec::from_ckpt(&dir, SpecSource::family(&qwen3_5_0_8b())).expect("全量 spec");
+    let (full, _) =
+        ModelSpec::from_ckpt(&dir, SpecSource::family(&qwen3_5_0_8b())).expect("全量 spec");
     assert_eq!(full.inter % 2, 0, "inter 必须偶(world = 2 整除硬门前提)");
     match first_div {
         None => eprintln!(
@@ -512,7 +582,10 @@ fn tp_perf_split_probe() {
         owl_shared::testkit::report::skip(format_args!("0.8B 检查点不在 {dir:?}(设 OWL_0_8B_DIR)"));
         return;
     }
-    let reps: usize = std::env::var("OWL_PERF_REPS").ok().and_then(|v| v.parse().ok()).unwrap_or(40);
+    let reps: usize = std::env::var("OWL_PERF_REPS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(40);
     let tag = std::env::var("OWL_PERF_TAG").unwrap_or_else(|_| "perf".to_string());
     let prompt: String = "在深海下面有一座城市它的名字没有人记得。".repeat(reps);
     std::thread::Builder::new()
@@ -533,9 +606,19 @@ async fn body_probe(oa: usize, ob: usize, dir: PathBuf, prompt: String, tag: Str
     // (不 init ⇒ `dump` 静默 Ok 且不落文件 —— 2026-10-18 踩过)
     let _ = owl_shared::metrics::init_metrics(owl_shared::metrics::MetricsStore::new());
     let mut e0 = Engine::new(cfg_eager(oa)).expect("engine rank0");
-    let l0 = e0.loader().slice(0, 2).load_qwen35_0_8b(&dir).await.expect("rank0 装载");
+    let l0 = e0
+        .loader()
+        .slice(0, 2)
+        .load_qwen35_0_8b(&dir)
+        .await
+        .expect("rank0 装载");
     let mut e1 = Engine::new_with_ledger(cfg_eager(ob), e0.ledger_cell(), 1).expect("engine rank1");
-    let l1 = e1.loader().slice(1, 2).load_qwen35_0_8b(&dir).await.expect("rank1 装载");
+    let l1 = e1
+        .loader()
+        .slice(1, 2)
+        .load_qwen35_0_8b(&dir)
+        .await
+        .expect("rank1 装载");
     // 2026-10-27:`TpOpts` 已无 env 读取(引擎零 env);本探针**显式**从 env
     // 取档位(测试例外),再交 `assemble_with`(push / 1-stage 两档已退役)。
     let flag = |k: &str| matches!(std::env::var(k).as_deref(), Ok("1") | Ok("true"));
@@ -551,7 +634,9 @@ async fn body_probe(oa: usize, ob: usize, dir: PathBuf, prompt: String, tag: Str
         .expect("装配");
     let mut r = tp.run().expect("进执行态");
     // 预热一次(装载后的首跑含 lazy 初始化;不进计时)
-    let _ = run_turn_plain(&mut r, 1, &prompt, 1).await.expect("预热 turn");
+    let _ = run_turn_plain(&mut r, 1, &prompt, 1)
+        .await
+        .expect("预热 turn");
     // ── ★ **串行 vs 并发**(2026-10-18;TBO 的最小验证)────────────────
     // sglang 的 TBO 本质 = "两个独立微批的 forward 交错" ⇒ 它能不能拿到重叠,
     // 取决于**调度层是否让两个 forward 同时在飞**。本档量这件事:
@@ -562,8 +647,12 @@ async fn body_probe(oa: usize, ob: usize, dir: PathBuf, prompt: String, tag: Str
     let mode = std::env::var("OWL_PERF_MODE").unwrap_or_else(|_| "serial".to_string());
     let t0 = std::time::Instant::now();
     let ngen = if mode == "concurrent" {
-        let (_s1, t1) = r.submit_session_ex(Some(11), &prompt, 1, true).expect("提交 A");
-        let (_s2, t2) = r.submit_session_ex(Some(12), &prompt, 1, true).expect("提交 B");
+        let (_s1, t1) = r
+            .submit_session_ex(Some(11), &prompt, 1, true)
+            .expect("提交 A");
+        let (_s2, t2) = r
+            .submit_session_ex(Some(12), &prompt, 1, true)
+            .expect("提交 B");
         let mut n = 0usize;
         loop {
             match r.pump().await.expect("pump") {
@@ -578,8 +667,12 @@ async fn body_probe(oa: usize, ob: usize, dir: PathBuf, prompt: String, tag: Str
         let _ = (t1, t2);
         n
     } else {
-        let a = run_turn_plain(&mut r, 21, &prompt, 1).await.expect("turn A");
-        let b = run_turn_plain(&mut r, 22, &prompt, 1).await.expect("turn B");
+        let a = run_turn_plain(&mut r, 21, &prompt, 1)
+            .await
+            .expect("turn A");
+        let b = run_turn_plain(&mut r, 22, &prompt, 1)
+            .await
+            .expect("turn B");
         a + b
     };
     let total = t0.elapsed();
@@ -600,11 +693,17 @@ async fn body_probe(oa: usize, ob: usize, dir: PathBuf, prompt: String, tag: Str
             .map(|r| r.counter)
             .sum()
     };
-    let fused = matches!(std::env::var("OWL_TP_AR_FUSED").as_deref(), Ok("1") | Ok("true"));
+    let fused = matches!(
+        std::env::var("OWL_TP_AR_FUSED").as_deref(),
+        Ok("1") | Ok("true")
+    );
     let (n_fused, n_v1) = (cnt("tp.ar.fused"), cnt("tp.ar.v1"));
     eprintln!("[perf-split:{tag}] 路径判据:fusion={n_fused} · v1={n_v1}(开融合={fused})");
     if fused {
-        assert!(n_fused > 0, "开了融合档但融合核一次都没被走到(tp.ar.fused = 0)");
+        assert!(
+            n_fused > 0,
+            "开了融合档但融合核一次都没被走到(tp.ar.fused = 0)"
+        );
     }
     assert!(n_v1 > 0 || n_fused > 0, "AR 两档都没被走到(判据失效)");
     let path = format!("/tmp/tp-perf-{tag}.txt");

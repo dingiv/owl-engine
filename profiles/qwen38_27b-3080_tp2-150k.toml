@@ -1,0 +1,30 @@
+# ── 双 3080 20G / TP2 / 150k 追随档（2026-11-18 实测） ─────────────────────
+#
+# 定位：长会话 follow-up（~150k 上下文、短输出）优先。
+# 与主档 `qwen38_27b-3080_tp2.toml` 的差异只有三处：
+#   1. 目标模型回到 cyankiwi W4A16（主档是 bytkim W4A8，为 prefill 选型）
+#   2. KV 池 f16（主档 int8；20G 卡在 150k 刚好装下）
+#   3. 单并发（150k 只留 1 路，避免第二路挤爆池）
+#
+# 2026-11-18 同 prompt 实测（147,904 ctx / 320 out / DFlash2 d7 / 双 3080）：
+#   vLLM 0.27.2 + FP8 KV + W4A16 : 93.9 t/s / 256-260W / 5.49 J/tok
+#   owl W4A8 + INT8 KV（主档）    : 60.5 t/s / 259-260W / 8.58 J/tok
+#   owl W4A8 + F16  KV            : 73.2 t/s / 257-259W / 7.06 J/tok
+#   owl W4A16 + F16 KV（本档）    : 78.7 t/s / 261-263W / 6.67 J/tok
+#   ⇒ 长 ctx 下 int8 KV 的 verify 读核明显吃亏；150k 用 f16 换 +30% decode。
+#   剩余差距 = spec round 35.8ms（verify 27.3 + fold 5.7 + propose 1.8）
+#   vs vLLM ~30ms；下一刀在 fold/verify，不在草稿模型。
+#
+# 约束：f16 池在 150k 已占 ~4.7GiB；不要把它直接拉到 262k（20G 装不下）。
+extends = ["qwen38_27b-3080_tp2.toml"]
+
+[model]
+path = "../models/cyankiwi/Qwen3.8-27B-AWQ-INT4"
+quant = "w4a16"
+
+[store.kv]
+kv_dtype = "f16"
+
+[runtime]
+max_context_length = 150000
+max_concurrency = 1

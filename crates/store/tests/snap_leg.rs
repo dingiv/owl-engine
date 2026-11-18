@@ -10,7 +10,7 @@ use owl_cpu::CpuFace;
 use owl_iface::contract::{DeviceClient, Dtype, HeapRegion, PinnedRegion, SwapDir};
 use owl_store::{
     AdmissionPolicy, BlockClass, BudgetInputs, ChainHash, LegConfig, PieceSpec, PoolLayout,
-    QueuePolicy, Rel, SnapRole, SnapDurability, SnapKey, StoreError, Tier,
+    QueuePolicy, Rel, SnapDurability, SnapKey, SnapRole, StoreError, Tier,
 };
 
 const ROW_BYTES: usize = 64; // 一条"行宽"(片步长)
@@ -21,8 +21,14 @@ async fn snap_pieces(face: &mut CpuFace, slots: usize) -> Vec<PieceSpec> {
     let mut out = Vec::new();
     for _ in 0..ROWS {
         // 每片 = 一条缓冲,长 = 槽数 × 行宽(KV 腿同构:池矩阵)
-        let b = face.alloc(Dtype::F32, (ROW_BYTES / 4) * slots, "snap").await.expect("快照池");
-        out.push(PieceSpec { buf: b, stride_bytes: ROW_BYTES });
+        let b = face
+            .alloc(Dtype::F32, (ROW_BYTES / 4) * slots, "snap")
+            .await
+            .expect("快照池");
+        out.push(PieceSpec {
+            buf: b,
+            stride_bytes: ROW_BYTES,
+        });
     }
     out
 }
@@ -53,16 +59,29 @@ fn rel(host_bytes: usize) -> Rel {
         host_bytes: inputs.host_bytes,
         disk_bytes: inputs.disk_bytes,
     });
-    Rel::open(inputs, AdmissionPolicy::new(2, QueuePolicy::Reject), kv_cfg, cell).expect("装配")
+    Rel::open(
+        inputs,
+        AdmissionPolicy::new(2, QueuePolicy::Reject),
+        kv_cfg,
+        cell,
+    )
+    .expect("装配")
 }
 
 async fn seed(face: &mut CpuFace, ps: &[PieceSpec], slot: u32, seed: u8) {
     for p in ps {
-        let pat: Vec<u8> = (0..p.stride_bytes).map(|i| seed.wrapping_add(i as u8)).collect();
+        let pat: Vec<u8> = (0..p.stride_bytes)
+            .map(|i| seed.wrapping_add(i as u8))
+            .collect();
         let lease: Box<dyn PinnedRegion + Send> = Box::new(HeapRegion(pat));
-        face.upload_pinned(lease, &p.buf, slot as usize * p.stride_bytes, p.stride_bytes)
-            .await
-            .expect("seed");
+        face.upload_pinned(
+            lease,
+            &p.buf,
+            slot as usize * p.stride_bytes,
+            p.stride_bytes,
+        )
+        .await
+        .expect("seed");
     }
 }
 
@@ -70,7 +89,9 @@ async fn read_slot(face: &mut CpuFace, ps: &[PieceSpec], slot: u32) -> Vec<u8> {
     let mut out = Vec::new();
     for p in ps {
         let mut d = vec![0u8; p.stride_bytes];
-        face.dtoh_at(&p.buf, slot as usize * p.stride_bytes, &mut d).await.expect("读槽");
+        face.dtoh_at(&p.buf, slot as usize * p.stride_bytes, &mut d)
+            .await
+            .expect("读槽");
         out.extend_from_slice(&d);
     }
     out
@@ -85,8 +106,12 @@ async fn snapshot_offload_and_reload_is_byte_identical() {
     let mut face = CpuFace::new();
     let ps = snap_pieces(&mut face, 4).await;
     let mut r = rel(SNAP_BYTES); // 宿主预算 = 一条快照(门③才好判)
-    r.attach_snap_layout(PoolLayout { class: BlockClass::GdnRow, epoch: 0, pieces: ps.clone() })
-        .expect("注册状态腿布局");
+    r.attach_snap_layout(PoolLayout {
+        class: BlockClass::GdnRow,
+        epoch: 0,
+        pieces: ps.clone(),
+    })
+    .expect("注册状态腿布局");
     assert_eq!(r.snap_bytes(), SNAP_BYTES);
 
     // 槽 0 上有一条快照(设备层)
@@ -99,7 +124,10 @@ async fn snapshot_offload_and_reload_is_byte_identical() {
 
     // ① 下沉:设备槽 0 → 宿主(一条 swap 搬 N 片)
     let (pieces, table) = r.plan_snap_offload(k, 0).expect("下沉计划");
-    let conn = face.swap(SwapDir::Out, &pieces[0], Box::new(table)).await.expect("swap(Out)");
+    let conn = face
+        .swap(SwapDir::Out, &pieces[0], Box::new(table))
+        .await
+        .expect("swap(Out)");
     let table = owl_store::reclaim_slot_table(conn).expect("回执取台");
     r.commit_snap_offload(k, table).expect("下沉记账");
     assert_eq!(r.state_locate(k), Some(Tier::Host), "层应下沉");
@@ -108,12 +136,19 @@ async fn snapshot_offload_and_reload_is_byte_identical() {
 
     // ② 回灌:宿主 → 设备槽 2(另一槽 ⇒ 证明内容跟着走,不是原地)
     let (pieces, table) = r.plan_snap_onload(k, 2).expect("回灌计划");
-    let conn = face.swap(SwapDir::In, &pieces[0], Box::new(table)).await.expect("swap(In)");
+    let conn = face
+        .swap(SwapDir::In, &pieces[0], Box::new(table))
+        .await
+        .expect("swap(In)");
     let table = owl_store::reclaim_slot_table(conn).expect("回执取台");
     r.commit_snap_onload(k, table).expect("回灌记账");
     assert_eq!(r.state_locate(k), Some(Tier::Gpu), "层应回设备");
     assert_eq!(r.snap_host_used(), 0, "宿主层应清空");
-    assert_eq!(read_slot(&mut face, &ps, 2).await, before, "**逐字节一致**(门④)");
+    assert_eq!(
+        read_slot(&mut face, &ps, 2).await,
+        before,
+        "**逐字节一致**(门④)"
+    );
 
     // ③ 宿主层满 ⇒ **政策 = 逐最冷腾位**(2026-10-19 改;旧 = 响亮拒 ⇒ 调用方
     //    回落"丢**新**快照" ⇒ 实测把整条链的旧边界挤死,部分前缀复用面 29%)。
@@ -121,17 +156,30 @@ async fn snapshot_offload_and_reload_is_byte_identical() {
     let k2 = key(8);
     r.register_snap_account(k2, SNAP_BYTES, Tier::Gpu, SnapDurability::Durable);
     let (p1, t1) = r.plan_snap_offload(k2, 3).expect("第一条");
-    let c1 = face.swap(SwapDir::Out, &p1[0], Box::new(t1)).await.expect("swap");
-    r.commit_snap_offload(k2, owl_store::reclaim_slot_table(c1).expect("台")).expect("落账");
+    let c1 = face
+        .swap(SwapDir::Out, &p1[0], Box::new(t1))
+        .await
+        .expect("swap");
+    r.commit_snap_offload(k2, owl_store::reclaim_slot_table(c1).expect("台"))
+        .expect("落账");
     assert_eq!(r.snap_host_free_slots(), 0, "预算 = 一条 ⇒ 此刻宿主满");
     let k3 = key(9);
     r.register_snap_account(k3, SNAP_BYTES, Tier::Gpu, SnapDurability::Durable);
-    let (p3, t3) = r.plan_snap_offload(k3, 1).expect("宿主满 ⇒ 逐最冷后应能下沉");
-    let c3 = face.swap(SwapDir::Out, &p3[0], Box::new(t3)).await.expect("swap");
-    r.commit_snap_offload(k3, owl_store::reclaim_slot_table(c3).expect("台")).expect("落账");
+    let (p3, t3) = r
+        .plan_snap_offload(k3, 1)
+        .expect("宿主满 ⇒ 逐最冷后应能下沉");
+    let c3 = face
+        .swap(SwapDir::Out, &p3[0], Box::new(t3))
+        .await
+        .expect("swap");
+    r.commit_snap_offload(k3, owl_store::reclaim_slot_table(c3).expect("台"))
+        .expect("落账");
     assert_eq!(r.state_locate(k2), None, "最冷条目 k2 应被逐(内容整体丢)");
     assert_eq!(r.state_locate(k3), Some(Tier::Host), "新条目应落宿主");
-    assert!(r.snap_host_evicted_bytes() >= SNAP_BYTES as u64, "逐出量应入账(观测面)");
+    assert!(
+        r.snap_host_evicted_bytes() >= SNAP_BYTES as u64,
+        "逐出量应入账(观测面)"
+    );
 
     // ④ 回灌失败可回滚:缓冲放回宿主(内容不丢)
     let (_pieces, _table) = r.plan_snap_onload(k3, 0).expect("回灌计划");
@@ -141,17 +189,21 @@ async fn snapshot_offload_and_reload_is_byte_identical() {
     assert_eq!(r.snap_host_used(), 0, "宿主账同步清");
 }
 
-/// 快照账的宿主面与**跨腿独立**:KV 腿关宿主时,状态腿照样能下沉(两腿两本账)。
+/// 2026-11-18 共享池：KV 与快照不再预切分片，两条腿看到同一个宿主总预算。
 #[tokio::test]
-async fn snap_host_is_independent_from_kv_host() {
+async fn snap_host_shares_kv_host_pool() {
     let mut face = CpuFace::new();
     let ps = snap_pieces(&mut face, 2).await;
     let mut r = rel(1 << 20); // host 总量 1MiB,全给状态腿(KV 腿分片 0)
-    r.attach_snap_layout(PoolLayout { class: BlockClass::GdnRow, epoch: 0, pieces: ps.clone() })
-        .expect("布局");
+    r.attach_snap_layout(PoolLayout {
+        class: BlockClass::GdnRow,
+        epoch: 0,
+        pieces: ps.clone(),
+    })
+    .expect("布局");
     assert_eq!(r.snap_host_budget(), 1 << 20);
     assert_eq!(r.snap_host_free_slots(), (1 << 20) / SNAP_BYTES);
-    assert_eq!(r.host_budget_bytes(), 0, "KV 腿宿主面仍关");
+    assert_eq!(r.host_budget_bytes(), 1 << 20, "两腿共享同一总池");
 }
 
 /// ⑤ **生成段(Transient)快照不可下沉**:逐出即丢,不占宿主带宽。
@@ -161,8 +213,12 @@ async fn transient_snapshot_is_not_offloadable() {
     let mut face = CpuFace::new();
     let ps = snap_pieces(&mut face, 2).await;
     let mut r = rel(1 << 20);
-    r.attach_snap_layout(PoolLayout { class: BlockClass::GdnRow, epoch: 0, pieces: ps.clone() })
-        .expect("布局");
+    r.attach_snap_layout(PoolLayout {
+        class: BlockClass::GdnRow,
+        epoch: 0,
+        pieces: ps.clone(),
+    })
+    .expect("布局");
     let k = key(11);
     seed(&mut face, &ps, 0, 0x22).await;
     r.register_snap_account(k, SNAP_BYTES, Tier::Gpu, SnapDurability::Transient);
@@ -195,8 +251,12 @@ async fn recapture_drops_stale_host_copy() {
     let mut face = CpuFace::new();
     let ps = snap_pieces(&mut face, 4).await;
     let mut r = rel(1 << 20);
-    r.attach_snap_layout(PoolLayout { class: BlockClass::GdnRow, epoch: 0, pieces: ps.clone() })
-        .expect("布局");
+    r.attach_snap_layout(PoolLayout {
+        class: BlockClass::GdnRow,
+        epoch: 0,
+        pieces: ps.clone(),
+    })
+    .expect("布局");
     let k = key(21);
     seed(&mut face, &ps, 0, 0x33).await;
     r.register_snap_captured(
@@ -210,8 +270,12 @@ async fn recapture_drops_stale_host_copy() {
     .expect("首拍");
     // 沉到宿主(此刻宿主真有内容)
     let (pieces, table) = r.plan_snap_offload(k, 0).expect("下沉计划");
-    let conn = face.swap(SwapDir::Out, &pieces[0], Box::new(table)).await.expect("swap");
-    r.commit_snap_offload(k, owl_store::reclaim_slot_table(conn).expect("台")).expect("落账");
+    let conn = face
+        .swap(SwapDir::Out, &pieces[0], Box::new(table))
+        .await
+        .expect("swap");
+    r.commit_snap_offload(k, owl_store::reclaim_slot_table(conn).expect("台"))
+        .expect("落账");
     assert_eq!(r.state_locate(k), Some(Tier::Host));
     assert_eq!(r.snap_host_used(), SNAP_BYTES);
 
@@ -232,7 +296,10 @@ async fn recapture_drops_stale_host_copy() {
 
     // 再沉一次:病灶版在这里抛「已在宿主层」
     let (pieces, table) = r.plan_snap_offload(k, 1).expect("重拍后可再沉(零幽灵)");
-    let conn = face.swap(SwapDir::Out, &pieces[0], Box::new(table)).await.expect("swap");
+    let conn = face
+        .swap(SwapDir::Out, &pieces[0], Box::new(table))
+        .await
+        .expect("swap");
     r.commit_snap_offload(k, owl_store::reclaim_slot_table(conn).expect("台"))
         .expect("再沉落账(不得撞不变量)");
     assert_eq!(r.state_locate(k), Some(Tier::Host));
@@ -248,8 +315,12 @@ async fn host_eviction_respects_snap_role_before_lru() {
     let mut face = CpuFace::new();
     let ps = snap_pieces(&mut face, 4).await;
     let mut r = rel(2 * SNAP_BYTES);
-    r.attach_snap_layout(PoolLayout { class: BlockClass::GdnRow, epoch: 0, pieces: ps.clone() })
-        .expect("布局");
+    r.attach_snap_layout(PoolLayout {
+        class: BlockClass::GdnRow,
+        epoch: 0,
+        pieces: ps.clone(),
+    })
+    .expect("布局");
 
     let k_tail = key(31);
     let k_history = key(32);
@@ -293,7 +364,9 @@ async fn host_eviction_respects_snap_role_before_lru() {
         SnapRole::History,
     )
     .expect("登记新 History");
-    let _ = r.plan_snap_offload(k_new, 2).expect("宿主满 ⇒ 按角色逐一条");
+    let _ = r
+        .plan_snap_offload(k_new, 2)
+        .expect("宿主满 ⇒ 按角色逐一条");
 
     assert_eq!(
         r.state_locate(k_history),
@@ -306,4 +379,3 @@ async fn host_eviction_respects_snap_role_before_lru() {
         "Tail 是最后淘汰角色，不应先走"
     );
 }
-

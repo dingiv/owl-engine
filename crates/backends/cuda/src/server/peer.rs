@@ -128,7 +128,9 @@ impl GpuServer {
         let t0 = std::time::Instant::now();
         let result = (|| {
             let (mapped, fd) = cred_decode(&credential)?;
-            let id = self.ctx_mut().peer_import(fd, mapped, bytes, &peer_uuid, &name, rw)?;
+            let id = self
+                .ctx_mut()
+                .peer_import(fd, mapped, bytes, &peer_uuid, &name, rw)?;
             self.trace_alloc_done(id);
             self.sink.logf(
                 owl_shared::log::LVL_INFO,
@@ -147,11 +149,7 @@ impl GpuServer {
     }
 
     /// `Command::PeerRelease`(TP2 S1;D2 = 显式释放 + Drop 兜底)。
-    pub(super) fn handle_peer_release(
-        &mut self,
-        ids: Vec<u64>,
-        ack: Ack<Result<(), ModelError>>,
-    ) {
+    pub(super) fn handle_peer_release(&mut self, ids: Vec<u64>, ack: Ack<Result<(), ModelError>>) {
         let t0 = std::time::Instant::now();
         let result = match self.ctx_mut().peer_release(&ids) {
             Ok(n) => {

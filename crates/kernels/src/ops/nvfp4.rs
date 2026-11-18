@@ -15,9 +15,9 @@
 //! - **可进图**(2026-10-28):alpha 在设备侧算(`dg` 槽 = `alpha = g·gb`),
 //!   发射路径零 host 工作/零同步 ⇒ decode / propose / verify 三张图都能捕
 
-use owl_macros::kernel_tags;
 use crate::contract::{Dtype, Law};
 use crate::spec::{meta_of, CaptureEvidence, Determinism, KernelMeta, KernelSpec, Param};
+use owl_macros::kernel_tags;
 
 /// `nvfp4_gemm` —— NVFP4 GEMM(prefill 臂;`m ≥ 128`)
 pub struct NvFp4Gemm;

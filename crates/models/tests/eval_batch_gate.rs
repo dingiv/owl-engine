@@ -7,7 +7,9 @@
 //! 运行:`OWL_TEST_DEVICE=01:00.0 cargo test -p owl-models --test eval_batch_gate`
 //! (未设 = skip;不隐式选卡。)
 
-use owl_cuda::{test_device_ordinal_opt, Command as Envelope, DeviceSelector, GpuClient, GpuServer};
+use owl_cuda::{
+    test_device_ordinal_opt, Command as Envelope, DeviceSelector, GpuClient, GpuServer,
+};
 use owl_iface::contract::{Bytes, DeviceClient, Dtype, ModelError};
 use owl_iface::handle::DeviceHandle;
 use owl_models::env::EnvProvider;

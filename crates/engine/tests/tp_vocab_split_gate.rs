@@ -44,7 +44,10 @@ fn dir_of() -> PathBuf {
     std::env::var("OWL_27B_DIR")
         .map(PathBuf::from)
         .unwrap_or_else(|_| {
-            PathBuf::from(concat!(env!("CARGO_MANIFEST_DIR"), "/../../models/cyankiwi/Qwen3.8-27B-AWQ-INT4"))
+            PathBuf::from(concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/../../models/cyankiwi/Qwen3.8-27B-AWQ-INT4"
+            ))
         })
 }
 
@@ -78,8 +81,17 @@ fn concat_halves(a: &[f32], b: &[f32]) -> Vec<f32> {
 }
 
 fn max_abs(a: &[f32], b: &[f32]) -> f32 {
-    assert_eq!(a.len(), b.len(), "max_abs: 长度不等 {} vs {}", a.len(), b.len());
-    a.iter().zip(b).map(|(x, y)| (x - y).abs()).fold(0f32, f32::max)
+    assert_eq!(
+        a.len(),
+        b.len(),
+        "max_abs: 长度不等 {} vs {}",
+        a.len(),
+        b.len()
+    );
+    a.iter()
+        .zip(b)
+        .map(|(x, y)| (x - y).abs())
+        .fold(0f32, f32::max)
 }
 
 fn topn(v: &[f32], n: usize) -> Vec<u32> {
@@ -113,7 +125,8 @@ async fn run_arm(dir: &Path, oa: usize, ob: usize, chunk: usize, vsplit: bool) -
         .load_qwen38_27b_awq(dir, dir, QuantPlan::F16, QuantPlan::W4A16Awq)
         .await
         .expect("rank0 分片装载");
-    let mut e1 = Engine::new_with_ledger(cfg_of(ob, chunk), e0.ledger_cell(), 1).expect("engine(r1)");
+    let mut e1 =
+        Engine::new_with_ledger(cfg_of(ob, chunk), e0.ledger_cell(), 1).expect("engine(r1)");
     let m1 = e1
         .loader()
         .slice(1, 2)
@@ -174,7 +187,12 @@ async fn run_arm(dir: &Path, oa: usize, ob: usize, chunk: usize, vsplit: bool) -
         .expect("rank1 末步")
         .expect("logits 槽");
     let _ = r.shutdown_tp().await;
-    Arm { gen, logits, l0_last, l1_last }
+    Arm {
+        gen,
+        logits,
+        l0_last,
+        l1_last,
+    }
 }
 
 #[test]
@@ -211,7 +229,11 @@ async fn body(oa: usize, ob: usize, dir: PathBuf) {
     // ── 臂 A:不切档(参考)──────────────────────────────────────────
     eprintln!("[vsplit] 臂 A(不切档)装载 + 跑 turn…");
     let a = run_arm(&dir, oa, ob, chunk, false).await;
-    assert_eq!(a.l0_last.len(), a.l1_last.len(), "不切档:两 rank 全表应等宽");
+    assert_eq!(
+        a.l0_last.len(),
+        a.l1_last.len(),
+        "不切档:两 rank 全表应等宽"
+    );
     eprintln!(
         "[vsplit] 臂 A:{} tok;全表宽 {};gen={:?}",
         a.gen.len(),

@@ -109,8 +109,7 @@ impl ChatRequest {
             // data URL(预处理在 `ChatRequest::images`,真正的解码错误在那里报)。
             if let Some(arr) = m.get("content").and_then(|c| c.as_array()) {
                 for (j, part) in arr.iter().enumerate() {
-                    let is_image = part.get("type").and_then(|t| t.as_str())
-                        == Some("image_url")
+                    let is_image = part.get("type").and_then(|t| t.as_str()) == Some("image_url")
                         || part.get("image_url").is_some();
                     if is_image {
                         let url = part
@@ -118,9 +117,7 @@ impl ChatRequest {
                             .and_then(|v| v.get("url"))
                             .and_then(|v| v.as_str())
                             .ok_or_else(|| {
-                                format!(
-                                    "messages[{i}].content[{j}].image_url.url 缺失或非字符串"
-                                )
+                                format!("messages[{i}].content[{j}].image_url.url 缺失或非字符串")
                             })?;
                         if !url.starts_with("data:") {
                             return Err(format!(
@@ -151,7 +148,9 @@ impl ChatRequest {
                     if tc.get("id").and_then(|v| v.as_str()).is_none() {
                         return Err(format!("{fd}.id 缺失"));
                     }
-                    let f = tc.get("function").ok_or_else(|| format!("{fd}.function 缺失"))?;
+                    let f = tc
+                        .get("function")
+                        .ok_or_else(|| format!("{fd}.function 缺失"))?;
                     if f.get("name").and_then(|v| v.as_str()).is_none() {
                         return Err(format!("{fd}.function.name 缺失"));
                     }
@@ -167,9 +166,7 @@ impl ChatRequest {
                         }
                         Some(Value::Object(_)) | Some(Value::Array(_)) => {}
                         _ => {
-                            return Err(format!(
-                                "{fd}.function.arguments 必须是 JSON 字符串或对象"
-                            ))
+                            return Err(format!("{fd}.function.arguments 必须是 JSON 字符串或对象"))
                         }
                     }
                 }
@@ -181,7 +178,12 @@ impl ChatRequest {
                 return Err("n > 1 未支持(本服务单序列)".into());
             }
         }
-        if self.extra.get("logprobs").and_then(|v| v.as_bool()).unwrap_or(false) {
+        if self
+            .extra
+            .get("logprobs")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false)
+        {
             return Err("logprobs 未支持".into());
         }
         if let Some(rf) = self.extra.get("response_format") {
@@ -205,7 +207,10 @@ impl ChatRequest {
     pub fn warnings(&self) -> Vec<String> {
         let mut out = Vec::new();
         if !self.extra.is_empty() {
-            out.push(format!("未知字段 {:?}", self.extra.keys().collect::<Vec<_>>()));
+            out.push(format!(
+                "未知字段 {:?}",
+                self.extra.keys().collect::<Vec<_>>()
+            ));
         }
         out
     }
@@ -291,7 +296,7 @@ impl ChatRequest {
     /// **收集并预处理图像**(内容顺序 = 模板 `<|image_pad|>` 顺序)。
     ///
     /// 仅 data URL;`vision_processor` 只做 base64 解码 + 内容缓存（P5 起
-/// Qwen2VL 的 resize/patchify 在 `owl_models::vlm::preprocess`）。
+    /// Qwen2VL 的 resize/patchify 在 `owl_models::vlm::preprocess`）。
     /// 无图像 = 空(纯文本逐字节旧行为)。
     ///
     /// **可删标记**(前缀无感删除;2026-10-23 用户裁决):图像 content part 上
@@ -305,8 +310,7 @@ impl ChatRequest {
                 continue;
             };
             for (j, part) in arr.iter().enumerate() {
-                let is_image = part.get("type").and_then(|t| t.as_str())
-                    == Some("image_url")
+                let is_image = part.get("type").and_then(|t| t.as_str()) == Some("image_url")
                     || part.get("image_url").is_some();
                 if !is_image {
                     continue;
@@ -355,7 +359,10 @@ impl ChatRequest {
         };
         let list: Vec<String> = list.into_iter().filter(|s| !s.is_empty()).collect();
         if list.len() > MAX_STOP_SEQS {
-            return Err(format!("stop 串个数 {} 超过上限 {MAX_STOP_SEQS}", list.len()));
+            return Err(format!(
+                "stop 串个数 {} 超过上限 {MAX_STOP_SEQS}",
+                list.len()
+            ));
         }
         if let Some(over) = list.iter().find(|s| s.len() > MAX_STOP_LEN) {
             return Err(format!("stop 串过长({}B > {MAX_STOP_LEN}B)", over.len()));
@@ -393,7 +400,10 @@ impl ChatRequest {
             };
             for (j, tc) in arr.iter_mut().enumerate() {
                 let fd = format!("messages[{i}].tool_calls[{j}]");
-                let ty = tc.get("type").and_then(|v| v.as_str()).unwrap_or("function");
+                let ty = tc
+                    .get("type")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("function");
                 if ty != "function" {
                     return Err(format!("{fd}.type={ty:?} 未支持(仅 function)"));
                 }
@@ -425,7 +435,10 @@ impl ChatRequest {
             .max_tokens
             .filter(|v| *v > 0)
             .unwrap_or(agent.max_generation_length);
-        (want.min(agent.max_generation_length), want > agent.max_generation_length)
+        (
+            want.min(agent.max_generation_length),
+            want > agent.max_generation_length,
+        )
     }
 
     /// **模板 kwargs 的唯一组装点**(vLLM `build_chat_params` 同款)。
@@ -683,7 +696,10 @@ impl Agg {
 /// 把模板里的每个 `<|image_pad|>` 展开成 `grid_h*grid_w/4` 个。
 ///
 /// 顺序 = `images` 序(内容序)。少/多占位 = 400(不许静默错位)。
-pub(crate) fn expand_image_pads(prompt: &str, images: &[owl_engine::TurnImage]) -> Result<String, String> {
+pub(crate) fn expand_image_pads(
+    prompt: &str,
+    images: &[owl_engine::TurnImage],
+) -> Result<String, String> {
     const PAD: &str = "<|image_pad|>";
     let mut out = String::with_capacity(prompt.len());
     let mut rest = prompt;
@@ -699,10 +715,7 @@ pub(crate) fn expand_image_pads(prompt: &str, images: &[owl_engine::TurnImage]) 
         rest = &rest[pos + PAD.len()..];
     }
     if rest.contains(PAD) {
-        return Err(format!(
-            "模板的 <|image_pad|> 多于图像数 {}",
-            images.len()
-        ));
+        return Err(format!("模板的 <|image_pad|> 多于图像数 {}", images.len()));
     }
     out.push_str(rest);
     Ok(out)
@@ -729,7 +742,12 @@ pub(crate) fn dump_request(dir: &std::path::Path, body: &[u8]) {
                 if let Err(e) = f.write_all(body) {
                     owl_shared::log_warn!("request-dump", "写入失败 {}: {e}", path.display());
                 } else {
-                    owl_shared::log_debug!("request-dump", "落盘 {} ({}B)", path.display(), body.len());
+                    owl_shared::log_debug!(
+                        "request-dump",
+                        "落盘 {} ({}B)",
+                        path.display(),
+                        body.len()
+                    );
                 }
                 return;
             }

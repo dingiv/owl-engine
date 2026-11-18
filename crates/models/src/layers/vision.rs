@@ -58,10 +58,13 @@ impl VisionCfg {
     pub fn from_json(cfg_text: &[u8]) -> Result<Self, ModelError> {
         let v: serde_json::Value = serde_json::from_slice(cfg_text)
             .map_err(|e| ModelError::Msg(format!("vision config.json 解析: {e}")))?;
-        let vc = v.get("vision_config")
+        let vc = v
+            .get("vision_config")
             .ok_or_else(|| ModelError::Msg("config.json 无 vision_config(不是 VLM?)".into()))?;
         let g = |k: &str| -> Result<usize, ModelError> {
-            vc.get(k).and_then(|x| x.as_u64()).map(|x| x as usize)
+            vc.get(k)
+                .and_then(|x| x.as_u64())
+                .map(|x| x as usize)
                 .ok_or_else(|| ModelError::Msg(format!("vision_config 缺 {k}")))
         };
         let eps = vc
@@ -205,7 +208,9 @@ impl VisionTables {
         let mut n = 0usize;
         for &(t, h, w) in grid {
             if h == 0 || w == 0 || t == 0 {
-                return Err(ModelError::Msg(format!("VisionTables::build: 非法网格 ({t},{h},{w})")));
+                return Err(ModelError::Msg(format!(
+                    "VisionTables::build: 非法网格 ({t},{h},{w})"
+                )));
             }
             if h % merge != 0 || w % merge != 0 {
                 return Err(ModelError::Msg(format!(
@@ -285,15 +290,41 @@ impl VisionTables {
         }
         let cast = |v: &[f32], dt: Dtype| -> Vec<u8> { pack(v, dt) };
         let px_t = TensorOps::from_host(dtype, vec![self.rows, flat], &cast(px, dtype));
-        let idx = TensorOps::from_host(Dtype::F32, vec![self.rows, 4], &cast(&self.idx, Dtype::F32));
-        let wts = TensorOps::from_host(Dtype::F32, vec![self.rows, 4], &cast(&self.wts, Dtype::F32));
-        let cos = TensorOps::from_host(dtype, vec![self.rows, self.cfg.half()], &cast(&self.cos, dtype));
-        let sin = TensorOps::from_host(dtype, vec![self.rows, self.cfg.half()], &cast(&self.sin, dtype));
+        let idx =
+            TensorOps::from_host(Dtype::F32, vec![self.rows, 4], &cast(&self.idx, Dtype::F32));
+        let wts =
+            TensorOps::from_host(Dtype::F32, vec![self.rows, 4], &cast(&self.wts, Dtype::F32));
+        let cos = TensorOps::from_host(
+            dtype,
+            vec![self.rows, self.cfg.half()],
+            &cast(&self.cos, dtype),
+        );
+        let sin = TensorOps::from_host(
+            dtype,
+            vec![self.rows, self.cfg.half()],
+            &cast(&self.sin, dtype),
+        );
         // ⚠️ `pos` 按 **rank 2** 声明(`owl_rope_half_partial_*` 的线契约是 [tokens, 1];
         // 核内线性取 `pos[t]`)—— 文本侧 caller 传的是 rank 1,属既存不一致,已记台账。
-        let pos = TensorOps::from_host(Dtype::F32, vec![self.rows, 1], &cast(&self.pos, Dtype::F32));
-        let cu = TensorOps::from_host(Dtype::F32, vec![self.n_seq + 1], &cast(&self.cu, Dtype::F32));
-        Ok(VisionInputs { px: px_t, idx, wts, cos, sin, pos, cu, rows: self.rows, n_seq: self.n_seq, cfg: self.cfg })
+        let pos =
+            TensorOps::from_host(Dtype::F32, vec![self.rows, 1], &cast(&self.pos, Dtype::F32));
+        let cu = TensorOps::from_host(
+            Dtype::F32,
+            vec![self.n_seq + 1],
+            &cast(&self.cu, Dtype::F32),
+        );
+        Ok(VisionInputs {
+            px: px_t,
+            idx,
+            wts,
+            cos,
+            sin,
+            pos,
+            cu,
+            rows: self.rows,
+            n_seq: self.n_seq,
+            cfg: self.cfg,
+        })
     }
 }
 
@@ -301,7 +332,10 @@ impl VisionTables {
 fn pack(v: &[f32], dtype: Dtype) -> Vec<u8> {
     match dtype {
         Dtype::F32 => v.iter().flat_map(|x| x.to_le_bytes()).collect(),
-        Dtype::F16 => v.iter().flat_map(|x| half::f16::from_f32(*x).to_le_bytes()).collect(),
+        Dtype::F16 => v
+            .iter()
+            .flat_map(|x| half::f16::from_f32(*x).to_le_bytes())
+            .collect(),
         other => panic!("vision::pack: 未预期的 dtype {other:?}(塔只走 f32/f16)"),
     }
 }
@@ -350,7 +384,16 @@ impl VisionPatchEmbed {
     pub fn new(cfg: &VisionCfg) -> Self {
         VisionPatchEmbed {
             // 检查点原布局 [hidden, in, t, p, p];前向按 [hidden, patch_flat] 行主序直读
-            w: Weight::new("patch_embed.proj.weight", vec![cfg.hidden, cfg.in_channels, cfg.temporal, cfg.patch, cfg.patch]),
+            w: Weight::new(
+                "patch_embed.proj.weight",
+                vec![
+                    cfg.hidden,
+                    cfg.in_channels,
+                    cfg.temporal,
+                    cfg.patch,
+                    cfg.patch,
+                ],
+            ),
             b: Weight::new("patch_embed.proj.bias", vec![cfg.hidden]),
             patch_flat: cfg.patch_flat(),
         }
@@ -386,7 +429,10 @@ impl VisionAttention {
     }
 
     pub fn is_loaded(&self) -> bool {
-        self.qkv_w.is_loaded() && self.qkv_b.is_loaded() && self.proj_w.is_loaded() && self.proj_b.is_loaded()
+        self.qkv_w.is_loaded()
+            && self.qkv_b.is_loaded()
+            && self.proj_w.is_loaded()
+            && self.proj_b.is_loaded()
     }
 
     /// `x [n, hidden]` + 表 ⇒ `[n, hidden]`
@@ -415,11 +461,16 @@ impl VisionAttention {
                 .arg_usize(half)
                 .with_shape(dt, vec![n, hw])
         };
-        let (q, k) = (rope(&q).reshape(vec![n, h, hd]), rope(&k).reshape(vec![n, h, hd]));
+        let (q, k) = (
+            rope(&q).reshape(vec![n, h, hd]),
+            rope(&k).reshape(vec![n, h, hd]),
+        );
         let v = v.reshape(vec![n, h, hd]);
         let scale = 1.0f32 / (hd as f32).sqrt();
         let attn = q.attn_full(&k, &v, &tb.cu, tb.n_seq, scale);
-        attn.reshape(vec![n, h * hd]).matmul_nt(&self.proj_w.decl()).bias_add(&self.proj_b.decl())
+        attn.reshape(vec![n, h * hd])
+            .matmul_nt(&self.proj_w.decl())
+            .bias_add(&self.proj_b.decl())
     }
 }
 
@@ -442,12 +493,17 @@ impl VisionMlp {
     }
 
     pub fn is_loaded(&self) -> bool {
-        self.fc1_w.is_loaded() && self.fc1_b.is_loaded() && self.fc2_w.is_loaded() && self.fc2_b.is_loaded()
+        self.fc1_w.is_loaded()
+            && self.fc1_b.is_loaded()
+            && self.fc2_w.is_loaded()
+            && self.fc2_b.is_loaded()
     }
 
     fn forward(&self, x: &TensorOps) -> TensorOps {
         let h = x.matmul_nt(&self.fc1_w.decl()).bias_add(&self.fc1_b.decl());
-        h.gelu_tanh().matmul_nt(&self.fc2_w.decl()).bias_add(&self.fc2_b.decl())
+        h.gelu_tanh()
+            .matmul_nt(&self.fc2_w.decl())
+            .bias_add(&self.fc2_b.decl())
     }
 }
 
@@ -470,7 +526,10 @@ impl VisionBlock {
     }
 
     pub fn is_loaded(&self) -> bool {
-        self.norm1.is_loaded() && self.attn.is_loaded() && self.norm2.is_loaded() && self.mlp.is_loaded()
+        self.norm1.is_loaded()
+            && self.attn.is_loaded()
+            && self.norm2.is_loaded()
+            && self.mlp.is_loaded()
     }
 
     fn forward(&self, x: &TensorOps, tb: &VisionInputs) -> TensorOps {
@@ -498,7 +557,12 @@ impl VisionMerger {
         let merged = cfg.hidden * cfg.merge * cfg.merge;
         VisionMerger {
             // HF:`use_postshuffle_norm=False` ⇒ LN 宽度 = hidden(逐 patch),先归一再 shuffle
-            norm: LayerNorm::new("merger.norm.weight", "merger.norm.bias", cfg.hidden, cfg.eps()),
+            norm: LayerNorm::new(
+                "merger.norm.weight",
+                "merger.norm.bias",
+                cfg.hidden,
+                cfg.eps(),
+            ),
             fc1_w: Weight::new("merger.linear_fc1.weight", vec![merged, merged]),
             fc1_b: Weight::new("merger.linear_fc1.bias", vec![merged]),
             fc2_w: Weight::new("merger.linear_fc2.weight", vec![cfg.out_hidden, merged]),
@@ -509,7 +573,11 @@ impl VisionMerger {
     }
 
     pub fn is_loaded(&self) -> bool {
-        self.norm.is_loaded() && self.fc1_w.is_loaded() && self.fc1_b.is_loaded() && self.fc2_w.is_loaded() && self.fc2_b.is_loaded()
+        self.norm.is_loaded()
+            && self.fc1_w.is_loaded()
+            && self.fc1_b.is_loaded()
+            && self.fc2_w.is_loaded()
+            && self.fc2_b.is_loaded()
     }
 
     fn forward(&self, x: &TensorOps, rows: usize) -> TensorOps {
@@ -519,7 +587,9 @@ impl VisionMerger {
         let y = y.reshape(vec![n_merged, self.merged_dim]);
         let h = y.matmul_nt(&self.fc1_w.decl()).bias_add(&self.fc1_b.decl());
         // ⚠️ **精确 erf GELU**(与 block MLP 的 tanh 版不同)
-        h.gelu_erf().matmul_nt(&self.fc2_w.decl()).bias_add(&self.fc2_b.decl())
+        h.gelu_erf()
+            .matmul_nt(&self.fc2_w.decl())
+            .bias_add(&self.fc2_b.decl())
     }
 }
 
@@ -579,7 +649,11 @@ impl VisionTower {
         }
         // ④ merger(注意:merger 自己内含 LN;pre_merger = 归一前 hidden)
         let merged = self.merger.forward(&h, tb.rows);
-        VisionOut { blocks, pre_merger: h, merged }
+        VisionOut {
+            blocks,
+            pre_merger: h,
+            merged,
+        }
     }
 }
 
@@ -595,13 +669,21 @@ impl Loadable for VisionPatchEmbed {
 
 impl Loadable for VisionAttention {
     fn layout(&self, ctx: &LoaderCtx) -> LoaderOps {
-        self.qkv_w.layout(ctx).chain(self.qkv_b.layout(ctx)).chain(self.proj_w.layout(ctx)).chain(self.proj_b.layout(ctx))
+        self.qkv_w
+            .layout(ctx)
+            .chain(self.qkv_b.layout(ctx))
+            .chain(self.proj_w.layout(ctx))
+            .chain(self.proj_b.layout(ctx))
     }
 }
 
 impl Loadable for VisionMlp {
     fn layout(&self, ctx: &LoaderCtx) -> LoaderOps {
-        self.fc1_w.layout(ctx).chain(self.fc1_b.layout(ctx)).chain(self.fc2_w.layout(ctx)).chain(self.fc2_b.layout(ctx))
+        self.fc1_w
+            .layout(ctx)
+            .chain(self.fc1_b.layout(ctx))
+            .chain(self.fc2_w.layout(ctx))
+            .chain(self.fc2_b.layout(ctx))
     }
 }
 
@@ -629,11 +711,15 @@ impl Loadable for VisionMerger {
 impl Loadable for VisionTower {
     /// 槽名 → 检查点全键(`model.visual.` 前缀在此**唯一**落点)
     fn layout(&self, ctx: &LoaderCtx) -> LoaderOps {
-        let mut ops = self.patch_embed.layout(ctx).chain(self.pos_embed.layout(ctx));
+        let mut ops = self
+            .patch_embed
+            .layout(ctx)
+            .chain(self.pos_embed.layout(ctx));
         for (i, blk) in self.blocks.iter().enumerate() {
             ops = ops.chain(blk.layout(ctx).map_keys(|k| format!("blocks.{i}.{k}")));
         }
-        ops.chain(self.merger.layout(ctx)).map_keys(|k| format!("model.visual.{k}"))
+        ops.chain(self.merger.layout(ctx))
+            .map_keys(|k| format!("model.visual.{k}"))
     }
 }
 
@@ -671,8 +757,9 @@ mod tests {
     fn visual_weights() -> (std::collections::HashMap<String, Vec<f32>>, VisionCfg) {
         // 默认档 = **Qwen3.5-4B**(用户裁决 2026-10-15:塔更小(hidden 1024/24 层/hd **64**)
         // + 文本 4B ⇒ 单张 3080 装得下;Holo-9B 塔 head_dim 72 不落 FlashInfer 实例化档)。
-        let ckpt = owl_shared::testkit::resource("ckpt:qwen35-4b")
-            .unwrap_or_else(|| concat!(env!("CARGO_MANIFEST_DIR"), "/../../models/Qwen/Qwen3.5-4B").into());
+        let ckpt = owl_shared::testkit::resource("ckpt:qwen35-4b").unwrap_or_else(|| {
+            concat!(env!("CARGO_MANIFEST_DIR"), "/../../models/Qwen/Qwen3.5-4B").into()
+        });
         let dir = PathBuf::from(ckpt);
         let mut out = std::collections::HashMap::new();
         let mut shards: Vec<PathBuf> = std::fs::read_dir(&dir)
@@ -681,13 +768,17 @@ mod tests {
             .filter(|p| {
                 // shard 命名两种:HF 分隔点(`model-00001-of-00002.safetensors`)
                 // 与新式(`model.safetensors-00001-of-00002.safetensors`)⇒ 只认 `model` + `.safetensors`
-                p.file_name().and_then(|n| n.to_str()).is_some_and(|n| {
-                    n.starts_with("model") && n.ends_with(".safetensors")
-                })
+                p.file_name()
+                    .and_then(|n| n.to_str())
+                    .is_some_and(|n| n.starts_with("model") && n.ends_with(".safetensors"))
             })
             .collect();
         shards.sort();
-        assert!(!shards.is_empty(), "{} 下没有 model-*.safetensors", dir.display());
+        assert!(
+            !shards.is_empty(),
+            "{} 下没有 model-*.safetensors",
+            dir.display()
+        );
         for shard in shards {
             let bytes = owl_shared::file_loader::read(&shard).expect("shard 读入");
             let st = safetensors::SafeTensors::deserialize(&bytes).expect("safetensors 解析");
@@ -771,7 +862,10 @@ mod tests {
         let (_, cfg) = visual_weights();
         for g in &goldens {
             let grid = golden_grid(g);
-            eprintln!("[vis] 表对拍 档 {} grid={grid:?}", g.file_name().unwrap().to_string_lossy());
+            eprintln!(
+                "[vis] 表对拍 档 {} grid={grid:?}",
+                g.file_name().unwrap().to_string_lossy()
+            );
             tables_match_golden(g, cfg, &grid);
         }
     }
@@ -804,7 +898,11 @@ mod tests {
     }
 
     /// 装权重 + 前向(CPU face)⇒ 逐层/末层对拍
-    async fn tower_forward(face: &mut owl_cpu::CpuFace, tb: &VisionTables, px: &[f32]) -> VisionOut {
+    async fn tower_forward(
+        face: &mut owl_cpu::CpuFace,
+        tb: &VisionTables,
+        px: &[f32],
+    ) -> VisionOut {
         let (weights, cfg) = visual_weights();
         let tower = VisionTower::new(cfg);
         let src = Src::from(weights);
@@ -854,10 +952,16 @@ mod tests {
         {
             let single = crate::testkit::harvest_f16(&mut gpu, &out.blocks[0]).await;
             let want = st_read(g, "h.blk_00");
-            let d = single.iter().zip(&want).map(|(a, b)| (a - b).abs()).fold(0.0f32, f32::max);
+            let d = single
+                .iter()
+                .zip(&want)
+                .map(|(a, b)| (a - b).abs())
+                .fold(0.0f32, f32::max);
             eprintln!("[vis-mr2] f16 单根 blk_00 对金标 max|Δ| = {d:.3e}");
         }
-        let vals = crate::interpreters::eval_ops_multi(&roots, &mut gpu, None).await.expect("eval_multi(gpu)");
+        let vals = crate::interpreters::eval_ops_multi(&roots, &mut gpu, None)
+            .await
+            .expect("eval_multi(gpu)");
 
         for (i, b) in vals.iter().take(cfg.depth).enumerate() {
             let n = tb.rows * cfg.hidden;
@@ -880,12 +984,17 @@ mod tests {
                 (got[at] - want[at]).abs(),
                 want[at].abs()
             );
-            assert!(worst <= 1.0, "gpu blk_{i:02}: f16 档归一化误差 {worst:.3e} > 1");
+            assert!(
+                worst <= 1.0,
+                "gpu blk_{i:02}: f16 档归一化误差 {worst:.3e} > 1"
+            );
         }
         {
             let n = (tb.rows / 4) * cfg.out_hidden;
             let mut buf = vec![0u8; n * 2];
-            gpu.dtoh(&vals[cfg.depth + 1], &mut buf).await.expect("dtoh(f16)");
+            gpu.dtoh(&vals[cfg.depth + 1], &mut buf)
+                .await
+                .expect("dtoh(f16)");
             let got: Vec<f32> = buf
                 .chunks_exact(2)
                 .map(|c| half::f16::from_le_bytes([c[0], c[1]]).to_f32())
@@ -926,7 +1035,16 @@ mod tests {
             .collect();
         let tower = VisionTower::new(cfg);
         let mut gpu = crate::testkit::gpu_client().await;
-        let lctx = crate::module::LoaderCtx { dtype: Dtype::F16, shard: 1, slice_id: 0, device_repack: false, verify: false, debug_tap: false, staging_mb: 128, dump: false };
+        let lctx = crate::module::LoaderCtx {
+            dtype: Dtype::F16,
+            shard: 1,
+            slice_id: 0,
+            device_repack: false,
+            verify: false,
+            debug_tap: false,
+            staging_mb: 128,
+            dump: false,
+        };
         crate::interpreters::eval_load(&tower, &mut gpu, &Src::from(weights), &lctx)
             .await
             .expect("塔 f16 装载");
@@ -939,9 +1057,14 @@ mod tests {
         // 27 层全部中间块留活 ⇒ 实测 7.8 GB 常驻,第二轮即撞池碎片化 OOM。
         let trees: Vec<TensorOps> = roots.iter().map(|t| (*t).clone()).collect();
         let refs: Vec<&TensorOps> = trees.iter().collect();
-        let _ = crate::interpreters::eval_ops_multi_scoped_env(&refs, &mut gpu, crate::env::EnvProvider::default(), None)
-            .await
-            .expect("warmup");
+        let _ = crate::interpreters::eval_ops_multi_scoped_env(
+            &refs,
+            &mut gpu,
+            crate::env::EnvProvider::default(),
+            None,
+        )
+        .await
+        .expect("warmup");
         gpu.sync().await.expect("sync");
         eprintln!(
             "[vis-bench] 暖机后 vram live {:.1} MiB / total {:.0} MiB",
@@ -952,9 +1075,14 @@ mod tests {
         for _ in 0..3 {
             gpu.sync().await.expect("sync");
             let t0 = std::time::Instant::now();
-            let _ = crate::interpreters::eval_ops_multi_scoped_env(&refs, &mut gpu, crate::env::EnvProvider::default(), None)
-                .await
-                .expect("bench");
+            let _ = crate::interpreters::eval_ops_multi_scoped_env(
+                &refs,
+                &mut gpu,
+                crate::env::EnvProvider::default(),
+                None,
+            )
+            .await
+            .expect("bench");
             gpu.sync().await.expect("sync"); // ⚠️ server 是异步提交 ⇒ 必须 sync 才含设备时间
             best = best.min(t0.elapsed().as_secs_f64());
         }
@@ -968,17 +1096,33 @@ mod tests {
         // ②仅注意力核(同形状;10 次平均)
         let n = tb.rows * cfg.hidden;
         let hb = |v: &[f32]| -> Vec<u8> { pack(v, Dtype::F16) };
-        let q = TensorOps::from_host(Dtype::F16, vec![tb.rows, cfg.heads, cfg.head_dim()], &hb(&vec![0.01f32; n]));
-        let k = TensorOps::from_host(Dtype::F16, vec![tb.rows, cfg.heads, cfg.head_dim()], &hb(&vec![0.02f32; n]));
-        let v = TensorOps::from_host(Dtype::F16, vec![tb.rows, cfg.heads, cfg.head_dim()], &hb(&vec![0.03f32; n]));
+        let q = TensorOps::from_host(
+            Dtype::F16,
+            vec![tb.rows, cfg.heads, cfg.head_dim()],
+            &hb(&vec![0.01f32; n]),
+        );
+        let k = TensorOps::from_host(
+            Dtype::F16,
+            vec![tb.rows, cfg.heads, cfg.head_dim()],
+            &hb(&vec![0.02f32; n]),
+        );
+        let v = TensorOps::from_host(
+            Dtype::F16,
+            vec![tb.rows, cfg.heads, cfg.head_dim()],
+            &hb(&vec![0.03f32; n]),
+        );
         let cu = TensorOps::from_host(Dtype::F32, vec![tb.n_seq + 1], &pack(&tb.cu, Dtype::F32));
         let scale = 1.0f32 / (cfg.head_dim() as f32).sqrt();
         let attn = q.attn_full(&k, &v, &cu, tb.n_seq, scale);
-        let _ = crate::interpreters::eval_ops(attn.step(), &mut gpu).await.expect("warm");
+        let _ = crate::interpreters::eval_ops(attn.step(), &mut gpu)
+            .await
+            .expect("warm");
         gpu.sync().await.expect("sync");
         let t0 = std::time::Instant::now();
         for _ in 0..10 {
-            let _ = crate::interpreters::eval_ops(attn.step(), &mut gpu).await.expect("bench");
+            let _ = crate::interpreters::eval_ops(attn.step(), &mut gpu)
+                .await
+                .expect("bench");
         }
         gpu.sync().await.expect("sync");
         eprintln!(
@@ -991,8 +1135,6 @@ mod tests {
         gpu.close().await.expect("关机");
     }
 
-
-
     /// 真图金标路径 + 图标签枚举(in./<tag>.pixel_values 推断)
     fn real_golden() -> PathBuf {
         golden_root().join("vision_real.safetensors")
@@ -1002,7 +1144,10 @@ mod tests {
     fn real_tags(g: &Path) -> Vec<String> {
         let all = real_tags_all(g);
         match std::env::var("OWL_VIS_IMAGE") {
-            Ok(pick) => all.into_iter().filter(|t| pick.split(',').any(|p| p == t)).collect(),
+            Ok(pick) => all
+                .into_iter()
+                .filter(|t| pick.split(',').any(|p| p == t))
+                .collect(),
             Err(_) => all,
         }
     }
@@ -1037,7 +1182,16 @@ mod tests {
         let (weights, cfg) = visual_weights();
         let mut gpu = crate::testkit::gpu_client().await;
         let tower = VisionTower::new(cfg);
-        let lctx = crate::module::LoaderCtx { dtype: Dtype::F16, shard: 1, slice_id: 0, device_repack: false, verify: false, debug_tap: false, staging_mb: 128, dump: false };
+        let lctx = crate::module::LoaderCtx {
+            dtype: Dtype::F16,
+            shard: 1,
+            slice_id: 0,
+            device_repack: false,
+            verify: false,
+            debug_tap: false,
+            staging_mb: 128,
+            dump: false,
+        };
         crate::interpreters::eval_load(&tower, &mut gpu, &Src::from(weights), &lctx)
             .await
             .expect("塔 f16 装载");
@@ -1049,13 +1203,21 @@ mod tests {
             let inputs = tb.inputs(&pv, Dtype::F16).expect("inputs(f16)");
             let out = tower.forward(&inputs);
             let roots: Vec<&TensorOps> = vec![&out.pre_merger, &out.merged];
-            let vals = crate::interpreters::eval_ops_multi(&roots, &mut gpu, None).await.expect("eval(gpu)");
-            for (i, (name, want_key)) in
-                [("pre_merger", format!("h.{tag}.pre_merger")), ("merged", format!("h.{tag}.merged"))]
-                    .iter()
-                    .enumerate()
+            let vals = crate::interpreters::eval_ops_multi(&roots, &mut gpu, None)
+                .await
+                .expect("eval(gpu)");
+            for (i, (name, want_key)) in [
+                ("pre_merger", format!("h.{tag}.pre_merger")),
+                ("merged", format!("h.{tag}.merged")),
+            ]
+            .iter()
+            .enumerate()
             {
-                let n = if i == 0 { tb.rows * cfg.hidden } else { (tb.rows / 4) * cfg.out_hidden };
+                let n = if i == 0 {
+                    tb.rows * cfg.hidden
+                } else {
+                    (tb.rows / 4) * cfg.out_hidden
+                };
                 let mut buf = vec![0u8; n * 2];
                 gpu.dtoh(&vals[i], &mut buf).await.expect("dtoh");
                 let got: Vec<f32> = buf
@@ -1064,13 +1226,21 @@ mod tests {
                     .collect();
                 let want = st_read(&g, want_key);
                 let want_f32 = st_read(&g, &want_key.replacen("h.", "g.", 1));
-                let ours = got.iter().zip(&want_f32).map(|(a, b)| (a - b).abs()).fold(0.0f32, f32::max);
+                let ours = got
+                    .iter()
+                    .zip(&want_f32)
+                    .map(|(a, b)| (a - b).abs())
+                    .fold(0.0f32, f32::max);
                 let hf_gap = want
                     .iter()
                     .zip(&want_f32)
                     .map(|(a, b)| (a - b).abs())
                     .fold(0.0f32, f32::max);
-                let dmax = got.iter().zip(&want).map(|(a, b)| (a - b).abs()).fold(0.0f32, f32::max);
+                let dmax = got
+                    .iter()
+                    .zip(&want)
+                    .map(|(a, b)| (a - b).abs())
+                    .fold(0.0f32, f32::max);
                 eprintln!(
                     "[vis-real] {:12} grid {:?} {:10} f16: vs HF-f16 max|Δ| {dmax:.3e} | 我方 vs **f32** 参考 {ours:.3e} vs HF 自身 f16 偏差 {hf_gap:.3e}(比值 {:.2}x)",
                     tag,
@@ -1098,7 +1268,9 @@ mod tests {
     #[tokio::test]
     async fn real_images_cpu_f32_match_golden() {
         if !owl_shared::env_reader::flag("OWL_VIS_CPU_REAL") {
-            owl_shared::testkit::report::skip("OWL_VIS_CPU_REAL 未开(debug 下逐图需数十分钟;用 --release)");
+            owl_shared::testkit::report::skip(
+                "OWL_VIS_CPU_REAL 未开(debug 下逐图需数十分钟;用 --release)",
+            );
             return;
         }
         let g = real_golden();
@@ -1109,7 +1281,16 @@ mod tests {
         let (weights, cfg) = visual_weights();
         let mut cpu = owl_cpu::CpuFace::new();
         let tower = VisionTower::new(cfg);
-        let lctx = crate::module::LoaderCtx { dtype: Dtype::F32, shard: 1, slice_id: 0, device_repack: false, verify: false, debug_tap: false, staging_mb: 128, dump: false };
+        let lctx = crate::module::LoaderCtx {
+            dtype: Dtype::F32,
+            shard: 1,
+            slice_id: 0,
+            device_repack: false,
+            verify: false,
+            debug_tap: false,
+            staging_mb: 128,
+            dump: false,
+        };
         crate::interpreters::eval_load(&tower, &mut cpu, &Src::from(weights), &lctx)
             .await
             .expect("塔 f32 装载");
@@ -1137,7 +1318,10 @@ mod tests {
                 (mg[a2] - wm[a2]).abs(),
                 rms(&wm)
             );
-            assert!(w1 <= 1.0 && w2 <= 1.0, "{tag}: 归一化误差 pre {w1:.3e} / merged {w2:.3e}");
+            assert!(
+                w1 <= 1.0 && w2 <= 1.0,
+                "{tag}: 归一化误差 pre {w1:.3e} / merged {w2:.3e}"
+            );
         }
     }
 
@@ -1151,7 +1335,11 @@ mod tests {
         }
         let (_, cfg) = visual_weights();
         for g in &goldens {
-            eprintln!("[vis] 塔对拍 档 {} grid={:?}", g.file_name().unwrap().to_string_lossy(), golden_grid(g));
+            eprintln!(
+                "[vis] 塔对拍 档 {} grid={:?}",
+                g.file_name().unwrap().to_string_lossy(),
+                golden_grid(g)
+            );
             tower_matches_golden(g, cfg).await;
         }
     }
@@ -1168,7 +1356,9 @@ mod tests {
         let mut roots: Vec<&TensorOps> = out.blocks.iter().collect();
         roots.push(&out.pre_merger);
         roots.push(&out.merged);
-        let blocks = crate::interpreters::eval_ops_multi(&roots, &mut face, None).await.expect("eval_multi");
+        let blocks = crate::interpreters::eval_ops_multi(&roots, &mut face, None)
+            .await
+            .expect("eval_multi");
 
         for (i, b) in blocks.iter().take(cfg.depth).enumerate() {
             let n = tb.rows * cfg.hidden;
@@ -1192,18 +1382,26 @@ mod tests {
             let got = f32_of(&buf);
             let want = st_read(g, "g.pre_merger");
             let (worst, at) = allclose(&got, &want, ATOL_REL, RTOL);
-            eprintln!("[vis] pre_merger 归一化误差 {worst:.3e}(@[{at}] |Δ| {:.3e})", (got[at] - want[at]).abs());
+            eprintln!(
+                "[vis] pre_merger 归一化误差 {worst:.3e}(@[{at}] |Δ| {:.3e})",
+                (got[at] - want[at]).abs()
+            );
             assert!(worst <= 1.0, "pre_merger: 归一化误差 {worst:.3e} > 1");
         }
         // merged
         {
             let n = (tb.rows / 4) * cfg.out_hidden;
             let mut buf = vec![0u8; n * 4];
-            face.dtoh(&blocks[cfg.depth + 1], &mut buf).await.expect("dtoh");
+            face.dtoh(&blocks[cfg.depth + 1], &mut buf)
+                .await
+                .expect("dtoh");
             let got = f32_of(&buf);
             let want = st_read(g, "g.merged");
             let (worst, at) = allclose(&got, &want, 1e-3, 1e-3);
-            eprintln!("[vis] merged 归一化误差 {worst:.3e}(@[{at}] |Δ| {:.3e})", (got[at] - want[at]).abs());
+            eprintln!(
+                "[vis] merged 归一化误差 {worst:.3e}(@[{at}] |Δ| {:.3e})",
+                (got[at] - want[at]).abs()
+            );
             assert!(worst <= 1.0, "merged: 归一化误差 {worst:.3e} > 1");
         }
     }
@@ -1221,4 +1419,3 @@ mod tests {
         assert_eq!(cfg.grid_side().expect("4 = 2²"), 2);
     }
 }
-

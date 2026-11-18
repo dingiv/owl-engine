@@ -1,11 +1,11 @@
 //! 逐元素 / 视图 / 采样 / 铸边界 生产算子元数据。
 
-use owl_macros::kernel_tags;
 use crate::contract::{Dtype, Law};
 use crate::spec::{
     meta_of, pools, CaptureEvidence, Determinism, KernelMeta, KernelSpec, LayoutTag, Param,
     PoolAccess,
 };
+use owl_macros::kernel_tags;
 
 /// `owl_narrow_strided_f16` —— 窄切物化(逐 token 视图;`outer/src_dim/start/out_dim` 四标量)
 pub struct NarrowStridedF16;
@@ -1116,7 +1116,6 @@ impl KernelSpec for RopeHalfPartialF32 {
     const DETERMINISM: Determinism = Determinism::Deterministic;
 }
 
-
 /// `owl_derope_half_partial_f16` —— rope_f32.cu(逆 rope;KVMem raw K 落盘)
 pub struct DeropeHalfPartialF16;
 
@@ -1269,7 +1268,13 @@ impl KernelSpec for QuantInt8RowBf16 {
 /// 出口 f16 均值（布局 `[block][layer][hkv][hd]`）。只读池，不写池。
 pub struct MeanKBlockF16;
 
-#[kernel_tags("dom.elem", "role.elem", "role.kv_read", "phase.prefill", "kv.main.f16")]
+#[kernel_tags(
+    "dom.elem",
+    "role.elem",
+    "role.kv_read",
+    "phase.prefill",
+    "kv.main.f16"
+)]
 impl KernelSpec for MeanKBlockF16 {
     const ENTRY: &'static str = "owl_mean_k_block_f16";
     const SRC: &'static str = "cu/elems/mean_k.cu";
@@ -1287,8 +1292,11 @@ impl KernelSpec for MeanKBlockF16 {
         Param::i32("layers"),
         Param::t_out("out", Dtype::F16, 2),
     ];
-    const POOL: &'static [PoolAccess] =
-        &[PoolAccess::read(pools::KV_MAIN, LayoutTag::Knhd, Dtype::F16)];
+    const POOL: &'static [PoolAccess] = &[PoolAccess::read(
+        pools::KV_MAIN,
+        LayoutTag::Knhd,
+        Dtype::F16,
+    )];
     const LAWS: &'static [Law] = &[Law::OutputFinite];
     const CAPTURE: CaptureEvidence = CaptureEvidence::NoHostWork;
     const DETERMINISM: Determinism = Determinism::Deterministic;
@@ -1304,7 +1312,13 @@ impl KernelSpec for MeanKBlockF16 {
 /// `owl_mean_k_block_fp8` —— 同上，主池 e4m3（1B/elem，裸 e4m3 无 scale）。
 pub struct MeanKBlockFp8;
 
-#[kernel_tags("dom.elem", "role.elem", "role.kv_read", "phase.prefill", "kv.main.fp8")]
+#[kernel_tags(
+    "dom.elem",
+    "role.elem",
+    "role.kv_read",
+    "phase.prefill",
+    "kv.main.fp8"
+)]
 impl KernelSpec for MeanKBlockFp8 {
     const ENTRY: &'static str = "owl_mean_k_block_fp8";
     const SRC: &'static str = "cu/elems/mean_k.cu";
@@ -1322,8 +1336,11 @@ impl KernelSpec for MeanKBlockFp8 {
         Param::i32("layers"),
         Param::t_out("out", Dtype::F16, 2),
     ];
-    const POOL: &'static [PoolAccess] =
-        &[PoolAccess::read(pools::KV_MAIN, LayoutTag::Knhd, Dtype::F8E4M3)];
+    const POOL: &'static [PoolAccess] = &[PoolAccess::read(
+        pools::KV_MAIN,
+        LayoutTag::Knhd,
+        Dtype::F8E4M3,
+    )];
     const LAWS: &'static [Law] = &[Law::OutputFinite];
     const CAPTURE: CaptureEvidence = CaptureEvidence::NoHostWork;
     const DETERMINISM: Determinism = Determinism::Deterministic;
@@ -1359,16 +1376,16 @@ impl KernelSpec for KvScoreLogitsF16 {
     const ENTRY: &'static str = "owl_kvscore_logits_f16";
     const SRC: &'static str = "cu/elems/page_softmax.cu";
     const PARAMS: &'static [Param] = &[
-        Param::t_in("q", Dtype::F16, 2),    // [W, hq, hd]（去位置后的 q̃）
-        Param::t_in("mk", Dtype::F16, 2),   // [nb, hkv, hd]（本层 mean-K）
-        Param::t_in("gqa", Dtype::U32, 1),  // [hq] ⇒ kv 头(u32 承载;核内按 int 读)
+        Param::t_in("q", Dtype::F16, 2),   // [W, hq, hd]（去位置后的 q̃）
+        Param::t_in("mk", Dtype::F16, 2),  // [nb, hkv, hd]（本层 mean-K）
+        Param::t_in("gqa", Dtype::U32, 1), // [hq] ⇒ kv 头(u32 承载;核内按 int 读)
         Param::i32("W"),
         Param::i32("hq"),
         Param::i32("hkv"),
         Param::i32("hd"),
         Param::i32("nb"),
         Param::f32("scale"),
-        Param::t_out("z", Dtype::F16, 2),   // [W, hq, nb]
+        Param::t_out("z", Dtype::F16, 2), // [W, hq, nb]
     ];
     const LAWS: &'static [Law] = &[Law::OutputFinite];
     const CAPTURE: CaptureEvidence = CaptureEvidence::NoHostWork;
@@ -1453,4 +1470,3 @@ mod tests {
         }
     }
 }
-

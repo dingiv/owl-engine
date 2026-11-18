@@ -38,6 +38,7 @@
 // **对外路径一个字都没变**:下面的 `pub use` 把域内模块重新挂回 crate 根
 // —— 原来平铺时的 `crate::xxx` 与 `owl_engine::xxx` 全部继续有效。
 // 归拢是**物理整理**,不是接口改版。
+pub(crate) mod exec;
 mod graph; // 图治理:plan(三态编排)+ fleet(图族账)
 mod io; // I/O 执行面(S1:store 只出计划,真正的 DMA/文件动作在这里)
 mod kernels; // 算子族装配参数下发(设备能力 ≠ 族装配)
@@ -45,11 +46,10 @@ mod mem; // 内存/存储三层:StatePool / Store 钩子 / 磁盘执行面
 mod parallel; // 并行域:TP2 双 rank 装配
 mod perf; // 诊断/取证:dump 路径唯一构造点
 mod sched; // 调度域(S0 决策半):词汇 / 政策 / 选择层 / 保洁账
-mod ttft_gate; // 首 token 门:按新增 token 预估期限,超时强停 prefill
 mod serve; // 请求面:Session → Turn → Step + 消息边界
 mod spec; // 投机解码运行域(轮内执行在 exec/)
-mod vision; // 视觉:VLM 请求态 / 塔输出缓存 / 图像段前缀删除
-pub(crate) mod exec; // 执行器(S0 决策/执行分离的**执行半**;本就在目录里)
+mod ttft_gate; // 首 token 门:按新增 token 预估期限,超时强停 prefill
+mod vision; // 视觉:VLM 请求态 / 塔输出缓存 / 图像段前缀删除 // 执行器(S0 决策/执行分离的**执行半**;本就在目录里)
 
 // 跨域叶子:greedy 与 spec 共用的 host 采样器(不属任何单域)
 pub(crate) mod sampler;
@@ -128,12 +128,12 @@ pub fn embed_plan_of(eq: owl_shared::config::EmbedQuant) -> Option<owl_models::m
         owl_shared::config::EmbedQuant::I8 => Some(owl_models::module::QuantPlan::I8W),
     }
 }
+pub use graph_plan::{GraphPlan, GraphPlanDesc, PlanOutcome};
+pub use running::{RunningEngine, TokenizeReply};
 pub use service::{
     BatchStatsSnapshot, BootSpec, Booted, DeviceOpts, DiagSnapshot, EngineClient, EngineService,
     QueueFacts, ServiceExit, StepGate, StreamEvent,
 };
-pub use graph_plan::{GraphPlan, GraphPlanDesc, PlanOutcome};
-pub use running::{RunningEngine, TokenizeReply};
 pub use session::{AgentSession, SessionAssets, SessionTable};
 pub use tp::{TpEngine, TpOpts, TpStaging};
 pub use turn::{TurnEvent, TurnImage, TurnOpts, TurnSampler, TurnSpec};

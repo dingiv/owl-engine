@@ -56,6 +56,7 @@
 //! | runtime | max_batch | ~~派生~~（= min(max_concurrency,8)；不是 TOML 键） |
 //! | ~~runtime~~ | *(slice_every / slice_tokens 2026-11-16 退役：相位节奏 = 内核常数 `SLICE_EVERY`=8，片长归引擎的正常 prefill 步)* |
 //! | runtime | admission_on_full | String / "reject"(准入满员姿态;`reject` \| `queue` \| `queue:<ms>`) |
+//! | runtime | ttft_on_expire | TtftOnExpire / "ignore"(首 token 超期动作;`ignore` 静默继续 \| `warn` 警告继续 \| `stop` 警告并停) |
 //! | ~~runtime~~ | *(腾挪/压力 8 键 2026-11-16 退役：`idle_compact` / `pressure_*` / `host_pressure_*`)* | → `owl_store::PressurePolicy`（零旋钮；水位由池几何导出） |
 //! | runtime | test_device | 测试域(不入 toml) |
 //! | parallel | mode | ParallelMode 枚举 single\|tensor / single |
@@ -76,8 +77,8 @@
 //! | vision | max_pixels / path | usize 0 / Option None(图像预处理像素封顶 / 视觉塔权重路径) |
 //! | ~~store~~ | *(prefill_align_tail / snap_msg_boundary / snap_evict_anchor 2026-11-16 退役：删键**默认开**，门由消费者/几何导出)* |
 //! | ~~store.gdn~~ | *(snap_decode_stride / snap_msg_min_gap / snap_msg_min_span 2026-11-17 退役；snap_msg_recent / snap_structural_reserve 2026-11-18 v4 退役 —— 统一为 `snap_session_cap` + `snap_tail`)* |
-//! | store | ram_pool_size / snap_host_mb | usize / 0、0(**宿主两层分片**;0 = 关层) |
-//! | store | disk_pool_size / snap_disk_mb | usize / 0、0(**磁盘两层分片**;0 = 关层) |
+//! | store | ram_pool_size | usize / 0(**宿主总池**,KV 与快照共享;0 = 关层) |
+//! | store | disk_pool_size | usize / 0(**磁盘总池**,KV 与快照共享;0 = 关层) |
 //! | store | disk_dir | String / ""(磁盘内容目录;**重启扫目录回填账**;空 = 关层) |
 //! | spec | depth / draft / dumb | usize 0(off)、SpecDraft auto/mtp/dflash2、flag |
 //! | store.kv | draft_kv_dtype | DraftKvDtype `bf16\|fp8` / bf16（2026-11-16 由 `[spec]` 迁入） |
@@ -527,6 +528,15 @@ pub struct RuntimeCfg {
     /// 坏值 = boot 拒启（`validate` 与引擎构造都走同一解析）。
     #[serde(default = "default_admission_on_full")]
     pub admission_on_full: String,
+    /// **首 token 超期动作**（`[runtime] ttft_on_expire`；2026-11-18 用户裁决）。
+    ///
+    /// - `ignore`（缺省/静默）：超过预算不打印、不停止，继续等首 token；
+    /// - `warn`：打印一次 WARN，但**不停止**；
+    /// - `stop`：打印 WARN 并强停该 turn（旧行为）。
+    ///
+    /// 只影响“首 token 门”的处置；预算算式仍由 `crate::ttft_gate` 定值。
+    #[serde(default)]
+    pub ttft_on_expire: TtftOnExpire,
     // **腾挪/压力策略的 8 个键已删**（2026-11-16 用户裁决）：
     // `idle_compact` / `pressure_low_pct` / `pressure_high_pct` /
     // `host_pressure_low_pct` / `host_pressure_high_pct` /
@@ -545,6 +555,24 @@ pub struct RuntimeCfg {
 pub enum AdmissionOnFullCfg {
     Reject,
     Queue { max_wait_ms: u64 },
+}
+
+/// **首 token 超期动作**（`[runtime] ttft_on_expire`）。
+///
+/// 只决定“门到点后做什么”，不改预算算式：
+/// - [`Self::Ignore`]（缺省）：静默，继续；
+/// - [`Self::Warn`]：WARN 一次，继续；
+/// - [`Self::Stop`]：WARN 并强停 turn（旧行为）。
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum TtftOnExpire {
+    /// 静默忽略（不打印、不停止）。
+    #[default]
+    Ignore,
+    /// 打印警告，但继续等待首 token。
+    Warn,
+    /// 打印警告并强停该 turn。
+    Stop,
 }
 
 impl RuntimeCfg {
@@ -802,7 +830,7 @@ pub struct StoreGdnCfg {
     ///
     /// 每槽 = 一条 GDN 行 × 层数（27B ≈ 148.5 MiB/槽，TP2 两 rank 各半）。
     /// 它决定设备上能同时留住多少条快照资产；容量必须由操作员按卡型给定，
-    /// 引擎无法从 `snap_host_mb` 反推（宿主/盘是下沉落点，不是设备池）。
+    /// 引擎无法从宿主/磁盘池反推（那是下沉落点，不是设备池）。
     /// 快照拍摄节奏（`snap_decode_stride`）已收为引擎常数，不再与容量混在一个段。
     pub snap_max: usize,
     /// 消息开启标记的**文本覆盖**（空 = 用模型的 `ChatFormat.im_open`，
@@ -846,17 +874,16 @@ impl Default for StoreGdnCfg {
 pub struct StoreCfg {
     /// **前缀缓存开/关**。
     pub prefix_cache: bool,
-    /// **宿主 KV 腿**(MiB;0 = 关层)。下沉的落点之一。
+    /// **宿主总池**(MiB;0 = 关层)。KV 块与 GDN 快照**共享**这一层。
+    ///
+    /// 2026-11-18 用户裁决：不再用 `snap_host_mb` 预切状态腿分片 ——
+    /// 总池按实际需求由两腿竞争，store 的 `plan_*` / `Rel` 统一出序。
     pub ram_pool_size: usize,
-    /// **宿主状态腿**(MiB;0 = 关层)。GDN 快照下沉的落点 ——
-    /// ⚠️ 超卖档会把压力推给它(实测 27B 单快照 607 MiB),别只给 KV 腿留量。
-    pub snap_host_mb: usize,
-    /// **磁盘 KV 腿**(MiB;0 = 关层;S6)。宿主装不下时的第二落点(内容不丢)。
+    /// **磁盘总池**(MiB;0 = 关层;S6)。KV 与快照共享这一层，宿主装不下时的
+    /// 第二落点(内容不丢)。
     ///
     /// 目录由 `disk_dir` 指定;进程重启后**扫目录回填账**(内容惰性读回)。
     pub disk_pool_size: usize,
-    /// **磁盘状态腿**(MiB;0 = 关层;与 [`Self::disk_pool_size`] 同属盘层总账的两个分片)。
-    pub snap_disk_mb: usize,
     /// **磁盘内容目录**(空 = 关层;两腿子目录 `kv/` 与 `snap/` 自动分)。
     ///
     /// 目录必须**独占**(同一目录给两个引擎用会互相扫到对方的块);
@@ -885,9 +912,7 @@ impl Default for StoreCfg {
         Self {
             prefix_cache: true,
             ram_pool_size: 0,
-            snap_host_mb: 0,
             disk_pool_size: 0,
-            snap_disk_mb: 0,
             disk_dir: String::new(),
             vram_budget: 0.97,
             vram_activation_reserve: 714,
@@ -2001,7 +2026,8 @@ impl RuntimeCfg {
     /// 正常会话永远到不了 `(max_context_length, pos_cap]`（pos_hi = n_tokens ≤ max_context_length）；
     /// 这一段专属 leave-gap。核里对 pos 无边界检查 ⇒ 超限必须在引擎侧挡/压实。
     pub fn rope_pos_cap(&self) -> usize {
-        self.max_context_length.saturating_add(self.gap_reserve_tokens())
+        self.max_context_length
+            .saturating_add(self.gap_reserve_tokens())
     }
 }
 
@@ -2014,6 +2040,7 @@ impl Default for RuntimeCfg {
             max_batch: 1,
             max_concurrency: 1,
             admission_on_full: default_admission_on_full(),
+            ttft_on_expire: TtftOnExpire::default(),
             test_device: None,
         }
     }
@@ -3218,20 +3245,13 @@ impl OwlConfig {
         // **磁盘层的配置自洽**(S6):给了配额就必须给目录(否则"要磁盘"变成静默关层);
         // 给了目录但没配额 = 空目录守着不用(允许,但 boot 日志会显示关层)。
         // 目录给多个引擎共用 = 互相扫到对方的块 ⇒ 拒(独占是硬约束)。
-        let disk_bytes = self.store.disk_pool_size + self.store.snap_disk_mb;
+        let disk_bytes = self.store.disk_pool_size;
         if disk_bytes > 0 && self.store.disk_dir.trim().is_empty() {
             return Err(format!(
                 "[store] 给了磁盘配额({} MiB)却没给 disk_dir —— 要么补目录,要么把配额清零\
                  (静默关层会让「别急着丢」的承诺失效)",
                 disk_bytes
             ));
-        }
-        if self.store.snap_disk_mb > 0 && self.store.gdn.snap_max == 0 {
-            return Err(
-                "[store.gdn] snap_disk_mb > 0 但 [store.gdn] snap_max = 0(没有快照池,盘上分片无意义)\
-                 —— 清掉 snap_disk_mb 或给快照池"
-                    .to_string(),
-            );
         }
         // **生成预算自洽**（2026-11-17 裁决 A：预留 = 上下文 + 请求 max_tokens）。
         // `max_generation_length = 0` ⇒ 请求的输出上限定死为 0（生成被关死）——
@@ -3479,17 +3499,39 @@ mod tests {
         assert!(cfg.validate().is_err(), "坏值必须被 validate 拒");
     }
 
+    /// **TTFT 超期动作**：缺省静默（ignore）；warn / stop 可显式选；坏值拒启。
+    #[test]
+    fn ttft_on_expire_defaults_to_ignore_and_parses_warn_stop() {
+        use super::TtftOnExpire;
+        assert_eq!(
+            OwlConfig::default().runtime.ttft_on_expire,
+            TtftOnExpire::Ignore
+        );
+        let c = OwlConfig::from_toml_str("[runtime]\nttft_on_expire = \"warn\"\n").expect("warn");
+        assert_eq!(c.runtime.ttft_on_expire, TtftOnExpire::Warn);
+        let c = OwlConfig::from_toml_str("[runtime]\nttft_on_expire = \"stop\"\n").expect("stop");
+        assert_eq!(c.runtime.ttft_on_expire, TtftOnExpire::Stop);
+        let e = OwlConfig::from_toml_str("[runtime]\nttft_on_expire = \"nope\"\n")
+            .expect_err("坏值必须拒启");
+        assert!(e.contains("ttft_on_expire"), "拒语应点名键: {e}");
+    }
+
     #[test]
     fn max_concurrency_derives_batch_and_gdn_slots() {
         let c = OwlConfig::from_toml_str("[runtime]\nmax_concurrency = 2\n").expect("合法并发档");
         assert_eq!(c.runtime.max_batch, 2, "max_batch 由 max_concurrency 派生");
-        assert_eq!(c.store.gdn.gdn_slots, 2, "gdn_slots 由 max_concurrency 派生");
+        assert_eq!(
+            c.store.gdn.gdn_slots, 2,
+            "gdn_slots 由 max_concurrency 派生"
+        );
         // max_batch 不再是 TOML 键
         assert!(OwlConfig::from_toml_str("[runtime]\nmax_batch = 2\n").is_err());
         // 超卖档强制串行（选择层视图与合批不共戴）
         assert!(
-            OwlConfig::from_toml_str("[runtime]\nmax_concurrency = 2\n[kvmem]\nselect_decode = true\n")
-                .is_err(),
+            OwlConfig::from_toml_str(
+                "[runtime]\nmax_concurrency = 2\n[kvmem]\nselect_decode = true\n"
+            )
+            .is_err(),
             "max_concurrency>1 + 选择层视图应拒"
         );
     }
@@ -3723,7 +3765,7 @@ mod retired_pool_keys {
         // 消费者门仍在：关 prefix_cache / snap_max=0 即自然退化（不需要开关）
         let c =
             OwlConfig::from_toml_str("[store.gdn]\nsnap_max = 0\n[store]\nprefix_cache = false\n")
-            .expect("合法档");
+                .expect("合法档");
         assert_eq!(c.store.gdn.snap_max, 0);
         assert!(!c.store.prefix_cache);
     }
@@ -3954,7 +3996,10 @@ mod extends_tests {
         let base = crate::profiles::profile_path("qwen38_27b-3090").expect("预设档");
         let c = OwlConfig::load(Some(&base), Some(&child)).expect("load");
         assert_eq!(c.spec.depth, 5, "子档覆盖基准/父档");
-        assert_eq!(c.runtime.max_context_length, 12345, "父档提供、基准未写者生效");
+        assert_eq!(
+            c.runtime.max_context_length, 12345,
+            "父档提供、基准未写者生效"
+        );
         assert_eq!(c.store.gdn.snap_max, 2, "父档覆盖基准");
         assert_eq!(
             c.sampling.mode,
@@ -3970,7 +4015,10 @@ mod extends_tests {
         let d = tmp_dir("chain");
         let sub = d.join("sub");
         file_loader::create_dir_all(&sub).expect("mkdir sub");
-        write(&d.join("grand.toml"), "[runtime]\nmax_context_length = 777\n");
+        write(
+            &d.join("grand.toml"),
+            "[runtime]\nmax_context_length = 777\n",
+        );
         write(
             &sub.join("mid.toml"),
             "extends = \"../grand.toml\"\n[spec]\ndepth = 4\n",
@@ -4266,7 +4314,6 @@ mod auto_pool_tests {
         // 健康档不受影响（水位/上限全在 store 内部）
         OwlConfig::from_toml_str("[runtime]\nmax_concurrency = 1\n").expect("合法档");
     }
-
 }
 
 #[cfg(test)]

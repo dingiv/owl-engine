@@ -53,8 +53,19 @@ impl GgufConvention {
 /// 量化后缀词表(与 `Qwen35Convention` 同表):GGUF 档**不接受**这些后缀 ——
 /// GGUF 的量化块住**同一个** `.weight` 键里(没有 `.qweight` 一族)。
 const QUANT_SUFFIXES: &[&str] = &[
-    "qweight", "scales", "zeros", "ws", "marlin_ws", "marlin_ctmp", "packed_raw",
-    "qweight_a8", "scales_a8", "zeros_a8", "a8_factor", "weight_packed", "weight_scale",
+    "qweight",
+    "scales",
+    "zeros",
+    "ws",
+    "marlin_ws",
+    "marlin_ctmp",
+    "packed_raw",
+    "qweight_a8",
+    "scales_a8",
+    "zeros_a8",
+    "a8_factor",
+    "weight_packed",
+    "weight_scale",
 ];
 
 /// 层内局部键 → `blk.N.<gguf 名>`(无后缀路径;纯映射,零 I/O)
@@ -162,7 +173,10 @@ mod tests {
         assert_eq!(c.head_key("lm_head"), "output.weight");
         for (local, want) in [
             ("input_layernorm", "blk.7.attn_norm.weight"),
-            ("post_attention_layernorm", "blk.7.post_attention_norm.weight"),
+            (
+                "post_attention_layernorm",
+                "blk.7.post_attention_norm.weight",
+            ),
             ("q_proj", "blk.7.attn_q.weight"),
             ("k_proj", "blk.7.attn_k.weight"),
             ("v_proj", "blk.7.attn_v.weight"),
@@ -238,7 +252,7 @@ mod tests {
                 device_repack: false,
                 verify: false,
                 debug_tap: false,
-                            staging_mb: 128,
+                staging_mb: 128,
                 dump: false,
             };
             let ops = model.layout(&ctx);
@@ -288,10 +302,12 @@ mod tests {
             let n_dec = spec.layer_types.len();
             let offenders: Vec<&&str> = unused
                 .iter()
-                .filter(|n| match n.strip_prefix("blk.").and_then(|r| r.split('.').next()) {
-                    Some(idx) => idx.parse::<usize>().map(|i| i < n_dec).unwrap_or(true),
-                    None => true, // 非 blk 键不该未声明
-                })
+                .filter(
+                    |n| match n.strip_prefix("blk.").and_then(|r| r.split('.').next()) {
+                        Some(idx) => idx.parse::<usize>().map(|i| i < n_dec).unwrap_or(true),
+                        None => true, // 非 blk 键不该未声明
+                    },
+                )
                 .collect();
             assert!(
                 offenders.is_empty(),

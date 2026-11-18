@@ -24,9 +24,26 @@ pub use super::BlockRef;
 /// `parse_verify` 取用的槽名(声明序;两臂共用一张表 —— F3 成对律,
 /// `client::tests::parse_slots_are_exactly_declared` 逐字锁死)。
 pub const PARSE_SLOTS: &[&str] = &[
-    "q", "k_cache", "v_cache", "page_table", "seq_lens", "mask", "semaphores", "scratch",
-    "wr", "out", "q_seq_len", "hkv", "hd", "page", "max_context_length_len", "q_scale_bits", "sm_count",
-    "stride_page", "stride_token", "stride_head",
+    "q",
+    "k_cache",
+    "v_cache",
+    "page_table",
+    "seq_lens",
+    "mask",
+    "semaphores",
+    "scratch",
+    "wr",
+    "out",
+    "q_seq_len",
+    "hkv",
+    "hd",
+    "page",
+    "max_context_length_len",
+    "q_scale_bits",
+    "sm_count",
+    "stride_page",
+    "stride_token",
+    "stride_head",
 ];
 
 #[derive(Clone, Debug)]

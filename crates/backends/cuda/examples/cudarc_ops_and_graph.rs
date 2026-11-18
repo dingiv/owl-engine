@@ -52,8 +52,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Safety:demo 进程内没有第三方代码依赖 cudarc 的事件秩序
     unsafe { ctx.disable_event_tracking() };
     let stream = ctx.new_stream()?; // non-blocking 流(与 NULL 流无隐式同步)
-    // demo 全程只用这一条流(分配/eager/捕获/回放);跨流引用未捕获工作
-    // 或 legacy 依赖,任一都会让 begin_capture 报 CAPTURE_ISOLATION
+                                    // demo 全程只用这一条流(分配/eager/捕获/回放);跨流引用未捕获工作
+                                    // 或 legacy 依赖,任一都会让 begin_capture 报 CAPTURE_ISOLATION
     println!("[init] device {ordinal}: {}", ctx.name()?);
 
     // ---- 2. nvrtc 编译 + 装载(源码 → PTX → CudaModule → CudaFunction)----
@@ -139,7 +139,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // 捕获就发生在 stream 自己身上(分配与 last-write 同流:跨流引用
     // 未捕获流的工作 = CAPTURE_ISOLATION)
     ctx.synchronize()?;
-    stream.begin_capture(cudarc::driver::sys::CUstreamCaptureMode::CU_STREAM_CAPTURE_MODE_RELAXED)?;
+    stream
+        .begin_capture(cudarc::driver::sys::CUstreamCaptureMode::CU_STREAM_CAPTURE_MODE_RELAXED)?;
 
     // 捕获 3 连发:同流 launch 录成依赖链 n1 → n2 → n3
     // (参数 = 第 4 步同一批指针;回放即重写同一批显存)
@@ -152,10 +153,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             .arg(&mut out)
             .arg(&N)
             .launch(LaunchConfig {
-            grid_dim: ((N as u32).div_ceil(256), 1, 1),
-            block_dim: (256, 1, 1),
-            shared_mem_bytes: 0,
-        })?;
+                grid_dim: ((N as u32).div_ceil(256), 1, 1),
+                block_dim: (256, 1, 1),
+                shared_mem_bytes: 0,
+            })?;
     }
 
     let graph = stream

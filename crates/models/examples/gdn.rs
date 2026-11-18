@@ -44,7 +44,11 @@ impl HostRef {
         let key_dim = NK * HK_DIM;
         let value_dim = NV * HV_DIM;
         HostRef {
-            conv: [vec![0.0; MAX_SLOTS * key_dim * 3], vec![0.0; MAX_SLOTS * key_dim * 3], vec![0.0; MAX_SLOTS * value_dim * 3]],
+            conv: [
+                vec![0.0; MAX_SLOTS * key_dim * 3],
+                vec![0.0; MAX_SLOTS * key_dim * 3],
+                vec![0.0; MAX_SLOTS * value_dim * 3],
+            ],
             rec: vec![0.0; MAX_SLOTS * NV * HK_DIM * HV_DIM],
             src,
         }
@@ -70,10 +74,18 @@ impl HostRef {
             let z = self.lin(x, &s["in_proj_z"], value_dim, HIDDEN);
             let b_v = self.lin(x, &s["in_proj_b"], NV, HIDDEN);
             let a_v = self.lin(x, &s["in_proj_a"], NV, HIDDEN);
-            let segs = [&qkv[0..key_dim], &qkv[key_dim..2 * key_dim], &qkv[2 * key_dim..]];
+            let segs = [
+                &qkv[0..key_dim],
+                &qkv[key_dim..2 * key_dim],
+                &qkv[2 * key_dim..],
+            ];
             let seg_dim = [key_dim, key_dim, value_dim];
             let seg_off = [0usize, key_dim, 2 * key_dim];
-            let mut post = [vec![0.0f32; key_dim], vec![0.0f32; key_dim], vec![0.0f32; value_dim]];
+            let mut post = [
+                vec![0.0f32; key_dim],
+                vec![0.0f32; key_dim],
+                vec![0.0f32; value_dim],
+            ];
             for (seg, inp) in segs.iter().enumerate() {
                 let st = &mut self.conv[seg];
                 let dim = seg_dim[seg];
@@ -102,8 +114,10 @@ impl HostRef {
             let mut qn = vec![0.0f32; key_dim];
             let mut kn = vec![0.0f32; key_dim];
             for h in 0..NK {
-                qn[h * HK_DIM..(h + 1) * HK_DIM].copy_from_slice(&l2(&post[0][h * HK_DIM..(h + 1) * HK_DIM]));
-                kn[h * HK_DIM..(h + 1) * HK_DIM].copy_from_slice(&l2(&post[1][h * HK_DIM..(h + 1) * HK_DIM]));
+                qn[h * HK_DIM..(h + 1) * HK_DIM]
+                    .copy_from_slice(&l2(&post[0][h * HK_DIM..(h + 1) * HK_DIM]));
+                kn[h * HK_DIM..(h + 1) * HK_DIM]
+                    .copy_from_slice(&l2(&post[1][h * HK_DIM..(h + 1) * HK_DIM]));
             }
             // 门控
             let a_log = &s["A_log"];
@@ -150,7 +164,8 @@ impl HostRef {
             let mut gated = vec![0.0f32; value_dim];
             for vh in 0..NV {
                 let base = vh * HV_DIM;
-                let ms: f32 = (0..HV_DIM).map(|i| y[base + i] * y[base + i]).sum::<f32>() / HV_DIM as f32;
+                let ms: f32 =
+                    (0..HV_DIM).map(|i| y[base + i] * y[base + i]).sum::<f32>() / HV_DIM as f32;
                 let inv = 1.0 / (ms.max(0.0) + 1e-6).sqrt();
                 for i in 0..HV_DIM {
                     let zv = z[base + i];
@@ -176,24 +191,60 @@ async fn main() {
         .map(|(i, (k, n))| (k, fixture::gen(n, 10.0 + i as f32)))
         .collect::<std::collections::HashMap<String, Vec<f32>>>();
 
-    let mut client = GpuClient::spawn(DeviceSelector::Ordinal(test_device_ordinal())).expect("gpu server boot");
-    let layer = GatedDeltaNet::new(NK, HK_DIM, NV, HV_DIM, HIDDEN, 1e-6, owl_models::module::QuantPlan::F16);
+    let mut client =
+        GpuClient::spawn(DeviceSelector::Ordinal(test_device_ordinal())).expect("gpu server boot");
+    let layer = GatedDeltaNet::new(
+        NK,
+        HK_DIM,
+        NV,
+        HV_DIM,
+        HIDDEN,
+        1e-6,
+        owl_models::module::QuantPlan::F16,
+    );
     owl_models::interpreters::eval_load(&layer, &mut client, &src, &Default::default())
         .await
         .expect("eval_load 九槽");
 
     // 常驻状态块(清零分配)
-    async fn alloc_block(client: &mut owl_cuda::GpuClient, v: &[f32], shape: Vec<usize>) -> TensorOps {
-        let b = eval_ops(TensorOps::from_host(Dtype::F32, vec![v.len()], &f32b(v)).step(), client)
-            .await
-            .expect("alloc");
+    async fn alloc_block(
+        client: &mut owl_cuda::GpuClient,
+        v: &[f32],
+        shape: Vec<usize>,
+    ) -> TensorOps {
+        let b = eval_ops(
+            TensorOps::from_host(Dtype::F32, vec![v.len()], &f32b(v)).step(),
+            client,
+        )
+        .await
+        .expect("alloc");
         TensorOps::of_block(b.id, Dtype::F32, shape)
     }
     let fill = |n: usize| vec![0.0f32; n];
-    let cq = alloc_block(&mut client, &fill(MAX_SLOTS * key_dim * 3), vec![MAX_SLOTS, key_dim, 3]).await;
-    let ck = alloc_block(&mut client, &fill(MAX_SLOTS * key_dim * 3), vec![MAX_SLOTS, key_dim, 3]).await;
-    let cv = alloc_block(&mut client, &fill(MAX_SLOTS * value_dim * 3), vec![MAX_SLOTS, value_dim, 3]).await;
-    let rc = alloc_block(&mut client, &fill(MAX_SLOTS * NV * HK_DIM * HV_DIM), vec![MAX_SLOTS, NV, HK_DIM, HV_DIM]).await;
+    let cq = alloc_block(
+        &mut client,
+        &fill(MAX_SLOTS * key_dim * 3),
+        vec![MAX_SLOTS, key_dim, 3],
+    )
+    .await;
+    let ck = alloc_block(
+        &mut client,
+        &fill(MAX_SLOTS * key_dim * 3),
+        vec![MAX_SLOTS, key_dim, 3],
+    )
+    .await;
+    let cv = alloc_block(
+        &mut client,
+        &fill(MAX_SLOTS * value_dim * 3),
+        vec![MAX_SLOTS, value_dim, 3],
+    )
+    .await;
+    let rc = alloc_block(
+        &mut client,
+        &fill(MAX_SLOTS * NV * HK_DIM * HV_DIM),
+        vec![MAX_SLOTS, NV, HK_DIM, HV_DIM],
+    )
+    .await;
 
     // host 参考(独立副本;跨步持缓存)
     let mut host = HostRef::new(src.clone());
@@ -221,7 +272,10 @@ async fn main() {
         let bytes = eval_ops(decl.step(), &mut client).await.expect("eval");
         let mut buf = vec![0u8; n * 4];
         client.dtoh(&bytes, &mut buf).await.expect("dtoh");
-        let got: Vec<f32> = buf.chunks_exact(4).map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]])).collect();
+        let got: Vec<f32> = buf
+            .chunks_exact(4)
+            .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+            .collect();
 
         let want = host.step(xs, slots);
         for (i, (g, w)) in got.iter().zip(&want).enumerate() {

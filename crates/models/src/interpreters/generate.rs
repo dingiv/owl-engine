@@ -68,7 +68,11 @@ pub async fn eval_generate<D: DeviceClient>(
     let mut out: Vec<u32> = Vec::new();
     let mut fed = 0usize; // 已喂 token 数
     while out.len() < spec.max_new {
-        let tid = if fed < prompt.len() { prompt[fed] } else { *out.last().expect("生成中") };
+        let tid = if fed < prompt.len() {
+            prompt[fed]
+        } else {
+            *out.last().expect("生成中")
+        };
         let pos = fed;
         // 每步动态 ctx:KV 槽 = 本 token 自己的格子(窗 = [slot-kv_len+1,
         // slot] = [0, pos];2026-09-26 窗口语义探针定谳 —— slots 恒 0 会
@@ -108,25 +112,26 @@ pub async fn eval_generate<D: DeviceClient>(
         // logits dtype 跟随声明链(F5 整模切换 = f16);按声明宽解码。
         // 声明链根 = embed(dt)→ 传播至 logits;模型根 dtype 从 KV 缓存
         // 声明取(同链同源)。
-        let model_dt = kvs
-            .first()
-            .map(|kv| kv.k_cache.dtype)
-            .unwrap_or(Dtype::F32);
+        let model_dt = kvs.first().map(|kv| kv.k_cache.dtype).unwrap_or(Dtype::F32);
         let esize = model_dt.size_bytes();
         let mut buf = vec![0u8; model.vocab_size() * esize];
         face.dtoh(&logits, &mut buf).await?;
-        let (ti, _) = buf
-            .chunks_exact(esize)
-            .enumerate()
-            .fold((0usize, f32::NEG_INFINITY), |a, (i, c)| {
-                // f16/f32 双口径解码(F5;chunks_exact(esize) 已按声明宽切)
-                let x = if esize == 2 {
-                    half::f16::from_le_bytes([c[0], c[1]]).to_f32()
-                } else {
-                    f32::from_le_bytes([c[0], c[1], c[2], c[3]])
-                };
-                if x > a.1 { (i, x) } else { a }
-            });
+        let (ti, _) =
+            buf.chunks_exact(esize)
+                .enumerate()
+                .fold((0usize, f32::NEG_INFINITY), |a, (i, c)| {
+                    // f16/f32 双口径解码(F5;chunks_exact(esize) 已按声明宽切)
+                    let x = if esize == 2 {
+                        half::f16::from_le_bytes([c[0], c[1]]).to_f32()
+                    } else {
+                        f32::from_le_bytes([c[0], c[1], c[2], c[3]])
+                    };
+                    if x > a.1 {
+                        (i, x)
+                    } else {
+                        a
+                    }
+                });
         let nt = ti as u32;
         if spec.eos_ids.contains(&nt) {
             break;

@@ -8,8 +8,8 @@
 //! 这正是 E10「池 dtype 改造漏写者 ⇒ 槽区永不落笔全零」的机器面:
 //! 漏写 = 毒值残留,越写 = 毒值被覆盖。
 
-use crate::contract::{LaunchVal, OpError};
 use crate::bootcheck::{BootCheck, CheckBuf, CheckReport, CheckRunner};
+use crate::contract::{LaunchVal, OpError};
 const RESHAPE_AND_CACHE_FP8KV: &str = "cu/attn/reshape_and_cache_fp8kv.cu";
 
 use super::{e4m3_encode, f16_to_f32, lcg_f16};
@@ -36,7 +36,10 @@ pub struct Case {
 
 /// 构造固定算例
 pub fn case() -> Case {
-    Case { key: lcg_f16(T * HKV * HD, 0x1234), value: lcg_f16(T * HKV * HD, 0x9ABC) }
+    Case {
+        key: lcg_f16(T * HKV * HD, 0x1234),
+        value: lcg_f16(T * HKV * HD, 0x9ABC),
+    }
 }
 
 /// 池字节数
@@ -59,7 +62,13 @@ pub fn run_case(r: &mut dyn CheckRunner, c: &Case) -> Result<(Vec<u8>, Vec<u8>),
     r.upload(d_val, &hb(&c.value))?;
     r.upload(d_kc, &vec![POISON; n])?;
     r.upload(d_vc, &vec![POISON; n])?;
-    r.upload(d_slots, &SLOTS.iter().flat_map(|s| s.to_le_bytes()).collect::<Vec<u8>>())?;
+    r.upload(
+        d_slots,
+        &SLOTS
+            .iter()
+            .flat_map(|s| s.to_le_bytes())
+            .collect::<Vec<u8>>(),
+    )?;
 
     let vals = [
         LaunchVal::Ptr(d_key.ptr),
@@ -86,8 +95,20 @@ pub fn run_case(r: &mut dyn CheckRunner, c: &Case) -> Result<(Vec<u8>, Vec<u8>),
     r.sync()?;
     let mut kc = vec![0u8; n];
     let mut vc = vec![0u8; n];
-    r.download(CheckBuf { ptr: d_kc.ptr, bytes: n }, &mut kc)?;
-    r.download(CheckBuf { ptr: d_vc.ptr, bytes: n }, &mut vc)?;
+    r.download(
+        CheckBuf {
+            ptr: d_kc.ptr,
+            bytes: n,
+        },
+        &mut kc,
+    )?;
+    r.download(
+        CheckBuf {
+            ptr: d_vc.ptr,
+            bytes: n,
+        },
+        &mut vc,
+    )?;
     Ok((kc, vc))
 }
 
@@ -108,7 +129,11 @@ pub fn reference(c: &Case, layout_classic: bool) -> Vec<(usize, u8, u8)> {
                 let idx = if layout_classic {
                     // classic x-block(故意错):[blk, h, d/X, off, X]
                     let hd_x = HD / X;
-                    blk * HKV * hd_x * BS * X + h * hd_x * BS * X + (d / X) * BS * X + off * X + (d % X)
+                    blk * HKV * hd_x * BS * X
+                        + h * hd_x * BS * X
+                        + (d / X) * BS * X
+                        + off * X
+                        + (d % X)
                 } else {
                     // knHD:[blk, off, h, d]
                     blk * HKV * HD * BS + off * HKV * HD + h * HD + d

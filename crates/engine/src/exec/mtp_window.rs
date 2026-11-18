@@ -66,25 +66,31 @@ impl<'a> MtpWindowPlan<'a> {
             });
         }
         let sink_eff = if cfg.active() {
-            cfg.sink
-                .div_ceil(page)
-                .checked_mul(page)
-                .ok_or_else(|| ModelError::EngineInvariant {
+            cfg.sink.div_ceil(page).checked_mul(page).ok_or_else(|| {
+                ModelError::EngineInvariant {
                     what: format!("MTP window: sink={} 页对齐溢出", cfg.sink),
-                })?
+                }
+            })?
         } else {
             0
         };
-        Ok(Self { full_bt, page, cfg, sink_eff })
+        Ok(Self {
+            full_bt,
+            page,
+            cfg,
+            sink_eff,
+        })
     }
 
     /// 构造 `[base, base+n)` 的行视图。
     pub(crate) fn rows(&self, base: usize, n: usize) -> Result<Vec<MtpRowView>, ModelError> {
         let mut out = Vec::with_capacity(n);
         for i in 0..n {
-            let row = base.checked_add(i).ok_or_else(|| ModelError::EngineInvariant {
-                what: format!("MTP window: row 溢出 base={base} i={i}"),
-            })?;
+            let row = base
+                .checked_add(i)
+                .ok_or_else(|| ModelError::EngineInvariant {
+                    what: format!("MTP window: row 溢出 base={base} i={i}"),
+                })?;
             out.push(self.row(row)?);
         }
         Ok(out)
@@ -166,7 +172,11 @@ mod tests {
         let plan = MtpWindowPlan::new(
             &full,
             4,
-            MtpWindowCfg { window: 0, sink: 64, min_ctx: 0 },
+            MtpWindowCfg {
+                window: 0,
+                sink: 64,
+                min_ctx: 0,
+            },
         )
         .unwrap();
         let v = plan.row(39).unwrap();
@@ -180,7 +190,11 @@ mod tests {
         let plan = MtpWindowPlan::new(
             &full,
             4,
-            MtpWindowCfg { window: 8, sink: 4, min_ctx: 0 },
+            MtpWindowCfg {
+                window: 8,
+                sink: 4,
+                min_ctx: 0,
+            },
         )
         .unwrap();
         // tokens=6 <= sink_eff(4)+window(8) => full
@@ -195,7 +209,11 @@ mod tests {
         let plan = MtpWindowPlan::new(
             &full,
             4,
-            MtpWindowCfg { window: 8, sink: 4, min_ctx: 0 },
+            MtpWindowCfg {
+                window: 8,
+                sink: 4,
+                min_ctx: 0,
+            },
         )
         .unwrap();
         // row=39 => tokens=40; sink_eff=4; recent_start=32; aligned=32;
@@ -211,7 +229,11 @@ mod tests {
         let plan = MtpWindowPlan::new(
             &full,
             4,
-            MtpWindowCfg { window: 8, sink: 0, min_ctx: 0 },
+            MtpWindowCfg {
+                window: 8,
+                sink: 0,
+                min_ctx: 0,
+            },
         )
         .unwrap();
         let v = plan.row(39).unwrap();
@@ -225,7 +247,11 @@ mod tests {
         let plan = MtpWindowPlan::new(
             &full,
             4,
-            MtpWindowCfg { window: 12, sink: 5, min_ctx: 0 },
+            MtpWindowCfg {
+                window: 12,
+                sink: 5,
+                min_ctx: 0,
+            },
         )
         .unwrap();
         // sink_eff=8; row=39 => tokens=40; recent_start=28 => aligned=28;
@@ -242,7 +268,11 @@ mod tests {
         let plan = MtpWindowPlan::new(
             &full,
             4,
-            MtpWindowCfg { window: 8, sink: 4, min_ctx: 0 },
+            MtpWindowCfg {
+                window: 8,
+                sink: 4,
+                min_ctx: 0,
+            },
         )
         .unwrap();
         // tokens=12 => sink_eff+window=12 => full branch
@@ -257,7 +287,11 @@ mod tests {
         let plan = MtpWindowPlan::new(
             &full,
             4,
-            MtpWindowCfg { window: 8, sink: 4, min_ctx: 0 },
+            MtpWindowCfg {
+                window: 8,
+                sink: 4,
+                min_ctx: 0,
+            },
         )
         .unwrap();
         let e = plan.row(20).unwrap_err();
@@ -270,7 +304,11 @@ mod tests {
         let plan = MtpWindowPlan::new(
             &full,
             4,
-            MtpWindowCfg { window: 8, sink: 4, min_ctx: 20 },
+            MtpWindowCfg {
+                window: 8,
+                sink: 4,
+                min_ctx: 20,
+            },
         )
         .unwrap();
         // tokens=20 <= min_ctx => full；tokens=21 才压缩
@@ -285,7 +323,11 @@ mod tests {
         let e = MtpWindowPlan::new(
             &full,
             4,
-            MtpWindowCfg { window: 4, sink: 4, min_ctx: 0 },
+            MtpWindowCfg {
+                window: 4,
+                sink: 4,
+                min_ctx: 0,
+            },
         )
         .unwrap_err();
         assert!(format!("{e}").contains("sink=4"), "{e}");
@@ -297,7 +339,11 @@ mod tests {
         let plan = MtpWindowPlan::new(
             &full,
             4,
-            MtpWindowCfg { window: 8, sink: 4, min_ctx: 0 },
+            MtpWindowCfg {
+                window: 8,
+                sink: 4,
+                min_ctx: 0,
+            },
         )
         .unwrap();
         let v = plan.rows(36, 4).unwrap();

@@ -89,12 +89,15 @@ fn table() -> &'static BTreeMap<String, Resource> {
 
 /// 退役 env 检查(纯函数;可单测):命中任一 = Some(迁移指引)
 fn retired_env_error(has: impl Fn(&str) -> bool) -> Option<String> {
-    RETIRED_ENV.iter().find(|(env, _)| has(env)).map(|(env, key)| {
-        format!(
-            "[测试资源] {env} 已退役:改用资源清单 {} 里的 \"{key}\"(env 不再参与测试资源选择)",
-            manifest_path().display()
-        )
-    })
+    RETIRED_ENV
+        .iter()
+        .find(|(env, _)| has(env))
+        .map(|(env, key)| {
+            format!(
+                "[测试资源] {env} 已退役:改用资源清单 {} 里的 \"{key}\"(env 不再参与测试资源选择)",
+                manifest_path().display()
+            )
+        })
 }
 
 /// 取资源**路径**(非路径条目/未列 = None)
@@ -151,7 +154,10 @@ mod tests {
         assert_eq!(resource("ckpt:definitely-not-listed"), None);
         assert!(!resource_flag("flag:definitely-not-listed"));
         let r = missing_reason("ckpt:nope");
-        assert!(r.contains("ckpt:nope") && r.contains("resources.toml"), "{r}");
+        assert!(
+            r.contains("ckpt:nope") && r.contains("resources.toml"),
+            "{r}"
+        );
     }
 
     /// 回退语义:`resource_or` 缺时给默认;有则清单优先(本机清单可能列了该 key,
@@ -166,7 +172,10 @@ mod tests {
     #[test]
     fn retired_env_is_loud() {
         let msg = retired_env_error(|k| k == "OWL_AWQ27B_DIR").expect("应命中");
-        assert!(msg.contains("已退役") && msg.contains("ckpt:27b-awq"), "{msg}");
+        assert!(
+            msg.contains("已退役") && msg.contains("ckpt:27b-awq"),
+            "{msg}"
+        );
         assert!(retired_env_error(|_| false).is_none(), "无退役键 = 无话");
         // 全表覆盖:每个退役键都能给出指引
         for (env, key) in RETIRED_ENV {

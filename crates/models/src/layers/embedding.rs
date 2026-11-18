@@ -5,12 +5,12 @@
 //! 零 host 转置、零第二份显存(2026-09-26 w_t 双槽形态作废)。
 //! 容器 + LoaderOps 装载形态。
 
+use crate::layers::linear::{gguf_quant_gemm, Linear};
+use crate::module::{ForwardCtx, Module};
+use crate::module::{Loadable, LoaderCtx, LoaderOps, QuantPlan, Weight};
 #[cfg(test)]
 use crate::ops::SemanticKernel;
 use crate::tensor::Dtype;
-use crate::module::{Loadable, LoaderCtx, LoaderOps, QuantPlan, Weight};
-use crate::module::{ForwardCtx, Module};
-use crate::layers::linear::{gguf_quant_gemm, Linear};
 use crate::TensorOps;
 use owl_kernels::family::gguf::GgmlTy;
 
@@ -53,7 +53,16 @@ impl Embedding {
     /// 准备容器(局部键 "weight":C10 前缀源下 →
     /// `{base}.embed_tokens.weight`;单槽,tied 经 nt matmul 复用)
     pub fn new(vocab: usize, d_dim: usize) -> Embedding {
-        Embedding { w: Weight::new("weight", vec![vocab, d_dim]), lm_head: None, head_i8: None, d_dim, vocab, gguf_ty: None, w_i8q: None, w_i8s: None }
+        Embedding {
+            w: Weight::new("weight", vec![vocab, d_dim]),
+            lm_head: None,
+            head_i8: None,
+            d_dim,
+            vocab,
+            gguf_ty: None,
+            w_i8q: None,
+            w_i8s: None,
+        }
     }
 
     /// **tied + 计划定形**(2026-10-19 刀 7g):`QuantPlan::Gguf(ty)` ⇒ 槽 = 块字节
@@ -61,7 +70,11 @@ impl Embedding {
     ///
     /// **响亮拒**:该型无行解量化入口(`ROWS_PORTED` 外,如 Q8_0 —— 快照无
     /// `dequantize_block_q8_0`)⇒ 构造期就报错,不做“装了才发现读不了”。
-    pub fn new_by_plan(vocab: usize, d_dim: usize, plan: QuantPlan) -> Result<Embedding, crate::contract::ModelError> {
+    pub fn new_by_plan(
+        vocab: usize,
+        d_dim: usize,
+        plan: QuantPlan,
+    ) -> Result<Embedding, crate::contract::ModelError> {
         let mut e = Embedding::new(vocab, d_dim);
         e.set_table_plan(plan)?;
         Ok(e)
@@ -82,17 +95,32 @@ impl Embedding {
             if self.lm_head.is_none() {
                 return Err(crate::contract::ModelError::Msg(
                     "Embedding: int8 表要求 untied 模型(独立 lm_head);\
-                     tied 头无法直读 int8 表".into(),
+                     tied 头无法直读 int8 表"
+                        .into(),
                 ));
             }
             // `w` = F16 占位(不声明/不装载):`embed` 的输出 dtype 由它携带,
             // 不能留默认 F32(否则 dtype 守门拒 `owl_embed_i8_f16`)。
-            self.w = Weight::new_typed("weight", vec![self.vocab, self.d_dim], crate::tensor::Dtype::F16);
-            self.w_i8q = Some(Weight::new_typed("i8q", vec![self.vocab, self.d_dim], crate::tensor::Dtype::I8));
-            self.w_i8s = Some(Weight::new_typed("i8s", vec![self.vocab], crate::tensor::Dtype::F32));
+            self.w = Weight::new_typed(
+                "weight",
+                vec![self.vocab, self.d_dim],
+                crate::tensor::Dtype::F16,
+            );
+            self.w_i8q = Some(Weight::new_typed(
+                "i8q",
+                vec![self.vocab, self.d_dim],
+                crate::tensor::Dtype::I8,
+            ));
+            self.w_i8s = Some(Weight::new_typed(
+                "i8s",
+                vec![self.vocab],
+                crate::tensor::Dtype::F32,
+            ));
             return Ok(());
         }
-        let QuantPlan::Gguf(ty) = plan else { return Ok(()) };
+        let QuantPlan::Gguf(ty) = plan else {
+            return Ok(());
+        };
         if owl_kernels::family::gguf::rows_entry_for(ty).is_none() {
             return Err(crate::contract::ModelError::Msg(format!(
                 "Embedding: 量化表型 {} 无行解量化入口(行臂集 = {:?})—— \
@@ -128,7 +156,12 @@ impl Embedding {
     }
 
     /// **untied + 词表切**(P1.1):embed 表**全量**,lm_head 只建 `head_vocab` 行。
-    pub fn new_untied_head(vocab: usize, head_vocab: usize, d_dim: usize, plan: QuantPlan) -> Embedding {
+    pub fn new_untied_head(
+        vocab: usize,
+        head_vocab: usize,
+        d_dim: usize,
+        plan: QuantPlan,
+    ) -> Embedding {
         // int8 头(§72/§73):不进 `Linear`(见 QuantPlan::I8W 的裁决注记)
         if matches!(plan, QuantPlan::I8W | QuantPlan::I8W8) {
             let rule = if head_vocab < vocab {
@@ -160,7 +193,16 @@ impl Embedding {
         } else {
             head
         };
-        Embedding { w: Weight::new("weight", vec![vocab, d_dim]), lm_head: Some(head), head_i8: None, d_dim, vocab, gguf_ty: None, w_i8q: None, w_i8s: None }
+        Embedding {
+            w: Weight::new("weight", vec![vocab, d_dim]),
+            lm_head: Some(head),
+            head_i8: None,
+            d_dim,
+            vocab,
+            gguf_ty: None,
+            w_i8q: None,
+            w_i8s: None,
+        }
     }
 
     /// **untied + 词表切 + 表/头两个独立计划**(并集:GGUF 27B 的真实形态 ——
@@ -199,7 +241,6 @@ impl Embedding {
         }
     }
 
-
     /// untied lm_head 槽装载声明(键 = **局部键** `lm_head[*]`;全键由调用方
     /// 经 [`crate::module::KeyConvention::head_key`] 改写 —— **第 4 类键**:
     /// HF 叫 `lm_head.weight`,GGUF 叫 `output.weight`)。
@@ -215,7 +256,8 @@ impl Embedding {
             // 是 `Replicate`(lm_head 不切),词表切档必须显式覆盖成 `UniformCol`
             // —— 否则两 rank 读同一段(高半 = 低半的复制,实测撞过)。
             let ops =
-                h.q.layout_as("lm_head.i8q", ctx).chain(h.s.layout_as("lm_head.i8s", ctx));
+                h.q.layout_as("lm_head.i8q", ctx)
+                    .chain(h.s.layout_as("lm_head.i8s", ctx));
             return Some(if h.rule != crate::plan::rules::rule_of("lm_head") {
                 ops.with_rule(h.rule)
             } else {
@@ -262,11 +304,12 @@ impl Embedding {
         }
         // 输出 dtype 跟随表 Weight(F5;LoaderCtx 自动跟随)
         let dt = self.w.dtype();
-        TensorOps::call(crate::ops::SemanticKernel::Embed).aux(&[tokens])
-        .arg(&self.w.decl())
-        .arg(ids)
-        .arg_usize(self.d_dim)
-        .with_shape(dt, vec![tokens, self.d_dim])
+        TensorOps::call(crate::ops::SemanticKernel::Embed)
+            .aux(&[tokens])
+            .arg(&self.w.decl())
+            .arg(ids)
+            .arg_usize(self.d_dim)
+            .with_shape(dt, vec![tokens, self.d_dim])
     }
 
     /// lm_head:hidden [.., D] → logits [.., vocab]
@@ -289,11 +332,8 @@ impl Embedding {
             //   没有 fp8 TC;M 补到 16,权重仍只读一遍);
             // - 其余多 token 形状 ⇒ dp4a 多头核(回退);
             // - m=1(prefill 末行/MTP)保持 W8A16,避免小 shape 量化开销。
-            let tc = owl_kernels::driver::elems::gemm_i8w_a8_tc_eligible(
-                h.rows,
-                self.d_dim,
-                tokens,
-            );
+            let tc =
+                owl_kernels::driver::elems::gemm_i8w_a8_tc_eligible(h.rows, self.d_dim, tokens);
             let dp4a = owl_kernels::driver::elems::gemv_i8w_mt_eligible(h.rows, tokens);
             if h.a8 && tokens > 1 && (tc || dp4a) {
                 use crate::ops::SemanticKernel as K;
@@ -337,18 +377,11 @@ impl Embedding {
             // 执行 dtype = f16 的档(W4A16Awq/F16 27B)拿到 bf16 核 = 输出域不符)。
             // 2026-10-22:多 token 且 K 16 对齐 ⇒ W8A16 f16/bf16 Tensor Core
             // (HBM 读 int8;B 在寄存器里反量化;激活不量化);否则回 multi-token FMA。
-            let a16tc = owl_kernels::driver::elems::gemm_i8w_a16_tc_eligible(
-                h.rows,
-                self.d_dim,
-                tokens,
-            );
+            let a16tc =
+                owl_kernels::driver::elems::gemm_i8w_a16_tc_eligible(h.rows, self.d_dim, tokens);
             let kern = match (hidden.dtype, a16tc) {
-                (crate::tensor::Dtype::BF16, true) => {
-                    crate::ops::SemanticKernel::GemmI8wA16TcBf16
-                }
-                (crate::tensor::Dtype::F16, true) => {
-                    crate::ops::SemanticKernel::GemmI8wA16TcF16
-                }
+                (crate::tensor::Dtype::BF16, true) => crate::ops::SemanticKernel::GemmI8wA16TcBf16,
+                (crate::tensor::Dtype::F16, true) => crate::ops::SemanticKernel::GemmI8wA16TcF16,
                 (crate::tensor::Dtype::BF16, false) => crate::ops::SemanticKernel::GemvI8wBf16,
                 (crate::tensor::Dtype::F16, false) => crate::ops::SemanticKernel::GemvI8wF16,
                 (other, _) => panic!("int8 头:GEMV 输出 dtype 只可能是 f16/bf16,实得 {other:?}"),
@@ -360,9 +393,12 @@ impl Embedding {
                 .arg_i32(h.rows as i32)
                 .arg_i32(self.d_dim as i32);
             // 多 token 核多一个 tokens 标量槽;driver 的几何门是唯一判据,模型侧不另立。
-            let mt = !a16tc
-                && owl_kernels::driver::elems::gemv_i8w_mt_eligible(h.rows, tokens);
-            let call = if mt || a16tc { call.arg_i32(tokens as i32) } else { call };
+            let mt = !a16tc && owl_kernels::driver::elems::gemv_i8w_mt_eligible(h.rows, tokens);
+            let call = if mt || a16tc {
+                call.arg_i32(tokens as i32)
+            } else {
+                call
+            };
             return call
                 .aux(&[h.rows, self.d_dim, tokens])
                 .with_shape(hidden.dtype, vec![tokens, h.rows]);
@@ -373,7 +409,9 @@ impl Embedding {
             // tied:**表兼头** —— 表是量化块(GGUF 档)时走同一套两发路径
             // (设计 §11.5 ②;与 `Linear` 的 GGUF 臂**同一实现**)
             None => match self.gguf_ty {
-                Some(ty) => gguf_quant_gemm(&self.w, ty, hidden, self.vocab, self.d_dim, None, arms),
+                Some(ty) => {
+                    gguf_quant_gemm(&self.w, ty, hidden, self.vocab, self.d_dim, None, arms)
+                }
                 None => hidden.matmul_nt(&self.w.decl()),
             },
         }
@@ -391,7 +429,6 @@ impl Loadable for Embedding {
             _ => self.w.layout(ctx),
         }
     }
-
 }
 
 impl Module for Embedding {
@@ -401,19 +438,22 @@ impl Module for Embedding {
     }
 }
 
-
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::testkit::{assert_close, f32b, harvest, hf_python, parity_enabled, skip_note, st_read, st_write, tmp_path, Src};
-    
+    use crate::testkit::{
+        assert_close, f32b, harvest, hf_python, parity_enabled, skip_note, st_read, st_write,
+        tmp_path, Src,
+    };
+
     #[tokio::test]
     async fn declaration_is_wellformed() {
         let mut face = owl_cpu::CpuFace::new();
         let emb = Embedding::new(16, 4);
-        let src = Src::from([
-            ("weight".to_string(), (0..64).map(|i| i as f32 * 0.1).collect()),
-        ]);
+        let src = Src::from([(
+            "weight".to_string(),
+            (0..64).map(|i| i as f32 * 0.1).collect(),
+        )]);
         crate::interpreters::eval_load(&emb, &mut face, &src, &Default::default())
             .await
             .expect("eval_load");
@@ -425,7 +465,11 @@ mod tests {
         assert_eq!(out.shape(), &[2, 4]);
 
         let hidden = TensorOps::from_host(Dtype::F32, vec![1, 4], &f32b(&[0.1; 4]));
-        let logits = harvest(&mut face, &emb.lm_head_matmul(&hidden, &crate::env::GgufEnv::default())).await;
+        let logits = harvest(
+            &mut face,
+            &emb.lm_head_matmul(&hidden, &crate::env::GgufEnv::default()),
+        )
+        .await;
         assert_eq!(logits.len(), 16);
     }
 
@@ -443,15 +487,22 @@ mod tests {
 
         let inp = tmp_path("embed_in");
         let outp = tmp_path("embed_out");
-        st_write(&inp, &[
-            ("ids", &ids, vec![tokens]),
-            ("w", &w, vec![vocab, d]),
-            ("x", &x, vec![1, d]),
-        ]);
-        let manifest = hf_python("embedding.py", &[
-            inp.to_str().unwrap(), outp.to_str().unwrap(),
-            &format!(r#"{{"vocab": {vocab}, "d": {d}}}"#),
-        ]);
+        st_write(
+            &inp,
+            &[
+                ("ids", &ids, vec![tokens]),
+                ("w", &w, vec![vocab, d]),
+                ("x", &x, vec![1, d]),
+            ],
+        );
+        let manifest = hf_python(
+            "embedding.py",
+            &[
+                inp.to_str().unwrap(),
+                outp.to_str().unwrap(),
+                &format!(r#"{{"vocab": {vocab}, "d": {d}}}"#),
+            ],
+        );
         eprintln!("[hf manifest] embedding: {manifest}");
         let want_y = st_read(&outp, "y");
         let want_logits = st_read(&outp, "logits");
@@ -463,28 +514,34 @@ mod tests {
             let (_, y, logits) = if !on_gpu {
                 let mut face = owl_cpu::CpuFace::new();
                 let emb = Embedding::new(vocab, d);
-                let src = Src::from([
-                    ("weight".to_string(), w.clone()),
-                ]);
+                let src = Src::from([("weight".to_string(), w.clone())]);
                 crate::interpreters::eval_load(&emb, &mut face, &src, &Default::default())
-                    .await.expect("eval_load");
+                    .await
+                    .expect("eval_load");
                 // embed = Kernel 节点(CPU face 不执行);lm_head = 语义 matmul 可跑
                 let x_t = TensorOps::from_host(Dtype::F32, vec![1, d], &f32b(&x));
                 let y = want_y.clone(); // CPU 臂无 embed 执行,占位由 GPU 臂覆盖
-                let logits = harvest(&mut face, &emb.lm_head_matmul(&x_t, &crate::env::GgufEnv::default())).await;
+                let logits = harvest(
+                    &mut face,
+                    &emb.lm_head_matmul(&x_t, &crate::env::GgufEnv::default()),
+                )
+                .await;
                 ("cpu", y, logits)
             } else {
                 let mut gpu = crate::testkit::gpu_client().await;
                 let emb = Embedding::new(vocab, d);
-                let src = Src::from([
-                    ("weight".to_string(), w.clone()),
-                ]);
+                let src = Src::from([("weight".to_string(), w.clone())]);
                 crate::interpreters::eval_load(&emb, &mut gpu, &src, &Default::default())
-                    .await.expect("eval_load");
+                    .await
+                    .expect("eval_load");
                 let ids_t = TensorOps::from_host(Dtype::F32, vec![tokens], &f32b(&ids));
                 let x_t = TensorOps::from_host(Dtype::F32, vec![1, d], &f32b(&x));
                 let y = harvest(&mut gpu, &emb.embed(&ids_t, tokens)).await;
-                let logits = harvest(&mut gpu, &emb.lm_head_matmul(&x_t, &crate::env::GgufEnv::default())).await;
+                let logits = harvest(
+                    &mut gpu,
+                    &emb.lm_head_matmul(&x_t, &crate::env::GgufEnv::default()),
+                )
+                .await;
                 gpu.close().await.expect("server 关机");
                 ("gpu", y, logits)
             };
@@ -499,9 +556,9 @@ mod tests {
 #[cfg(test)]
 mod f16_tests {
     use super::*;
-    use crate::testkit::{gpu_client, gpu_enabled};
     use crate::contract::DeviceClient as _;
-    
+    use crate::testkit::{gpu_client, gpu_enabled};
+
     fn half_le(f: f32) -> [u8; 2] {
         half::f16::from_f32(f).to_le_bytes()
     }
@@ -522,27 +579,44 @@ mod f16_tests {
         let tokens = 3usize;
 
         let mut gpu = gpu_client().await;
-        let dw = owl_iface::htod!(gpu, Dtype::F16, &crate::contract::Shape::from(vec![vocab, d]),
-            &w.iter().flat_map(|f| half_le(*f)).collect::<Vec<u8>>()).await.expect("htod w");
-        let di = owl_iface::htod!(gpu, Dtype::F32, &crate::contract::Shape::from(vec![tokens]),
-            &crate::testkit::f32b(&ids)).await.expect("htod ids");
+        let dw = owl_iface::htod!(
+            gpu,
+            Dtype::F16,
+            &crate::contract::Shape::from(vec![vocab, d]),
+            &w.iter().flat_map(|f| half_le(*f)).collect::<Vec<u8>>()
+        )
+        .await
+        .expect("htod w");
+        let di = owl_iface::htod!(
+            gpu,
+            Dtype::F32,
+            &crate::contract::Shape::from(vec![tokens]),
+            &crate::testkit::f32b(&ids)
+        )
+        .await
+        .expect("htod ids");
 
         // htod 块 → Block 叶子声明(f16 链不走 CpuFace 的 from_host)
         let w_decl = TensorOps::of_block(dw.id, Dtype::F16, vec![vocab, d]);
         let i_decl = TensorOps::of_block(di.id, Dtype::F32, vec![tokens]);
-        let decl = TensorOps::call(SemanticKernel::Embed).aux(&[tokens])
-        .arg(&w_decl)
-        .arg(&i_decl)
-        .arg_usize(d)
-        .with_shape(Dtype::F16, vec![tokens, d]);
-        let out = crate::interpreters::eval_ops(decl.step(), &mut gpu).await.expect("eval");
+        let decl = TensorOps::call(SemanticKernel::Embed)
+            .aux(&[tokens])
+            .arg(&w_decl)
+            .arg(&i_decl)
+            .arg_usize(d)
+            .with_shape(Dtype::F16, vec![tokens, d]);
+        let out = crate::interpreters::eval_ops(decl.step(), &mut gpu)
+            .await
+            .expect("eval");
         let mut buf = vec![0u8; tokens * d * 2];
         gpu.dtoh(&out, &mut buf).await.expect("dtoh");
 
         for t in 0..tokens {
             let id = ids[t] as usize;
             for dd in 0..d {
-                let got = half::f16::from_le_bytes([buf[(t * d + dd) * 2], buf[(t * d + dd) * 2 + 1]]).to_f32();
+                let got =
+                    half::f16::from_le_bytes([buf[(t * d + dd) * 2], buf[(t * d + dd) * 2 + 1]])
+                        .to_f32();
                 assert_eq!(got, w[id * d + dd], "查表须逐位一致 [{t},{dd}]");
             }
         }

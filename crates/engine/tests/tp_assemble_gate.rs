@@ -39,10 +39,17 @@ fn dir_of() -> PathBuf {
 /// 抠 `"key":<digits>`(server LedgerJson 取数;与 cuda 门同法)
 fn json_u64(json: &str, key: &str) -> u64 {
     let pat = format!("\"{key}\":");
-    let i = json.find(&pat).unwrap_or_else(|| panic!("LedgerJson 缺键 {key}: {json}")) + pat.len();
+    let i = json
+        .find(&pat)
+        .unwrap_or_else(|| panic!("LedgerJson 缺键 {key}: {json}"))
+        + pat.len();
     let rest = &json[i..];
-    let end = rest.find(|c: char| !c.is_ascii_digit()).unwrap_or(rest.len());
-    rest[..end].parse().unwrap_or_else(|e| panic!("键 {key} 数值非法: {e}"))
+    let end = rest
+        .find(|c: char| !c.is_ascii_digit())
+        .unwrap_or(rest.len());
+    rest[..end]
+        .parse()
+        .unwrap_or_else(|e| panic!("键 {key} 数值非法: {e}"))
 }
 
 fn le_f32(v: &[f32]) -> Vec<u8> {
@@ -61,7 +68,9 @@ fn cfg_of(ordinal: usize) -> EngineConfig {
 #[test]
 fn tp_assemble_gate() {
     let (Some(oa), Some(ob)) = (dev("OWL_TP_TEST_DEV_A"), dev("OWL_TP_TEST_DEV_B")) else {
-        owl_shared::testkit::report::skip("需 OWL_TP_TEST_DEV_A / OWL_TP_TEST_DEV_B(两张空闲卡的 CUDA ordinal)");
+        owl_shared::testkit::report::skip(
+            "需 OWL_TP_TEST_DEV_A / OWL_TP_TEST_DEV_B(两张空闲卡的 CUDA ordinal)",
+        );
         return;
     };
     assert_ne!(oa, ob, "A/B 必须是两张不同卡");
@@ -130,7 +139,11 @@ async fn body(oa: usize, ob: usize, dir: PathBuf) {
         .expect("全量 spec(CPU 只读回退)");
     for r in 0..2 {
         let s = tp.spec(r);
-        assert_eq!(tp.plan(r), TpPlan::new(r, 2).expect("plan"), "rank{r} 的分片计划");
+        assert_eq!(
+            tp.plan(r),
+            TpPlan::new(r, 2).expect("plan"),
+            "rank{r} 的分片计划"
+        );
         assert_eq!(s.inter * 2, full.inter, "rank{r}:inter 应恰半分");
         assert_eq!(s.full_heads.0 * 2, full.full_heads.0, "rank{r}:hq 半分");
         assert_eq!(s.full_heads.1 * 2, full.full_heads.1, "rank{r}:hkv 半分");
@@ -140,12 +153,20 @@ async fn body(oa: usize, ob: usize, dir: PathBuf) {
         assert_eq!(s.vocab, full.vocab, "v1 词表复制(AG 词表切分是将来项)");
         assert_eq!(s.dtype, full.dtype);
     }
-    assert_eq!(tp.spec(0).inter, tp.spec(1).inter, "两 rank 同形(分片协议对称)");
+    assert_eq!(
+        tp.spec(0).inter,
+        tp.spec(1).inter,
+        "两 rank 同形(分片协议对称)"
+    );
 
     // ── ④ staging 账(两侧同额 + 领主账)────────────────────────────
     let layout = owl_cuda::comm::ar::StagingLayout::default_layout();
     for r in 0..2 {
-        assert_eq!(tp.staging(r).total_bytes(), layout.total_bytes(), "rank{r} staging 额度");
+        assert_eq!(
+            tp.staging(r).total_bytes(),
+            layout.total_bytes(),
+            "rank{r} staging 额度"
+        );
         assert_eq!(tp.slot_bytes(), layout.slot_bytes, "slot 两侧同参");
     }
     // 账本口径:VMM 分配按**粒度上取整**(min granularity = 2MiB;
@@ -172,31 +193,55 @@ async fn body(oa: usize, ob: usize, dir: PathBuf) {
             "rank{r} 超出部分应是粒度上取整(< 2MiB);实得 {}B",
             shared[r]
         );
-        assert_eq!(json_u64(&js[r], "alias_bytes"), shared[1 - r], "rank{r} alias 应等于对端分配额");
+        assert_eq!(
+            json_u64(&js[r], "alias_bytes"),
+            shared[1 - r],
+            "rank{r} alias 应等于对端分配额"
+        );
         // staging = 1 分配 + 1 别名(1-stage arena 已退役,2026-10-27)
-        assert_eq!(json_u64(&js[r], "mappings"), 2, "rank{r} 映射笔数 = staging 2");
+        assert_eq!(
+            json_u64(&js[r], "mappings"),
+            2,
+            "rank{r} 映射笔数 = staging 2"
+        );
     }
     // ── ⑤ 别名连通实证:rank0 写 own → rank1 经 peer 读回 ───────────
     let pattern: [f32; 4] = [1.5, -2.25, 3.125, 42.0];
     let mut f0 = tp.face_clone(0).expect("face0");
     let src = f0
-        .htod(Dtype::F32, &Shape::from(vec![4]), &le_f32(&pattern), "tp-gate:pattern")
+        .htod(
+            Dtype::F32,
+            &Shape::from(vec![4]),
+            &le_f32(&pattern),
+            "tp-gate:pattern",
+        )
         .await
         .expect("htod 模式块");
     let own0 = tp.staging(0).own().clone();
-    f0.copy_block_at(&src, 0, &own0, 0, 16).await.expect("copy → rank0.own");
+    f0.copy_block_at(&src, 0, &own0, 0, 16)
+        .await
+        .expect("copy → rank0.own");
     f0.sync().await.expect("sync");
     let mut f1 = tp.face_clone(1).expect("face1");
     let mut got = vec![0u8; 16];
-    f1.dtoh(tp.staging(1).peer(), &mut got).await.expect("dtoh(rank1.peer)");
-    assert_eq!(got, le_f32(&pattern), "rank1 的 peer 别名应是 rank0 的 own(交叉接线错位?)");
+    f1.dtoh(tp.staging(1).peer(), &mut got)
+        .await
+        .expect("dtoh(rank1.peer)");
+    assert_eq!(
+        got,
+        le_f32(&pattern),
+        "rank1 的 peer 别名应是 rank0 的 own(交叉接线错位?)"
+    );
     f0.free(&[src.id]).await.expect("free 模式块");
 
     // ── ⑥ 图族真捕到(staging 块烘进图 ⇒ 捕获窗零分配的前提成立)────
     for r in 0..2 {
         assert!(tp.session_captured(r), "rank{r} 主会话图应捕获成功");
         assert!(tp.session_slab_bytes(r) > 0, "rank{r} 图 slab 应 > 0");
-        eprintln!("[tp-gate] rank{r} 会话图 slab = {} MiB", tp.session_slab_bytes(r) >> 20);
+        eprintln!(
+            "[tp-gate] rank{r} 会话图 slab = {} MiB",
+            tp.session_slab_bytes(r) >> 20
+        );
     }
     // 注入计数(K1 标记面):两 rank 各自有 AR 注入,且计数相等(模型对称)
     let ar_count = |tag: &str| -> u64 {
@@ -206,8 +251,14 @@ async fn body(oa: usize, ob: usize, dir: PathBuf) {
             .sum()
     };
     let (c0, c1) = (ar_count("tp.ar.r0"), ar_count("tp.ar.r1"));
-    assert!(c0 > 0 && c1 > 0, "两 rank 都应有 AR 注入(实得 r0={c0} r1={c1})");
-    assert_eq!(c0, c1, "对称模型 ⇒ 两 rank 注入次数相等(实得 r0={c0} r1={c1})");
+    assert!(
+        c0 > 0 && c1 > 0,
+        "两 rank 都应有 AR 注入(实得 r0={c0} r1={c1})"
+    );
+    assert_eq!(
+        c0, c1,
+        "对称模型 ⇒ 两 rank 注入次数相等(实得 r0={c0} r1={c1})"
+    );
     eprintln!("[tp-gate] AR 注入计数:r0={c0} r1={c1}(捕获期已烙进图)");
 
     // ── ⑦ 收尾:卸图 + PeerRelease ⇒ peer 三账归零 ─────────────────
@@ -215,7 +266,11 @@ async fn body(oa: usize, ob: usize, dir: PathBuf) {
     let k1 = tp.face_clone(1).expect("face1(收尾)");
     tp.shutdown().await.expect("TP 收尾");
     for (tag, mut f) in [("rank0", k0), ("rank1", k1)] {
-        let j = f.client_mut().ledger_json().await.expect("ledger_json(after shutdown)");
+        let j = f
+            .client_mut()
+            .ledger_json()
+            .await
+            .expect("ledger_json(after shutdown)");
         assert_eq!(json_u64(&j, "shared_bytes"), 0, "{tag} shared 未归零(泄漏)");
         assert_eq!(json_u64(&j, "alias_bytes"), 0, "{tag} alias 未归零(泄漏)");
         assert_eq!(json_u64(&j, "mappings"), 0, "{tag} mappings 未归零(泄漏)");

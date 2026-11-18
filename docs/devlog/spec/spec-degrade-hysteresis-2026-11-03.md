@@ -173,3 +173,104 @@ turn: decode=21994ms/2399tok=109.1 t/s · deg=24/2399(1%)
 - **A/B 只能靠单元门**:本机 30 秒内没能造出"≥1.2 s 真死域"的负载(随机词/随机
   hex/temperature=1 都被草稿器扛住了)⇒ "两个连续低窗必降"由纯函数单测钉住,
   真机只验证了"不再误降 + 探测必恢复"。
+
+---
+
+## 七、2026-11-18 回归:计数器只在同步分支自增 ⇒ 降级永不探测
+
+2026-11-18 真实 agent 场景复现:**同一 turn 前段 ~100 t/s,decode 中段跌到 ~50 t/s
+并一直保持**;日志 `spec.degrade=8 / spec.undegrad=0 / spec.probe.round=0`,
+每个 turn 只记 1 个 `decode.step.deg`,`deg` 只占 1/1584(实际约 2/3 的 token
+在裸 decode)。
+
+根因不是 11-03 的陈旧草稿(那条仍在修),而是后来加入的同步节流:
+
+```rust
+// 旧(错):计数器只在“同步草稿池”分支里自增
+if (degraded || seeding) && sync_due && taps > 0 {
+    ...
+    if degraded { spec_steps_degraded += 1; spec_degraded_steps += 1; }
+}
+```
+
+`sync_due` 本身由 `spec_steps_degraded % 8 == 0 || steps + 1 >= probe_every` 判定
+⇒ 第一次同步后计数 = 1,之后 `1 % 8 != 0` 且 `1 + 1 < probe_every` ⇒ **永远不再
+同步、也永远到不了探测点**。调度面 `spec_steps_degraded >= spec_probe_every`
+因此恒假,降级态一次探测都不发,只能整段裸 decode。
+
+修法(2026-11-18):
+
+- `spec_steps_degraded` / `spec_degraded_steps` **每个降级裸步都自增**(与同步解耦);
+- 同步仍按 `degraded_sync_due`(每 8 步 + 探测前最后一步);
+- 调度面探测判据抽成 `degraded_probe_due`,与 `degraded_sync_due` 同源;
+- `decode.step.deg` 改为每降级步记账(此前只在同步步记,`deg` 被系统性低估)。
+
+真机验证(双 3080 / 8135 / 同一 prose+thinking 负载):
+
+```text
+修前: degrade=8  undegrad=0  probe.round=0   decode 50.0 t/s
+修后: degrade=3  undegrad=2  probe.round=31  decode 61.0 t/s(prose,AL≈1.3~2.1)
+```
+
+另测高 AL 对照:
+
+```text
+1..1200 数字(短 ctx): AL 7.99 / 292 t/s / deg 0
+147k 长文档 + 1..600: AL 7.68 / 148.8 t/s / deg 0
+```
+
+⇒ 修复恢复的是**降级后的反悔通路**,不是把低 AL 内容变高。真实 agent 的
+thinking/prose 段 AL 仍会从 ~7 掉到 ~1.3,那是草稿域质量(模型侧),不是位置/
+长 ctx 结构 bug;`spec` 在该段只能贴近盈亏线,裸 decode 约 47 t/s。
+
+### 7.1 vLLM 交叉验证(2026-11-18)
+
+同模型/同量化/同 DFlash2 d7,换 vLLM 0.27.2-dev + 双 3090 Ti TP2(8133),
+同一句“凌晨四点的便利店”prose prompt,`max_tokens=1000`:
+
+```text
+vLLM: 952 tok / 18.39s = 51.8 t/s
+  0-100 tok: 78.4 t/s    100-200: 57.2    200-300: 53.0
+  300-400:   45.1        400-900: 40.5~56.8
+  AL 窗口: 0-2s 2.80 → 2-6s 1.74 → 6-18s 1.61/1.62
+```
+
+对照“只输出 1..1000 数字”(thinking off):
+
+```text
+vLLM: 1200 tok / 5.37s = 223.4 t/s
+  每 100 tok: 203~277 t/s(首桶含 warmup)
+  AL 全程恒 8.0(7 草稿全收)
+```
+
+⇒ **vLLM 也复现同样的 AL/速度衰减**,且数字任务同样不衰减。这排除
+“owl 降级计数器”是衰减的唯一原因;计数器 bug 只负责把低 AL 段**永久锁死**
+在裸 decode。prose/thinking 段的 AL 从 ~7 掉到 ~1.6 是 DFlash2 草稿的
+域质量(模型侧),不是长 ctx / decode 位置 / owl 特有结构。
+
+### 7.2 147k follow-up 的功耗/吞吐 A/B(2026-11-18)
+
+同 3080 双卡、同 147,904-token 长文档、同 320-token 输出、同 DFlash2 d7：
+
+| 引擎/档 | decode | 每卡平均功率 | J/token |
+|---|---:|---:|---:|
+| vLLM 0.27.2 + FP8 KV + W4A16 | **93.9 t/s** | 256–260W | **5.49** |
+| owl W4A8 + INT8 KV(主档) | 60.5 t/s | 259–260W | 8.58 |
+| owl W4A8 + F16 KV | 73.2 t/s | 257–259W | 7.06 |
+| **owl W4A16 + F16 KV** | **78.7 t/s** | 261–263W | **6.67** |
+
+定谳：**功耗不是主问题**。147k 下 owl 与 vLLM 都是 ~260W；owl 是
+“同功率、少 20~35% token”。第一杠杆是 **KV dtype**：int8 主池在长 ctx 的
+verify 读核明显吃亏，f16 换回 +30% decode；第二杠杆仍是 spec round：
+
+```text
+owl W4A16+F16: round 35.8ms = verify 27.3 + fold 5.7 + propose 1.8
+vLLM 同 AL 2.86 ≈ 30ms/round
+```
+
+⇒ 剩余 ~5.8ms 主要在 fold/verify；不再动草稿模型。f16 池 150k 已占
+~4.7GiB，不能直接拉到 262k；262k 仍走主档 int8。
+
+新增落档：`profiles/qwen38_27b-3080_tp2-150k.toml`(W4A16 + F16 KV +
+`max_context_length=150000` + 单并发)。FP8 KV 当前会因缺
+`owl_qknorm_rope_kv_insert_f16_fp8kv_knhd` 准入声明而拒启，暂以 f16 桥接。

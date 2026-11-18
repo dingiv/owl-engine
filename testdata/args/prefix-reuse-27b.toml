@@ -30,7 +30,7 @@ prefill_chunk = 512
 [store]
 [store.gdn]
 # **容量面全部继承 flavor**(2026-10-19 容量定档后):`prefix_cache=true` /
-# `ram_pool_size=4096` / `snap_max=4` / `snap_host_mb=2048`
+# `ram_pool_size=13312` / `snap_max=2`（宿主总池 KV+快照共享）
 # 都在 `profiles/qwen38_27b-3090.toml` 里(三层账与 VRAM 算式见该档注释)。
 # 本测装**不再覆盖**它们 —— 测的就是生产档的真实容量策略。
 gdn_slots = 1

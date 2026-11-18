@@ -15,10 +15,10 @@ use std::path::PathBuf;
 
 use owl_iface::contract::ModelError;
 
-use super::devices::{Devices, resolve_devices};
+use super::devices::{resolve_devices, Devices};
 use crate::engine::{Engine, EngineConfig};
-use crate::{LoadArm, LoadIntent, LoadedModel, TpEngine, TpOpts};
 use crate::Result;
+use crate::{LoadArm, LoadIntent, LoadedModel, TpEngine, TpOpts};
 
 /// `[parallel]` + 站点面（选卡所需的全部输入）。
 #[derive(Clone, Debug)]
@@ -73,7 +73,8 @@ pub struct Booted {
 
 /// **选卡**（引擎线程内调用；失败 = 结构化 Err）。
 pub fn resolve(spec: &BootSpec) -> Result<Devices> {
-    resolve_devices(&spec.devices.parallel, spec.devices.gpu_min_free_ratio).map_err(ModelError::Msg)
+    resolve_devices(&spec.devices.parallel, spec.devices.gpu_min_free_ratio)
+        .map_err(ModelError::Msg)
 }
 
 /// **装配 + 装载 + run**（引擎线程内调用；失败 = 结构化 Err）。
@@ -85,8 +86,8 @@ pub async fn assemble(
     let world = devices.world();
     // **装载白名单在此判死**（非白名单组合 = boot 期拒，不等到装载到一半才报缺键）；
     // 臂 → 计划 / 头表覆盖 → LoadIntent 的换算也在这里（server 不再知道这些）。
-    let arm = crate::load_arm_of(spec.format, spec.quant)
-        .map_err(|e| ModelError::Msg(e.to_string()))?;
+    let arm =
+        crate::load_arm_of(spec.format, spec.quant).map_err(|e| ModelError::Msg(e.to_string()))?;
     let intent = crate::LoadIntent::of(arm, spec.head_quant, spec.embed_quant);
     let tp = TpOpts {
         ar_f8: spec.tp_ar_f8,
@@ -122,7 +123,11 @@ pub async fn assemble(
             );
             vram_phase("engine:weights", engine.mem_info().await, &mut phase_used);
             let running = engine.run(model).await?;
-            owl_shared::log_info!("boot", "引擎装配(run)总计 {:.2}s", t0.elapsed().as_secs_f32());
+            owl_shared::log_info!(
+                "boot",
+                "引擎装配(run)总计 {:.2}s",
+                t0.elapsed().as_secs_f32()
+            );
             running
         }
         // ── TP 档（world = 2；rank 序 = devices 列表序）────────────────────
@@ -134,17 +139,17 @@ pub async fn assemble(
             let mut engine1 =
                 Engine::new_with_ledger(engine_cfg(ord[1]), engine0.ledger_cell(), 1)?;
             let (join0, join1) = std::thread::scope(|scope| {
-                let h0 =
-                    scope.spawn(|| load_rank(spec, arm, &intent, &mut engine0, 0, 2, "rank0"));
-                let h1 =
-                    scope.spawn(|| load_rank(spec, arm, &intent, &mut engine1, 1, 2, "rank1"));
+                let h0 = scope.spawn(|| load_rank(spec, arm, &intent, &mut engine0, 0, 2, "rank0"));
+                let h1 = scope.spawn(|| load_rank(spec, arm, &intent, &mut engine1, 1, 2, "rank1"));
                 (h0.join(), h1.join())
             });
-            let model0 = join0
-                .map_err(|_| ModelError::Msg("TP rank0 装载线程 panic".into()))??;
-            let model1 = join1
-                .map_err(|_| ModelError::Msg("TP rank1 装载线程 panic".into()))??;
-            vram_phase("engine:tp-weights", engine0.mem_info().await, &mut phase_used);
+            let model0 = join0.map_err(|_| ModelError::Msg("TP rank0 装载线程 panic".into()))??;
+            let model1 = join1.map_err(|_| ModelError::Msg("TP rank1 装载线程 panic".into()))??;
+            vram_phase(
+                "engine:tp-weights",
+                engine0.mem_info().await,
+                &mut phase_used,
+            );
             owl_shared::log_info!(
                 "boot",
                 "TP2 分片装载(rank0 ordinal {} / rank1 ordinal {}):{:.2}s",
@@ -152,8 +157,8 @@ pub async fn assemble(
                 ord[1],
                 t0.elapsed().as_secs_f32()
             );
-            let tp = TpEngine::assemble_with(vec![engine0, engine1], vec![model0, model1], tp)
-                .await?;
+            let tp =
+                TpEngine::assemble_with(vec![engine0, engine1], vec![model0, model1], tp).await?;
             if spec.tp_ar_f8 {
                 owl_shared::log_info!(
                     "boot",
@@ -166,7 +171,11 @@ pub async fn assemble(
                 t0.elapsed().as_secs_f32()
             );
             let running = tp.run()?;
-            owl_shared::log_info!("boot", "引擎装配(run)总计 {:.2}s", t0.elapsed().as_secs_f32());
+            owl_shared::log_info!(
+                "boot",
+                "引擎装配(run)总计 {:.2}s",
+                t0.elapsed().as_secs_f32()
+            );
             running
         }
         // config 层只放 1/2；到这里 = 内部不变量破了 ⇒ 响亮拒，不静默降级

@@ -64,22 +64,30 @@ fn dir_of() -> PathBuf {
     std::env::var("OWL_27B_DIR")
         .map(PathBuf::from)
         .unwrap_or_else(|_| {
-            PathBuf::from(concat!(env!("CARGO_MANIFEST_DIR"), "/../../models/cyankiwi/Qwen3.8-27B-AWQ-INT4"))
+            PathBuf::from(concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/../../models/cyankiwi/Qwen3.8-27B-AWQ-INT4"
+            ))
         })
 }
 
 fn spec_on() -> bool {
-    matches!(std::env::var("OWL_TP_HEAD_SPEC").as_deref(), Ok("1") | Ok("true"))
+    matches!(
+        std::env::var("OWL_TP_HEAD_SPEC").as_deref(),
+        Ok("1") | Ok("true")
+    )
 }
 
 fn draft_dir_of(dir: &Path) -> PathBuf {
-    std::env::var("OWL_TP_HEAD_DRAFT").map(PathBuf::from).unwrap_or_else(|_| {
-        let models = dir
-            .parent()
-            .and_then(|p| p.parent())
-            .unwrap_or_else(|| Path::new("."));
-        models.join("syvai/Qwen3.8-27B-DFlash2-W4A16")
-    })
+    std::env::var("OWL_TP_HEAD_DRAFT")
+        .map(PathBuf::from)
+        .unwrap_or_else(|_| {
+            let models = dir
+                .parent()
+                .and_then(|p| p.parent())
+                .unwrap_or_else(|| Path::new("."));
+            models.join("syvai/Qwen3.8-27B-DFlash2-W4A16")
+        })
 }
 
 /// 臂 → 配置头方案。**必须与 loader 的 head_plan 同源**:tag filter 从
@@ -96,7 +104,10 @@ fn head_quant_of(plan: QuantPlan) -> HeadQuant {
 /// 两臂同参:greedy(设备 argmax)+ 关前缀缓存(同 `tp_vocab_split_gate`)。
 /// spec 臂按生产 DFlash2 d7:草稿双 rank 放行 + 单快照 + 160MB capture slab。
 fn sample_on() -> bool {
-    matches!(std::env::var("OWL_TP_HEAD_SAMPLE").as_deref(), Ok("1") | Ok("true"))
+    matches!(
+        std::env::var("OWL_TP_HEAD_SAMPLE").as_deref(),
+        Ok("1") | Ok("true")
+    )
 }
 
 fn flag(k: &str) -> bool {
@@ -138,7 +149,10 @@ fn knobs_for(plan: QuantPlan, dir: &Path) -> EngineKnobs {
     k.head_quant = head_quant_of(plan);
     if spec_on() {
         let draft = draft_dir_of(dir);
-        assert!(draft.join("config.json").exists(), "DFlash2 草稿目录不在: {draft:?}");
+        assert!(
+            draft.join("config.json").exists(),
+            "DFlash2 草稿目录不在: {draft:?}"
+        );
         k.draft.depth = std::env::var("OWL_TP_HEAD_DEPTH")
             .ok()
             .and_then(|s| s.parse().ok())
@@ -199,12 +213,9 @@ async fn run_arm(
         .await
         .expect("rank0 分片装载");
     // rank1:账本/设备序**装载前**从 rank0 接过(TP 合流纪律)
-    let mut e1 = Engine::new_with_ledger(
-        cfg_of(ob, chunk, knobs_for(plan, dir)),
-        e0.ledger_cell(),
-        1,
-    )
-    .expect("engine(r1)");
+    let mut e1 =
+        Engine::new_with_ledger(cfg_of(ob, chunk, knobs_for(plan, dir)), e0.ledger_cell(), 1)
+            .expect("engine(r1)");
     let m1 = e1
         .loader()
         .slice(1, 2)
@@ -254,17 +265,42 @@ async fn run_arm(
             owl_engine::turn::TurnOpts {
                 ignore_eos: true,
                 sampler: Some(owl_engine::turn::TurnSampler {
-                    temp: Some(std::env::var("OWL_TP_HEAD_TEMP").ok().and_then(|s| s.parse().ok()).unwrap_or(0.7)),
-                    topk: Some(std::env::var("OWL_TP_HEAD_TOPK").ok().and_then(|s| s.parse().ok()).unwrap_or(20)),
-                    topp: Some(std::env::var("OWL_TP_HEAD_TOPP").ok().and_then(|s| s.parse().ok()).unwrap_or(0.95)),
+                    temp: Some(
+                        std::env::var("OWL_TP_HEAD_TEMP")
+                            .ok()
+                            .and_then(|s| s.parse().ok())
+                            .unwrap_or(0.7),
+                    ),
+                    topk: Some(
+                        std::env::var("OWL_TP_HEAD_TOPK")
+                            .ok()
+                            .and_then(|s| s.parse().ok())
+                            .unwrap_or(20),
+                    ),
+                    topp: Some(
+                        std::env::var("OWL_TP_HEAD_TOPP")
+                            .ok()
+                            .and_then(|s| s.parse().ok())
+                            .unwrap_or(0.95),
+                    ),
                 }),
-                seed: Some(std::env::var("OWL_TP_HEAD_SEED").ok().and_then(|s| s.parse().ok()).unwrap_or(12345)),
+                seed: Some(
+                    std::env::var("OWL_TP_HEAD_SEED")
+                        .ok()
+                        .and_then(|s| s.parse().ok())
+                        .unwrap_or(12345),
+                ),
                 ..Default::default()
             }
         } else {
-            owl_engine::turn::TurnOpts { ignore_eos: true, ..Default::default() }
+            owl_engine::turn::TurnOpts {
+                ignore_eos: true,
+                ..Default::default()
+            }
         };
-        let (sid, turn) = r.submit_session_opts(Some(sid), p, n, opts).expect("submit");
+        let (sid, turn) = r
+            .submit_session_opts(Some(sid), p, n, opts)
+            .expect("submit");
         let prompt_len = r.turn_prompt_len(turn).expect("prompt 长度");
         // 逐步计时(decode 段):首 token 到末 token 的墙钟 ⇒ ms/tok。
         // 24B 的 int8 头收益 ≈ 0.87 ms/tok(1.76 → 0.89),要分辨它需 ≥256 tok。
@@ -309,7 +345,11 @@ async fn run_arm(
                     }
                     eprintln!(
                         "[tp-head] p{i} top1={}({:.4}) top2={}({:.4}) margin={:.2e}",
-                        best.0, best.1, second.0, second.1, best.1 - second.1
+                        best.0,
+                        best.1,
+                        second.0,
+                        second.1,
+                        best.1 - second.1
                     );
                 }
             }
@@ -336,12 +376,10 @@ async fn run_arm(
     let _ = r.shutdown_tp().await;
     if spec_on() {
         let cnt = |t: &str| -> u64 {
-            owl_shared::metrics::query_metrics(
-                &owl_shared::metrics::MetricsFilter::new().tag(t),
-            )
-            .iter()
-            .map(|x| x.counter)
-            .sum()
+            owl_shared::metrics::query_metrics(&owl_shared::metrics::MetricsFilter::new().tag(t))
+                .iter()
+                .map(|x| x.counter)
+                .sum()
         };
         let rounds = cnt("spec.rounds");
         let hist: Vec<u64> = (0..=owl_shared::config::SPEC_DEPTH_MAX)
@@ -357,9 +395,7 @@ async fn run_arm(
             cnt("spec.q.none"),
             cnt("spec.reject")
         );
-        eprintln!(
-            "[tp-head] AR 路径账:v1={n_v1} fused={n_fused} ar2={n_ar2}"
-        );
+        eprintln!("[tp-head] AR 路径账:v1={n_v1} fused={n_fused} ar2={n_ar2}");
         if opts.ar2 {
             assert!(n_ar2 > 0, "开了 ar2 但一次都没走到");
             // 预填充/propose 的大包仍走 fused;这里只要求小包路径真的进 ar2。
@@ -414,7 +450,11 @@ fn tp_head_i8_gate() {
     );
     // ── 比对臂(零 GPU):读两臂 token → 一致率 ───────────────────────
     if arm == "compare" || arm == "compare_a8" {
-        let (left, right) = if arm == "compare_a8" { ("i8", "a8") } else { ("f16", "i8") };
+        let (left, right) = if arm == "compare_a8" {
+            ("i8", "a8")
+        } else {
+            ("f16", "i8")
+        };
         let read = |a: &str| -> Vec<(String, Vec<u32>)> {
             std::fs::read_to_string(art(a))
                 .unwrap_or_else(|e| panic!("读 {a} 臂失败({}):{e} —— 先跑两臂", art(a).display()))
@@ -423,7 +463,9 @@ fn tp_head_i8_gate() {
                     let (p, rest) = l.split_once('\t')?;
                     Some((
                         p.to_string(),
-                        rest.split_whitespace().filter_map(|t| t.parse().ok()).collect(),
+                        rest.split_whitespace()
+                            .filter_map(|t| t.parse().ok())
+                            .collect(),
                     ))
                 })
                 .collect()
@@ -456,8 +498,12 @@ fn tp_head_i8_gate() {
         return;
     }
     let (Some(oa), Some(ob)) = (
-        std::env::var("OWL_TP_TEST_DEV_A").ok().and_then(|s| s.parse().ok()),
-        std::env::var("OWL_TP_TEST_DEV_B").ok().and_then(|s| s.parse().ok()),
+        std::env::var("OWL_TP_TEST_DEV_A")
+            .ok()
+            .and_then(|s| s.parse().ok()),
+        std::env::var("OWL_TP_TEST_DEV_B")
+            .ok()
+            .and_then(|s| s.parse().ok()),
     ) else {
         owl_shared::testkit::report::skip("需 OWL_TP_TEST_DEV_A / _B(TP2 双 rank;CUDA ordinal)");
         return;
@@ -467,10 +513,12 @@ fn tp_head_i8_gate() {
         owl_shared::testkit::report::skip(format_args!("27B 检查点不在 {dir:?}"));
         return;
     }
-    let prompts: Vec<String> = match std::env::var("OWL_TP_HEAD_PROMPT_FILE") {
-        Ok(f) => vec![std::fs::read_to_string(&f).unwrap_or_else(|e| panic!("读 prompt 文件 {f} 失败:{e}"))],
-        Err(_) => PROMPTS.iter().map(|s| (*s).to_string()).collect(),
-    };
+    let prompts: Vec<String> =
+        match std::env::var("OWL_TP_HEAD_PROMPT_FILE") {
+            Ok(f) => vec![std::fs::read_to_string(&f)
+                .unwrap_or_else(|e| panic!("读 prompt 文件 {f} 失败:{e}"))],
+            Err(_) => PROMPTS.iter().map(|s| (*s).to_string()).collect(),
+        };
     let plan = match arm.as_str() {
         "f16" => QuantPlan::F16,
         "i8" => QuantPlan::I8W,
@@ -487,17 +535,27 @@ fn tp_head_i8_gate() {
                     let (toks, width) = run_arm(&dir, oa, ob, plan, vsplit, n, &prompts).await;
                     let vocab = 248320usize;
                     if vsplit {
-                        assert_eq!(width * 2, vocab, "运行时 logits 宽 ×2 ≠ 词表({width}×2 vs {vocab})");
+                        assert_eq!(
+                            width * 2,
+                            vocab,
+                            "运行时 logits 宽 ×2 ≠ 词表({width}×2 vs {vocab})"
+                        );
                         eprintln!("[tp-head] 运行时 logits 宽 = {width}(半表;×2 = {vocab})✓");
                     } else {
-                        assert_eq!(width, vocab, "不切档时 logits 宽应 = 全词表({width} vs {vocab})");
+                        assert_eq!(
+                            width, vocab,
+                            "不切档时 logits 宽应 = 全词表({width} vs {vocab})"
+                        );
                     }
                     let mut out = String::new();
                     for (p, t) in prompts.iter().zip(toks.iter()) {
                         out.push_str(&format!(
                             "{}\t{}\n",
                             p.replace('\t', " "),
-                            t.iter().map(|x| x.to_string()).collect::<Vec<_>>().join(" ")
+                            t.iter()
+                                .map(|x| x.to_string())
+                                .collect::<Vec<_>>()
+                                .join(" ")
                         ));
                     }
                     let path = art(&arm);

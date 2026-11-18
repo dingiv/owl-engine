@@ -33,7 +33,9 @@ use crate::contract::{Dtype, ModelError};
 use crate::layers::decoder::DecoderLayer;
 use crate::layers::embedding::Embedding;
 use crate::layers::rmsnorm::RmsNorm;
-use crate::module::{ForwardCtx, KeyConvention, Loadable, LoaderCtx, LoaderOps, Module, PlanSource, QuantPlan};
+use crate::module::{
+    ForwardCtx, KeyConvention, Loadable, LoaderCtx, LoaderOps, Module, PlanSource, QuantPlan,
+};
 use crate::TensorOps;
 
 // ============================================================================
@@ -109,7 +111,11 @@ impl ModelSpec {
             vocab: self.vocab,
             // **词表切(P1.1)**:embed 表保持全量(查表要任意 token);
             // lm_head 行数按 world 等分(`head_split = false` ⇒ 全量)。
-            head_vocab: if self.head_split { plan.shard_len(self.vocab)? } else { self.vocab },
+            head_vocab: if self.head_split {
+                plan.shard_len(self.vocab)?
+            } else {
+                self.vocab
+            },
             head_split: self.head_split,
             hidden: self.hidden,
             inter: plan.shard_len(self.inter)?,
@@ -185,7 +191,16 @@ impl Model {
                 DecoderLayer::new_full(hq, hkv, hd, spec.hidden, spec.inter, spec.eps, src)
             } else {
                 let (nk, hk_dim, nv, hv_dim) = spec.gdn_heads;
-                DecoderLayer::new_gdn(nk, hk_dim, nv, hv_dim, spec.hidden, spec.inter, spec.eps, src)
+                DecoderLayer::new_gdn(
+                    nk,
+                    hk_dim,
+                    nv,
+                    hv_dim,
+                    spec.hidden,
+                    spec.inter,
+                    spec.eps,
+                    src,
+                )
             });
         }
         // 计划表覆盖门(响亮;Keyed 臂)。为什么在**构造期**判:计划在此定形,
@@ -256,7 +271,6 @@ impl Model {
         }
     }
 
-
     /// per-layer 子 ctx(整模 ctx → 单层 ctx;kvs/gdns 按混型游标取,
     /// Attention/Gdn 层读单引用零感知)
     pub(crate) fn layer_ctx<'a>(
@@ -266,7 +280,6 @@ impl Model {
         gi: usize,
     ) -> ForwardCtx<'a> {
         ForwardCtx {
-
             tokens: ctx.tokens,
             kind: ctx.kind,
             pos: ctx.pos,
@@ -367,9 +380,10 @@ impl Model {
         let (mut kvi, mut gi) = (0usize, 0usize);
         for (li, layer) in self.layers.iter().enumerate() {
             let sub = self.layer_ctx(ctx, kvi, gi);
-            xs = layer
-                .forward(&xs, &sub)
-                .tag(format!("L{li}.{}", if layer.is_full() { "attn" } else { "gdn" }));
+            xs = layer.forward(&xs, &sub).tag(format!(
+                "L{li}.{}",
+                if layer.is_full() { "attn" } else { "gdn" }
+            ));
             if layer.is_full() {
                 kvi += 1;
             } else {
@@ -406,9 +420,10 @@ impl Model {
         let (mut kvi, mut gi) = (0usize, 0usize);
         for (li, layer) in self.layers.iter().enumerate() {
             let sub = self.layer_ctx(ctx, kvi, gi);
-            xs = layer
-                .forward(&xs, &sub)
-                .tag(format!("L{li}.{}", if layer.is_full() { "attn" } else { "gdn" }));
+            xs = layer.forward(&xs, &sub).tag(format!(
+                "L{li}.{}",
+                if layer.is_full() { "attn" } else { "gdn" }
+            ));
             if let Some(pos) = tap_ids.iter().position(|&t| t == li) {
                 taps[pos] = Some(xs.clone().tag(format!("tap{li}")));
             }
@@ -457,7 +472,9 @@ impl Model {
         let fin = self.norm.forward(&xs, ctx).tag("final_norm");
         (
             fin,
-            taps.into_iter().map(|t| t.expect("tap_ids 层号非法")).collect(),
+            taps.into_iter()
+                .map(|t| t.expect("tap_ids 层号非法"))
+                .collect(),
         )
     }
 }
@@ -474,7 +491,7 @@ impl Module for Model {
 /// 刀D 取证:层间时间戳内核(OWL_TS_PROBE)。拷贝 in→out(链式接续)+
 /// thread(0,0) 写 clock64 到 ts_buf[idx]。发射 = 哨兵自动网格
 /// (2026-10-12 源收编 kernels cu/owl/ts_probe.cu + 登记表;三形态归一 Call)。
-fn ts_stamp(xs: &TensorOps, buf: &TensorOps, idx: usize) -> TensorOps{
+fn ts_stamp(xs: &TensorOps, buf: &TensorOps, idx: usize) -> TensorOps {
     let shape = xs.shape.clone();
     TensorOps::call(crate::ops::SemanticKernel::TsStamp)
         .arg(xs)
@@ -493,10 +510,10 @@ impl Model {
         let hidden = self.last_hidden(ids, ctx);
         let t = ctx.tokens;
         let d = hidden.shape[1];
-        let last = crate::layers::narrow_strided(
-            &hidden, 1, d, (t - 1) * d, d, vec![1, d],
-        );
-        self.embed.lm_head_matmul(&last, &ctx.env.gguf).tag("logits_last")
+        let last = crate::layers::narrow_strided(&hidden, 1, d, (t - 1) * d, d, vec![1, d]);
+        self.embed
+            .lm_head_matmul(&last, &ctx.env.gguf)
+            .tag("logits_last")
     }
 }
 
@@ -550,7 +567,10 @@ mod spec_shard_tests {
         assert_eq!(s.tied, full.tied);
         // 两 rank 的分片尺寸相同(等分)
         let s1 = full.sharded(plan(1, 2)).expect("rank1");
-        assert_eq!((s1.inter, s1.full_heads, s1.gdn_heads), (s.inter, s.full_heads, s.gdn_heads));
+        assert_eq!(
+            (s1.inter, s1.full_heads, s1.gdn_heads),
+            (s.inter, s.full_heads, s.gdn_heads)
+        );
     }
 
     /// **P1.1 词表切**:`head_split = true` ⇒ `head_vocab = vocab / world`,
@@ -569,7 +589,10 @@ mod spec_shard_tests {
         // 两 rank 行区间恰好覆盖 [0, vocab) 且互不重叠
         let r0 = TpPlan::new(0, 2).unwrap().shard_range(248320).unwrap();
         let r1 = TpPlan::new(1, 2).unwrap().shard_range(248320).unwrap();
-        assert_eq!((r0.start, r0.end, r1.start, r1.end), (0, 124160, 124160, 248320));
+        assert_eq!(
+            (r0.start, r0.end, r1.start, r1.end),
+            (0, 124160, 124160, 248320)
+        );
         // world=1 退化:即使开了切,头也是全量
         let s1 = full.sharded(TpPlan::single()).expect("单卡");
         assert_eq!(s1.head_vocab, 248320);
@@ -596,7 +619,10 @@ mod spec_shard_tests {
             Err(e) => e,
             Ok(_) => panic!("vocab 5 不被 2 整除应拒"),
         };
-        assert!(e.contains("整除") || e.contains("shard"), "拒因应指向整除:{e}");
+        assert!(
+            e.contains("整除") || e.contains("shard"),
+            "拒因应指向整除:{e}"
+        );
         // 同 spec 关掉切 ⇒ 可切(证明拒因只在词表切那一维)
         let mut ok = full.clone();
         ok.head_split = false;
@@ -609,18 +635,38 @@ mod spec_shard_tests {
     fn model_head_vocab_and_rule_follow_the_split() {
         let full = crate::formats::qwen35::qwen3_8_27b();
         let keys = || crate::formats::qwen35::Qwen35Convention::new("model");
-        let m_full = super::Model::new(&full, keys(), crate::module::QuantPlan::F16, crate::module::QuantPlan::F16).expect("模型构造");
+        let m_full = super::Model::new(
+            &full,
+            keys(),
+            crate::module::QuantPlan::F16,
+            crate::module::QuantPlan::F16,
+        )
+        .expect("模型构造");
         assert_eq!(m_full.logits_vocab(), 248320);
         assert_eq!(m_full.vocab_size(), 248320);
-        assert_eq!(m_full.embed.head_rule(), crate::plan::rules::WeightRule::Replicate, "未切:头不切");
+        assert_eq!(
+            m_full.embed.head_rule(),
+            crate::plan::rules::WeightRule::Replicate,
+            "未切:头不切"
+        );
 
         let mut sp = full.clone();
         sp.head_split = true;
         let sharded = sp.sharded(plan(0, 2)).expect("切");
-        let m = super::Model::new(&sharded, keys(), crate::module::QuantPlan::F16, crate::module::QuantPlan::F16).expect("模型构造");
+        let m = super::Model::new(
+            &sharded,
+            keys(),
+            crate::module::QuantPlan::F16,
+            crate::module::QuantPlan::F16,
+        )
+        .expect("模型构造");
         assert_eq!(m.logits_vocab(), 124160, "本 rank 的 logits 宽度");
         assert_eq!(m.vocab_size(), 248320, "词表全量(embed/tokenizer 面)");
-        assert_eq!(m.embed.head_rule(), crate::plan::rules::WeightRule::UniformCol, "切档:头按 out 维切");
+        assert_eq!(
+            m.embed.head_rule(),
+            crate::plan::rules::WeightRule::UniformCol,
+            "切档:头按 out 维切"
+        );
     }
 
     /// world=1 = 逐字段恒等(退化路径零特判)
@@ -649,7 +695,10 @@ mod spec_shard_tests {
         assert!(small.sharded(plan(0, 3)).is_err());
         // 0.8B world=2:hq 8→4, hkv 2→1, gdn (16,16)→(8,8);inter 1792
         let s = small.sharded(plan(0, 2)).expect("0.8B 可切");
-        assert_eq!((s.inter, s.full_heads, s.gdn_heads), (1792, (4, 1, 256), (8, 128, 8, 128)));
+        assert_eq!(
+            (s.inter, s.full_heads, s.gdn_heads),
+            (1792, (4, 1, 256), (8, 128, 8, 128))
+        );
     }
 
     /// **几何闭合**:所有 rank 的分片**拼接回全量**(被切维),未切维原样
@@ -691,13 +740,13 @@ mod spec_shard_tests {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::module::QuantPlan;
     use crate::layers::gdn::GdnBuffers;
-    use crate::module::LlamaFamily;
     use crate::layers::rope::Rope;
     use crate::module::KvBuffers;
-    use crate::testkit::{assert_close, f32b, gpu_client, gpu_enabled, skip_note};
+    use crate::module::LlamaFamily;
+    use crate::module::QuantPlan;
     use crate::tensor::Dtype;
+    use crate::testkit::{assert_close, f32b, gpu_client, gpu_enabled, skip_note};
     use std::collections::HashMap;
 
     // fixture 维度(缩水档;两 mixer + 3:1 周期一轮)
@@ -749,7 +798,9 @@ mod tests {
     }
 
     fn gen(seed: f32, n: usize) -> Vec<f32> {
-        (0..n).map(|i| ((i as f32 + seed) * 0.13).sin() * 0.5).collect()
+        (0..n)
+            .map(|i| ((i as f32 + seed) * 0.13).sin() * 0.5)
+            .collect()
     }
 
     /// checkpoint 全键源(经 LlamaFamily 约定走 C10 真路径)
@@ -798,7 +849,11 @@ mod tests {
     }
 
     /// 零块(htod 清零;勿用裸 alloc —— 垃圾内存会进 conv/rec/KV 状态)
-    async fn zero_block(client: &mut owl_cuda::GpuClient, n: usize, shape: Vec<usize>) -> TensorOps {
+    async fn zero_block(
+        client: &mut owl_cuda::GpuClient,
+        n: usize,
+        shape: Vec<usize>,
+    ) -> TensorOps {
         let b = crate::interpreters::eval_ops(
             TensorOps::from_host(Dtype::F32, vec![n], &f32b(&vec![0.0; n])).step(),
             client,
@@ -830,7 +885,8 @@ mod tests {
             LlamaFamily::new("model.language_model"),
             QuantPlan::F16,
             QuantPlan::F16,
-        ).expect("Model::new");
+        )
+        .expect("Model::new");
         crate::interpreters::eval_load(&model, &mut face, &checkpoint_src(), &Default::default())
             .await
             .expect("model.eval_load(C10 声明路径)");
@@ -841,13 +897,13 @@ mod tests {
 
         // 声明良构:logits [1, vocab] 无毒(CPU face 不执行 Kernel,只验声明)
         let ids = TensorOps::from_host(Dtype::F32, vec![1], &f32b(&[3.0]));
-        let pos = TensorOps::from_host(Dtype::F32, vec![1, 1], &f32b(&[0.0]));  // 契约 pos r2
+        let pos = TensorOps::from_host(Dtype::F32, vec![1, 1], &f32b(&[0.0])); // 契约 pos r2
         let kvs: Vec<KvBuffers> = (0..1)
             .map(|_| KvBuffers {
                 k_cache: TensorOps::zeros(Dtype::F32, vec![KV_ROWS, HKV, HD]),
                 v_cache: TensorOps::zeros(Dtype::F32, vec![KV_ROWS, HKV, HD]),
-                slots: TensorOps::from_host(Dtype::F32, vec![1, 1], &f32b(&[0.0])),  // 契约 slots/kv_lens r2(B6 收敛)
-                kv_lens: TensorOps::from_host(Dtype::F32, vec![1, 1], &f32b(&[1.0])),  // 契约 slots/kv_lens r2(B6 收敛)
+                slots: TensorOps::from_host(Dtype::F32, vec![1, 1], &f32b(&[0.0])), // 契约 slots/kv_lens r2(B6 收敛)
+                kv_lens: TensorOps::from_host(Dtype::F32, vec![1, 1], &f32b(&[1.0])), // 契约 slots/kv_lens r2(B6 收敛)
                 block_tables: TensorOps::zeros(Dtype::F32, vec![1]), // 哑表(legacy 路径不解引用)
 
                 int8: None,
@@ -857,7 +913,10 @@ mod tests {
         let rp = Rope::new(64, HD, HD, 10_000.0).expect("rope");
         let ctx = ForwardCtx::model_decode(1, &pos, &kvs, &rp, &gdns);
         let logits = model.forward(&ids, &ctx);
-        assert!(!logits.is_poisoned(), "整模声明不应有毒(缺依赖会沿分支毒化)");
+        assert!(
+            !logits.is_poisoned(),
+            "整模声明不应有毒(缺依赖会沿分支毒化)"
+        );
         assert_eq!(logits.shape(), &[1, VOCAB]);
         assert_eq!(model.hidden(), HIDDEN);
         assert_eq!(model.vocab_size(), VOCAB);
@@ -871,9 +930,9 @@ mod tests {
     /// 两步跨步持状态:GDN conv/rec per-layer、full 层 KV cache 增行。
     struct HostModel {
         src: HashMap<String, Vec<f32>>,
-        gdn_conv: Vec<[Vec<f32>; 3]>,       // per gdn 层 q/k/v 段 [slot, dim, 3]
-        gdn_rec: Vec<Vec<f32>>,             // per gdn 层 [slot, NV, HK_DIM, HV_DIM]
-        kv: Vec<(Vec<f32>, Vec<f32>)>,      // per full 层 (k, v) [row, hkv*hd]
+        gdn_conv: Vec<[Vec<f32>; 3]>, // per gdn 层 q/k/v 段 [slot, dim, 3]
+        gdn_rec: Vec<Vec<f32>>,       // per gdn 层 [slot, NV, HK_DIM, HV_DIM]
+        kv: Vec<(Vec<f32>, Vec<f32>)>, // per full 层 (k, v) [row, hkv*hd]
     }
 
     impl HostModel {
@@ -941,7 +1000,15 @@ mod tests {
         }
 
         /// full mixer(单 token decode;cache 增行 + 窗 softmax)
-        fn attn(&mut self, fi: usize, i: usize, n1: &[f32], pos: f32, slot: usize, kv_len: usize) -> Vec<f32> {
+        fn attn(
+            &mut self,
+            fi: usize,
+            i: usize,
+            n1: &[f32],
+            pos: f32,
+            slot: usize,
+            kv_len: usize,
+        ) -> Vec<f32> {
             let q_raw = self.lin(n1, self.s(i, "q_proj"), HQ * HD * 2, HIDDEN);
             let k_raw = self.lin(n1, self.s(i, "k_proj"), HKV * HD, HIDDEN);
             let v_raw = self.lin(n1, self.s(i, "v_proj"), HKV * HD, HIDDEN);
@@ -960,8 +1027,9 @@ mod tests {
                     .copy_from_slice(&self.rms_hd(&q[h * HD..(h + 1) * HD], self.s(i, "q_norm")));
             }
             for h in 0..HKV {
-                kn[h * HD..(h + 1) * HD]
-                    .copy_from_slice(&self.rms_hd(&k_raw[h * HD..(h + 1) * HD], self.s(i, "k_norm")));
+                kn[h * HD..(h + 1) * HD].copy_from_slice(
+                    &self.rms_hd(&k_raw[h * HD..(h + 1) * HD], self.s(i, "k_norm")),
+                );
             }
             let q = Self::rope_one(&qn, HQ, pos);
             let k = Self::rope_one(&kn, HKV, pos);
@@ -1009,10 +1077,18 @@ mod tests {
             let z = &qkvz[conv_dim..];
             let b_v = self.lin(n1, self.s(i, "in_proj_b"), NV, HIDDEN);
             let a_v = self.lin(n1, self.s(i, "in_proj_a"), NV, HIDDEN);
-            let segs = [&qkv[0..key_dim], &qkv[key_dim..2 * key_dim], &qkv[2 * key_dim..]];
+            let segs = [
+                &qkv[0..key_dim],
+                &qkv[key_dim..2 * key_dim],
+                &qkv[2 * key_dim..],
+            ];
             let seg_dim = [key_dim, key_dim, value_dim];
             let seg_off = [0usize, key_dim, 2 * key_dim];
-            let mut post = [vec![0.0f32; key_dim], vec![0.0f32; key_dim], vec![0.0f32; value_dim]];
+            let mut post = [
+                vec![0.0f32; key_dim],
+                vec![0.0f32; key_dim],
+                vec![0.0f32; value_dim],
+            ];
             for (seg, inp) in segs.iter().enumerate() {
                 let w = self.s(i, "conv1d").clone();
                 let st = &mut self.gdn_conv[gi][seg];
@@ -1086,7 +1162,8 @@ mod tests {
             let mut gated = vec![0.0f32; value_dim];
             for vh in 0..NV {
                 let base = vh * HV_DIM;
-                let ms: f32 = (0..HV_DIM).map(|k| y[base + k] * y[base + k]).sum::<f32>() / HV_DIM as f32;
+                let ms: f32 =
+                    (0..HV_DIM).map(|k| y[base + k] * y[base + k]).sum::<f32>() / HV_DIM as f32;
                 let inv = 1.0 / (ms.max(0.0) + EPS).sqrt();
                 for k in 0..HV_DIM {
                     let zv = z[base + k];
@@ -1103,7 +1180,14 @@ mod tests {
 
         /// kv_slot / gdn_slot 分离(单序列 prefill 对拍:KV 行随 token 走,
         /// GDN 状态格恒定;旧双参 step 保留 = 两槽同值的两 token 语义)
-        fn step2(&mut self, id: f32, pos: f32, kv_slot: usize, kv_len: usize, gdn_slot: usize) -> Vec<f32> {
+        fn step2(
+            &mut self,
+            id: f32,
+            pos: f32,
+            kv_slot: usize,
+            kv_len: usize,
+            gdn_slot: usize,
+        ) -> Vec<f32> {
             let w = self.src["model.language_model.embed_tokens.weight"].clone();
             let mut x = w[(id as usize) * HIDDEN..(id as usize + 1) * HIDDEN].to_vec();
             let (mut kvi, mut gi) = (0usize, 0usize);
@@ -1136,7 +1220,12 @@ mod tests {
             }
             let f = self.ln(&x, &self.src["model.language_model.norm.weight"]);
             (0..VOCAB)
-                .map(|v| f.iter().enumerate().map(|(d, fv)| fv * w[v * HIDDEN + d]).sum::<f32>())
+                .map(|v| {
+                    f.iter()
+                        .enumerate()
+                        .map(|(d, fv)| fv * w[v * HIDDEN + d])
+                        .sum::<f32>()
+                })
                 .collect()
         }
     }
@@ -1154,7 +1243,8 @@ mod tests {
             LlamaFamily::new("model.language_model"),
             QuantPlan::F16,
             QuantPlan::F16,
-        ).expect("Model::new");
+        )
+        .expect("Model::new");
         let src = checkpoint_src();
         let mut gpu = gpu_client().await;
         crate::interpreters::eval_load(&model, &mut gpu, &src, &Default::default())
@@ -1173,8 +1263,8 @@ mod tests {
                 v.push(KvBuffers {
                     k_cache: zero_block(&mut gpu, kv_zero.len(), vec![KV_ROWS, HKV, HD]).await,
                     v_cache: zero_block(&mut gpu, kv_zero.len(), vec![KV_ROWS, HKV, HD]).await,
-                    slots: TensorOps::from_host(Dtype::F32, vec![1, 1], &f32b(&[0.0])),  // 契约 slots/kv_lens r2(B6 收敛)
-                    kv_lens: TensorOps::from_host(Dtype::F32, vec![1, 1], &f32b(&[1.0])),  // 契约 slots/kv_lens r2(B6 收敛)
+                    slots: TensorOps::from_host(Dtype::F32, vec![1, 1], &f32b(&[0.0])), // 契约 slots/kv_lens r2(B6 收敛)
+                    kv_lens: TensorOps::from_host(Dtype::F32, vec![1, 1], &f32b(&[1.0])), // 契约 slots/kv_lens r2(B6 收敛)
                     block_tables: TensorOps::zeros(Dtype::F32, vec![1]), // 哑表(legacy 路径不解引用)
 
                     int8: None,
@@ -1188,10 +1278,30 @@ mod tests {
             let mut v = Vec::new();
             for _ in 0..3 {
                 v.push(GdnBuffers {
-                    conv_q: zero_block(&mut gpu, MAX_SLOTS * key_dim * 3, vec![MAX_SLOTS, key_dim, 3]).await,
-                    conv_k: zero_block(&mut gpu, MAX_SLOTS * key_dim * 3, vec![MAX_SLOTS, key_dim, 3]).await,
-                    conv_v: zero_block(&mut gpu, MAX_SLOTS * value_dim * 3, vec![MAX_SLOTS, value_dim, 3]).await,
-                    rec: zero_block(&mut gpu, MAX_SLOTS * NV * HK_DIM * HV_DIM, vec![MAX_SLOTS, NV, HK_DIM, HV_DIM]).await,
+                    conv_q: zero_block(
+                        &mut gpu,
+                        MAX_SLOTS * key_dim * 3,
+                        vec![MAX_SLOTS, key_dim, 3],
+                    )
+                    .await,
+                    conv_k: zero_block(
+                        &mut gpu,
+                        MAX_SLOTS * key_dim * 3,
+                        vec![MAX_SLOTS, key_dim, 3],
+                    )
+                    .await,
+                    conv_v: zero_block(
+                        &mut gpu,
+                        MAX_SLOTS * value_dim * 3,
+                        vec![MAX_SLOTS, value_dim, 3],
+                    )
+                    .await,
+                    rec: zero_block(
+                        &mut gpu,
+                        MAX_SLOTS * NV * HK_DIM * HV_DIM,
+                        vec![MAX_SLOTS, NV, HK_DIM, HV_DIM],
+                    )
+                    .await,
                     slots: TensorOps::from_host(Dtype::F32, vec![1], &f32b(&[0.0])),
                 });
             }
@@ -1205,15 +1315,15 @@ mod tests {
         let steps: [(f32, f32, f32, f32); 2] = [(5.0, 0.0, 0.0, 1.0), (9.0, 1.0, 1.0, 2.0)];
         for (si, &(id, pos, slot, kv_len)) in steps.iter().enumerate() {
             let ids = TensorOps::from_host(Dtype::F32, vec![1], &f32b(&[id]));
-            let pos_t = TensorOps::from_host(Dtype::F32, vec![1, 1], &f32b(&[pos]));  // 契约 pos r2
-            // 每步重写动态标量块(slots/kv_lens 由 runner 步间改写 —— C7)
+            let pos_t = TensorOps::from_host(Dtype::F32, vec![1, 1], &f32b(&[pos])); // 契约 pos r2
+                                                                                     // 每步重写动态标量块(slots/kv_lens 由 runner 步间改写 —— C7)
             let kvs_step: Vec<KvBuffers> = kvs
                 .iter()
                 .map(|kv| KvBuffers {
                     k_cache: kv.k_cache.clone(),
                     v_cache: kv.v_cache.clone(),
-                    slots: TensorOps::from_host(Dtype::F32, vec![1, 1], &f32b(&[slot])),  // 契约 slots/kv_lens r2(B6 收敛)
-                    kv_lens: TensorOps::from_host(Dtype::F32, vec![1, 1], &f32b(&[kv_len])),  // 契约 slots/kv_lens r2(B6 收敛)
+                    slots: TensorOps::from_host(Dtype::F32, vec![1, 1], &f32b(&[slot])), // 契约 slots/kv_lens r2(B6 收敛)
+                    kv_lens: TensorOps::from_host(Dtype::F32, vec![1, 1], &f32b(&[kv_len])), // 契约 slots/kv_lens r2(B6 收敛)
                     block_tables: TensorOps::zeros(Dtype::F32, vec![1]), // 哑表(legacy 路径不解引用)
 
                     int8: None,
@@ -1304,7 +1414,8 @@ mod tests {
             LlamaFamily::new("model.language_model"),
             QuantPlan::F16,
             QuantPlan::F16,
-        ).expect("模型构造");
+        )
+        .expect("模型构造");
         let src = checkpoint_src();
         let mut gpu = gpu_client().await;
         crate::interpreters::eval_load(&model, &mut gpu, &src, &Default::default())
@@ -1328,28 +1439,110 @@ mod tests {
             (&[7.0], &[1.0], &[5.0], &[2.0], &[1.0]),
         ];
         for (tok, pos, slot, len, gs) in steps {
-            let _ = model_step(&mut gpu, &model, &rp, &kvs_s, &gdns_s, tok, pos, slot, len, gs).await;
-            let _ = model_step(&mut gpu, &model, &rp, &kvs_b, &gdns_b, tok, pos, slot, len, gs).await;
+            let _ = model_step(
+                &mut gpu, &model, &rp, &kvs_s, &gdns_s, tok, pos, slot, len, gs,
+            )
+            .await;
+            let _ = model_step(
+                &mut gpu, &model, &rp, &kvs_b, &gdns_b, tok, pos, slot, len, gs,
+            )
+            .await;
         }
 
         // 串行臂:两步单行(A 再 B)。
-        let a1 = model_step(&mut gpu, &model, &rp, &kvs_s, &gdns_s, &[11.0], &[2.0], &[2.0], &[3.0], &[0.0]).await;
-        let b1 = model_step(&mut gpu, &model, &rp, &kvs_s, &gdns_s, &[13.0], &[2.0], &[6.0], &[3.0], &[1.0]).await;
+        let a1 = model_step(
+            &mut gpu,
+            &model,
+            &rp,
+            &kvs_s,
+            &gdns_s,
+            &[11.0],
+            &[2.0],
+            &[2.0],
+            &[3.0],
+            &[0.0],
+        )
+        .await;
+        let b1 = model_step(
+            &mut gpu,
+            &model,
+            &rp,
+            &kvs_s,
+            &gdns_s,
+            &[13.0],
+            &[2.0],
+            &[6.0],
+            &[3.0],
+            &[1.0],
+        )
+        .await;
         // 合批臂:一次 T=2(各走各的链/行)。
-        let batch1 = model_step(&mut gpu, &model, &rp, &kvs_b, &gdns_b, &[11.0, 13.0], &[2.0, 2.0], &[2.0, 6.0], &[3.0, 3.0], &[0.0, 1.0]).await;
+        let batch1 = model_step(
+            &mut gpu,
+            &model,
+            &rp,
+            &kvs_b,
+            &gdns_b,
+            &[11.0, 13.0],
+            &[2.0, 2.0],
+            &[2.0, 6.0],
+            &[3.0, 3.0],
+            &[0.0, 1.0],
+        )
+        .await;
         assert_eq!(batch1.len(), 2 * VOCAB, "合批 logits 行数");
         assert_close(&batch1[..VOCAB], &a1, 1e-5, "batch-step1-rowA");
         assert_close(&batch1[VOCAB..], &b1, 1e-5, "batch-step1-rowB");
 
         // 第二步:验**状态续跑**(KV 写入 + GDN conv/rec 推进)两臂仍同。
-        let a2 = model_step(&mut gpu, &model, &rp, &kvs_s, &gdns_s, &[17.0], &[3.0], &[3.0], &[4.0], &[0.0]).await;
-        let b2 = model_step(&mut gpu, &model, &rp, &kvs_s, &gdns_s, &[19.0], &[3.0], &[7.0], &[4.0], &[1.0]).await;
-        let batch2 = model_step(&mut gpu, &model, &rp, &kvs_b, &gdns_b, &[17.0, 19.0], &[3.0, 3.0], &[3.0, 7.0], &[4.0, 4.0], &[0.0, 1.0]).await;
+        let a2 = model_step(
+            &mut gpu,
+            &model,
+            &rp,
+            &kvs_s,
+            &gdns_s,
+            &[17.0],
+            &[3.0],
+            &[3.0],
+            &[4.0],
+            &[0.0],
+        )
+        .await;
+        let b2 = model_step(
+            &mut gpu,
+            &model,
+            &rp,
+            &kvs_s,
+            &gdns_s,
+            &[19.0],
+            &[3.0],
+            &[7.0],
+            &[4.0],
+            &[1.0],
+        )
+        .await;
+        let batch2 = model_step(
+            &mut gpu,
+            &model,
+            &rp,
+            &kvs_b,
+            &gdns_b,
+            &[17.0, 19.0],
+            &[3.0, 3.0],
+            &[3.0, 7.0],
+            &[4.0, 4.0],
+            &[0.0, 1.0],
+        )
+        .await;
         assert_close(&batch2[..VOCAB], &a2, 1e-5, "batch-step2-rowA");
         assert_close(&batch2[VOCAB..], &b2, 1e-5, "batch-step2-rowB");
 
         // 反向判别:两行必须**不同**(否则判据无分辨率)
-        let d: f32 = batch1[..VOCAB].iter().zip(&batch1[VOCAB..]).map(|(x, y)| (x - y).abs()).fold(0.0, f32::max);
+        let d: f32 = batch1[..VOCAB]
+            .iter()
+            .zip(&batch1[VOCAB..])
+            .map(|(x, y)| (x - y).abs())
+            .fold(0.0, f32::max);
         assert!(d > 1e-3, "两行 logits 相同(maxdiff={d})→ 判据无分辨率");
         println!("✅ batch decode: T=2 与串行 T=1×2 两行逐位同级(maxdiff row={d:.3e})");
         gpu.close().await.expect("关机");
@@ -1449,8 +1642,18 @@ mod tests {
             gdns.push(GdnBuffers {
                 conv_q: zero_block(gpu, MAX_SLOTS * key_dim * 3, vec![MAX_SLOTS, key_dim, 3]).await,
                 conv_k: zero_block(gpu, MAX_SLOTS * key_dim * 3, vec![MAX_SLOTS, key_dim, 3]).await,
-                conv_v: zero_block(gpu, MAX_SLOTS * value_dim * 3, vec![MAX_SLOTS, value_dim, 3]).await,
-                rec: zero_block(gpu, MAX_SLOTS * NV * HK_DIM * HV_DIM, vec![MAX_SLOTS, NV, HK_DIM, HV_DIM]).await,
+                conv_v: zero_block(
+                    gpu,
+                    MAX_SLOTS * value_dim * 3,
+                    vec![MAX_SLOTS, value_dim, 3],
+                )
+                .await,
+                rec: zero_block(
+                    gpu,
+                    MAX_SLOTS * NV * HK_DIM * HV_DIM,
+                    vec![MAX_SLOTS, NV, HK_DIM, HV_DIM],
+                )
+                .await,
                 slots: TensorOps::from_host(Dtype::F32, vec![1], &f32b(&[0.0])),
             });
         }
@@ -1472,10 +1675,14 @@ mod tests {
             LlamaFamily::new("model.language_model"),
             QuantPlan::F16,
             QuantPlan::F16,
-        ).expect("模型构造");
+        )
+        .expect("模型构造");
         let src = checkpoint_src();
         let mut gpu = gpu_client().await;
-        let lctx = crate::module::LoaderCtx { dtype: Dtype::F16, ..Default::default() };
+        let lctx = crate::module::LoaderCtx {
+            dtype: Dtype::F16,
+            ..Default::default()
+        };
         crate::interpreters::eval_load(&model, &mut gpu, &src, &lctx)
             .await
             .expect("model.eval_load(F16)");
@@ -1488,38 +1695,127 @@ mod tests {
 
         // ── prefill:会话 A 2 行(slot 0,1 / GDN 0)、B 1 行(slot 4 / GDN 1)──
         // 串行臂:两次单序列 prefill
-        let _ = model_prefill_step(&mut gpu, &model, &rp, &kvs_s, &gdns_s,
-            &[5.0, 9.0], &[0.0, 1.0], &[0.0, 1.0], &[1.0, 2.0], &[0.0], &[0.0, 2.0]).await;
-        let _ = model_prefill_step(&mut gpu, &model, &rp, &kvs_s, &gdns_s,
-            &[3.0], &[0.0], &[4.0], &[1.0], &[1.0], &[0.0, 1.0]).await;
+        let _ = model_prefill_step(
+            &mut gpu,
+            &model,
+            &rp,
+            &kvs_s,
+            &gdns_s,
+            &[5.0, 9.0],
+            &[0.0, 1.0],
+            &[0.0, 1.0],
+            &[1.0, 2.0],
+            &[0.0],
+            &[0.0, 2.0],
+        )
+        .await;
+        let _ = model_prefill_step(
+            &mut gpu,
+            &model,
+            &rp,
+            &kvs_s,
+            &gdns_s,
+            &[3.0],
+            &[0.0],
+            &[4.0],
+            &[1.0],
+            &[1.0],
+            &[0.0, 1.0],
+        )
+        .await;
         // 合批臂:一次 T=3,seq_cu = [0,2,3]
-        let batch_pre = model_prefill_step(&mut gpu, &model, &rp, &kvs_b, &gdns_b,
-            &[5.0, 9.0, 3.0], &[0.0, 1.0, 0.0], &[0.0, 1.0, 4.0], &[1.0, 2.0, 1.0],
-            &[0.0, 1.0], &[0.0, 2.0, 3.0]).await;
+        let batch_pre = model_prefill_step(
+            &mut gpu,
+            &model,
+            &rp,
+            &kvs_b,
+            &gdns_b,
+            &[5.0, 9.0, 3.0],
+            &[0.0, 1.0, 0.0],
+            &[0.0, 1.0, 4.0],
+            &[1.0, 2.0, 1.0],
+            &[0.0, 1.0],
+            &[0.0, 2.0, 3.0],
+        )
+        .await;
         // 串行臂的逐会话 logits(重跑以取输出;状态已推进 ⇒ 用第二套缓冲)
         let (kvs_s2, gdns_s2) = model_bufs_f16(&mut gpu, 1, 3).await;
-        let s_a = model_prefill_step(&mut gpu, &model, &rp, &kvs_s2, &gdns_s2,
-            &[5.0, 9.0], &[0.0, 1.0], &[0.0, 1.0], &[1.0, 2.0], &[0.0], &[0.0, 2.0]).await;
-        let s_b = model_prefill_step(&mut gpu, &model, &rp, &kvs_s2, &gdns_s2,
-            &[3.0], &[0.0], &[4.0], &[1.0], &[1.0], &[0.0, 1.0]).await;
+        let s_a = model_prefill_step(
+            &mut gpu,
+            &model,
+            &rp,
+            &kvs_s2,
+            &gdns_s2,
+            &[5.0, 9.0],
+            &[0.0, 1.0],
+            &[0.0, 1.0],
+            &[1.0, 2.0],
+            &[0.0],
+            &[0.0, 2.0],
+        )
+        .await;
+        let s_b = model_prefill_step(
+            &mut gpu,
+            &model,
+            &rp,
+            &kvs_s2,
+            &gdns_s2,
+            &[3.0],
+            &[0.0],
+            &[4.0],
+            &[1.0],
+            &[1.0],
+            &[0.0, 1.0],
+        )
+        .await;
         assert_close(&batch_pre[..2 * VOCAB], &s_a[..], 1e-5, "batch-prefill-A");
         assert_close(&batch_pre[2 * VOCAB..], &s_b[..], 1e-5, "batch-prefill-B");
 
         // ── verify 形(槽区不重叠):A 2 行(slot 2,3;pos 2,3)、
         //    B 3 行(slot 5..7;pos 1..3)──
-        let a1 = model_prefill_step(&mut gpu, &model, &rp, &kvs_s2, &gdns_s2,
-            &[11.0, 12.0], &[2.0, 3.0], &[2.0, 3.0], &[3.0, 4.0],
-            &[0.0], &[0.0, 2.0]).await;
-        let b1 = model_prefill_step(&mut gpu, &model, &rp, &kvs_s2, &gdns_s2,
-            &[21.0, 22.0, 23.0], &[1.0, 2.0, 3.0], &[5.0, 6.0, 7.0], &[2.0, 3.0, 4.0],
-            &[1.0], &[0.0, 3.0]).await;
+        let a1 = model_prefill_step(
+            &mut gpu,
+            &model,
+            &rp,
+            &kvs_s2,
+            &gdns_s2,
+            &[11.0, 12.0],
+            &[2.0, 3.0],
+            &[2.0, 3.0],
+            &[3.0, 4.0],
+            &[0.0],
+            &[0.0, 2.0],
+        )
+        .await;
+        let b1 = model_prefill_step(
+            &mut gpu,
+            &model,
+            &rp,
+            &kvs_s2,
+            &gdns_s2,
+            &[21.0, 22.0, 23.0],
+            &[1.0, 2.0, 3.0],
+            &[5.0, 6.0, 7.0],
+            &[2.0, 3.0, 4.0],
+            &[1.0],
+            &[0.0, 3.0],
+        )
+        .await;
         // 合批臂:一次 T=5,seq_cu = [0,2,5]
-        let batch_v = model_prefill_step(&mut gpu, &model, &rp, &kvs_b, &gdns_b,
+        let batch_v = model_prefill_step(
+            &mut gpu,
+            &model,
+            &rp,
+            &kvs_b,
+            &gdns_b,
             &[11.0, 12.0, 21.0, 22.0, 23.0],
             &[2.0, 3.0, 1.0, 2.0, 3.0],
             &[2.0, 3.0, 5.0, 6.0, 7.0],
             &[3.0, 4.0, 2.0, 3.0, 4.0],
-            &[0.0, 1.0], &[0.0, 2.0, 5.0]).await;
+            &[0.0, 1.0],
+            &[0.0, 2.0, 5.0],
+        )
+        .await;
         assert_close(&batch_v[..2 * VOCAB], &a1[..], 1e-5, "batch-verify-A");
         assert_close(&batch_v[2 * VOCAB..], &b1[..], 1e-5, "batch-verify-B");
         println!("✅ 多序列 prefill/verify(2 会话,seq_cu 分段)与串行逐位同级");
@@ -1527,15 +1823,19 @@ mod tests {
     }
 
     /// 常驻缓冲一套(full 1 KV + gdn 3 状态;全零起步)
-    async fn model_bufs(gpu: &mut owl_cuda::GpuClient, n_full: usize, n_gdn: usize) -> (Vec<KvBuffers>, Vec<GdnBuffers>) {
+    async fn model_bufs(
+        gpu: &mut owl_cuda::GpuClient,
+        n_full: usize,
+        n_gdn: usize,
+    ) -> (Vec<KvBuffers>, Vec<GdnBuffers>) {
         let kv_zero = [0.0f32; KV_ROWS * HKV * HD];
         let mut kvs = Vec::new();
         for _ in 0..n_full {
             kvs.push(KvBuffers {
                 k_cache: zero_block(gpu, kv_zero.len(), vec![KV_ROWS, HKV, HD]).await,
                 v_cache: zero_block(gpu, kv_zero.len(), vec![KV_ROWS, HKV, HD]).await,
-                slots: TensorOps::from_host(Dtype::F32, vec![1, 1], &f32b(&[0.0])),  // 契约 slots/kv_lens r2(B6 收敛)
-                kv_lens: TensorOps::from_host(Dtype::F32, vec![1, 1], &f32b(&[1.0])),  // 契约 slots/kv_lens r2(B6 收敛)
+                slots: TensorOps::from_host(Dtype::F32, vec![1, 1], &f32b(&[0.0])), // 契约 slots/kv_lens r2(B6 收敛)
+                kv_lens: TensorOps::from_host(Dtype::F32, vec![1, 1], &f32b(&[1.0])), // 契约 slots/kv_lens r2(B6 收敛)
                 block_tables: TensorOps::zeros(Dtype::F32, vec![1]), // 哑表(legacy 路径不解引用)
 
                 int8: None,
@@ -1548,8 +1848,18 @@ mod tests {
             gdns.push(GdnBuffers {
                 conv_q: zero_block(gpu, MAX_SLOTS * key_dim * 3, vec![MAX_SLOTS, key_dim, 3]).await,
                 conv_k: zero_block(gpu, MAX_SLOTS * key_dim * 3, vec![MAX_SLOTS, key_dim, 3]).await,
-                conv_v: zero_block(gpu, MAX_SLOTS * value_dim * 3, vec![MAX_SLOTS, value_dim, 3]).await,
-                rec: zero_block(gpu, MAX_SLOTS * NV * HK_DIM * HV_DIM, vec![MAX_SLOTS, NV, HK_DIM, HV_DIM]).await,
+                conv_v: zero_block(
+                    gpu,
+                    MAX_SLOTS * value_dim * 3,
+                    vec![MAX_SLOTS, value_dim, 3],
+                )
+                .await,
+                rec: zero_block(
+                    gpu,
+                    MAX_SLOTS * NV * HK_DIM * HV_DIM,
+                    vec![MAX_SLOTS, NV, HK_DIM, HV_DIM],
+                )
+                .await,
                 slots: TensorOps::from_host(Dtype::F32, vec![1], &f32b(&[0.0])),
             });
         }
@@ -1572,7 +1882,8 @@ mod tests {
             LlamaFamily::new("model.language_model"),
             QuantPlan::F16,
             QuantPlan::F16,
-        ).expect("Model::new");
+        )
+        .expect("Model::new");
         let src = checkpoint_src();
         let mut gpu = gpu_client().await;
         crate::interpreters::eval_load(&model, &mut gpu, &src, &Default::default())
@@ -1584,7 +1895,7 @@ mod tests {
             .expect("rope 表");
 
         let ids: [f32; 4] = [5.0, 9.0, 3.0, 7.0];
-        let pos_of = |t: usize| TensorOps::from_host(Dtype::F32, vec![1, 1], &f32b(&[t as f32]));  // 契约 pos r2
+        let pos_of = |t: usize| TensorOps::from_host(Dtype::F32, vec![1, 1], &f32b(&[t as f32])); // 契约 pos r2
 
         // ── 参考:T 次 decode 步,单根 = last_hidden(缓冲套 A)──
         let (kvs_a, gdns_a) = model_bufs(&mut gpu, 1, 3).await;
@@ -1598,8 +1909,8 @@ mod tests {
                 .map(|kv| KvBuffers {
                     k_cache: kv.k_cache.clone(),
                     v_cache: kv.v_cache.clone(),
-                    slots: TensorOps::from_host(Dtype::F32, vec![1, 1], &f32b(&[t as f32])),  // 契约 slots/kv_lens r2(B6 收敛)
-                    kv_lens: TensorOps::from_host(Dtype::F32, vec![1, 1], &f32b(&[t as f32 + 1.0])),  // 契约 slots/kv_lens r2(B6 收敛)
+                    slots: TensorOps::from_host(Dtype::F32, vec![1, 1], &f32b(&[t as f32])), // 契约 slots/kv_lens r2(B6 收敛)
+                    kv_lens: TensorOps::from_host(Dtype::F32, vec![1, 1], &f32b(&[t as f32 + 1.0])), // 契约 slots/kv_lens r2(B6 收敛)
                     block_tables: TensorOps::zeros(Dtype::F32, vec![1]), // 哑表(legacy 路径不解引用)
 
                     int8: None,
@@ -1618,18 +1929,34 @@ mod tests {
                 })
                 .collect();
             let ctx = ForwardCtx::model_decode(1, &pos_t, &kvs_step, &rp, &gdns_step);
-            ref_hidden.push(crate::testkit::harvest(&mut gpu, &model.last_hidden(&ids_t, &ctx)).await);
+            ref_hidden
+                .push(crate::testkit::harvest(&mut gpu, &model.last_hidden(&ids_t, &ctx)).await);
         }
 
         // ── 被测:一次 prefill 块(缓冲套 B;单根 = last_hidden)──
         let (kvs_b, gdns_b) = model_bufs(&mut gpu, 1, 3).await;
         let ids_all = TensorOps::from_host(Dtype::F32, vec![t_len], &f32b(&ids));
-        let pos_all = TensorOps::from_host(Dtype::F32, vec![1, t_len], &f32b(&(0..t_len).map(|t| t as f32).collect::<Vec<_>>()));
-        let slots_all = TensorOps::from_host(Dtype::F32, vec![t_len], &f32b(&(0..t_len).map(|t| t as f32).collect::<Vec<_>>()));
-        let lens_all = TensorOps::from_host(Dtype::F32, vec![t_len], &f32b(&(0..t_len).map(|t| t as f32 + 1.0).collect::<Vec<_>>()));
+        let pos_all = TensorOps::from_host(
+            Dtype::F32,
+            vec![1, t_len],
+            &f32b(&(0..t_len).map(|t| t as f32).collect::<Vec<_>>()),
+        );
+        let slots_all = TensorOps::from_host(
+            Dtype::F32,
+            vec![t_len],
+            &f32b(&(0..t_len).map(|t| t as f32).collect::<Vec<_>>()),
+        );
+        let lens_all = TensorOps::from_host(
+            Dtype::F32,
+            vec![t_len],
+            &f32b(&(0..t_len).map(|t| t as f32 + 1.0).collect::<Vec<_>>()),
+        );
         let gdn_slot = TensorOps::from_host(Dtype::F32, vec![1], &f32b(&[0.0]));
-        let ctx = ForwardCtx::model_prefill(t_len, &pos_all, &kvs_b, &rp, &gdns_b, &slots_all, &lens_all, &gdn_slot, None, 0, None);
-        let pre_hidden = crate::testkit::harvest(&mut gpu, &model.last_hidden(&ids_all, &ctx)).await;
+        let ctx = ForwardCtx::model_prefill(
+            t_len, &pos_all, &kvs_b, &rp, &gdns_b, &slots_all, &lens_all, &gdn_slot, None, 0, None,
+        );
+        let pre_hidden =
+            crate::testkit::harvest(&mut gpu, &model.last_hidden(&ids_all, &ctx)).await;
         for t in 0..t_len {
             let d: f32 = pre_hidden[t * HIDDEN..(t + 1) * HIDDEN]
                 .iter()
@@ -1641,12 +1968,18 @@ mod tests {
 
         // ── logits 根(缓冲套 C)+ host 锚 ──
         let (kvs_c, gdns_c) = model_bufs(&mut gpu, 1, 3).await;
-        let ctx_c = ForwardCtx::model_prefill(t_len, &pos_all, &kvs_c, &rp, &gdns_c, &slots_all, &lens_all, &gdn_slot, None, 0, None);
+        let ctx_c = ForwardCtx::model_prefill(
+            t_len, &pos_all, &kvs_c, &rp, &gdns_c, &slots_all, &lens_all, &gdn_slot, None, 0, None,
+        );
         let got_all = crate::testkit::harvest(&mut gpu, &model.forward(&ids_all, &ctx_c)).await;
         let mut host2 = HostModel::new(checkpoint_src());
         for t in 0..t_len {
             let want = host2.step2(ids[t], t as f32, t, t + 1, 0);
-            eprintln!("[dbg] logits 行{t}: prefill {:?} host {:?}", &got_all[t * VOCAB..(t + 1) * VOCAB], want);
+            eprintln!(
+                "[dbg] logits 行{t}: prefill {:?} host {:?}",
+                &got_all[t * VOCAB..(t + 1) * VOCAB],
+                want
+            );
             assert_close(
                 &got_all[t * VOCAB..(t + 1) * VOCAB],
                 &want,
@@ -1656,5 +1989,4 @@ mod tests {
         }
         gpu.close().await.expect("关机");
     }
-
 }

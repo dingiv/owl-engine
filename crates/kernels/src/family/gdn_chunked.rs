@@ -86,8 +86,7 @@ pub fn table_host_bytes(t_real: usize, nt: usize) -> Vec<u8> {
 ///   sz T, sz slot, sz hv, sz nk, sz kd, sz scale_bits, sz nt]`
 /// = 7 Block + 1 O + 1 Block(o_f32:f32 中间,cast 由 handler 内置核转 out)+ 7 sz。
 /// state = 槽寻址块 [slots, HV, KD, VD](slot 标量寻址;in/out 同块)。
-pub const GDN_CHUNKED_SLOTS: &str =
-    "[T q, T k, T v, T g, T beta, T state, O out, T o_f32, \
+pub const GDN_CHUNKED_SLOTS: &str = "[T q, T k, T v, T g, T beta, T state, O out, T o_f32, \
      sz T, sz slot, sz hv, sz nk, sz kd, sz scale_bits, sz nt]";
 
 /// foreign 分派谓词
@@ -208,7 +207,10 @@ mod table_layout_tests {
     fn tp_tag_matches_aot_config() {
         const CFG: &str = include_str!("../../triton/gdn_chunked_aot.json");
         let want = format!("\"tag\": \"{}\"", super::cubins::TP_TAG);
-        assert!(CFG.contains(&want), "AOT 配置 extra_shapes 里找不到 {want}(TP 标签漂移?)");
+        assert!(
+            CFG.contains(&want),
+            "AOT 配置 extra_shapes 里找不到 {want}(TP 标签漂移?)"
+        );
     }
 
     /// **TP 形状六核齐全**(构建期真编过才判;`GDN_TRITON_BUILD=0`/`OWL_CUBIN_SKIP`
@@ -238,10 +240,22 @@ mod table_layout_tests {
             let s = off + k * 8;
             i64::from_le_bytes(b[s..s + 8].try_into().unwrap())
         };
-        assert_eq!((i64_at(super::CU_OFF, 0), i64_at(super::CU_OFF, 1)), (0, 192));
-        assert_eq!((i64_at(super::COFF_OFF, 0), i64_at(super::COFF_OFF, 1)), (0, 3));
+        assert_eq!(
+            (i64_at(super::CU_OFF, 0), i64_at(super::CU_OFF, 1)),
+            (0, 192)
+        );
+        assert_eq!(
+            (i64_at(super::COFF_OFF, 0), i64_at(super::COFF_OFF, 1)),
+            (0, 3)
+        );
         for i in 0..nt {
-            assert_eq!((i64_at(super::IDX_OFF, 2 * i), i64_at(super::IDX_OFF, 2 * i + 1)), (0, i as i64));
+            assert_eq!(
+                (
+                    i64_at(super::IDX_OFF, 2 * i),
+                    i64_at(super::IDX_OFF, 2 * i + 1)
+                ),
+                (0, i as i64)
+            );
         }
     }
 }

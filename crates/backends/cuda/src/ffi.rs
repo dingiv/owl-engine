@@ -1,5 +1,3 @@
-
-
 //! cudarc 受控再导出(A4:精确到接口粒度,禁止整库 re-export)。
 //! 这是上层(nn/未来的 rocnn)唯一可见的 cudarc 表面。
 //! 扩充本清单 = 扩大 driver 依赖面,须过 backends/README 准入审核并登记。
@@ -60,31 +58,54 @@ pub use cudarc::driver::result::stream::wait_event as stream_wait_event;
 pub mod sys {
     // driver 侧:指针类型 + 显式拷贝(tensor 装载/回读)
     pub use cudarc::driver::sys::{
-        CUdeviceptr, cuMemcpyDtoH_v2, cuMemcpyHtoD_v2, cuMemcpyDtoDAsync_v2, cuMemsetD8Async, cuMemsetD16Async, cuMemsetD32Async,
-        // E1 事件序:句柄类型 + 创建标志(证据:cudarc 0.19.9 sys/mod.rs:423 CUevent /
-        // :43 CUevent_flags(别名) / :3058 CUevent_flags_enum)
-        CUevent, CUevent_flags, CUevent_wait_flags,
-        // graph 捕获(M1 归入 graph 治理层)
-        CUgraphInstantiate_flags, CUstreamCaptureMode,
+        cuFuncGetName,
+        cuGraphGetNodes,
         // 图实例化零旗标入口(S1;见上方 graph 定谳注释)
         cuGraphInstantiateWithFlags,
+        cuGraphKernelNodeGetParams_v2,
+        cuGraphMemAllocNodeGetParams,
+        cuGraphMemFreeNodeGetParams,
+        cuGraphMemcpyNodeGetParams,
+        cuGraphNodeGetType,
+        cuGraphUpload,
+        cuKernelGetParamInfo,
+        cuMemHostGetDevicePointer_v2,
+        cuMemcpyDtoDAsync_v2,
+        cuMemcpyDtoH_v2,
+        cuMemcpyHtoD_v2,
+        cuMemsetD16Async,
+        cuMemsetD32Async,
+        cuMemsetD8Async,
+        CUdeviceptr,
+        // E1 事件序:句柄类型 + 创建标志(证据:cudarc 0.19.9 sys/mod.rs:423 CUevent /
+        // :43 CUevent_flags(别名) / :3058 CUevent_flags_enum)
+        CUevent,
+        CUevent_flags,
+        CUevent_wait_flags,
+        CUfunction,
+        CUgraph,
+        CUgraphExec,
+        // graph 捕获(M1 归入 graph 治理层)
+        CUgraphInstantiate_flags,
+        CUgraphNode,
+        CUgraphNodeType,
+        CUkernel,
+        CUresult,
+        CUstreamCaptureMode,
         // 图审计与枚举(哨兵③,M1;只读查询 API,零分配零懒状态——
         // 准入铁律通过,证据:cudarc 0.19.9 sys 绑定均为 load::<_F> 直通)
-        CUDA_KERNEL_NODE_PARAMS, CUfunction, CUresult, CUgraph, CUgraphExec, CUgraphNode,
-        CUgraphNodeType, CUkernel, cuGraphGetNodes, cuGraphKernelNodeGetParams_v2, cuGraphNodeGetType, cuGraphUpload,
-        cuKernelGetParamInfo,
+        CUDA_KERNEL_NODE_PARAMS,
+        CUDA_MEMCPY_NODE_PARAMS,
         // 刀1 取证:MEM_ALLOC/FREE/MEMCPY 节点参数(派发税立案;只读查询)
-        CUDA_MEM_ALLOC_NODE_PARAMS, cuGraphMemAllocNodeGetParams, cuGraphMemFreeNodeGetParams,
-        CUDA_MEMCPY_NODE_PARAMS, cuGraphMemcpyNodeGetParams,
-        cuFuncGetName,
+        CUDA_MEM_ALLOC_NODE_PARAMS,
         // **pinned host-mapped 面**(2026-11-04,host relay 兜底通道):
         // `cuMemHostAlloc` 由 cudarc `malloc_host` 包装;这里只补
         // `cuMemHostGetDevicePointer_v2` 与两个 flags。准入(A4):纯查询/
         // 分配 flag,无编译、无懒状态;host relay 的 Block 解析需要稳定的
         // device alias(for `block_ptr` 与核参数)。证据:cudarc 0.19.10
         // `driver/sys/mod.rs:12839` / `:256` / `:257`。
-        CU_MEMHOSTALLOC_DEVICEMAP, CU_MEMHOSTALLOC_PORTABLE,
-        cuMemHostGetDevicePointer_v2,
+        CU_MEMHOSTALLOC_DEVICEMAP,
+        CU_MEMHOSTALLOC_PORTABLE,
     };
 
     /// cuBLAS FFI(matmul/workspace/stream 重绑)
@@ -116,14 +137,29 @@ pub mod sys {
     /// (`vmm.rs` 里有唯一一处构造点,升/降 CUDA 大版本时改那处)。
     pub mod vmm {
         pub use cudarc::driver::sys::{
-            CUmemAccess_flags, CUmemAccessDesc, CUmemAllocationGranularity_flags,
-            CUmemAllocationHandleType, CUmemAllocationProp, CUmemAllocationType,
-            CUmemGenericAllocationHandle, CUmemLocation, CUmemLocationType, CUresult,
+            cuMemAddressFree,
+            cuMemAddressReserve,
+            cuMemCreate,
+            cuMemExportToShareableHandle,
+            cuMemGetAllocationGranularity,
+            cuMemImportFromShareableHandle,
+            cuMemMap,
+            cuMemRelease,
+            cuMemSetAccess,
+            cuMemUnmap,
+            CUmemAccessDesc,
+            CUmemAccess_flags,
+            CUmemAllocationGranularity_flags,
+            CUmemAllocationHandleType,
+            CUmemAllocationProp,
             // 结构体字面量字段类型(bindgen 生成;构造 prop/location 必需)
-            CUmemAllocationProp_st__bindgen_ty_1, CUmemLocation_st__bindgen_ty_1,
-            cuMemAddressFree, cuMemAddressReserve, cuMemCreate, cuMemExportToShareableHandle,
-            cuMemGetAllocationGranularity, cuMemImportFromShareableHandle, cuMemMap, cuMemRelease,
-            cuMemSetAccess, cuMemUnmap,
+            CUmemAllocationProp_st__bindgen_ty_1,
+            CUmemAllocationType,
+            CUmemGenericAllocationHandle,
+            CUmemLocation,
+            CUmemLocationType,
+            CUmemLocation_st__bindgen_ty_1,
+            CUresult,
         };
     }
 
@@ -157,7 +193,9 @@ pub use cudarc::driver::result::init as driver_init;
 /// 走驱动 API ⇒ 与 `cudaSetDevice` **同序**(不看 nvidia-smi 序)。
 /// 名字/PCI 取不到时留空串(不静默:调用方按需响亮拒绝),UUID 取不到 = Err。
 pub fn device_rows() -> Result<Vec<owl_shared::device::DeviceRow>, String> {
-    use cudarc::driver::sys::{cuDeviceGetAttribute, cuDeviceGetName, CUdevice_attribute, CUresult};
+    use cudarc::driver::sys::{
+        cuDeviceGetAttribute, cuDeviceGetName, CUdevice_attribute, CUresult,
+    };
     driver_init().map_err(|e| format!("driver_init: {e:?}"))?;
     let n = device_get_count().map_err(|e| format!("device_get_count: {e:?}"))?;
     let mut out: Vec<owl_shared::device::DeviceRow> = Vec::with_capacity(n as usize);
@@ -167,7 +205,9 @@ pub fn device_rows() -> Result<Vec<owl_shared::device::DeviceRow>, String> {
         let mut nbuf = [0i8; 128];
         let rc = unsafe { cuDeviceGetName(nbuf.as_mut_ptr(), nbuf.len() as i32, dev) };
         let name = if rc == CUresult::CUDA_SUCCESS {
-            unsafe { std::ffi::CStr::from_ptr(nbuf.as_ptr()) }.to_string_lossy().into_owned()
+            unsafe { std::ffi::CStr::from_ptr(nbuf.as_ptr()) }
+                .to_string_lossy()
+                .into_owned()
         } else {
             String::new()
         };
@@ -212,7 +252,9 @@ pub fn device_sm_count(ordinal: usize) -> Result<usize, String> {
         )
     };
     if rc != CUresult::CUDA_SUCCESS {
-        return Err(format!("cuDeviceGetAttribute(MULTIPROCESSOR_COUNT): {rc:?}"));
+        return Err(format!(
+            "cuDeviceGetAttribute(MULTIPROCESSOR_COUNT): {rc:?}"
+        ));
     }
     Ok(v.max(1) as usize)
 }
@@ -271,10 +313,10 @@ pub fn peer_supported(a: usize, b: usize) -> Result<bool, String> {
     Ok(can != 0)
 }
 
+pub use cudarc::driver::sys::CUgraphInstantiate_flags;
+pub use cudarc::driver::sys::CUstreamCaptureMode;
 /// 图句柄 safe 面(捕获产物;非 Send —— 钉死 actor 线程使用)
 pub use cudarc::driver::CudaGraph;
-pub use cudarc::driver::sys::CUstreamCaptureMode;
-pub use cudarc::driver::sys::CUgraphInstantiate_flags;
 
 /// 捕获模式常量(ThreadLocal = 只锁本线程,不霸锁全进程)
 pub const CAPTURE_MODE_THREAD_LOCAL: CUstreamCaptureMode =
@@ -294,10 +336,10 @@ pub use cudarc::driver::result::memset_d8_async;
 /// 做纯 host 侧动作(如 channel send)。
 pub use cudarc::driver::result::stream::launch_host_function;
 
-/// 非阻塞搬运(流序;host 侧须为 pinned)
-pub use cudarc::driver::result::{memcpy_dtoh_async, memcpy_htod_async};
 /// 设备内块→块拷贝(DtoD,流序非阻塞;E2c GDN 快照拍摄/恢复通道)
 pub use cudarc::driver::result::memcpy_dtod_async;
+/// 非阻塞搬运(流序;host 侧须为 pinned)
+pub use cudarc::driver::result::{memcpy_dtoh_async, memcpy_htod_async};
 
 #[cfg(test)]
 mod device_rows_tests {
@@ -311,10 +353,19 @@ mod device_rows_tests {
         let rows = super::device_rows().expect("枚举设备表");
         assert!(!rows.is_empty(), "至少一台设备");
         for r in &rows {
-            eprintln!("  ordinal {} | {} | {} | {}", r.ordinal, r.name, r.bdf, r.uuid);
+            eprintln!(
+                "  ordinal {} | {} | {} | {}",
+                r.ordinal, r.name, r.bdf, r.uuid
+            );
             assert!(!r.name.is_empty(), "名字非空:{r:?}");
-            assert!(r.bdf.contains(':') && r.bdf.ends_with(".0"), "BDF 形如 domain:bus:dev.0:{r:?}");
-            assert!(r.uuid.starts_with("GPU-") && r.uuid.len() == 40, "UUID 形如 GPU-8-4-4-4-12:{r:?}");
+            assert!(
+                r.bdf.contains(':') && r.bdf.ends_with(".0"),
+                "BDF 形如 domain:bus:dev.0:{r:?}"
+            );
+            assert!(
+                r.uuid.starts_with("GPU-") && r.uuid.len() == 40,
+                "UUID 形如 GPU-8-4-4-4-12:{r:?}"
+            );
         }
         let mut bdfs: Vec<&str> = rows.iter().map(|r| r.bdf.as_str()).collect();
         let n = bdfs.len();
@@ -367,5 +418,3 @@ impl GraphShape {
         self.aux_nodes > 0
     }
 }
-
-

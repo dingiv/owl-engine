@@ -82,9 +82,8 @@ pub fn case_config(name: &str, file: &str) -> OwlConfig {
     }
 
     let refs: Vec<&std::path::Path> = layers.iter().map(|p| p.as_path()).collect();
-    let mut cfg = OwlConfig::load_chain(None, &refs).unwrap_or_else(|e| {
-        panic!("[owl_test] 用例 {name} 配置加载失败(层:{layers:?}): {e}")
-    });
+    let mut cfg = OwlConfig::load_chain(None, &refs)
+        .unwrap_or_else(|e| panic!("[owl_test] 用例 {name} 配置加载失败(层:{layers:?}): {e}"));
     // 设备序回填(隐藏 env 的另一半;GPU 门控判据)
     cfg.runtime.test_device = crate::device::test_device_bdf();
     cfg
@@ -108,9 +107,18 @@ mod tests {
         let p = case_overlay_path("crates/models/src/layers/gdn.rs", "gpu_l2norm_matches_host")
             .expect("应有 overlay 路径");
         let s = p.to_string_lossy().replace('\\', "/");
-        assert!(s.ends_with("testdata/cases/models/layers/gdn/gpu_l2norm_matches_host.toml"), "{s}");
-        assert!(case_overlay_path("crates/models/tests/e2e.rs", "x").is_none(), "集成测试无 overlay");
-        assert!(case_overlay_path("apps/server/src/main.rs", "x").is_none(), "非 crates/ 前缀不猜");
+        assert!(
+            s.ends_with("testdata/cases/models/layers/gdn/gpu_l2norm_matches_host.toml"),
+            "{s}"
+        );
+        assert!(
+            case_overlay_path("crates/models/tests/e2e.rs", "x").is_none(),
+            "集成测试无 overlay"
+        );
+        assert!(
+            case_overlay_path("apps/server/src/main.rs", "x").is_none(),
+            "非 crates/ 前缀不猜"
+        );
     }
 
     /// 环境档双臂:未设 ⇒ default;设 ⇒ `flavor` 基准 + 覆盖项都到手,且与
@@ -121,7 +129,10 @@ mod tests {
         let _no_dev = crate::env_reader::EnvGuard::unset("OWL_TEST_DEVICE");
         let _no_conf = crate::env_reader::EnvGuard::unset(TEST_CONF_ENV);
         // 臂 1:未设 + 无 overlay ⇒ 引擎缺省
-        let cfg = case_config("definitely_unset_case_xyz", "crates/shared/src/testkit/case.rs");
+        let cfg = case_config(
+            "definitely_unset_case_xyz",
+            "crates/shared/src/testkit/case.rs",
+        );
         assert_eq!(cfg, OwlConfig::default(), "未设 = 引擎缺省配置");
         // 臂 2:设环境档(extends 基准 + 覆盖)
         // 基准档取 `full`(全量档恒在;旧名 `spec-dflash` 已随 profile 重命名退场)
@@ -129,13 +140,20 @@ mod tests {
         let path = std::env::temp_dir().join(format!("owl_test_conf_{}.toml", std::process::id()));
         std::fs::write(
             &path,
-            format!("extends = \"{}\"\n[runtime]\nmax_context_length = 2048\n", base.display()),
+            format!(
+                "extends = \"{}\"\n[runtime]\nmax_context_length = 2048\n",
+                base.display()
+            ),
         )
         .expect("写");
         let _c = crate::env_reader::EnvGuard::set(TEST_CONF_ENV, path.to_str().unwrap());
         let cfg2 = case_config("env_conf_arm", "crates/shared/src/testkit/case.rs");
         assert_eq!(cfg2.runtime.max_context_length, 2048, "覆盖项到手");
-        assert_eq!(cfg2.sampling.mode, crate::config::SamplerMode::Greedy, "基准在手");
+        assert_eq!(
+            cfg2.sampling.mode,
+            crate::config::SamplerMode::Greedy,
+            "基准在手"
+        );
         let direct = OwlConfig::load_chain(None, &[path.as_path()]).expect("直调复算");
         assert_eq!(cfg2, direct, "与 load_chain 直调逐字段同");
         drop(_c);
@@ -143,8 +161,16 @@ mod tests {
         // 臂 3:设备序回填
         let _d = crate::env_reader::EnvGuard::set("OWL_TEST_DEVICE", "41:00.0");
         let cfg3 = case_config("env_conf_dev", "crates/shared/src/testkit/case.rs");
-        assert_eq!(cfg3.runtime.test_device.as_deref(), Some("41:00.0"), "OWL_TEST_DEVICE(BDF)回填");
-        assert_eq!(crate::device::test_device_bdf().as_deref(), Some("41:00.0"), "唯一门控读取面");
+        assert_eq!(
+            cfg3.runtime.test_device.as_deref(),
+            Some("41:00.0"),
+            "OWL_TEST_DEVICE(BDF)回填"
+        );
+        assert_eq!(
+            crate::device::test_device_bdf().as_deref(),
+            Some("41:00.0"),
+            "唯一门控读取面"
+        );
     }
 
     /// 退役键 = 响亮 panic(带迁移指引)。
@@ -164,7 +190,8 @@ mod tests {
         let file = "crates/shared/src/testkit/case.rs";
         let p = case_overlay_path(file, "overlay_probe").expect("路径");
         crate::file_loader::create_dir_all(p.parent().unwrap()).expect("mkdir");
-        crate::file_loader::write(&p, "[runtime]\nmax_context_length = 4321\n").expect("写 overlay");
+        crate::file_loader::write(&p, "[runtime]\nmax_context_length = 4321\n")
+            .expect("写 overlay");
         let cfg = case_config("overlay_probe", file);
         assert_eq!(cfg.runtime.max_context_length, 4321, "overlay 文件被吃到");
         std::fs::remove_file(&p).ok();

@@ -103,7 +103,11 @@ pub async fn read_request<R: AsyncReadExt + Unpin>(r: &mut R) -> io::Result<Opti
             }
         }
     }
-    let keep_alive = if http_11 { !conn_close } else { conn_keep_alive && !conn_close };
+    let keep_alive = if http_11 {
+        !conn_close
+    } else {
+        conn_keep_alive && !conn_close
+    };
     // 两种定界同时给 = 经典走私向量(不同层取不同长度)⇒ 响亮拒
     if chunked && content_length.is_some() {
         return Err(io::Error::new(
@@ -173,19 +177,29 @@ async fn read_chunked<R: AsyncReadExt + Unpin>(
                 break p;
             }
             if pending.len() > 64 {
-                return Err(io::Error::new(io::ErrorKind::InvalidData, "chunked 块头过长"));
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "chunked 块头过长",
+                ));
             }
             let n = r.read(&mut read).await?;
             if n == 0 {
-                return Err(io::Error::new(io::ErrorKind::UnexpectedEof, "chunked 提前结束"));
+                return Err(io::Error::new(
+                    io::ErrorKind::UnexpectedEof,
+                    "chunked 提前结束",
+                ));
             }
             pending.extend_from_slice(&read[..n]);
         };
         let line = String::from_utf8_lossy(&pending[..line_end]).to_string();
         pending.drain(..line_end + 2);
         let hex = line.split(';').next().unwrap_or("").trim();
-        let n = usize::from_str_radix(hex, 16)
-            .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, format!("chunked 块长非法:{hex:?}")))?;
+        let n = usize::from_str_radix(hex, 16).map_err(|_| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("chunked 块长非法:{hex:?}"),
+            )
+        })?;
         if n == 0 {
             // 终止块:先按语法跳过**可选 trailer 段**(空行结尾),再看残留。
             // 旧实现直接 return ⇒ trailer 被当垃圾丢弃、管线化请求被静默吞掉。
@@ -218,7 +232,10 @@ async fn read_chunked<R: AsyncReadExt + Unpin>(
             if !pending.is_empty() {
                 return Err(io::Error::new(
                     io::ErrorKind::InvalidData,
-                    format!("chunked 终止块后残留 {}B(不支持 HTTP 管线化)", pending.len()),
+                    format!(
+                        "chunked 终止块后残留 {}B(不支持 HTTP 管线化)",
+                        pending.len()
+                    ),
                 ));
             }
             return Ok(out);
@@ -230,7 +247,10 @@ async fn read_chunked<R: AsyncReadExt + Unpin>(
         while pending.len() < n + 2 {
             let got = r.read(&mut read).await?;
             if got == 0 {
-                return Err(io::Error::new(io::ErrorKind::UnexpectedEof, "chunked 数据截断"));
+                return Err(io::Error::new(
+                    io::ErrorKind::UnexpectedEof,
+                    "chunked 数据截断",
+                ));
             }
             pending.extend_from_slice(&read[..got]);
         }
@@ -336,11 +356,11 @@ pub async fn respond_sse_head<W: AsyncWriteExt + Unpin>(w: &mut W) -> io::Result
     respond_sse_head_hdr(w, &[]).await
 }
 
-
 /// 一条 SSE data 事件(chunked 帧;json 文本须已单行化 —— serde_json 天然无换行)
 pub async fn sse_data<W: AsyncWriteExt + Unpin>(w: &mut W, data: &str) -> io::Result<()> {
     let payload = format!("data: {data}\n\n");
-    w.write_all(format!("{:x}\r\n", payload.len()).as_bytes()).await?;
+    w.write_all(format!("{:x}\r\n", payload.len()).as_bytes())
+        .await?;
     w.write_all(payload.as_bytes()).await?;
     w.write_all(b"\r\n").await?;
     w.flush().await
@@ -365,7 +385,8 @@ pub async fn sse_end<W: AsyncWriteExt + Unpin>(w: &mut W) -> io::Result<()> {
 /// (0 = 关)。
 pub async fn sse_comment<W: AsyncWriteExt + Unpin>(w: &mut W, text: &str) -> io::Result<()> {
     let payload = format!(": {text}\n\n");
-    w.write_all(format!("{:x}\r\n", payload.len()).as_bytes()).await?;
+    w.write_all(format!("{:x}\r\n", payload.len()).as_bytes())
+        .await?;
     w.write_all(payload.as_bytes()).await?;
     w.write_all(b"\r\n").await?;
     w.flush().await
@@ -483,7 +504,10 @@ mod tests {
         let s = String::from_utf8(out).expect("utf8");
         assert!(s.starts_with("HTTP/1.1 200 OK\r\n"), "{s:?}");
         assert!(s.contains("Transfer-Encoding: chunked\r\n"), "{s:?}");
-        assert!(!s.contains("Connection: close"), "SSE 不再 close 定界:{s:?}");
+        assert!(
+            !s.contains("Connection: close"),
+            "SSE 不再 close 定界:{s:?}"
+        );
         assert!(
             s.contains("\r\ndata: [DONE]\n\n\r\n"),
             "chunk 帧 = 长度行 + 体 + CRLF:{s:?}"

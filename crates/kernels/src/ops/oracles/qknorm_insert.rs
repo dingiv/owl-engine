@@ -13,8 +13,8 @@
 //! 参考带两个"故意做错"开关(测试证明判据敏感性):`rope_swap`(历史 rope
 //! 配对错)、`layout_classic`(池布局错)。
 
-use crate::contract::{LaunchVal, OpError};
 use crate::bootcheck::{BootCheck, CheckBuf, CheckReport, CheckRunner};
+use crate::contract::{LaunchVal, OpError};
 const QKNORM_ROPE_KV_INSERT_F16_FP8KV: &str = "cu/fused/qknorm_insert.cu";
 
 use super::{e4m3_encode, f16_bits, f16_to_f32, lcg_f16};
@@ -55,8 +55,14 @@ pub fn case() -> Case {
         k: lcg_f16(T * HKV * HD, 0xA2),
         v: lcg_f16(T * HKV * HD, 0xA3),
         // 权重/rope 表用小幅值(贴近真实:权重 ~1,cos/sin ∈ [-1,1])
-        q_w: lcg_f16(HD, 0xA4).iter().map(|h| f16_bits(f16_to_f32(*h) * 0.25)).collect(),
-        k_w: lcg_f16(HD, 0xA5).iter().map(|h| f16_bits(f16_to_f32(*h) * 0.25)).collect(),
+        q_w: lcg_f16(HD, 0xA4)
+            .iter()
+            .map(|h| f16_bits(f16_to_f32(*h) * 0.25))
+            .collect(),
+        k_w: lcg_f16(HD, 0xA5)
+            .iter()
+            .map(|h| f16_bits(f16_to_f32(*h) * 0.25))
+            .collect(),
         cos_t: (0..MAX_POS * HALF)
             .map(|i| f16_bits((i as f32 * 0.01).cos()))
             .collect(),
@@ -72,10 +78,12 @@ pub fn pool_bytes() -> usize {
 
 /// q 行归一(值半段 = 前 HD 个元素)
 fn row_inv(xs: &[u16]) -> f32 {
-    let ss: f32 = (0..HD).map(|d| {
-        let x = f16_to_f32(xs[d]);
-        x * x
-    }).sum();
+    let ss: f32 = (0..HD)
+        .map(|d| {
+            let x = f16_to_f32(xs[d]);
+            x * x
+        })
+        .sum();
     1.0 / (ss / HD as f32 + EPS).sqrt()
 }
 
@@ -147,14 +155,22 @@ pub fn reference(c: &Case, rope_swap: bool, layout_classic: bool) -> Reference {
                     let nb = xb * inv * (wb + 1.0);
                     let cf = f16_to_f32(c.cos_t[p * HALF + d]);
                     let sf = f16_to_f32(c.sin_t[p * HALF + d]);
-                    n = if rope_swap { nb * cf - n * sf } else { n * cf - nb * sf };
+                    n = if rope_swap {
+                        nb * cf - n * sf
+                    } else {
+                        n * cf - nb * sf
+                    };
                 } else {
                     let xb = f16_to_f32(ks[d - HALF]);
                     let wb = f16_to_f32(c.k_w[d - HALF]);
                     let nb = xb * inv * (wb + 1.0);
                     let cf = f16_to_f32(c.cos_t[p * HALF + d - HALF]);
                     let sf = f16_to_f32(c.sin_t[p * HALF + d - HALF]);
-                    n = if rope_swap { n * cf - nb * sf } else { n * cf + nb * sf };
+                    n = if rope_swap {
+                        n * cf - nb * sf
+                    } else {
+                        n * cf + nb * sf
+                    };
                 }
                 let idx = if layout_classic {
                     // classic:[blk, hkv, hd/8, page, 8](故意错)
@@ -165,7 +181,10 @@ pub fn reference(c: &Case, rope_swap: bool, layout_classic: bool) -> Reference {
                     ((blk * PAGE + off) * HKV + kh) * HD + d
                 };
                 keys.push((idx, e4m3_encode(n)));
-                vals.push((idx, e4m3_encode(f16_to_f32(c.v[t * HKV * HD + kh * HD + d]))));
+                vals.push((
+                    idx,
+                    e4m3_encode(f16_to_f32(c.v[t * HKV * HD + kh * HD + d])),
+                ));
             }
         }
     }
@@ -196,12 +215,23 @@ pub fn run_case(r: &mut dyn CheckRunner, c: &Case) -> Result<RawOut, OpError> {
     r.upload(d_v, &bytes(&c.v))?;
     r.upload(d_kc, &vec![POISON; n_pool])?;
     r.upload(d_vc, &vec![POISON; n_pool])?;
-    r.upload(d_slots, &SLOTS.iter().flat_map(|s| s.to_le_bytes()).collect::<Vec<u8>>())?;
+    r.upload(
+        d_slots,
+        &SLOTS
+            .iter()
+            .flat_map(|s| s.to_le_bytes())
+            .collect::<Vec<u8>>(),
+    )?;
     r.upload(d_qw, &bytes(&c.q_w))?;
     r.upload(d_kw, &bytes(&c.k_w))?;
     r.upload(d_cos, &bytes(&c.cos_t))?;
     r.upload(d_sin, &bytes(&c.sin_t))?;
-    r.upload(d_pos, &POS.iter().flat_map(|s| s.to_le_bytes()).collect::<Vec<u8>>())?;
+    r.upload(
+        d_pos,
+        &POS.iter()
+            .flat_map(|s| s.to_le_bytes())
+            .collect::<Vec<u8>>(),
+    )?;
 
     // 参数序逐字对齐 .cu 签名(11 块 + f32 + 4 i32 + 输出)
     let vals = [
@@ -235,12 +265,33 @@ pub fn run_case(r: &mut dyn CheckRunner, c: &Case) -> Result<RawOut, OpError> {
 
     let n_out = T * HQ * HD;
     let mut raw = vec![0u8; n_out * 2];
-    r.download(CheckBuf { ptr: d_out.ptr, bytes: n_out * 2 }, &mut raw)?;
-    let q_out: Vec<u16> = raw.chunks_exact(2).map(|x| u16::from_le_bytes([x[0], x[1]])).collect();
+    r.download(
+        CheckBuf {
+            ptr: d_out.ptr,
+            bytes: n_out * 2,
+        },
+        &mut raw,
+    )?;
+    let q_out: Vec<u16> = raw
+        .chunks_exact(2)
+        .map(|x| u16::from_le_bytes([x[0], x[1]]))
+        .collect();
     let mut kc = vec![0u8; n_pool];
     let mut vc = vec![0u8; n_pool];
-    r.download(CheckBuf { ptr: d_kc.ptr, bytes: n_pool }, &mut kc)?;
-    r.download(CheckBuf { ptr: d_vc.ptr, bytes: n_pool }, &mut vc)?;
+    r.download(
+        CheckBuf {
+            ptr: d_kc.ptr,
+            bytes: n_pool,
+        },
+        &mut kc,
+    )?;
+    r.download(
+        CheckBuf {
+            ptr: d_vc.ptr,
+            bytes: n_pool,
+        },
+        &mut vc,
+    )?;
     Ok((q_out, kc, vc))
 }
 

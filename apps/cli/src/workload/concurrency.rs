@@ -27,7 +27,7 @@ use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 
-use serde_json::{Value, json};
+use serde_json::{json, Value};
 
 use crate::client::{ChatReply, ChatRequest, Client};
 use crate::workload::report::{ScenarioReport, TurnRecord};
@@ -37,15 +37,15 @@ use crate::workload::Args;
 const WORDS: &[&str] = &[
     "amber", "basin", "cobalt", "delta", "ember", "fjord", "garnet", "harbor", "iris", "jasper",
     "kelp", "lumen", "meadow", "nimbus", "onyx", "prism", "quartz", "raven", "sable", "tundra",
-    "umber", "vapor", "willow", "xenon", "yarrow", "zephyr", "anchor", "beacon", "cinder",
-    "drift", "echo", "fable", "glacier", "hollow", "indigo", "juniper", "kestrel", "lantern",
-    "marble", "nectar", "orbit", "pebble", "quiver", "ripple", "summit", "thistle", "upland",
-    "vertex", "whisper", "yonder", "zinnia", "arbor", "bramble", "cedar", "dune", "fern", "grove",
-    "heather", "inlet", "jetty", "knoll", "lagoon", "moss", "nook", "orchard", "pine", "quill",
-    "reed", "stone", "trail", "vale", "wren", "yew", "zenith", "alder", "birch", "cliff", "dew",
-    "elm", "frost", "glen", "haze", "isle", "kite", "leaf", "mist", "nest", "oak", "path", "quay",
-    "root", "sage", "tide", "vine", "wave", "yard", "zinc", "acorn", "bloom", "cloud", "creek",
-    "dawn", "dusk", "field", "grain", "hill",
+    "umber", "vapor", "willow", "xenon", "yarrow", "zephyr", "anchor", "beacon", "cinder", "drift",
+    "echo", "fable", "glacier", "hollow", "indigo", "juniper", "kestrel", "lantern", "marble",
+    "nectar", "orbit", "pebble", "quiver", "ripple", "summit", "thistle", "upland", "vertex",
+    "whisper", "yonder", "zinnia", "arbor", "bramble", "cedar", "dune", "fern", "grove", "heather",
+    "inlet", "jetty", "knoll", "lagoon", "moss", "nook", "orchard", "pine", "quill", "reed",
+    "stone", "trail", "vale", "wren", "yew", "zenith", "alder", "birch", "cliff", "dew", "elm",
+    "frost", "glen", "haze", "isle", "kite", "leaf", "mist", "nest", "oak", "path", "quay", "root",
+    "sage", "tide", "vine", "wave", "yard", "zinc", "acorn", "bloom", "cloud", "creek", "dawn",
+    "dusk", "field", "grain", "hill",
 ];
 
 const LONG_QUESTION: &str = "Write a very long, detailed technical essay about the history of \
@@ -116,7 +116,8 @@ pub fn run(args: &Args, pid: u32) -> i32 {
         let arr: Vec<Value> = reports.iter().map(ScenarioReport::to_json).collect();
         println!(
             "{}",
-            serde_json::to_string_pretty(&arr).unwrap_or_else(|e| format!("[{{\"error\":\"{e}\"}}]"))
+            serde_json::to_string_pretty(&arr)
+                .unwrap_or_else(|e| format!("[{{\"error\":\"{e}\"}}]"))
         );
     }
     let failed = reports.iter().filter(|r| !r.pass).count();
@@ -125,7 +126,11 @@ pub fn run(args: &Args, pid: u32) -> i32 {
         reports.len() - failed,
         reports.len()
     );
-    if failed == 0 { 0 } else { 1 }
+    if failed == 0 {
+        0
+    } else {
+        1
+    }
 }
 
 /// 等引擎静默：`active == 0 && queue_len == 0` 连续 3 拍（≈300ms）。
@@ -189,7 +194,11 @@ fn spawn_stream(url: String, model: Option<String>, req: ChatRequest) -> Broadca
         let ended = Instant::now();
         (r, started, ended)
     });
-    BroadcastStream { handle, first_rx, times }
+    BroadcastStream {
+        handle,
+        first_rx,
+        times,
+    }
 }
 
 struct BroadcastStream {
@@ -202,7 +211,10 @@ impl BroadcastStream {
     fn into_streamed(self) -> Result<Streamed, String> {
         // ⚠️ **先 join 再取时间戳**：反过来的话，线程在 clone 之后、退出之前
         // 产生的 delta 会丢（尾段 ITL/gap 统计被截断，窗口末尾假绿）。
-        let (r, started, ended) = self.handle.join().map_err(|_| "流式线程 panic".to_string())?;
+        let (r, started, ended) = self
+            .handle
+            .join()
+            .map_err(|_| "流式线程 panic".to_string())?;
         let deltas = self.times.lock().map(|v| v.clone()).unwrap_or_default();
         let reply = r.map_err(|e| format!("chat 失败: {e}"))?;
         Ok(Streamed {

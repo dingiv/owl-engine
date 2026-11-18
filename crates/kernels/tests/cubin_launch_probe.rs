@@ -90,7 +90,9 @@ fn inputs() -> (Vec<f16>, Vec<f16>) {
             _ => f16::from_f32((i as f32) * 1e-3),
         })
         .collect();
-    let b: Vec<f16> = (0..N).map(|i| f16::from_f32((i % 13) as f32 - 6.5)).collect();
+    let b: Vec<f16> = (0..N)
+        .map(|i| f16::from_f32((i % 13) as f32 - 6.5))
+        .collect();
     (a, b)
 }
 
@@ -249,7 +251,11 @@ use cudarc::driver::CudaModule;
 use std::sync::Arc;
 
 /// 双载体模块:nvrtc(源)与 fatbin(资产)
-fn dual_modules(ctx: &Arc<CudaContext>, src_id: &str, source: &str) -> (Arc<CudaModule>, Arc<CudaModule>) {
+fn dual_modules(
+    ctx: &Arc<CudaContext>,
+    src_id: &str,
+    source: &str,
+) -> (Arc<CudaModule>, Arc<CudaModule>) {
     let ptx = cudarc::nvrtc::compile_ptx_with_opts(
         source,
         cudarc::nvrtc::CompileOptions {
@@ -270,7 +276,12 @@ fn dual_modules(ctx: &Arc<CudaContext>, src_id: &str, source: &str) -> (Arc<Cuda
 fn cmp_bitwise(tag: &str, a: &[u16], b: &[u16]) {
     let bad = a.iter().zip(b).filter(|(x, y)| x != y).count();
     let first = a.iter().zip(b).position(|(x, y)| x != y);
-    assert_eq!(bad, 0, "{tag}: nvrtc vs fatbin 输出不一致 {bad}/{} 处,首个 {first:?}", a.len());
+    assert_eq!(
+        bad,
+        0,
+        "{tag}: nvrtc vs fatbin 输出不一致 {bad}/{} 处,首个 {first:?}",
+        a.len()
+    );
     eprintln!("[aot-equiv] {tag} 绿({} 元素逐位一致)", a.len());
 }
 
@@ -372,7 +383,11 @@ fn aot_equiv_argmax_ties() {
                 .arg(&n)
                 .arg(&off)
                 .arg(&po)
-                .launch(LaunchConfig { grid_dim: (1, 1, 1), block_dim: (256, 1, 1), shared_mem_bytes: 0 })
+                .launch(LaunchConfig {
+                    grid_dim: (1, 1, 1),
+                    block_dim: (256, 1, 1),
+                    shared_mem_bytes: 0,
+                })
                 .expect("launch");
         }
         stream.synchronize().unwrap();
@@ -420,8 +435,12 @@ fn aot_equiv_paged_attention_v2_chain() {
     let alibi = vec![0f32];
 
     let run = |m: &Arc<CudaModule>| -> Vec<u16> {
-        let kf = m.load_function("vllm_paged_attention_v2_f16_hd256bs32").expect("v2 fn");
-        let rf = m.load_function("vllm_paged_attention_v2_reduce_f16_hd256").expect("reduce fn");
+        let kf = m
+            .load_function("vllm_paged_attention_v2_f16_hd256bs32")
+            .expect("v2 fn");
+        let rf = m
+            .load_function("vllm_paged_attention_v2_reduce_f16_hd256")
+            .expect("reduce fn");
         let dq = stream.clone_htod(&q).unwrap();
         let dk = stream.clone_htod(&k).unwrap();
         let dv = stream.clone_htod(&v).unwrap();
@@ -443,15 +462,33 @@ fn aot_equiv_paged_attention_v2_chain() {
         let (ptp, _) = d_tmp.device_ptr(&stream);
         let (po, _) = d_out.device_ptr(&stream);
         let (nkv, scale, mnbp) = (KV_HEADS as i32, 1f32 / (HD as f32).sqrt(), bps as i32);
-        let (qst, bst, hst) = ((HEADS * HD) as i32, head_stride as i32, (HD / X * PAGE * X) as i32);
+        let (qst, bst, hst) = (
+            (HEADS * HD) as i32,
+            head_stride as i32,
+            (HD / X * PAGE * X) as i32,
+        );
         let (ss, sw, ua) = (1f32, 0i32, 0i32);
         unsafe {
             stream
                 .launch_builder(&kf)
-                .arg(&pq).arg(&pk).arg(&pv).arg(&pbt).arg(&pl).arg(&pab)
-                .arg(&pes).arg(&pml)
-                .arg(&nkv).arg(&scale).arg(&mnbp).arg(&qst).arg(&bst).arg(&hst)
-                .arg(&ss).arg(&sw).arg(&ua).arg(&ptp)
+                .arg(&pq)
+                .arg(&pk)
+                .arg(&pv)
+                .arg(&pbt)
+                .arg(&pl)
+                .arg(&pab)
+                .arg(&pes)
+                .arg(&pml)
+                .arg(&nkv)
+                .arg(&scale)
+                .arg(&mnbp)
+                .arg(&qst)
+                .arg(&bst)
+                .arg(&hst)
+                .arg(&ss)
+                .arg(&sw)
+                .arg(&ua)
+                .arg(&ptp)
                 .launch(LaunchConfig {
                     grid_dim: (HEADS as u32, 1, nparts as u32),
                     block_dim: (THREADS as u32, 1, 1),
@@ -461,7 +498,12 @@ fn aot_equiv_paged_attention_v2_chain() {
             let np = nparts as i32;
             stream
                 .launch_builder(&rf)
-                .arg(&pes).arg(&pml).arg(&ptp).arg(&pl).arg(&np).arg(&po)
+                .arg(&pes)
+                .arg(&pml)
+                .arg(&ptp)
+                .arg(&pl)
+                .arg(&np)
+                .arg(&po)
                 .launch(LaunchConfig {
                     grid_dim: (HEADS as u32, 1, 1),
                     block_dim: (THREADS as u32, 1, 1),

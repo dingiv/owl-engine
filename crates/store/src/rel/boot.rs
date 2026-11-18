@@ -75,21 +75,15 @@ impl Rel {
             }
         }
         let state = StateStore::new(policy.gdn_slots, inputs.gdn_row_bytes);
-        // 状态腿宿主层:预算 = store host 总量 − KV 腿分片(负数 = 装配错,响亮拒)
-        let snap_host_bytes = inputs
-            .host_bytes
-            .checked_sub(kv_cfg.host_bytes)
-            .ok_or_else(|| {
-                StoreError::Budget(format!(
-                    "KV 腿 host 分片 {} > store host 总量 {}",
-                    kv_cfg.host_bytes, inputs.host_bytes
-                ))
-            })?;
+        // **宿主 = 一层一个总池**（2026-11-18 用户裁决）：KV 与快照共享
+        // `inputs.host_bytes`，不再从 `kv_cfg.host_bytes` 里预切状态腿分片。
+        // 两条腿各自保留驻留表/键空间，但物理预算记在同一本 `SharedTierBudget`。
+        let host_budget = crate::shared_budget::SharedTierBudget::new(inputs.host_bytes);
         Ok(Self {
-            leg: BlockLeg::open_planes(kv_cfg, world)?,
+            leg: BlockLeg::open_planes_shared(kv_cfg, world, host_budget.clone())?,
             index: None,
             state,
-            snap_host: HostTier::new(1, snap_host_bytes)?,
+            snap_host: HostTier::new_shared(1, host_budget)?,
             disk: None,
             snap_disk: None,
             ledger,

@@ -34,7 +34,9 @@ fn record_cost(n: usize, pool: usize) -> (u64, u64, u64) {
     // 排空一次(把提交队列落定,顺带确认 record 本身不阻塞)
     stream.synchronize().expect("流排空");
     for ev in events {
-        unsafe { let _ = ffi::event_destroy(ev); }
+        unsafe {
+            let _ = ffi::event_destroy(ev);
+        }
     }
     let total: u64 = samples.iter().sum();
     samples.sort_unstable();
@@ -83,20 +85,30 @@ fn stream_wait_event_is_sub_10us() {
         let ev = pool[i % pool.len()];
         unsafe { ffi::event_record(ev, a.cu_stream()) }.expect("record(A)");
         let t0 = std::time::Instant::now();
-        unsafe { ffi::stream_wait_event(b.cu_stream(), ev, ffi::sys::CUevent_wait_flags::CU_EVENT_WAIT_DEFAULT) }
-            .expect("wait(B)");
+        unsafe {
+            ffi::stream_wait_event(
+                b.cu_stream(),
+                ev,
+                ffi::sys::CUevent_wait_flags::CU_EVENT_WAIT_DEFAULT,
+            )
+        }
+        .expect("wait(B)");
         samples.push(t0.elapsed().as_nanos() as u64);
     }
     let _ = b.synchronize();
     let _ = a.synchronize();
     for ev in pool {
-        unsafe { let _ = ffi::event_destroy(ev); }
+        unsafe {
+            let _ = ffi::event_destroy(ev);
+        }
     }
     samples.sort_unstable();
     let p50 = samples[samples.len() / 2];
     let p99 = samples[(samples.len() * 99) / 100];
     let mean = samples.iter().sum::<u64>() / samples.len() as u64;
-    eprintln!("[ev-cost] cuStreamWaitEvent 提交: p50={p50}ns p99={p99}ns mean={mean}ns(A 录→B 等, 池 8)");
+    eprintln!(
+        "[ev-cost] cuStreamWaitEvent 提交: p50={p50}ns p99={p99}ns mean={mean}ns(A 录→B 等, 池 8)"
+    );
     assert!(
         p50 < 10_000,
         "cuStreamWaitEvent p50 = {p50}ns ≥ 10µs —— E3 的收益须重算(设计 §5)"

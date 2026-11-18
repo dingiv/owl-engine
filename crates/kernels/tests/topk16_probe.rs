@@ -285,7 +285,10 @@ fn topk16_bench() {
 
     let prod_src = owl_kernels::cu_sig::cu_text(owl_kernels::ops::source("owl_topk16_f16"));
     let base_mod = compile_module(&ctx, &prod_src);
-    let diag_mod = compile_module(&ctx, &format!("{DIAG_SCAN}\n{prod_src}\n{SPLIT_SRC}\n{MERGE_SRC}"));
+    let diag_mod = compile_module(
+        &ctx,
+        &format!("{DIAG_SCAN}\n{prod_src}\n{SPLIT_SRC}\n{MERGE_SRC}"),
+    );
 
     let (x_p, o_p, s_p) = (
         d_x.device_ptr(&stream).0,
@@ -296,11 +299,15 @@ fn topk16_bench() {
     let rows_i = ROWS as i32;
 
     let time = |call: &dyn Fn()| -> f64 {
-        for _ in 0..3 { call(); }
+        for _ in 0..3 {
+            call();
+        }
         stream.synchronize().unwrap();
         let iters = 20;
         let t0 = Instant::now();
-        for _ in 0..iters { call(); }
+        for _ in 0..iters {
+            call();
+        }
         stream.synchronize().unwrap();
         t0.elapsed().as_secs_f64() * 1e6 / iters as f64
     };
@@ -308,7 +315,11 @@ fn topk16_bench() {
 
     // ---- A) 生产核 ----
     let f_base = base_mod.load_function("owl_topk16_f16").unwrap();
-    let cfg1 = LaunchConfig { grid_dim: (ROWS as u32, 1, 1), block_dim: (BLK as u32, 1, 1), shared_mem_bytes: 0 };
+    let cfg1 = LaunchConfig {
+        grid_dim: (ROWS as u32, 1, 1),
+        block_dim: (BLK as u32, 1, 1),
+        shared_mem_bytes: 0,
+    };
     let call_base = || {
         let mut b = stream.launch_builder(&f_base);
         b.arg(&x_p).arg(&vocab_i).arg(&o_p);
@@ -316,7 +327,10 @@ fn topk16_bench() {
     };
     let us_base = time(&call_base);
     println!("=== A) 生产核 grid=({ROWS},1,1)×{BLK} ===");
-    println!("  单发 {us_base:9.3} µs ({:.1} GB/s)", bytes / (us_base * 1e-6) / 1e9);
+    println!(
+        "  单发 {us_base:9.3} µs ({:.1} GB/s)",
+        bytes / (us_base * 1e-6) / 1e9
+    );
 
     // ---- B) 单块一行 纯扫描地板 ----
     let f_scan1 = diag_mod.load_function("diag_scan_f16").unwrap();
@@ -327,7 +341,10 @@ fn topk16_bench() {
     };
     let us_scan1 = time(&call_scan1);
     println!("=== B) 纯扫描地板(同 grid)===");
-    println!("  单发 {us_scan1:9.3} µs ({:.1} GB/s)", bytes / (us_scan1 * 1e-6) / 1e9);
+    println!(
+        "  单发 {us_scan1:9.3} µs ({:.1} GB/s)",
+        bytes / (us_scan1 * 1e-6) / 1e9
+    );
 
     // ---- C) split 分解矩阵(固定 nparts=16)----
     println!("=== C) split 分解(nparts=16,grid={} × {BLK})===", ROWS * 16);
@@ -338,12 +355,27 @@ fn topk16_bench() {
     let d_pi = unsafe { stream.alloc::<f32>(npart_buf) }.unwrap();
     let pv_p = d_pv.device_ptr(&stream).0;
     let pi_p = d_pi.device_ptr(&stream).0;
-    let cfg_split = LaunchConfig { grid_dim: ((ROWS * nparts) as u32, 1, 1), block_dim: (BLK as u32, 1, 1), shared_mem_bytes: 0 };
-    for name in ["diag_split_scan_f16", "diag_split_old_w_f16", "diag_split_old_f16", "diag_split_new_w_f16", "diag_split_new_f16"] {
+    let cfg_split = LaunchConfig {
+        grid_dim: ((ROWS * nparts) as u32, 1, 1),
+        block_dim: (BLK as u32, 1, 1),
+        shared_mem_bytes: 0,
+    };
+    for name in [
+        "diag_split_scan_f16",
+        "diag_split_old_w_f16",
+        "diag_split_old_f16",
+        "diag_split_new_w_f16",
+        "diag_split_new_f16",
+    ] {
         let f = diag_mod.load_function(name).unwrap();
         let call = || {
             let mut b = stream.launch_builder(&f);
-            b.arg(&x_p).arg(&vocab_i).arg(&np_i).arg(&rows_i).arg(&pv_p).arg(&pi_p);
+            b.arg(&x_p)
+                .arg(&vocab_i)
+                .arg(&np_i)
+                .arg(&rows_i)
+                .arg(&pv_p)
+                .arg(&pi_p);
             unsafe { b.launch(cfg_split) }.expect(name);
         };
         println!("  {name:26} {:.3} µs", time(&call));
@@ -360,13 +392,26 @@ fn topk16_bench() {
             let pv_p = d_pv.device_ptr(&stream).0;
             let pi_p = d_pi.device_ptr(&stream).0;
             let n_pi = np as i32;
-            let cfg_s = LaunchConfig { grid_dim: ((ROWS * np) as u32, 1, 1), block_dim: (BLK as u32, 1, 1), shared_mem_bytes: 0 };
-            let cfg_m = LaunchConfig { grid_dim: (ROWS as u32, 1, 1), block_dim: (BLK as u32, 1, 1), shared_mem_bytes: (2 * 4096 * 4) as u32 };
+            let cfg_s = LaunchConfig {
+                grid_dim: ((ROWS * np) as u32, 1, 1),
+                block_dim: (BLK as u32, 1, 1),
+                shared_mem_bytes: 0,
+            };
+            let cfg_m = LaunchConfig {
+                grid_dim: (ROWS as u32, 1, 1),
+                block_dim: (BLK as u32, 1, 1),
+                shared_mem_bytes: (2 * 4096 * 4) as u32,
+            };
             let f_split = diag_mod.load_function(kname).unwrap();
             let call = || {
                 {
                     let mut b = stream.launch_builder(&f_split);
-                    b.arg(&x_p).arg(&vocab_i).arg(&n_pi).arg(&rows_i).arg(&pv_p).arg(&pi_p);
+                    b.arg(&x_p)
+                        .arg(&vocab_i)
+                        .arg(&n_pi)
+                        .arg(&rows_i)
+                        .arg(&pv_p)
+                        .arg(&pi_p);
                     unsafe { b.launch(cfg_s) }.expect(kname);
                 }
                 {
@@ -379,9 +424,16 @@ fn topk16_bench() {
             stream.synchronize().unwrap();
             let mut o2 = vec![0f32; 2 * ROWS * K];
             stream.memcpy_dtoh(&d_out, &mut o2).unwrap();
-            let bi = (0..ROWS * K).filter(|&i| (o2[ROWS * K + i] as i32) != h_idx[i]).count();
-            let bv = (0..ROWS * K).filter(|&i| (o2[i] - h_vals[i]).abs() > 1e-3).count();
-            println!("  np={np:3} {kname:20} {:.3} µs  索引差 {bi} 值差 {bv}", time(&call));
+            let bi = (0..ROWS * K)
+                .filter(|&i| (o2[ROWS * K + i] as i32) != h_idx[i])
+                .count();
+            let bv = (0..ROWS * K)
+                .filter(|&i| (o2[i] - h_vals[i]).abs() > 1e-3)
+                .count();
+            println!(
+                "  np={np:3} {kname:20} {:.3} µs  索引差 {bi} 值差 {bv}",
+                time(&call)
+            );
             let _ = d_pv.device_ptr(&stream);
             let _ = d_pi.device_ptr(&stream);
         }
@@ -396,16 +448,32 @@ fn topk16_bench() {
         let d_tmp = unsafe { stream.alloc::<f32>(buf) }.unwrap();
         let tmp_p = d_tmp.device_ptr(&stream).0;
         let n_pi = np as i32;
-        let cfg_s = LaunchConfig { grid_dim: ((ROWS * np) as u32, 1, 1), block_dim: (BLK as u32, 1, 1), shared_mem_bytes: 0 };
-        let cfg_m = LaunchConfig { grid_dim: (ROWS as u32, 1, 1), block_dim: (32, 1, 1), shared_mem_bytes: 0 };
+        let cfg_s = LaunchConfig {
+            grid_dim: ((ROWS * np) as u32, 1, 1),
+            block_dim: (BLK as u32, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        let cfg_m = LaunchConfig {
+            grid_dim: (ROWS as u32, 1, 1),
+            block_dim: (32, 1, 1),
+            shared_mem_bytes: 0,
+        };
         let call_s = || {
             let mut b = stream.launch_builder(&f_split2);
-            b.arg(&x_p).arg(&vocab_i).arg(&n_pi).arg(&rows_i).arg(&tmp_p);
+            b.arg(&x_p)
+                .arg(&vocab_i)
+                .arg(&n_pi)
+                .arg(&rows_i)
+                .arg(&tmp_p);
             unsafe { b.launch(cfg_s) }.expect("split");
         };
         let call_m = || {
             let mut b = stream.launch_builder(&f_merge2);
-            b.arg(&tmp_p).arg(&n_pi).arg(&rows_i).arg(&vocab_i).arg(&o_p);
+            b.arg(&tmp_p)
+                .arg(&n_pi)
+                .arg(&rows_i)
+                .arg(&vocab_i)
+                .arg(&o_p);
             unsafe { b.launch(cfg_m) }.expect("merge");
         };
         call_s();
@@ -413,9 +481,16 @@ fn topk16_bench() {
         stream.synchronize().unwrap();
         let mut o2 = vec![0f32; 2 * ROWS * K];
         stream.memcpy_dtoh(&d_out, &mut o2).unwrap();
-        let bi = (0..ROWS * K).filter(|&i| (o2[ROWS * K + i] as i32) != h_idx[i]).count();
-        let bv = (0..ROWS * K).filter(|&i| (o2[i] - h_vals[i]).abs() > 1e-3).count();
-        let us2 = time(&|| { call_s(); call_m(); });
+        let bi = (0..ROWS * K)
+            .filter(|&i| (o2[ROWS * K + i] as i32) != h_idx[i])
+            .count();
+        let bv = (0..ROWS * K)
+            .filter(|&i| (o2[i] - h_vals[i]).abs() > 1e-3)
+            .count();
+        let us2 = time(&|| {
+            call_s();
+            call_m();
+        });
         let us_s2 = time(&call_s);
         let us_m2 = time(&call_m);
         println!("  np={np:3}: 合 {us2:7.3} µs(段一 {us_s2:6.3} + 段二 {us_m2:6.3})  索引差 {bi} 值差 {bv}");
@@ -431,7 +506,11 @@ fn topk16_bench() {
         let pv_p = d_pv.device_ptr(&stream).0;
         let pi_p = d_pi.device_ptr(&stream).0;
         let n_pi = np as i32;
-        let cfg_m = LaunchConfig { grid_dim: (ROWS as u32, 1, 1), block_dim: (BLK as u32, 1, 1), shared_mem_bytes: (2 * 4096 * 4) as u32 };
+        let cfg_m = LaunchConfig {
+            grid_dim: (ROWS as u32, 1, 1),
+            block_dim: (BLK as u32, 1, 1),
+            shared_mem_bytes: (2 * 4096 * 4) as u32,
+        };
         let call = || {
             let mut b = stream.launch_builder(&f_merge);
             b.arg(&pv_p).arg(&pi_p).arg(&n_pi).arg(&rows_i).arg(&o_p);

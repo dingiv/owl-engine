@@ -19,7 +19,9 @@ pub struct FuseAdd {
 impl FuseAdd {
     /// 静态依赖(权重)构造期捕获
     pub fn new(w: &[f32]) -> Self {
-        Self { w: TensorOps::from_host(Dtype::F32, vec![4, 4], &f32b(w)) }
+        Self {
+            w: TensorOps::from_host(Dtype::F32, vec![4, 4], &f32b(w)),
+        }
     }
 
     /// 具名双输入 forward:纯描述(total;零 ? 零 await)

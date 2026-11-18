@@ -75,8 +75,16 @@ fn make_case(seed: u32, dup: bool, holes: usize) -> (Vec<f32>, Vec<f32>, Vec<f32
         for j in 0..K {
             let i = r * K + j;
             // 值:±8 量级;dup 档每行只造 3 个不同值 ⇒ 大量平局
-            vals_a[i] = if dup { (j % 3) as f32 - 1.0 } else { (rnd() - 0.5) * 16.0 };
-            vals_b[i] = if dup { ((j + 1) % 3) as f32 - 1.0 } else { (rnd() - 0.5) * 16.0 };
+            vals_a[i] = if dup {
+                (j % 3) as f32 - 1.0
+            } else {
+                (rnd() - 0.5) * 16.0
+            };
+            vals_b[i] = if dup {
+                ((j + 1) % 3) as f32 - 1.0
+            } else {
+                (rnd() - 0.5) * 16.0
+            };
             // id:半表域各自递增,互不重叠
             ids_a[i] = (j * 7 + r) as f32;
             ids_b[i] = (j * 5 + r * 3) as f32;
@@ -158,7 +166,10 @@ fn run_case(seed: u32, dup: bool, holes: usize) {
     let got_v = &out[..ROWS * K];
     let got_i: Vec<u32> = out[ROWS * K..].iter().map(|&v| v as u32).collect();
 
-    let v_ok = got_v.iter().zip(want_v.iter()).all(|(a, b)| a.to_bits() == b.to_bits());
+    let v_ok = got_v
+        .iter()
+        .zip(want_v.iter())
+        .all(|(a, b)| a.to_bits() == b.to_bits());
     let i_ok = got_i == want_i;
     println!(
         "merge_halves seed={seed} dup={dup} holes={holes}: 值逐位 {} / id 逐位 {}",
@@ -173,8 +184,14 @@ fn run_case(seed: u32, dup: bool, holes: usize) {
             println!("  row {r}: want_i={:?}", &want_i[r * K..(r + 1) * K]);
         }
     }
-    assert!(v_ok, "候选值不是逐位相同(seed={seed} dup={dup} holes={holes})");
-    assert!(i_ok, "候选 id 不是逐位相同(seed={seed} dup={dup} holes={holes})");
+    assert!(
+        v_ok,
+        "候选值不是逐位相同(seed={seed} dup={dup} holes={holes})"
+    );
+    assert!(
+        i_ok,
+        "候选 id 不是逐位相同(seed={seed} dup={dup} holes={holes})"
+    );
 }
 
 #[owl_test(gpu)]

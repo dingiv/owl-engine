@@ -121,7 +121,11 @@ fn host_ref(
 fn run_case(prefix: usize, hq: usize, hkv: usize, ring_cap: usize, check: bool) {
     let kv_len = prefix + T;
     // 池页数:线性档 = ceil(prefix/page);ring 档 = ring_cap/page(槽空间)
-    let nb = if ring_cap == 0 { prefix.div_ceil(PAGE) } else { ring_cap / PAGE };
+    let nb = if ring_cap == 0 {
+        prefix.div_ceil(PAGE)
+    } else {
+        ring_cap / PAGE
+    };
     let ctx = CudaContext::new(1).expect("ctx");
     ctx.bind_to_thread().expect("bind");
     let stream = ctx.default_stream();
@@ -155,7 +159,8 @@ fn run_case(prefix: usize, hq: usize, hkv: usize, ring_cap: usize, check: bool) 
 
     // ---- 编译 + 取核(OWL_NC_KERNEL 可切名做 A/B)----
     let ptx = cudarc::nvrtc::compile_ptx_with_opts(
-        owl_kernels::cu_sig::cu_text(owl_kernels::ops::source("owl_naive_attn_nc_bf16_v2")).as_str(),
+        owl_kernels::cu_sig::cu_text(owl_kernels::ops::source("owl_naive_attn_nc_bf16_v2"))
+            .as_str(),
         cudarc::nvrtc::CompileOptions {
             arch: Some("compute_86"),
             include_paths: vec!["/usr/local/cuda/include".into()],
@@ -166,7 +171,9 @@ fn run_case(prefix: usize, hq: usize, hkv: usize, ring_cap: usize, check: bool) 
     let m = ctx.load_module(ptx).expect("module");
     let name = owl_shared::env_reader::str("OWL_NC_KERNEL")
         .unwrap_or_else(|| "owl_naive_attn_nc_bf16".to_string());
-    let f = m.load_function(&name).unwrap_or_else(|e| panic!("load {name}: {e}"));
+    let f = m
+        .load_function(&name)
+        .unwrap_or_else(|e| panic!("load {name}: {e}"));
 
     // ---- 发射形状(按核族)----
     //   v1 旧核:grid (T, Hq), block hd, smem 0
@@ -198,9 +205,19 @@ fn run_case(prefix: usize, hq: usize, hkv: usize, ring_cap: usize, check: bool) 
         d_len.device_ptr(&stream).0,
         d_out.device_ptr(&stream).0,
     );
-    let (hq_i, hkv_i, hd_i, page_i, x_i, ring_i) =
-        (hq as i32, hkv as i32, HD as i32, PAGE as i32, X as i32, ring_cap as i32);
-    let cfg = LaunchConfig { grid_dim: grid, block_dim: block, shared_mem_bytes: smem };
+    let (hq_i, hkv_i, hd_i, page_i, x_i, ring_i) = (
+        hq as i32,
+        hkv as i32,
+        HD as i32,
+        PAGE as i32,
+        X as i32,
+        ring_cap as i32,
+    );
+    let cfg = LaunchConfig {
+        grid_dim: grid,
+        block_dim: block,
+        shared_mem_bytes: smem,
+    };
     let call = || {
         let mut b = stream.launch_builder(&f);
         b.arg(&q_p)
@@ -241,7 +258,12 @@ fn run_case(prefix: usize, hq: usize, hkv: usize, ring_cap: usize, check: bool) 
     let n_zero = got.iter().filter(|&&v| v == 0.0).count();
     let d_h = if check {
         let h = host_ref(&q, &k_self, &v_self, &kc, &vc, kv_len, hq, hkv, ring_cap);
-        Some(got.iter().zip(h.iter()).map(|(a, b)| (a - b).abs()).fold(0f32, f32::max))
+        Some(
+            got.iter()
+                .zip(h.iter())
+                .map(|(a, b)| (a - b).abs())
+                .fold(0f32, f32::max),
+        )
     } else {
         None
     };
@@ -389,8 +411,14 @@ fn run_diag(prefix: usize, variant: &str) {
         stream.memcpy_htod(v, &mut d).unwrap();
         d
     };
-    let (d_q, d_ks, d_vs, d_kc, d_vc, d_out) =
-        (dev(&q), dev(&k_self), dev(&v_self), dev(&kc), dev(&vc), dev(&vec![0u16; T * HQ * HD]));
+    let (d_q, d_ks, d_vs, d_kc, d_vc, d_out) = (
+        dev(&q),
+        dev(&k_self),
+        dev(&v_self),
+        dev(&kc),
+        dev(&vc),
+        dev(&vec![0u16; T * HQ * HD]),
+    );
     let d_len = {
         let mut d = unsafe { stream.alloc::<f32>(1) }.unwrap();
         stream.memcpy_htod(&[kv_len as f32], &mut d).unwrap();
@@ -406,11 +434,17 @@ fn run_diag(prefix: usize, variant: &str) {
     )
     .expect("nvrtc compile diag");
     let m = ctx.load_module(ptx).expect("module");
-    let f = m.load_function(variant).unwrap_or_else(|e| panic!("load {variant}: {e}"));
+    let f = m
+        .load_function(variant)
+        .unwrap_or_else(|e| panic!("load {variant}: {e}"));
     let (q_p, ks_p, vs_p, kc_p, vc_p, ln_p, o_p) = (
-        d_q.device_ptr(&stream).0, d_ks.device_ptr(&stream).0, d_vs.device_ptr(&stream).0,
-        d_kc.device_ptr(&stream).0, d_vc.device_ptr(&stream).0,
-        d_len.device_ptr(&stream).0, d_out.device_ptr(&stream).0,
+        d_q.device_ptr(&stream).0,
+        d_ks.device_ptr(&stream).0,
+        d_vs.device_ptr(&stream).0,
+        d_kc.device_ptr(&stream).0,
+        d_vc.device_ptr(&stream).0,
+        d_len.device_ptr(&stream).0,
+        d_out.device_ptr(&stream).0,
     );
     let (hq_i, hkv_i, hd_i, page_i, x_i) =
         (HQ as i32, HKV as i32, HD as i32, PAGE as i32, X as i32);
@@ -421,23 +455,43 @@ fn run_diag(prefix: usize, variant: &str) {
     };
     let call = || {
         let mut b = stream.launch_builder(&f);
-        b.arg(&q_p).arg(&ks_p).arg(&vs_p).arg(&kc_p).arg(&vc_p).arg(&ln_p)
-            .arg(&hq_i).arg(&hkv_i).arg(&hd_i).arg(&page_i).arg(&x_i).arg(&o_p);
+        b.arg(&q_p)
+            .arg(&ks_p)
+            .arg(&vs_p)
+            .arg(&kc_p)
+            .arg(&vc_p)
+            .arg(&ln_p)
+            .arg(&hq_i)
+            .arg(&hkv_i)
+            .arg(&hd_i)
+            .arg(&page_i)
+            .arg(&x_i)
+            .arg(&o_p);
         unsafe { b.launch(cfg) }.expect("diag launch");
     };
-    for _ in 0..3 { call(); }
+    for _ in 0..3 {
+        call();
+    }
     stream.synchronize().unwrap();
     let iters = 20;
     let t0 = Instant::now();
-    for _ in 0..iters { call(); }
+    for _ in 0..iters {
+        call();
+    }
     stream.synchronize().unwrap();
-    println!("  {variant:<10} {:.3} ms", t0.elapsed().as_secs_f64() * 1e3 / iters as f64);
+    println!(
+        "  {variant:<10} {:.3} ms",
+        t0.elapsed().as_secs_f64() * 1e3 / iters as f64
+    );
 }
 
 #[owl_test(gpu)]
 fn dflash2_nc_bottleneck_split() {
     for prefix in [2048usize, 8192] {
-        println!("=== 拆分(prefix={prefix}, 窗口 {} + 自块 {T})===", prefix.min(2048));
+        println!(
+            "=== 拆分(prefix={prefix}, 窗口 {} + 自块 {T})===",
+            prefix.min(2048)
+        );
         for v in ["diag_kv", "diag_k", "diag_v", "diag_none"] {
             run_diag(prefix, v);
         }

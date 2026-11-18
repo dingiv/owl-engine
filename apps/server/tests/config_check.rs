@@ -12,7 +12,9 @@ use std::process::Command;
 use std::time::{Duration, Instant};
 
 fn repo(path: &str) -> std::path::PathBuf {
-    std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../..").join(path)
+    std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../..")
+        .join(path)
 }
 
 fn profile(name: &str) -> std::path::PathBuf {
@@ -69,8 +71,7 @@ fn print_config_json_carries_provenance_and_estimate() {
         "print-config 应成功:\n{}",
         String::from_utf8_lossy(&out.stderr)
     );
-    let v: serde_json::Value =
-        serde_json::from_slice(&out.stdout).expect("stdout 必须是合法 JSON");
+    let v: serde_json::Value = serde_json::from_slice(&out.stdout).expect("stdout 必须是合法 JSON");
     assert_eq!(v["config"]["runtime"]["max_context_length"], 57344);
     // 2026-10-22:池容量配置项删除;池由 [vram-gov] 按剩余显存自动定。
     assert!(v["config"]["pool"].get("pool_tokens").is_none());
@@ -86,7 +87,11 @@ fn explain_prints_origin_and_rule() {
         "--explain",
         "runtime.max_context_length",
     ]);
-    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
     let s = String::from_utf8_lossy(&out.stdout);
     assert!(s.contains("runtime.max_context_length = 57344"), "{s}");
     // 完整档:来源必须是文件(file:…),不再是 derived
@@ -102,9 +107,16 @@ fn set_overrides_derived_value() {
         "runtime.max_context_length=32768",
         "--check",
     ]);
-    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
     let s = String::from_utf8_lossy(&out.stdout);
-    assert!(s.contains("max_context_length=32768"), "--set 应覆盖文件值:\n{s}");
+    assert!(
+        s.contains("max_context_length=32768"),
+        "--set 应覆盖文件值:\n{s}"
+    );
     // 池容量无配置项;改 max_context_length 只改单请求上限,物理池仍自动。
     assert!(s.contains("pool=auto"), "池应为自动:\n{s}");
 }
@@ -118,7 +130,11 @@ fn legacy_profile_still_works() {
         profile("qwen38_27b-3090").to_str().expect("路径"),
         "--check",
     ]);
-    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
     let s = String::from_utf8_lossy(&out.stdout);
     assert!(s.contains("无 [intent]"), "旧档应走兼容分支:\n{s}");
     assert!(s.contains("OK"), "{s}");
@@ -138,7 +154,14 @@ fn incomplete_profile_is_rejected_with_key_list() {
     std::fs::write(&path, broken).expect("写残缺档");
     let out = run(&["-p", path.to_str().expect("路径"), "--check"]);
     assert!(!out.status.success(), "缺字段应拒启");
-    let s = format!("{}{}", String::from_utf8_lossy(&out.stderr), String::from_utf8_lossy(&out.stdout));
-    assert!(s.contains("未显式声明") || s.contains("不精确匹配"), "应点名缺字段:\n{s}");
+    let s = format!(
+        "{}{}",
+        String::from_utf8_lossy(&out.stderr),
+        String::from_utf8_lossy(&out.stdout)
+    );
+    assert!(
+        s.contains("未显式声明") || s.contains("不精确匹配"),
+        "应点名缺字段:\n{s}"
+    );
     assert!(s.contains("kernel.gguf_tile"), "缺项应列出键路径:\n{s}");
 }

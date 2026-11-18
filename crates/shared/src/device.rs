@@ -50,15 +50,25 @@ pub fn uuid_display(bytes: &[u8; 16]) -> String {
     let hex: String = bytes.iter().map(|b| format!("{b:02x}")).collect();
     format!(
         "GPU-{}-{}-{}-{}-{}",
-        &hex[0..8], &hex[8..12], &hex[12..16], &hex[16..20], &hex[20..32]
+        &hex[0..8],
+        &hex[8..12],
+        &hex[12..16],
+        &hex[16..20],
+        &hex[20..32]
     )
 }
 
 /// UUID 归一(**匹配端与显示端同一套**):去 `GPU-`/`gpu-` 前缀、去连字符、小写
 pub fn uuid_norm(s: &str) -> String {
     let t = s.trim();
-    let t = t.strip_prefix("GPU-").or_else(|| t.strip_prefix("gpu-")).unwrap_or(t);
-    t.chars().filter(|c| c.is_ascii_hexdigit()).map(|c| c.to_ascii_lowercase()).collect()
+    let t = t
+        .strip_prefix("GPU-")
+        .or_else(|| t.strip_prefix("gpu-"))
+        .unwrap_or(t);
+    t.chars()
+        .filter(|c| c.is_ascii_hexdigit())
+        .map(|c| c.to_ascii_lowercase())
+        .collect()
 }
 
 /// 解析 `nvidia-smi --query-gpu=uuid,memory.free,memory.total --format=csv,noheader,nounits`
@@ -118,7 +128,10 @@ pub fn parse_nvidia_smi_bar1(text: &str) -> std::collections::HashMap<String, u6
         if in_bar1 {
             if let Some(v) = t.strip_prefix("Total") {
                 let v = v.trim_start_matches([' ', ':', '\t']);
-                let mib = v.split_whitespace().next().and_then(|x| x.parse::<u64>().ok());
+                let mib = v
+                    .split_whitespace()
+                    .next()
+                    .and_then(|x| x.parse::<u64>().ok());
                 if let (Some(bdf), Some(mib)) = (cur.as_ref(), mib) {
                     out.insert(bdf.clone(), mib << 20);
                 }
@@ -196,26 +209,42 @@ pub fn parse_device_spec(raw: &str) -> Result<DeviceSpec, String> {
                  请写 BDF(如 41:00.0)或 UUID、或名字子串(如 3090)"
             ));
         }
-        return Ok(DeviceSpec { find_name: Some(t.to_string()), ..Default::default() });
+        return Ok(DeviceSpec {
+            find_name: Some(t.to_string()),
+            ..Default::default()
+        });
     }
     // UUID:GPU- 前缀,或 32 位十六进制(允许 8-4-4-4-12 连字符)
     let hex_only: String = t.chars().filter(|c| c.is_ascii_hexdigit()).collect();
-    if t.starts_with("GPU-") || t.starts_with("gpu-") || t.starts_with("MIG-")
+    if t.starts_with("GPU-")
+        || t.starts_with("gpu-")
+        || t.starts_with("MIG-")
         || (hex_only.len() == 32 && t.chars().all(|c| c.is_ascii_hexdigit() || c == '-'))
     {
-        return Ok(DeviceSpec { uuid: Some(t.to_string()), ..Default::default() });
+        return Ok(DeviceSpec {
+            uuid: Some(t.to_string()),
+            ..Default::default()
+        });
     }
     // BDF:[domain:]bus:dev[.func] —— 两段或三段、全十六进制、分隔符只有 : 和 .
     let bdf_like = {
         let parts: Vec<&str> = t.split([':', '.']).filter(|p| !p.is_empty()).collect();
         (parts.len() == 2 || parts.len() == 3 || parts.len() == 4)
-            && parts.iter().all(|p| p.chars().all(|c| c.is_ascii_hexdigit()))
+            && parts
+                .iter()
+                .all(|p| p.chars().all(|c| c.is_ascii_hexdigit()))
             && t.contains(':')
     };
     if bdf_like {
-        return Ok(DeviceSpec { bdf: Some(t.to_string()), ..Default::default() });
+        return Ok(DeviceSpec {
+            bdf: Some(t.to_string()),
+            ..Default::default()
+        });
     }
-    Ok(DeviceSpec { find_name: Some(t.to_string()), ..Default::default() })
+    Ok(DeviceSpec {
+        find_name: Some(t.to_string()),
+        ..Default::default()
+    })
 }
 
 impl DeviceSpec {
@@ -247,8 +276,7 @@ pub fn bdf_norm(s: &str) -> String {
         // (4 位),`nvidia-smi -q` 给 `00000000:41:00.0`(**8 位**)—— 2026-10-17
         // K2 探测当场踩到(两源归一后必须可比:TP 分档按 BDF 对账 BAR1)。
         Some((dom, rest))
-            if (dom.len() == 4 || dom.len() == 8)
-                && dom.chars().all(|c| c.is_ascii_hexdigit()) =>
+            if (dom.len() == 4 || dom.len() == 8) && dom.chars().all(|c| c.is_ascii_hexdigit()) =>
         {
             rest
         }
@@ -261,7 +289,11 @@ pub fn bdf_norm(s: &str) -> String {
         .take(2)
         .map(|p| {
             let t = p.trim_start_matches('0');
-            if t.is_empty() { "0".to_string() } else { t.to_string() }
+            if t.is_empty() {
+                "0".to_string()
+            } else {
+                t.to_string()
+            }
         })
         .collect();
     parts.join(":")
@@ -273,10 +305,30 @@ mod tests {
 
     fn rows() -> Vec<DeviceRow> {
         vec![
-            DeviceRow { ordinal: 0, name: "NVIDIA GeForce RTX 3090 Ti".into(), bdf: "0000:41:00.0".into(), uuid: "GPU-aaaa".into() },
-            DeviceRow { ordinal: 1, name: "NVIDIA GeForce RTX 3090 Ti".into(), bdf: "0000:42:00.0".into(), uuid: "GPU-bbbb".into() },
-            DeviceRow { ordinal: 2, name: "NVIDIA GeForce RTX 3080".into(), bdf: "0000:01:00.0".into(), uuid: "GPU-cccc".into() },
-            DeviceRow { ordinal: 3, name: "NVIDIA GeForce RTX 3080".into(), bdf: "0000:c1:00.0".into(), uuid: "GPU-dddd".into() },
+            DeviceRow {
+                ordinal: 0,
+                name: "NVIDIA GeForce RTX 3090 Ti".into(),
+                bdf: "0000:41:00.0".into(),
+                uuid: "GPU-aaaa".into(),
+            },
+            DeviceRow {
+                ordinal: 1,
+                name: "NVIDIA GeForce RTX 3090 Ti".into(),
+                bdf: "0000:42:00.0".into(),
+                uuid: "GPU-bbbb".into(),
+            },
+            DeviceRow {
+                ordinal: 2,
+                name: "NVIDIA GeForce RTX 3080".into(),
+                bdf: "0000:01:00.0".into(),
+                uuid: "GPU-cccc".into(),
+            },
+            DeviceRow {
+                ordinal: 3,
+                name: "NVIDIA GeForce RTX 3080".into(),
+                bdf: "0000:c1:00.0".into(),
+                uuid: "GPU-dddd".into(),
+            },
         ]
     }
 
@@ -294,7 +346,10 @@ mod tests {
     fn bdf_forms_are_equivalent() {
         let r = rows();
         for q in ["0000:42:00.0", "42:00.0", "42:0.0", "42:00", "42.0"] {
-            let s = DeviceSpec { bdf: Some(q.into()), ..Default::default() };
+            let s = DeviceSpec {
+                bdf: Some(q.into()),
+                ..Default::default()
+            };
             let hit = s.select(&r);
             assert_eq!(hit.len(), 1, "{q} 应命中恰 1 台,得 {}", hit.len());
             assert_eq!(hit[0].ordinal, 1, "{q} 应命中 42:00 那台");
@@ -305,9 +360,15 @@ mod tests {
     #[test]
     fn find_name_substring_multi_hit() {
         let r = rows();
-        let s = DeviceSpec { find_name: Some("3090".into()), ..Default::default() };
+        let s = DeviceSpec {
+            find_name: Some("3090".into()),
+            ..Default::default()
+        };
         assert_eq!(s.select(&r).len(), 2);
-        let s2 = DeviceSpec { find_name: Some("rtx 3080".into()), ..Default::default() };
+        let s2 = DeviceSpec {
+            find_name: Some("rtx 3080".into()),
+            ..Default::default()
+        };
         assert_eq!(s2.select(&r).len(), 2, "大小写不敏感");
     }
 
@@ -315,14 +376,25 @@ mod tests {
     #[test]
     fn fields_are_conjunctive() {
         let r = rows();
-        let s = DeviceSpec { find_name: Some("3090".into()), bdf: Some("42:00.0".into()), ..Default::default() };
+        let s = DeviceSpec {
+            find_name: Some("3090".into()),
+            bdf: Some("42:00.0".into()),
+            ..Default::default()
+        };
         let hit = s.select(&r);
         assert_eq!(hit.len(), 1);
         assert_eq!(hit[0].uuid, "GPU-bbbb");
-        let s2 = DeviceSpec { uuid: Some("gpu-CCCC".into()), ..Default::default() };
+        let s2 = DeviceSpec {
+            uuid: Some("gpu-CCCC".into()),
+            ..Default::default()
+        };
         assert_eq!(s2.select(&r)[0].ordinal, 2);
         // 交集为空 ⇒ 零命中(上层响亮拒绝)
-        let s3 = DeviceSpec { find_name: Some("3080".into()), uuid: Some("GPU-aaaa".into()), ..Default::default() };
+        let s3 = DeviceSpec {
+            find_name: Some("3080".into()),
+            uuid: Some("GPU-aaaa".into()),
+            ..Default::default()
+        };
         assert!(s3.select(&r).is_empty());
     }
 
@@ -331,17 +403,33 @@ mod tests {
     fn uuid_display_norm_roundtrip() {
         // 合成 UUID(**非**真实卡):01234567-89ab-cdef-0123-456789abcdef
         let bytes: [u8; 16] = [
-            0x01, 0x23, 0x45, 0x67, 0x89, 0xab, 0xcd, 0xef, 0x01, 0x23, 0x45, 0x67, 0x89, 0xab, 0xcd,
-            0xef,
+            0x01, 0x23, 0x45, 0x67, 0x89, 0xab, 0xcd, 0xef, 0x01, 0x23, 0x45, 0x67, 0x89, 0xab,
+            0xcd, 0xef,
         ];
         let disp = uuid_display(&bytes);
         assert_eq!(disp, "GPU-01234567-89ab-cdef-0123-456789abcdef");
-        let row = DeviceRow { ordinal: 2, name: "RTX 3090 Ti".into(), bdf: "0000:42:00.0".into(), uuid: disp.clone() };
-        for q in [disp.clone(), disp.to_uppercase(), disp.replace('-', ""), "01234567-89ab-cdef-0123-456789abcdef".into()] {
-            let s = DeviceSpec { uuid: Some(q.clone()), ..Default::default() };
+        let row = DeviceRow {
+            ordinal: 2,
+            name: "RTX 3090 Ti".into(),
+            bdf: "0000:42:00.0".into(),
+            uuid: disp.clone(),
+        };
+        for q in [
+            disp.clone(),
+            disp.to_uppercase(),
+            disp.replace('-', ""),
+            "01234567-89ab-cdef-0123-456789abcdef".into(),
+        ] {
+            let s = DeviceSpec {
+                uuid: Some(q.clone()),
+                ..Default::default()
+            };
             assert!(s.matches(&row), "写法 {q:?} 应命中");
         }
-        let other = DeviceSpec { uuid: Some("GPU-00000000".into()), ..Default::default() };
+        let other = DeviceSpec {
+            uuid: Some("GPU-00000000".into()),
+            ..Default::default()
+        };
         assert!(!other.matches(&row));
     }
 
@@ -372,8 +460,16 @@ mod tests {
         let m = parse_nvidia_smi_bar1(text);
         assert_eq!(m.len(), 2, "两张卡各一条");
         // 键 = `bdf_norm` 规范形(驱动枚举与 nvidia-smi 两源同归一)
-        assert_eq!(m[&bdf_norm("00000000:41:00.0")], 32768 << 20, "3090 Ti = 32GiB");
-        assert_eq!(m[&bdf_norm("00000000:01:00.0")], 256 << 20, "3080 魔改 = 256MiB");
+        assert_eq!(
+            m[&bdf_norm("00000000:41:00.0")],
+            32768 << 20,
+            "3090 Ti = 32GiB"
+        );
+        assert_eq!(
+            m[&bdf_norm("00000000:01:00.0")],
+            256 << 20,
+            "3080 魔改 = 256MiB"
+        );
         // 两源可比(8 位 domain vs 4 位 domain;2026-10-17 K2 探测踩坑回归)
         assert_eq!(bdf_norm("00000000:41:00.0"), bdf_norm("0000:41:00.0"));
         assert!(parse_nvidia_smi_bar1("").is_empty());

@@ -38,7 +38,11 @@ pub(crate) fn apply(
         plan_restore: knobs.fi_plan_restore,
         cuda_graph: knobs.fi_cuda_graph,
         prefill_shadow: knobs.prefill_shadow,
-        prefill_shadow_cap: if knobs.prefill_shadow { max_context_length_tokens } else { 0 },
+        prefill_shadow_cap: if knobs.prefill_shadow {
+            max_context_length_tokens
+        } else {
+            0
+        },
         // 40/50 系原生 FP8 MMA：唯一判据 = **运行期 GPU 代际**（非编译 feature）。
         // 这里只负责把引擎的事实投影给族；选核名由 KernelPick 自己按 OpEnv 选。
         fp8_native: matches!(

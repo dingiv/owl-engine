@@ -55,8 +55,6 @@ impl Entry {
     }
 }
 
-
-
 impl SafeTensorsSource {
     /// **索引锁的唯一取用口**(2026-10-17 审查 §④ 档③:锁中毒 = 响亮拒)。
     ///
@@ -114,7 +112,10 @@ impl SafeTensorsSource {
                 },
             );
         }
-        Ok(Self { maps, index: Mutex::new(index) })
+        Ok(Self {
+            maps,
+            index: Mutex::new(index),
+        })
     }
 
     pub fn len(&self) -> Result<usize, ModelError> {
@@ -162,9 +163,8 @@ impl SafeTensorsSource {
                         }
                         safetensors::Dtype::BF16 => {
                             for (i, c) in src_slice.chunks_exact(2).enumerate() {
-                                dst_slice[i] = f32::from_bits(
-                                    (u16::from_le_bytes([c[0], c[1]]) as u32) << 16,
-                                );
+                                dst_slice[i] =
+                                    f32::from_bits((u16::from_le_bytes([c[0], c[1]]) as u32) << 16);
                             }
                         }
                         _ => {}
@@ -264,7 +264,8 @@ impl SafeTensorsSource {
                 }
                 safetensors::Dtype::BF16 => {
                     for (k, c2) in chunk.chunks_exact(2).enumerate() {
-                        v[i + k] = f32::from_bits((u16::from_le_bytes([c2[0], c2[1]]) as u32) << 16);
+                        v[i + k] =
+                            f32::from_bits((u16::from_le_bytes([c2[0], c2[1]]) as u32) << 16);
                     }
                 }
                 _ => return None,
@@ -330,7 +331,8 @@ impl WeightSource for SafeTensorsSource {
                 return Ok(None);
             }
             let esz = d1.size_bytes();
-            let (Some(want), Some(end)) = (len.checked_mul(esz), offset_elems.checked_add(len)) else {
+            let (Some(want), Some(end)) = (len.checked_mul(esz), offset_elems.checked_add(len))
+            else {
                 return Ok(None);
             };
             if dst.len() < want || end > n1 + n2 {
@@ -510,11 +512,23 @@ impl WeightSource for SafeTensorsSource {
             let head_elems = n1 - offset_elems;
             let head_bytes = head_elems * out_esz;
             // 两半均须已写(任一 `Ok(None)` = 子键不支持 ⇒ 整体回退)
-            let h = self.convert_chunk_into_bytes(&k1, offset_elems, head_elems, &mut dst[..head_bytes], dtype)?;
+            let h = self.convert_chunk_into_bytes(
+                &k1,
+                offset_elems,
+                head_elems,
+                &mut dst[..head_bytes],
+                dtype,
+            )?;
             if h.is_none() {
                 return Ok(None);
             }
-            return self.convert_chunk_into_bytes(&k2, 0, len - head_elems, &mut dst[head_bytes..], dtype);
+            return self.convert_chunk_into_bytes(
+                &k2,
+                0,
+                len - head_elems,
+                &mut dst[head_bytes..],
+                dtype,
+            );
         }
         let Some(e) = self.idx()?.get(key).cloned() else {
             owl_shared::log_info!("st", "[DIAG] 索引未命中: {key}");
@@ -522,7 +536,9 @@ impl WeightSource for SafeTensorsSource {
         };
         let esz = e.esz();
         if (offset_elems + len) * esz > e.nbytes {
-            owl_shared::log_info!("st", "[DIAG] OOB: {key} off{offset_elems} len{len} esz{esz} nbytes{}",
+            owl_shared::log_info!(
+                "st",
+                "[DIAG] OOB: {key} off{offset_elems} len{len} esz{esz} nbytes{}",
                 e.nbytes
             );
             return Ok(None);
@@ -695,7 +711,12 @@ mod tests {
             let s = SafeTensorsSource::open_dir(&dir).expect("开箱");
             let mut dst = vec![0u8; 4 * Dtype::F16.size_bytes()];
             let got = crate::module::WeightSource::convert_chunk_into_bytes(
-                &s, "w.weight", 0, 4, &mut dst, Dtype::F16,
+                &s,
+                "w.weight",
+                0,
+                4,
+                &mut dst,
+                Dtype::F16,
             )
             .expect("源");
             assert!(got.is_some(), "pad={pad}:(F32 → F16) 必须可达");

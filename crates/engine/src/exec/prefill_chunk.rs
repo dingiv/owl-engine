@@ -1,9 +1,9 @@
 //! 块式 prefill(树根装配与执行;taps/encode/BISECT 取证)
-use crate::spec_runtime::DraftHead as _;
 use super::*;
 use crate::engine::EngineKnobs;
 use crate::running::StepProbes;
 use crate::session::SessionBank;
+use crate::spec_runtime::DraftHead as _;
 use owl_iface::contract::ModelError;
 
 // ============================================================================
@@ -157,9 +157,8 @@ impl ChunkTables {
         past: Option<(&[u32], usize)>,
         positions: Option<&[[i32; 3]]>,
     ) -> Result<Self> {
-        let seq = |start: usize, n: usize| -> Vec<f32> {
-            (0..n).map(|i| (start + i) as f32).collect()
-        };
+        let seq =
+            |start: usize, n: usize| -> Vec<f32> { (0..n).map(|i| (start + i) as f32).collect() };
         let slots = if paged {
             (base..base + t)
                 .map(|pos| {
@@ -192,7 +191,11 @@ impl ChunkTables {
         // ⚠️ **传 `base_for_len`(视图等效偏移),不是 `base`** —— 子集档下两者差
         // `base − recall_pos`(随 ctx 增长);传错的后果 = 注意力窗口 = 全 ctx
         // (O(ctx)/chunk ⇒ 总 O(ctx²))+ 末页读越界(2026-10-19 定谳)。
-        let fi = if fi_face { Some(fi_tables_view(base_for_len, t, &tbl, page)?) } else { None };
+        let fi = if fi_face {
+            Some(fi_tables_view(base_for_len, t, &tbl, page)?)
+        } else {
+            None
+        };
         // **视图账逐 chunk 取证**(2026-10-28;`--log-level debug` 可见):
         // 稀疏 prefill 的硬塌(collapse)要逐 chunk diff 才能定位 —— 一行里把
         // "链长 vs 记账长度 vs FI 四件套 vs 本 chunk 写入槽"全摆出来。
@@ -222,7 +225,9 @@ impl ChunkTables {
                     if p.len() < base + t {
                         return Err(ModelError::Msg(format!(
                             "ChunkTables: 位置表 {} 短于 [{}..{})",
-                            p.len(), base, base + t
+                            p.len(),
+                            base,
+                            base + t
                         )));
                     }
                     // `ChunkTables.pos` 是**标量 rope 槽**(长度 t);m-RoPE
@@ -341,7 +346,10 @@ impl<D: DeviceClient> crate::engine::RankDev<D> {
             token = f32::from_le_bytes(buf) as u32;
         }
         face.free(&[tail.tok.id]).await?;
-        Ok(PrefillHarvested { token, seed_hidden: tail.seed_hidden })
+        Ok(PrefillHarvested {
+            token,
+            seed_hidden: tail.seed_hidden,
+        })
     }
 
     /// **prefill 入队半**(S4 ⑤-K3 分相):除末块 token 回读外**零同步**
@@ -385,7 +393,9 @@ impl<D: DeviceClient> crate::engine::RankDev<D> {
             &bt_chain,
             gdn_slot_v,
             self.pool.geom.fi_face,
-            past_view.as_ref().map(|(pages, tokens)| (pages.as_slice(), *tokens)),
+            past_view
+                .as_ref()
+                .map(|(pages, tokens)| (pages.as_slice(), *tokens)),
             Some(host.positions),
         )?;
         // **B-3e-2 第 3 项**:子集档 ⇒ 把本 chunk 的"过去表"写进池里的视图块,
@@ -440,8 +450,12 @@ impl<D: DeviceClient> crate::engine::RankDev<D> {
             // 单条批量命令 + 回执即落地 = 无跨流竞态)
             let face = self.graphs.session.face_mut();
             fi_leaves = self.pool.write_fi_tables(face, ft).await?;
-            let (kcs, vcs): (Vec<TensorOps>, Vec<TensorOps>) =
-                self.pool.kv_fi_leaves().iter().map(|(k, v)| (k.clone(), v.clone())).unzip();
+            let (kcs, vcs): (Vec<TensorOps>, Vec<TensorOps>) = self
+                .pool
+                .kv_fi_leaves()
+                .iter()
+                .map(|(k, v)| (k.clone(), v.clone()))
+                .unzip();
             fi_kv = (kcs, vcs);
             Some(FiPrefillCtx {
                 kcs: &fi_kv.0,
@@ -472,11 +486,19 @@ impl<D: DeviceClient> crate::engine::RankDev<D> {
             && (base + t).is_multiple_of(self.pool.geom.page))
         .then(|| crate::exec::coverage::QSink::new(Vec::new()));
         let mut ctx = ForwardCtx::model_prefill(
-            t, &ci.pos_t, &ci.kvs_step, &self.boot.rope, &ci.gdns_step, &ci.slots_leaf, &ci.lens_leaf, &ci.gdn_slot,
+            t,
+            &ci.pos_t,
+            &ci.kvs_step,
+            &self.boot.rope,
+            &ci.gdns_step,
+            &ci.slots_leaf,
+            &ci.lens_leaf,
+            &ci.gdn_slot,
             // A13(2026-10-14):chunked/scalar 臂的 rec 态寻址吃这个 host 标量
             // —— 必须喂本会话真槽(曾恒 0 = 读写别人格 → 长 prompt 塌陷)
             Some(gdn_slot_v),
-            base, fi,
+            base,
+            fi,
         );
         // W4A8 prefill 固定 M tile：Marlin 的 `parallel` 随批 M 变，同一 token
         // 的 K 归约顺序会漂。固定 512 后 1024/2048 由 host 拆成 512 段，
@@ -523,9 +545,7 @@ impl<D: DeviceClient> crate::engine::RankDev<D> {
         let gdn_tbl = {
             let face = self.graphs.session.face_mut();
             let nt = t.div_ceil(owl_models::kernel::GDN_BT).max(1);
-            self.pool
-                .write_gdn_tables(face, t, nt)
-                .await?
+            self.pool.write_gdn_tables(face, t, nt).await?
         };
         let gdn_tables = gdn_tbl.as_ref().map(|g| owl_models::module::GdnTableSlot {
             table: &g.leaf,
@@ -569,8 +589,11 @@ impl<D: DeviceClient> crate::engine::RankDev<D> {
             // DFlash2:同树多根(hidden + 5 taps;CSE 共享前向零额外计算)。
             // 树根 = concat(hidden, taps)(单根 scoped eval 竞技场回收照旧;
             // 块内切片消费 —— SliceView 作根丢偏移,故不走多根 plain eval)
-        let (hidden_full, prefill_taps) = if self.spec_rt.dflash_tap_count > 0 {
-                let (h, tp) = self.boot.model.tapped_hidden(&ci.ids_t, &ctx, &self.spec_rt.dflash_tap_ids);
+            let (hidden_full, prefill_taps) = if self.spec_rt.dflash_tap_count > 0 {
+                let (h, tp) =
+                    self.boot
+                        .model
+                        .tapped_hidden(&ci.ids_t, &ctx, &self.spec_rt.dflash_tap_ids);
                 let mut c = TensorOps::call(owl_models::ops::SemanticKernel::Concat).arg(&h);
                 for t in &tp {
                     c = c.arg(t);
@@ -643,7 +666,8 @@ impl<D: DeviceClient> crate::engine::RankDev<D> {
                         })
                         .collect();
                     let t_de = std::time::Instant::now();
-                    self.prefill_dflash_encode(host.probes, &tap_views, base, host.gdn_slot).await?;
+                    self.prefill_dflash_encode(host.probes, &tap_views, base, host.gdn_slot)
+                        .await?;
                     mrec("dflash.encode", t_de.elapsed());
                     // 探针:concat 父块整块落盘(python 对拍 taps;真块 dtoh)
                     if host.probes.dflash_probe && !self.spec_rt.mem_dumped2 {
@@ -662,7 +686,12 @@ impl<D: DeviceClient> crate::engine::RankDev<D> {
                             "concat 父块落盘 /tmp/owl_dflash_root.bin t={t}"
                         );
                     }
-                    owl_shared::log_debug!("dflash", "prefill encode {t} rows @{} {:?}", base, ts.elapsed());
+                    owl_shared::log_debug!(
+                        "dflash",
+                        "prefill encode {t} rows @{} {:?}",
+                        base,
+                        ts.elapsed()
+                    );
                 }
             }
             let hview = TensorOps::of_block(hfb.id, d.dtype, vec![t, d_model]);
@@ -695,7 +724,10 @@ impl<D: DeviceClient> crate::engine::RankDev<D> {
                     let mut lbuf2 = vec![0u8; vocab * 2];
                     face.dtoh(&lb2, &mut lbuf2).await?;
                     let same_inproc = lbuf == lbuf2;
-                    owl_shared::log_debug!("pf-probe", "boot{bs_seq} 同boot两次lm_head一致={same_inproc}");
+                    owl_shared::log_debug!(
+                        "pf-probe",
+                        "boot{bs_seq} 同boot两次lm_head一致={same_inproc}"
+                    );
                     let mut top: Vec<(f32, u32)> = lbuf
                         .chunks_exact(2)
                         .enumerate()
@@ -713,11 +745,15 @@ impl<D: DeviceClient> crate::engine::RankDev<D> {
                             line!(),
                         );
                     });
-                    owl_shared::log_debug!("pf-probe", "boot{} argmax(top2)={} gap={:.5} top=({} {:.4}) ({:.4})",
+                    owl_shared::log_debug!(
+                        "pf-probe",
+                        "boot{} argmax(top2)={} gap={:.5} top=({} {:.4}) ({:.4})",
                         bs_seq,
                         top[0].1,
                         top[0].0 - top[1].0,
-                        top[0].1, top[0].0, top[1].0
+                        top[0].1,
+                        top[0].0,
+                        top[1].0
                     );
                 }
                 // 两根**一次**求值(顺序 = [logits, token]):logits 根必须拿到
@@ -756,13 +792,21 @@ impl<D: DeviceClient> crate::engine::RankDev<D> {
                     }
                 }
             }
-            if self.spec_rt.drafter.as_ref().map(|d| d.as_mtp().is_some()).unwrap_or(false) && t > 1 {
+            if self
+                .spec_rt
+                .drafter
+                .as_ref()
+                .map(|d| d.as_mtp().is_some())
+                .unwrap_or(false)
+                && t > 1
+            {
                 // prefill extend(E5-M5):本 chunk 行 0..T-1 的 mtp KV
                 // (行 T-1 的配对需下一 chunk 首 token,由其 extend 补;
                 // 末位 P-1 由首轮 propose_first 的 extend 行补)
                 let sid = host.sid;
                 let bank = host.bank_mut()?;
-                self.prefill_extend(bank, sid, &hfb, t - 1, ids, base).await?;
+                self.prefill_extend(bank, sid, &hfb, t - 1, ids, base)
+                    .await?;
             }
             // S4 ⑤-K3 分相:**末块 token 回读移出本函数**(收割半 `prefill_harvest`)
             // —— 入队半必须零同步(TP 镜像块契约:对端 stage 未入队时读数 = AR 死锁)。
@@ -786,7 +830,10 @@ impl<D: DeviceClient> crate::engine::RankDev<D> {
             // B7(2026-10-15):末块也记 `prefill.chunk`(中间块/桶路都有;此处缺行
             // 会让图表按"chunk 数"口径对不上)
             mrec("prefill.chunk", t_chunk.elapsed());
-            Ok(Some(PrefillTail { tok: b, seed_hidden: seed_keep }))
+            Ok(Some(PrefillTail {
+                tok: b,
+                seed_hidden: seed_keep,
+            }))
         } else {
             // 中间块:last_hidden 根(状态推进完整;lm_head 免算)。
             // DFlash2:同构 concat 单根(taps 随块回收前切片 encode)
@@ -800,8 +847,7 @@ impl<D: DeviceClient> crate::engine::RankDev<D> {
                 // fused_add_rmsnorm 原地路）；只额外克隆 l0..l4。单根
                 // concat 求值，避免多 root 改变批/发射边界。
                 let tap_ids = [0usize, 1, 2, 3, 4, 7, 15, 31, 47, 63];
-                let (hidden, taps) =
-                    self.boot.model.last_hidden_taps(&ci.ids_t, &ctx, &tap_ids);
+                let (hidden, taps) = self.boot.model.last_hidden_taps(&ci.ids_t, &ctx, &tap_ids);
                 let mut all: Vec<&TensorOps> = Vec::with_capacity(taps.len() + 1);
                 all.push(&hidden);
                 all.extend(taps.iter());
@@ -828,8 +874,7 @@ impl<D: DeviceClient> crate::engine::RankDev<D> {
                     }
                     for (i, tap) in tap_ids.iter().enumerate() {
                         // 行序 = [hidden, l0, l1, l2, l3, l4]
-                        let start = (i + 1) * t * d.hidden * esz
-                            + local_row * d.hidden * esz;
+                        let start = (i + 1) * t * d.hidden * esz + local_row * d.hidden * esz;
                         let row = &buf[start..start + d.hidden * esz];
                         let (fnv, rms, mx) = row_stats(row, d.dtype);
                         owl_shared::log_info!(
@@ -867,7 +912,10 @@ impl<D: DeviceClient> crate::engine::RankDev<D> {
                 let tree = TensorOps::of_block(b.id, d.dtype, vec![n * t, d.hidden]);
                 (tree, None)
             } else if self.spec_rt.dflash_tap_count > 0 {
-                let (h, tp) = self.boot.model.tapped_hidden(&ci.ids_t, &ctx, &self.spec_rt.dflash_tap_ids);
+                let (h, tp) =
+                    self.boot
+                        .model
+                        .tapped_hidden(&ci.ids_t, &ctx, &self.spec_rt.dflash_tap_ids);
                 let mut c = TensorOps::call(owl_models::ops::SemanticKernel::Concat).arg(&h);
                 for tt in &tp {
                     c = c.arg(tt);
@@ -914,7 +962,11 @@ impl<D: DeviceClient> crate::engine::RankDev<D> {
                 // hidden,taps 同块后随)—— dtoh 整父块契约必须等大读
                 // (曾用 t·hidden → 多 chunk DFlash2 首跑即炸;MTP 无 taps
                 // 时 n_tp=0 同式兼容)
-                let rows_b = if let Some(tp) = &prefill_taps { tp.0.len() + 1 } else { 1 } * t;
+                let rows_b = if let Some(tp) = &prefill_taps {
+                    tp.0.len() + 1
+                } else {
+                    1
+                } * t;
                 // 勘误(2026-10-27):原 `prefill_cksum` 探针已退役 —— 那段
                 // 无条件 dtoh 在 2026-10-17 已收进门内,现在整段去掉(零回读)。
                 let _ = (&face, rows_b, esz);
@@ -949,10 +1001,18 @@ impl<D: DeviceClient> crate::engine::RankDev<D> {
                             })
                             .collect();
                         let t_de = std::time::Instant::now();
-                        self.prefill_dflash_encode(host.probes, &tap_views, base, host.gdn_slot).await?;
+                        self.prefill_dflash_encode(host.probes, &tap_views, base, host.gdn_slot)
+                            .await?;
                         mrec("dflash.encode", t_de.elapsed());
                     }
-                } else if self.spec_rt.drafter.as_ref().map(|d| d.as_mtp().is_some()).unwrap_or(false) && t > 1 {
+                } else if self
+                    .spec_rt
+                    .drafter
+                    .as_ref()
+                    .map(|d| d.as_mtp().is_some())
+                    .unwrap_or(false)
+                    && t > 1
+                {
                     let ts = std::time::Instant::now();
                     let sid = host.sid;
                     let bank = host.bank_mut()?;
@@ -1019,7 +1079,11 @@ fn row_stats(raw: &[u8], dt: Dtype) -> (u64, f32, f32) {
         mx = mx.max(v.abs());
         n += 1;
     }
-    let rms = if n == 0 { 0.0 } else { (sum / n as f64).sqrt() as f32 };
+    let rms = if n == 0 {
+        0.0
+    } else {
+        (sum / n as f64).sqrt() as f32
+    };
     (fnv1a64(raw), rms, mx)
 }
 
@@ -1039,23 +1103,21 @@ fn live_diag_end(on: bool, base: usize, t: usize) {
     owl_shared::log_debug!(
         "live-diag",
         "chunk@{base} t={t}:影子 arena 高水位 = {} MiB",
-peak >> 20
+        peak >> 20
     );
     let rep = owl_shared::slab_hint::take_probe_report();
     if !rep.is_empty() {
-        owl_shared::log_debug!(
-            "live-diag",
-            "峰值构成:{rep}");
+        owl_shared::log_debug!("live-diag", "峰值构成:{rep}");
     }
     owl_shared::log_debug!(
         "live-diag",
         "回收出口:{}",
-owl_shared::slab_hint::live_diag::take_report()
+        owl_shared::slab_hint::live_diag::take_report()
     );
     owl_shared::log_debug!(
         "live-diag",
         "引用计数推送 {} 次",
-owl_shared::slab_hint::refs_pushed()
+        owl_shared::slab_hint::refs_pushed()
     );
 }
 

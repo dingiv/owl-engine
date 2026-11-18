@@ -43,8 +43,7 @@ rep_penalty = 1.00
 # 显式钉死显存预算：全部给 KV 池
 vram_budget = 1.0
 vram_activation_reserve = 970
-ram_pool_size = 10240
-snap_host_mb = 3072
+ram_pool_size = 13312
 
 [store.gdn]
 snap_max = 2

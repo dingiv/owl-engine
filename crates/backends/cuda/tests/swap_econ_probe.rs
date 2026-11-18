@@ -118,14 +118,26 @@ fn pieces(block: u64, total: usize, n: usize) -> Vec<SwapPiece> {
     let mut conn = 0usize;
     for i in 0..n {
         let len = if i + 1 == n { total - dev } else { per };
-        out.push(SwapPiece { block, dev_off: dev, conn_off: conn, len, slot: ConnSlot(0) });
+        out.push(SwapPiece {
+            block,
+            dev_off: dev,
+            conn_off: conn,
+            len,
+            slot: ConnSlot(0),
+        });
         dev += len;
         conn += len;
     }
     out
 }
 
-async fn swap_out_once(client: &mut GpuClient, block: u64, total: usize, n: usize, host: Vec<u8>) -> (f64, Vec<u8>) {
+async fn swap_out_once(
+    client: &mut GpuClient,
+    block: u64,
+    total: usize,
+    n: usize,
+    host: Vec<u8>,
+) -> (f64, Vec<u8>) {
     let conn = VecConn { slots: vec![host] };
     let t0 = Instant::now();
     let conn = client
@@ -152,7 +164,10 @@ async fn swap_econ() {
         .expect("alloc 159MiB");
     // 先写一遍(经 pinned 租约,顺带预热 staging 池)
     for i in 0..(SNAP_BYTES / (1 << 20)) {
-        let mut lease = client.alloc_pinned(1 << 20, "econ:warm").await.expect("pinned");
+        let mut lease = client
+            .alloc_pinned(1 << 20, "econ:warm")
+            .await
+            .expect("pinned");
         lease.slice_bytes_mut()[..1 << 20].fill((i % 251) as u8);
         client
             .upload_pinned(lease, &blk, i << 20, 1 << 20)
@@ -179,7 +194,11 @@ async fn swap_econ() {
         let conn = NullConn { seen: 0 };
         let t0 = Instant::now();
         let conn = client
-            .swap(SwapDir::Out, &pieces(blk.id, SNAP_BYTES, N_PIECES_REAL), Box::new(conn))
+            .swap(
+                SwapDir::Out,
+                &pieces(blk.id, SNAP_BYTES, N_PIECES_REAL),
+                Box::new(conn),
+            )
             .await
             .expect("swap out(null)");
         let dt = t0.elapsed().as_secs_f64() * 1e3;
@@ -191,7 +210,14 @@ async fn swap_econ() {
     }
     // ①c 对照:同 192 片 → THP 宿主块(与生产 HostBlock 同形)
     for round in 0..2 {
-        let (dt, _) = swap_out_once(&mut client, blk.id, SNAP_BYTES, N_PIECES_REAL, host_block(SNAP_BYTES, true)).await;
+        let (dt, _) = swap_out_once(
+            &mut client,
+            blk.id,
+            SNAP_BYTES,
+            N_PIECES_REAL,
+            host_block(SNAP_BYTES, true),
+        )
+        .await;
         eprintln!("[swap-econ] 192 片 Out → 宿主块(THP 冷写)round{round} = {dt:8.1} ms");
     }
 

@@ -37,10 +37,7 @@ impl ChatFormat {
     pub fn render_chat(&self, msgs: &[(&str, &str)], thinking: bool) -> String {
         let mut out = String::new();
         for (role, text) in msgs {
-            out += &format!(
-                "{}{}\n{text}{}\n",
-                self.im_open, role, self.im_close
-            );
+            out += &format!("{}{}\n{text}{}\n", self.im_open, role, self.im_close);
         }
         out += &self.assistant_open;
         if !thinking {
@@ -75,12 +72,12 @@ impl Tokenizer {
     /// 与 [`from_spec`](Self::from_spec) 的差别**只在 eos 来源**:HF 盘上给的是
     /// **名**(`eos_tokens` ⇒ 查表得 id),GGUF 盘上直接给 **id**
     /// (`tokenizer.ggml.eos_token_id`)—— 同一条事实的两个来源,不重复解析。
-    pub fn from_parts(
-        inner: tokenizers::Tokenizer,
-        eos_ids: Vec<u32>,
-        fmt: ChatFormat,
-    ) -> Self {
-        Self { inner, eos_ids, fmt }
+    pub fn from_parts(inner: tokenizers::Tokenizer, eos_ids: Vec<u32>, fmt: ChatFormat) -> Self {
+        Self {
+            inner,
+            eos_ids,
+            fmt,
+        }
     }
 
     /// 从模型快照目录加载(tokenizer.json 必在)+ 按 spec 注入家族事实
@@ -93,7 +90,11 @@ impl Tokenizer {
             .iter()
             .filter_map(|t| inner.token_to_id(t))
             .collect();
-        Ok(Self { inner, eos_ids, fmt: spec.chat.clone() })
+        Ok(Self {
+            inner,
+            eos_ids,
+            fmt: spec.chat.clone(),
+        })
     }
 
     /// 文本 → token id(不自动加特殊 token;调用方经 chat_wrap 拼模板)

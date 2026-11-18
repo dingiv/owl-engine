@@ -51,8 +51,11 @@ fn compile(ctx: &Arc<CudaContext>, src: &str, name: &str) -> cudarc::driver::Cud
         },
     )
     .unwrap_or_else(|e| panic!("nvrtc({name}): {e:?}"));
-    let m = ctx.load_module(ptx).unwrap_or_else(|e| panic!("module({name}): {e:?}"));
-    m.load_function(name).unwrap_or_else(|e| panic!("fn({name}): {e:?}"))
+    let m = ctx
+        .load_module(ptx)
+        .unwrap_or_else(|e| panic!("module({name}): {e:?}"));
+    m.load_function(name)
+        .unwrap_or_else(|e| panic!("fn({name}): {e:?}"))
 }
 
 fn deterministic_slots() -> [f32; T] {
@@ -118,7 +121,11 @@ fn reshape_and_cache_knhd_parity() {
                 .arg(&xt)
                 .arg(&op);
             unsafe {
-                b.launch(LaunchConfig { grid_dim: (T as u32, 1, 1), block_dim: (256, 1, 1), shared_mem_bytes: 0 })
+                b.launch(LaunchConfig {
+                    grid_dim: (T as u32, 1, 1),
+                    block_dim: (256, 1, 1),
+                    shared_mem_bytes: 0,
+                })
             }
             .unwrap();
             stream.synchronize().unwrap();
@@ -130,11 +137,13 @@ fn reshape_and_cache_knhd_parity() {
         };
         let (kc_c, vc_c) = run(
             "vllm_reshape_and_cache_f16",
-            owl_kernels::cu_sig::cu_text(owl_kernels::ops::source("vllm_reshape_and_cache_bf16")).as_str(),
+            owl_kernels::cu_sig::cu_text(owl_kernels::ops::source("vllm_reshape_and_cache_bf16"))
+                .as_str(),
         );
         let (kc_n, vc_n) = run(
             "vllm_reshape_and_cache_f16_knhd",
-            owl_kernels::cu_sig::cu_text(owl_kernels::ops::source("vllm_reshape_and_cache_bf16")).as_str(),
+            owl_kernels::cu_sig::cu_text(owl_kernels::ops::source("vllm_reshape_and_cache_bf16"))
+                .as_str(),
         );
         for &slot in &slots {
             if slot < 0.0 {
@@ -160,7 +169,10 @@ fn reshape_and_cache_knhd_parity() {
         let run = |name: &str| -> (Vec<u8>, Vec<u8>) {
             let f = compile(
                 &ctx,
-                owl_kernels::cu_sig::cu_text(owl_kernels::ops::source("owl_reshape_and_cache_fp8kv")).as_str(),
+                owl_kernels::cu_sig::cu_text(owl_kernels::ops::source(
+                    "owl_reshape_and_cache_fp8kv",
+                ))
+                .as_str(),
                 name,
             );
             let mut d_k = unsafe { stream.alloc::<u16>(key.len()) }.unwrap();
@@ -203,7 +215,11 @@ fn reshape_and_cache_knhd_parity() {
                 .arg(&xt)
                 .arg(&op);
             unsafe {
-                b.launch(LaunchConfig { grid_dim: (T as u32, 1, 1), block_dim: (256, 1, 1), shared_mem_bytes: 0 })
+                b.launch(LaunchConfig {
+                    grid_dim: (T as u32, 1, 1),
+                    block_dim: (256, 1, 1),
+                    shared_mem_bytes: 0,
+                })
             }
             .unwrap();
             stream.synchronize().unwrap();
@@ -247,7 +263,14 @@ fn reshape_and_cache_knhd_parity() {
             .map(|i| ((((i * 53 + 7) % 199) as f32 / 20.0 - 5.0).to_bits() >> 16) as u16)
             .collect();
         let run = |name: &str| -> (Vec<u16>, Vec<u16>) {
-            let f = compile(&ctx, owl_kernels::cu_sig::cu_text(owl_kernels::ops::source("vllm_reshape_and_cache_bf16")).as_str(), name);
+            let f = compile(
+                &ctx,
+                owl_kernels::cu_sig::cu_text(owl_kernels::ops::source(
+                    "vllm_reshape_and_cache_bf16",
+                ))
+                .as_str(),
+                name,
+            );
             let mut d_k = unsafe { stream.alloc::<u16>(key.len()) }.unwrap();
             stream.memcpy_htod(&key, &mut d_k).unwrap();
             let mut d_v = unsafe { stream.alloc::<u16>(value.len()) }.unwrap();
@@ -288,7 +311,11 @@ fn reshape_and_cache_knhd_parity() {
                 .arg(&xt)
                 .arg(&op);
             unsafe {
-                b.launch(LaunchConfig { grid_dim: (T as u32, 1, 1), block_dim: (256, 1, 1), shared_mem_bytes: 0 })
+                b.launch(LaunchConfig {
+                    grid_dim: (T as u32, 1, 1),
+                    block_dim: (256, 1, 1),
+                    shared_mem_bytes: 0,
+                })
             }
             .unwrap();
             stream.synchronize().unwrap();
@@ -323,7 +350,6 @@ fn reshape_and_cache_knhd_parity() {
         }
     }
 }
-
 
 /// 池 dtype I/O 统一面(macro 双型展开用)
 trait PoolIo: Copy {
@@ -364,13 +390,23 @@ fn fused_insert_knhd_parity() {
     let max_pos = 8usize;
 
     // 输入面:f16 位型确定性;q_raw [T, HQ·2HD](per-head [value|gate])
-    let q_raw: Vec<u16> = (0..T * HQ * 2 * HD).map(|i| deterministic_u16(i, 5)).collect();
+    let q_raw: Vec<u16> = (0..T * HQ * 2 * HD)
+        .map(|i| deterministic_u16(i, 5))
+        .collect();
     let k: Vec<u16> = (0..T * HKV * HD).map(|i| deterministic_u16(i, 6)).collect();
     let v: Vec<u16> = (0..T * HKV * HD).map(|i| deterministic_u16(i, 7)).collect();
-    let q_w: Vec<u16> = (0..HD).map(|i| half_bits(((i % 13) as f32) / 50.0)).collect();
-    let k_w: Vec<u16> = (0..HD).map(|i| half_bits(((i % 7) as f32) / 40.0)).collect();
-    let cos_t: Vec<u16> = (0..max_pos * HALF).map(|i| half_bits(((i % 17) as f32 / 17.0) * 2.0 - 1.0)).collect();
-    let sin_t: Vec<u16> = (0..max_pos * HALF).map(|i| half_bits(((i % 11) as f32 / 11.0) * 2.0 - 1.0)).collect();
+    let q_w: Vec<u16> = (0..HD)
+        .map(|i| half_bits(((i % 13) as f32) / 50.0))
+        .collect();
+    let k_w: Vec<u16> = (0..HD)
+        .map(|i| half_bits(((i % 7) as f32) / 40.0))
+        .collect();
+    let cos_t: Vec<u16> = (0..max_pos * HALF)
+        .map(|i| half_bits(((i % 17) as f32 / 17.0) * 2.0 - 1.0))
+        .collect();
+    let sin_t: Vec<u16> = (0..max_pos * HALF)
+        .map(|i| half_bits(((i % 11) as f32 / 11.0) * 2.0 - 1.0))
+        .collect();
     let pos: Vec<f32> = (0..T).map(|t| (t % max_pos) as f32).collect();
     let eps = 1e-6f32;
     let (hkv_i, half_i, page_i, w_off_i) = (HKV as i32, HALF as i32, PAGE as i32, 1i32);
@@ -455,12 +491,14 @@ fn fused_insert_knhd_parity() {
     // ---- f16 池 ----
     let (qo_c, kc_c, vc_c) = run!(
         "owl_qknorm_rope_kv_insert_f16",
-        owl_kernels::cu_sig::cu_text(owl_kernels::ops::source("owl_qknorm_rope_kv_insert_f16")).as_str(),
+        owl_kernels::cu_sig::cu_text(owl_kernels::ops::source("owl_qknorm_rope_kv_insert_f16"))
+            .as_str(),
         u16
     );
     let (qo_n, kc_n, vc_n) = run!(
         "owl_qknorm_rope_kv_insert_f16_knhd",
-        owl_kernels::cu_sig::cu_text(owl_kernels::ops::source("owl_qknorm_rope_kv_insert_f16")).as_str(),
+        owl_kernels::cu_sig::cu_text(owl_kernels::ops::source("owl_qknorm_rope_kv_insert_f16"))
+            .as_str(),
         u16
     );
     assert_eq!(qo_c, qo_n, "q_out f16 bitwise");
@@ -489,12 +527,18 @@ fn fused_insert_knhd_parity() {
     // ---- fp8 池(e4m3 字节)----
     let (qo_c, kc_c, vc_c) = run!(
         "owl_qknorm_rope_kv_insert_f16_fp8kv",
-        owl_kernels::cu_sig::cu_text(owl_kernels::ops::source("owl_qknorm_rope_kv_insert_f16_fp8kv")).as_str(),
+        owl_kernels::cu_sig::cu_text(owl_kernels::ops::source(
+            "owl_qknorm_rope_kv_insert_f16_fp8kv"
+        ))
+        .as_str(),
         u8
     );
     let (qo_n, kc_n, vc_n) = run!(
         "owl_qknorm_rope_kv_insert_f16_fp8kv_knhd",
-        owl_kernels::cu_sig::cu_text(owl_kernels::ops::source("owl_qknorm_rope_kv_insert_f16_fp8kv")).as_str(),
+        owl_kernels::cu_sig::cu_text(owl_kernels::ops::source(
+            "owl_qknorm_rope_kv_insert_f16_fp8kv"
+        ))
+        .as_str(),
         u8
     );
     assert_eq!(qo_c, qo_n, "q_out fp8kv bitwise");

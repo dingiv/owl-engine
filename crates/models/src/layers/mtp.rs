@@ -93,8 +93,18 @@ impl MtpPredictor {
             fc_e: Linear::new("fc_e", hidden, hidden, p.at(&fc_e_key, hidden, hidden)),
             fc_h: Linear::new("fc_h", hidden, hidden, p.at(&fc_h_key, hidden, hidden)),
             layer: DecoderLayer::new_full(hq, hkv, hd, hidden, inter, eps, p.at_layer(block)),
-            pre_fc_norm_hidden: RmsNorm::new_by_facts("pre_fc_norm_hidden", hidden, eps, SourceFacts::GGUF),
-            pre_fc_norm_embedding: RmsNorm::new_by_facts("pre_fc_norm_embedding", hidden, eps, SourceFacts::GGUF),
+            pre_fc_norm_hidden: RmsNorm::new_by_facts(
+                "pre_fc_norm_hidden",
+                hidden,
+                eps,
+                SourceFacts::GGUF,
+            ),
+            pre_fc_norm_embedding: RmsNorm::new_by_facts(
+                "pre_fc_norm_embedding",
+                hidden,
+                eps,
+                SourceFacts::GGUF,
+            ),
             norm: RmsNorm::new_by_facts("norm", hidden, eps, SourceFacts::GGUF),
             hidden,
             gguf_block: block,
@@ -273,7 +283,12 @@ impl MtpPredictor {
         assert_eq!(hiddens.shape[0], m1, "extend 行数 = token 数");
         // extend 批行(prefill 形;fi=None → paged/naive,MTP 层专用)
         let mut ctx = crate::module::ForwardCtx::attn_prefill(
-            m1, extend_pos, extend_kv, rope, extend_slots, extend_lens,
+            m1,
+            extend_pos,
+            extend_kv,
+            rope,
+            extend_slots,
+            extend_lens,
         );
         ctx.env = env;
         ctx.seq_cu = Some(seq_cu);
@@ -326,9 +341,7 @@ impl MtpPredictor {
         env: crate::env::EnvProvider,
     ) -> TensorOps {
         let t = hiddens.shape()[0];
-        let mut ctx = crate::module::ForwardCtx::attn_prefill(
-            t, pos, kv, rope, slots, lens,
-        );
+        let mut ctx = crate::module::ForwardCtx::attn_prefill(t, pos, kv, rope, slots, lens);
         ctx.env = env;
         ctx.seq_cu = Some(seq_cu);
         let emb = embed.embed(tokens, t);
@@ -384,9 +397,14 @@ mod tests {
         let mut src = crate::formats::awq::AwqSource::open_dir(dir).expect("源打开");
         let r16 = |x: f32| half::f16::from_f32(x).to_f32();
         let take = |src: &mut crate::formats::awq::AwqSource, k: &str| -> Vec<f32> {
-            src.take(k).expect("源").unwrap_or_else(|| panic!("键缺失 {k}"))
+            src.take(k)
+                .expect("源")
+                .unwrap_or_else(|| panic!("键缺失 {k}"))
         };
-        let w_fc = take(&mut src, "mtp.fc.weight").iter().map(|&x| r16(x)).collect::<Vec<_>>();
+        let w_fc = take(&mut src, "mtp.fc.weight")
+            .iter()
+            .map(|&x| r16(x))
+            .collect::<Vec<_>>();
         let w_pfh = take(&mut src, "mtp.pre_fc_norm_hidden.weight")
             .iter()
             .map(|&x| r16(x))
@@ -399,7 +417,9 @@ mod tests {
         let hidden = 5120usize;
         let eps = 1e-6f32;
         let gen = |n: usize, seed: f32| {
-            (0..n).map(|i| r16(((i as f32 + seed) * 0.17).sin() * 0.8)).collect::<Vec<f32>>()
+            (0..n)
+                .map(|i| r16(((i as f32 + seed) * 0.17).sin() * 0.8))
+                .collect::<Vec<f32>>()
         };
         let emb = gen(hidden, 7.0);
         let th = gen(hidden, 8.0);
@@ -407,7 +427,10 @@ mod tests {
         let host_norm = |x: &[f32], w: &[f32]| -> Vec<f32> {
             let mean = x.iter().map(|&v| v * v).sum::<f32>() / x.len() as f32;
             let inv = 1.0 / (mean + eps).sqrt();
-            x.iter().zip(w).map(|(&v, &g)| v * inv * (1.0 + g)).collect()
+            x.iter()
+                .zip(w)
+                .map(|(&v, &g)| v * inv * (1.0 + g))
+                .collect()
         };
         let e_n = host_norm(&emb, &w_pfe);
         let h_n = host_norm(&th, &w_pfh);
@@ -438,8 +461,7 @@ mod tests {
         assert_eq!(mtp.hidden(), hidden);
 
         // 键集断言:16 键全 mtp.* 且逐键符合结构(fc 列半拆 → fc_e/fc_h)
-        let mut keys: Vec<String> =
-            manifest.entries().iter().map(|e| e.key.clone()).collect();
+        let mut keys: Vec<String> = manifest.entries().iter().map(|e| e.key.clone()).collect();
         keys.sort();
         assert_eq!(keys.len(), 16, "MTP 头键数 {keys:?}");
         for k in &keys {
@@ -477,15 +499,17 @@ mod tests {
     }
 
     fn f16bytes(v: &[f32]) -> Vec<u8> {
-        v.iter().flat_map(|f| half::f16::from_f32(*f).to_le_bytes()).collect()
+        v.iter()
+            .flat_map(|f| half::f16::from_f32(*f).to_le_bytes())
+            .collect()
     }
 }
 
 #[cfg(test)]
 mod wiring_tests {
     use super::*;
-    use crate::tensor::Dtype;
     use crate::module::LoaderCtx;
+    use crate::tensor::Dtype;
     use crate::testkit::{f32b, gpu_client, gpu_enabled};
     use std::collections::HashMap;
 
@@ -499,13 +523,18 @@ mod wiring_tests {
             owl_shared::testkit::report::skip("OWL_TEST_DEVICE 未设");
             return;
         }
-        let (hidden, inter, hq, hkv, hd, vocab) = (32usize, 32usize, 2usize, 1usize, 16usize, 11usize);
+        let (hidden, inter, hq, hkv, hd, vocab) =
+            (32usize, 32usize, 2usize, 1usize, 16usize, 11usize);
         let eps = 1e-6f32;
         let gen = |n: usize, seed: f32| {
-            (0..n).map(|i| half::f16::from_f32(((i as f32 + seed) * 0.23).sin() * 0.7).to_f32()).collect::<Vec<f32>>()
+            (0..n)
+                .map(|i| half::f16::from_f32(((i as f32 + seed) * 0.23).sin() * 0.7).to_f32())
+                .collect::<Vec<f32>>()
         };
         let hb = |v: &[f32]| -> Vec<u8> {
-            v.iter().flat_map(|f| half::f16::from_f32(*f).to_le_bytes()).collect()
+            v.iter()
+                .flat_map(|f| half::f16::from_f32(*f).to_le_bytes())
+                .collect()
         };
 
         // 草稿头权重(mtp.* 键面;HashMap 源;fc 列半拆 = 两块 [h,h])
@@ -515,24 +544,56 @@ mod wiring_tests {
         for k in ["input_layernorm", "post_attention_layernorm"] {
             src.insert(format!("mtp.layers.0.{k}.weight"), gen(hidden, 2.0));
         }
-        src.insert("mtp.layers.0.self_attn.q_proj.weight".into(), gen(2 * hq * hd * hidden, 3.0));
-        src.insert("mtp.layers.0.self_attn.k_proj.weight".into(), gen(hkv * hd * hidden, 4.0));
-        src.insert("mtp.layers.0.self_attn.v_proj.weight".into(), gen(hkv * hd * hidden, 5.0));
-        src.insert("mtp.layers.0.self_attn.o_proj.weight".into(), gen(hidden * hq * hd, 6.0));
+        src.insert(
+            "mtp.layers.0.self_attn.q_proj.weight".into(),
+            gen(2 * hq * hd * hidden, 3.0),
+        );
+        src.insert(
+            "mtp.layers.0.self_attn.k_proj.weight".into(),
+            gen(hkv * hd * hidden, 4.0),
+        );
+        src.insert(
+            "mtp.layers.0.self_attn.v_proj.weight".into(),
+            gen(hkv * hd * hidden, 5.0),
+        );
+        src.insert(
+            "mtp.layers.0.self_attn.o_proj.weight".into(),
+            gen(hidden * hq * hd, 6.0),
+        );
         src.insert("mtp.layers.0.self_attn.q_norm.weight".into(), gen(hd, 7.0));
         src.insert("mtp.layers.0.self_attn.k_norm.weight".into(), gen(hd, 8.0));
-        src.insert("mtp.layers.0.mlp.gate_proj.weight".into(), gen(inter * hidden, 9.0));
-        src.insert("mtp.layers.0.mlp.up_proj.weight".into(), gen(inter * hidden, 10.0));
-        src.insert("mtp.layers.0.mlp.down_proj.weight".into(), gen(hidden * inter, 11.0));
+        src.insert(
+            "mtp.layers.0.mlp.gate_proj.weight".into(),
+            gen(inter * hidden, 9.0),
+        );
+        src.insert(
+            "mtp.layers.0.mlp.up_proj.weight".into(),
+            gen(inter * hidden, 10.0),
+        );
+        src.insert(
+            "mtp.layers.0.mlp.down_proj.weight".into(),
+            gen(hidden * inter, 11.0),
+        );
         src.insert("mtp.norm.weight".into(), gen(hidden, 12.0));
         src.insert("mtp.pre_fc_norm_hidden.weight".into(), gen(hidden, 13.0));
         src.insert("mtp.pre_fc_norm_embedding.weight".into(), gen(hidden, 14.0));
 
         let mut gpu = gpu_client().await;
-        let lctx = LoaderCtx { dtype: Dtype::F16, shard: 1, slice_id: 0, device_repack: false, verify: false, debug_tap: false, staging_mb: 128, dump: false };
+        let lctx = LoaderCtx {
+            dtype: Dtype::F16,
+            shard: 1,
+            slice_id: 0,
+            device_repack: false,
+            verify: false,
+            debug_tap: false,
+            staging_mb: 128,
+            dump: false,
+        };
 
         let mtp = MtpPredictor::new(hidden, inter, hq, hkv, hd, eps);
-        crate::interpreters::eval_load(&mtp, &mut gpu, &src, &lctx).await.expect("mtp 装载");
+        crate::interpreters::eval_load(&mtp, &mut gpu, &src, &lctx)
+            .await
+            .expect("mtp 装载");
 
         // 共享 embed/lm_head(tiny 独立方)
         let mut esrc: HashMap<String, Vec<f32>> = HashMap::new();
@@ -544,7 +605,9 @@ mod wiring_tests {
         }
         impl crate::module::Loadable for EmbWithHead<'_> {
             fn layout(&self, ctx: &LoaderCtx) -> crate::module::LoaderOps {
-                self.e.layout(ctx).chain(self.e.layout_lm_head(ctx).unwrap())
+                self.e
+                    .layout(ctx)
+                    .chain(self.e.layout_lm_head(ctx).unwrap())
             }
         }
         crate::interpreters::eval_load(&EmbWithHead { e: &embed }, &mut gpu, &esrc, &lctx)
@@ -552,22 +615,34 @@ mod wiring_tests {
             .expect("embed 装载");
 
         let rope = Rope::new(64, hd, 4, 10_000.0).expect("rope");
-        crate::interpreters::eval_load(&rope, &mut gpu, &rope.tables(), &lctx).await.expect("rope 表");
+        crate::interpreters::eval_load(&rope, &mut gpu, &rope.tables(), &lctx)
+            .await
+            .expect("rope 表");
 
         // mtp 链 KV(paged;page 32 x 8;nb=1 恒等表;三步递进 lens 1/2/3)
         let (page, x, nb) = (32usize, 8usize, 1usize);
         let kc_b = crate::interpreters::eval_ops(
-            TensorOps::zeros(Dtype::F16, vec![nb, hkv, hd / x, page, x]).step(), &mut gpu)
-            .await.expect("kc");
+            TensorOps::zeros(Dtype::F16, vec![nb, hkv, hd / x, page, x]).step(),
+            &mut gpu,
+        )
+        .await
+        .expect("kc");
         let vc_b = crate::interpreters::eval_ops(
-            TensorOps::zeros(Dtype::F16, vec![nb, hkv, hd, page]).step(), &mut gpu)
-            .await.expect("vc");
-        let bt = TensorOps::from_host(Dtype::F32, vec![1, nb], &f32b(&(0..nb).map(|i| i as f32).collect::<Vec<_>>()));
+            TensorOps::zeros(Dtype::F16, vec![nb, hkv, hd, page]).step(),
+            &mut gpu,
+        )
+        .await
+        .expect("vc");
+        let bt = TensorOps::from_host(
+            Dtype::F32,
+            vec![1, nb],
+            &f32b(&(0..nb).map(|i| i as f32).collect::<Vec<_>>()),
+        );
         let mtp_kv = |slot: f32, len: f32| KvBuffers {
             k_cache: TensorOps::of_block(kc_b.id, Dtype::F16, vec![nb, hkv, hd / x, page, x]),
             v_cache: TensorOps::of_block(vc_b.id, Dtype::F16, vec![nb, hkv, hd, page]),
-            slots: TensorOps::from_host(Dtype::F32, vec![1, 1], &f32b(&[slot])),  // 契约 r2
-            kv_lens: TensorOps::from_host(Dtype::F32, vec![1, 1], &f32b(&[len])),  // 契约 slots/kv_lens r2(B6 收敛)
+            slots: TensorOps::from_host(Dtype::F32, vec![1, 1], &f32b(&[slot])), // 契约 r2
+            kv_lens: TensorOps::from_host(Dtype::F32, vec![1, 1], &f32b(&[len])), // 契约 slots/kv_lens r2(B6 收敛)
             block_tables: bt.clone(),
 
             int8: None,
@@ -579,11 +654,19 @@ mod wiring_tests {
 
         // 锚:token 3,hidden 行(确定性)
         let anchor_token = TensorOps::from_host(Dtype::F32, vec![1], &f32b(&[3.0]));
-        let anchor_hidden = TensorOps::from_host(Dtype::F16, vec![1, hidden], &hb(&gen(hidden, 30.0)));
+        let anchor_hidden =
+            TensorOps::from_host(Dtype::F16, vec![1, hidden], &hb(&gen(hidden, 30.0)));
 
         // propose(k=3)
         let drafts = mtp.propose(
-            &anchor_token, &anchor_hidden, 3, &embed, &rope, &kvs, &pos_t, vocab,
+            &anchor_token,
+            &anchor_hidden,
+            3,
+            &embed,
+            &rope,
+            &kvs,
+            &pos_t,
+            vocab,
             crate::env::EnvProvider::default(),
             None,
         );

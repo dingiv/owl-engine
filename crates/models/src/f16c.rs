@@ -242,10 +242,20 @@ mod tests {
 
     #[test]
     fn f32_matches_half_scalar() {
-        let src: Vec<f32> = [0.0, -0.0, 1.0, -1.5, 65504.0, 65520.0, 1e-8, 5.9e-8, f32::INFINITY]
-            .into_iter()
-            .chain((0..1000).map(|i| i as f32 * 0.3717))
-            .collect();
+        let src: Vec<f32> = [
+            0.0,
+            -0.0,
+            1.0,
+            -1.5,
+            65504.0,
+            65520.0,
+            1e-8,
+            5.9e-8,
+            f32::INFINITY,
+        ]
+        .into_iter()
+        .chain((0..1000).map(|i| i as f32 * 0.3717))
+        .collect();
         let mut got = vec![0u8; src.len() * 2];
         f32_slice_to_f16_bytes(&src, &mut got);
         for (i, f) in src.iter().enumerate() {
@@ -277,7 +287,13 @@ mod tests {
 
         // 门:≥ 0.4 GB/s(原病线 80MB/s 的 5×;原 opt-3 时代 GB/s 级。
         // CI 机差异敏感 → 门放宽到「量级正确」,数值细节看打印趋势)
-        assert!(f32_gbps > 0.4, "f32→f16 debug 吞吐 {f32_gbps:.2} GB/s 过病线");
-        assert!(bf16_gbps > 0.4, "bf16→f16 debug 吞吐 {bf16_gbps:.2} GB/s 过病线");
+        assert!(
+            f32_gbps > 0.4,
+            "f32→f16 debug 吞吐 {f32_gbps:.2} GB/s 过病线"
+        );
+        assert!(
+            bf16_gbps > 0.4,
+            "bf16→f16 debug 吞吐 {bf16_gbps:.2} GB/s 过病线"
+        );
     }
 }

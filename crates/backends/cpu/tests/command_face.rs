@@ -11,7 +11,7 @@ use std::sync::{Arc, Mutex};
 
 use owl_iface::command::{BatchOutcome, Command, Outcome};
 use owl_iface::contract::{
-    Bytes, DeviceClient, Dtype, LaunchMsg, KernelSource, ModelError, UpStream,
+    Bytes, DeviceClient, Dtype, KernelSource, LaunchMsg, ModelError, UpStream,
 };
 
 /// 只记录命令 + 按命令变体产生**定型结果**的 face(不实现任何具名方法)。
@@ -26,7 +26,14 @@ struct RecFace {
 impl RecFace {
     fn new() -> (Self, Arc<Mutex<Vec<Command>>>) {
         let log = Arc::new(Mutex::new(Vec::new()));
-        (Self { cmds: log.clone(), poison_alloc: false, pending: Vec::new() }, log)
+        (
+            Self {
+                cmds: log.clone(),
+                poison_alloc: false,
+                pending: Vec::new(),
+            },
+            log,
+        )
     }
 }
 
@@ -47,9 +54,9 @@ impl DeviceClient for RecFace {
                     Outcome::Buf(Bytes::new(7, *elems, *dtype, 0))
                 }
             }
-            Command::Htod { dtype, shape, src, .. } => {
-                Outcome::Buf(Bytes::new(8, src.len(), *dtype, shape.len() as u8))
-            }
+            Command::Htod {
+                dtype, shape, src, ..
+            } => Outcome::Buf(Bytes::new(8, src.len(), *dtype, shape.len() as u8)),
             Command::Dtoh { want_bytes, .. } => Outcome::Bytes(vec![9u8; *want_bytes]),
             Command::Launch { msg } => Outcome::Buf(Bytes::new(9, msg.out_elems, Dtype::F32, 1)),
             Command::GraphEnd => Outcome::Graph(42),
@@ -85,7 +92,10 @@ impl DeviceClient for RecFace {
 
 fn msg(n: usize) -> LaunchMsg {
     LaunchMsg {
-        kernel: KernelSource { name: "k".into(), source: String::new() },
+        kernel: KernelSource {
+            name: "k".into(),
+            source: String::new(),
+        },
         args: vec![],
         grid: (1, 1, 1),
         block: (1, 1, 1),
@@ -100,12 +110,23 @@ async fn alloc_sugar_maps_to_zero_flag() {
     let (mut f, log) = RecFace::new();
     let b = f.alloc(Dtype::F16, 64, "w").await.expect("alloc");
     assert_eq!((b.len, b.dtype), (64, Dtype::F16));
-    let _ = f.alloc_uninit(Dtype::F16, 32, "scratch").await.expect("uninit");
+    let _ = f
+        .alloc_uninit(Dtype::F16, 32, "scratch")
+        .await
+        .expect("uninit");
 
     let g = log.lock().expect("log");
     match &g[0] {
-        Command::Alloc { dtype, elems, zero, name } => {
-            assert_eq!((*dtype, *elems, *zero, name.as_str()), (Dtype::F16, 64, true, "w"));
+        Command::Alloc {
+            dtype,
+            elems,
+            zero,
+            name,
+        } => {
+            assert_eq!(
+                (*dtype, *elems, *zero, name.as_str()),
+                (Dtype::F16, 64, true, "w")
+            );
         }
         other => panic!("alloc 应产生 Command::Alloc,得 {}", other.kind()),
     }
@@ -122,15 +143,29 @@ async fn alloc_sugar_maps_to_zero_flag() {
 async fn htod_streams_are_explicit() {
     let (mut f, log) = RecFace::new();
     let data = vec![0u8; 8];
-    let _ = f.htod(Dtype::F16, &vec![4], &data, "batch").await.expect("htod");
-    let _ = f.htod_on(UpStream::Compute, Dtype::F16, &vec![4], &data, "param").await.expect("htod_on");
-    let _ = f.htod_f32(&vec![2], vec![1.0, 2.0], "f32").await.expect("htod_f32");
+    let _ = f
+        .htod(Dtype::F16, &vec![4], &data, "batch")
+        .await
+        .expect("htod");
+    let _ = f
+        .htod_on(UpStream::Compute, Dtype::F16, &vec![4], &data, "param")
+        .await
+        .expect("htod_on");
+    let _ = f
+        .htod_f32(&vec![2], vec![1.0, 2.0], "f32")
+        .await
+        .expect("htod_f32");
 
     let g = log.lock().expect("log");
     let streams: Vec<(UpStream, Dtype, String)> = g
         .iter()
         .map(|c| match c {
-            Command::Htod { stream, dtype, name, .. } => (*stream, *dtype, name.clone()),
+            Command::Htod {
+                stream,
+                dtype,
+                name,
+                ..
+            } => (*stream, *dtype, name.clone()),
             other => panic!("应全是 Htod,得 {}", other.kind()),
         })
         .collect();
@@ -156,13 +191,21 @@ async fn dtoh_offset_and_result_copy() {
 
     let g = log.lock().expect("log");
     match &g[0] {
-        Command::Dtoh { id, off_bytes, want_bytes } => {
+        Command::Dtoh {
+            id,
+            off_bytes,
+            want_bytes,
+        } => {
             assert_eq!((*id, *off_bytes, *want_bytes), (3, 0, 4));
         }
         other => panic!("dtoh 应产生 Command::Dtoh,得 {}", other.kind()),
     }
     match &g[1] {
-        Command::Dtoh { off_bytes, want_bytes, .. } => {
+        Command::Dtoh {
+            off_bytes,
+            want_bytes,
+            ..
+        } => {
             assert_eq!((*off_bytes, *want_bytes), (16, 2), "偏移不得被吞");
         }
         other => panic!("dtoh_at 应产生 Command::Dtoh,得 {}", other.kind()),
@@ -189,9 +232,15 @@ async fn launch_sync_free_graph_map_to_commands() {
 async fn wrong_outcome_variant_is_loud() {
     let (mut f, _log) = RecFace::new();
     f.poison_alloc = true;
-    let e = f.alloc(Dtype::F32, 1, "x").await.expect_err("变体不符必须 Err");
+    let e = f
+        .alloc(Dtype::F32, 1, "x")
+        .await
+        .expect_err("变体不符必须 Err");
     let s = format!("{e}");
-    assert!(s.contains("变体不符") && s.contains("Buf") && s.contains("Done"), "得 {s}");
+    assert!(
+        s.contains("变体不符") && s.contains("Buf") && s.contains("Done"),
+        "得 {s}"
+    );
 }
 
 /// ⑥ `exec_batch` 的顺序/结果对位(CPU 面语义 = 逐条即序)。
@@ -200,7 +249,12 @@ async fn exec_batch_keeps_order_and_reports_errors() {
     let (mut f, log) = RecFace::new();
     let r = f
         .exec_batch(vec![
-            Command::Alloc { dtype: Dtype::F16, elems: 1, zero: true, name: "a".into() },
+            Command::Alloc {
+                dtype: Dtype::F16,
+                elems: 1,
+                zero: true,
+                name: "a".into(),
+            },
             Command::GraphEnd,
             Command::Sync,
         ])
@@ -240,7 +294,12 @@ async fn handle_trait_exec_refuses_accounting_commands() {
     let mut dev: DeviceHandle<CpuFace> = DeviceHandle::new(CpuFace::new(), None);
     let e = <DeviceHandle<CpuFace> as DeviceClient>::exec(
         &mut dev,
-        Command::Alloc { dtype: Dtype::F16, elems: 4, zero: true, name: "bypass".into() },
+        Command::Alloc {
+            dtype: Dtype::F16,
+            elems: 4,
+            zero: true,
+            name: "bypass".into(),
+        },
     )
     .await
     .expect_err("分配命令必须被拒(记账不可绕过)");
@@ -298,14 +357,18 @@ async fn handle_queue_refuses_accounting_commands() {
     let mut dev: DeviceHandle<CpuFace> = DeviceHandle::new(CpuFace::new(), None);
     let e = <DeviceHandle<CpuFace> as DeviceClient>::queue(
         &mut dev,
-        Command::Alloc { dtype: Dtype::F16, elems: 4, zero: true, name: "x".into() },
+        Command::Alloc {
+            dtype: Dtype::F16,
+            elems: 4,
+            zero: true,
+            name: "x".into(),
+        },
     )
     .expect_err("分配命令必须被拒");
     assert!(format!("{e}").contains("记账"), "得 {e}");
 
     // 发射类命令可以入队(不产生/不销毁块)
-    <DeviceHandle<CpuFace> as DeviceClient>::queue(&mut dev, Command::Sync)
-        .expect("Sync 可入队");
+    <DeviceHandle<CpuFace> as DeviceClient>::queue(&mut dev, Command::Sync).expect("Sync 可入队");
     <DeviceHandle<CpuFace> as DeviceClient>::flush(&mut dev)
         .await
         .expect("flush 应直通");

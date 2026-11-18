@@ -82,7 +82,9 @@ fn lcg_vec(n: usize, seed: u64) -> Vec<f32> {
     let mut s = seed;
     (0..n)
         .map(|_| {
-            s = s.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            s = s
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
             ((s >> 40) as f32 / (1u64 << 24) as f32) * 2.0 - 1.0
         })
         .collect()
@@ -100,7 +102,10 @@ fn width(dt: Dtype) -> usize {
 /// 字节位型 → f32 向量(与核的 `to_float` 同构)
 fn to_f32_vec(bytes: &[u8], dt: Dtype) -> Vec<f32> {
     match dt {
-        Dtype::F32 => bytes.chunks_exact(4).map(|c| f32::from_le_bytes(c.try_into().unwrap())).collect(),
+        Dtype::F32 => bytes
+            .chunks_exact(4)
+            .map(|c| f32::from_le_bytes(c.try_into().unwrap()))
+            .collect(),
         Dtype::F16 => bytes
             .chunks_exact(2)
             .map(|c| f16::from_bits(u16::from_le_bytes(c.try_into().unwrap())).to_f32())
@@ -260,7 +265,11 @@ async fn emit_rank(
 }
 
 /// 读回 payload(整块)
-async fn read_payload(client: &mut GpuClient, b: &Bytes, n_bytes: usize) -> Result<Vec<u8>, ModelError> {
+async fn read_payload(
+    client: &mut GpuClient,
+    b: &Bytes,
+    n_bytes: usize,
+) -> Result<Vec<u8>, ModelError> {
     let mut buf = vec![0u8; n_bytes];
     client.dtoh(b, &mut buf).await?;
     Ok(buf)
@@ -282,7 +291,9 @@ async fn read_hdr(client: &mut GpuClient, staging: &Bytes) -> Result<[u8; HDR], 
 #[tokio::test]
 async fn comm_ar_parity() {
     let (Some(oa), Some(ob)) = (dev("OWL_PEER_TEST_DEV_A"), dev("OWL_PEER_TEST_DEV_B")) else {
-        owl_shared::testkit::report::skip("需 OWL_PEER_TEST_DEV_A / OWL_PEER_TEST_DEV_B(两张可 P2P 的空闲卡)");
+        owl_shared::testkit::report::skip(
+            "需 OWL_PEER_TEST_DEV_A / OWL_PEER_TEST_DEV_B(两张可 P2P 的空闲卡)",
+        );
         return;
     };
     assert_ne!(oa, ob, "A/B 必须是两张不同卡");
@@ -292,8 +303,14 @@ async fn comm_ar_parity() {
 
     // ── VMM 对称握手(S1):staging + 跨卡别名 ─────────────────────────
     let staging_bytes = HDR as u64 + SLOT * N_SLOTS as u64;
-    let (staging_a, cred_a) = a.peer_alloc(staging_bytes as usize, "ar:staging-a").await.expect("A PeerAlloc");
-    let (staging_b, cred_b) = b.peer_alloc(staging_bytes as usize, "ar:staging-b").await.expect("B PeerAlloc");
+    let (staging_a, cred_a) = a
+        .peer_alloc(staging_bytes as usize, "ar:staging-a")
+        .await
+        .expect("A PeerAlloc");
+    let (staging_b, cred_b) = b
+        .peer_alloc(staging_bytes as usize, "ar:staging-b")
+        .await
+        .expect("B PeerAlloc");
     let alias_b_on_a = a
         .peer_import(cred_b, staging_bytes as usize, &ub, "ar:alias-b@a")
         .await
@@ -302,8 +319,12 @@ async fn comm_ar_parity() {
         .peer_import(cred_a, staging_bytes as usize, &ua, "ar:alias-a@b")
         .await
         .expect("B 导入 A");
-    write_hdr(&mut a, &staging_a, "ar:hdr-a").await.expect("A header");
-    write_hdr(&mut b, &staging_b, "ar:hdr-b").await.expect("B header");
+    write_hdr(&mut a, &staging_a, "ar:hdr-a")
+        .await
+        .expect("A header");
+    write_hdr(&mut b, &staging_b, "ar:hdr-b")
+        .await
+        .expect("B header");
 
     let layout = StagingLayout::new(SLOT, N_SLOTS);
 
@@ -331,7 +352,12 @@ async fn comm_ar_parity() {
         ((SLOT as usize) + 1, Dtype::F32),
     ];
     let mut g1_cases = 0usize;
-    for (i, (bytes, dt)) in small.iter().chain(tp27b.iter()).chain(big.iter()).enumerate() {
+    for (i, (bytes, dt)) in small
+        .iter()
+        .chain(tp27b.iter())
+        .chain(big.iter())
+        .enumerate()
+    {
         eprintln!("[G1] case {i}: {bytes}B {dt:?} …");
         let w = width(*dt);
         // 元素取整:参与 AR 的完整元素 = bytes/w;分配 = 向上取整(尾部不满元素
@@ -352,8 +378,24 @@ async fn comm_ar_parity() {
         let want = host_ref(&a_bytes[..head], &b_bytes[..head], *dt);
 
         let (ra, rb) = tokio::join!(
-            emit_rank(&mut a, &payload_a, &staging_a, &alias_b_on_a, *bytes as u64, &layout, false),
-            emit_rank(&mut b, &payload_b, &staging_b, &alias_a_on_b, *bytes as u64, &layout, false),
+            emit_rank(
+                &mut a,
+                &payload_a,
+                &staging_a,
+                &alias_b_on_a,
+                *bytes as u64,
+                &layout,
+                false
+            ),
+            emit_rank(
+                &mut b,
+                &payload_b,
+                &staging_b,
+                &alias_a_on_b,
+                *bytes as u64,
+                &layout,
+                false
+            ),
         );
         ra.expect("A 发射序列");
         rb.expect("B 发射序列");
@@ -362,9 +404,16 @@ async fn comm_ar_parity() {
         sb.expect("B sync");
 
         // err 面:两侧 header 都必须无错
-        for (h, who) in [(read_hdr(&mut a, &staging_a), "A"), (read_hdr(&mut b, &staging_b), "B")] {
+        for (h, who) in [
+            (read_hdr(&mut a, &staging_a), "A"),
+            (read_hdr(&mut b, &staging_b), "B"),
+        ] {
             let h = h.await.expect("读 header");
-            assert_eq!(hdr_u32(&h, 28), 0, "{who} 侧 err 非 0(case {i}: {bytes}B {dt:?})");
+            assert_eq!(
+                hdr_u32(&h, 28),
+                0,
+                "{who} 侧 err 非 0(case {i}: {bytes}B {dt:?})"
+            );
         }
         // 两侧结果都必须 == A + B(对称 allreduce;头部逐位 + 尾部不动)
         // 尾部期望 = **各侧自己的初始数据**(未被核处理的字节)
@@ -374,7 +423,10 @@ async fn comm_ar_parity() {
         ] {
             let got = read_payload(cl, p, n_alloc * w).await.expect("读 payload");
             if got[..head] != want[..] {
-                let pos = got[..head].iter().zip(want.iter()).position(|(x, y)| x != y);
+                let pos = got[..head]
+                    .iter()
+                    .zip(want.iter())
+                    .position(|(x, y)| x != y);
                 panic!(
                     "{who} 侧 G1 对拍失败(case {i}: {bytes}B {dt:?});首个不同字节 @ {pos:?}\n  got  = {:?}\n  want = {:?}",
                     got.get(pos.unwrap_or(0)..pos.unwrap_or(0) + 8.min(got.len())),
@@ -409,7 +461,11 @@ async fn comm_ar_parity() {
             eprintln!("[G1b] case {i}: n={n} ({tag}) …");
             let a_bytes = from_f32_vec(&lcg_vec(n, 0xF8A0_0000 + i as u64), Dtype::F16);
             let b_bytes = from_f32_vec(&lcg_vec(n, 0xF8B0_0000 + i as u64), Dtype::F16);
-            let want = f8_ref(&to_f32_vec(&a_bytes, Dtype::F16), &to_f32_vec(&b_bytes, Dtype::F16), n);
+            let want = f8_ref(
+                &to_f32_vec(&a_bytes, Dtype::F16),
+                &to_f32_vec(&b_bytes, Dtype::F16),
+                n,
+            );
             let payload_a = a
                 .htod(Dtype::F16, &Shape::from(vec![n]), &a_bytes, "ar:f8-a")
                 .await
@@ -422,30 +478,63 @@ async fn comm_ar_parity() {
             for round in 0..2 {
                 // 第二跑前重置 payload(核是原地累加 ⇒ 不重置等于测“双重加法”)
                 if round == 1 {
-                    reset_payload(&mut a, &payload_a, &a_bytes).await.expect("reset a");
-                    reset_payload(&mut b, &payload_b, &b_bytes).await.expect("reset b");
+                    reset_payload(&mut a, &payload_a, &a_bytes)
+                        .await
+                        .expect("reset a");
+                    reset_payload(&mut b, &payload_b, &b_bytes)
+                        .await
+                        .expect("reset b");
                 }
                 let (ra, rb) = tokio::join!(
-                    emit_rank(&mut a, &payload_a, &staging_a, &alias_b_on_a, bytes, &layout, true),
-                    emit_rank(&mut b, &payload_b, &staging_b, &alias_a_on_b, bytes, &layout, true),
+                    emit_rank(
+                        &mut a,
+                        &payload_a,
+                        &staging_a,
+                        &alias_b_on_a,
+                        bytes,
+                        &layout,
+                        true
+                    ),
+                    emit_rank(
+                        &mut b,
+                        &payload_b,
+                        &staging_b,
+                        &alias_a_on_b,
+                        bytes,
+                        &layout,
+                        true
+                    ),
                 );
                 ra.expect("A f8 发射序列");
                 rb.expect("B f8 发射序列");
                 let (sa, sb) = tokio::join!(a.sync(), b.sync());
                 sa.expect("A sync");
                 sb.expect("B sync");
-                for (h, who) in [(read_hdr(&mut a, &staging_a), "A"), (read_hdr(&mut b, &staging_b), "B")] {
+                for (h, who) in [
+                    (read_hdr(&mut a, &staging_a), "A"),
+                    (read_hdr(&mut b, &staging_b), "B"),
+                ] {
                     let h = h.await.expect("读 header");
                     assert_eq!(hdr_u32(&h, 28), 0, "{who} 侧 err 非 0(f8 case {i}: {tag})");
                 }
-                let ga = read_payload(&mut a, &payload_a, n * 2).await.expect("F8 读 A");
-                let gb = read_payload(&mut b, &payload_b, n * 2).await.expect("F8 读 B");
+                let ga = read_payload(&mut a, &payload_a, n * 2)
+                    .await
+                    .expect("F8 读 A");
+                let gb = read_payload(&mut b, &payload_b, n * 2)
+                    .await
+                    .expect("F8 读 B");
                 // ① 两 rank 逐位一致(对称律);② == host 参考(绝对);③ 两跑逐位
                 if ga != gb {
-                    let pos = ga.iter().zip(gb.iter()).position(|(x, y)| x != y).unwrap_or(0);
+                    let pos = ga
+                        .iter()
+                        .zip(gb.iter())
+                        .position(|(x, y)| x != y)
+                        .unwrap_or(0);
                     let elem = pos / 2;
-                    let va = f16::from_le_bytes([ga[pos - pos % 2], ga[pos - pos % 2 + 1]]).to_f32();
-                    let vb = f16::from_le_bytes([gb[pos - pos % 2], gb[pos - pos % 2 + 1]]).to_f32();
+                    let va =
+                        f16::from_le_bytes([ga[pos - pos % 2], ga[pos - pos % 2 + 1]]).to_f32();
+                    let vb =
+                        f16::from_le_bytes([gb[pos - pos % 2], gb[pos - pos % 2 + 1]]).to_f32();
                     let (fa, fb) = (
                         f16::from_le_bytes([a_bytes[elem * 2], a_bytes[elem * 2 + 1]]).to_f32(),
                         f16::from_le_bytes([b_bytes[elem * 2], b_bytes[elem * 2 + 1]]).to_f32(),
@@ -494,15 +583,33 @@ async fn comm_ar_parity() {
                 .await
                 .expect("htod");
             let (ra, rb) = tokio::join!(
-                emit_rank(&mut a, &payload_a, &staging_a, &alias_b_on_a, bytes as u64, &layout, false),
-                emit_rank(&mut b, &payload_b, &staging_b, &alias_a_on_b, bytes as u64, &layout, false),
+                emit_rank(
+                    &mut a,
+                    &payload_a,
+                    &staging_a,
+                    &alias_b_on_a,
+                    bytes as u64,
+                    &layout,
+                    false
+                ),
+                emit_rank(
+                    &mut b,
+                    &payload_b,
+                    &staging_b,
+                    &alias_a_on_b,
+                    bytes as u64,
+                    &layout,
+                    false
+                ),
             );
             ra.expect("G2 A");
             rb.expect("G2 B");
             let (sa, sb) = tokio::join!(a.sync(), b.sync());
             sa.expect("G2 sync a");
             sb.expect("G2 sync b");
-            let got = read_payload(&mut a, &payload_a, bytes).await.expect("G2 读");
+            let got = read_payload(&mut a, &payload_a, bytes)
+                .await
+                .expect("G2 读");
             assert_eq!(got, want, "G2 round {round} 与 host 参考不符");
             if round == 0 {
                 r1 = got;
@@ -534,18 +641,38 @@ async fn comm_ar_parity() {
         // 捕获(窗内只发射;两侧都捕)
         a.graph_begin().await.expect("A graph_begin");
         b.graph_begin().await.expect("B graph_begin");
-        emit_rank(&mut a, &payload_a, &staging_a, &alias_b_on_a, bytes as u64, &layout, false)
-            .await
-            .expect("A 窗内发射");
-        emit_rank(&mut b, &payload_b, &staging_b, &alias_a_on_b, bytes as u64, &layout, false)
-            .await
-            .expect("B 窗内发射");
+        emit_rank(
+            &mut a,
+            &payload_a,
+            &staging_a,
+            &alias_b_on_a,
+            bytes as u64,
+            &layout,
+            false,
+        )
+        .await
+        .expect("A 窗内发射");
+        emit_rank(
+            &mut b,
+            &payload_b,
+            &staging_b,
+            &alias_a_on_b,
+            bytes as u64,
+            &layout,
+            false,
+        )
+        .await
+        .expect("B 窗内发射");
         let ga = a.graph_end().await.expect("A graph_end");
         let gb = b.graph_end().await.expect("B graph_end");
 
         // 重置 payload(eager 基线语义:payload = 原始数据)
-        reset_payload(&mut a, &payload_a, &a_bytes).await.expect("reset a");
-        reset_payload(&mut b, &payload_b, &b_bytes).await.expect("reset b");
+        reset_payload(&mut a, &payload_a, &a_bytes)
+            .await
+            .expect("reset a");
+        reset_payload(&mut b, &payload_b, &b_bytes)
+            .await
+            .expect("reset b");
 
         // replay(两侧并发提交 → 两侧 sync)
         let (la, lb) = tokio::join!(a.graph_launch(ga), b.graph_launch(gb));
@@ -560,16 +687,25 @@ async fn comm_ar_parity() {
             assert_eq!(got, want, "G3({who}):replay 结果 ≠ host 参考");
         }
         // 图的进一步回放:再 replay 一次(游标继续推进;结果仍正确 —— 相对量 I3)
-        reset_payload(&mut a, &payload_a, &a_bytes).await.expect("reset a2");
-        reset_payload(&mut b, &payload_b, &b_bytes).await.expect("reset b2");
+        reset_payload(&mut a, &payload_a, &a_bytes)
+            .await
+            .expect("reset a2");
+        reset_payload(&mut b, &payload_b, &b_bytes)
+            .await
+            .expect("reset b2");
         let (la, lb) = tokio::join!(a.graph_launch(ga), b.graph_launch(gb));
         la.expect("A graph_launch 2");
         lb.expect("B graph_launch 2");
         let (sa, sb) = tokio::join!(a.sync(), b.sync());
         sa.expect("sync");
         sb.expect("sync");
-        let got = read_payload(&mut a, &payload_a, bytes).await.expect("G3 二回读");
-        assert_eq!(got, want, "G3:第二次 replay 结果 ≠ host 参考(游标推进应无影响)");
+        let got = read_payload(&mut a, &payload_a, bytes)
+            .await
+            .expect("G3 二回读");
+        assert_eq!(
+            got, want,
+            "G3:第二次 replay 结果 ≠ host 参考(游标推进应无影响)"
+        );
         // 图钉住 staging/alias/payload(捕获窗 block_ptr 登记租约)⇒ 先销图再回收
         // (顺带验证:租约未解除时 peer_release/free 会被**响亮拒收** —— 见下断言)
         assert!(
@@ -584,8 +720,12 @@ async fn comm_ar_parity() {
 
     eprintln!("[收尾] peer_release + close");
     // ── 收尾(peer 块显式释放;闭 G5 语义)────────────────────────
-    a.peer_release(vec![staging_a.id, alias_b_on_a.id]).await.expect("A 释放");
-    b.peer_release(vec![staging_b.id, alias_a_on_b.id]).await.expect("B 释放");
+    a.peer_release(vec![staging_a.id, alias_b_on_a.id])
+        .await
+        .expect("A 释放");
+    b.peer_release(vec![staging_b.id, alias_a_on_b.id])
+        .await
+        .expect("B 释放");
     a.close().await.expect("close a");
     b.close().await.expect("close b");
     eprintln!(

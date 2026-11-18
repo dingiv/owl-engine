@@ -15,7 +15,12 @@ fn swap_phase(tag: &'static str, t0: std::time::Instant) {
         return;
     }
     owl_shared::metrics::with_metrics_store(|s| {
-        s.timer_record_tag(tag, std::time::Duration::from_secs_f64(ms / 1000.0), file!(), line!());
+        s.timer_record_tag(
+            tag,
+            std::time::Duration::from_secs_f64(ms / 1000.0),
+            file!(),
+            line!(),
+        );
     });
 }
 
@@ -33,7 +38,6 @@ impl GpuServer {
             format_args!("{what} notify 失败(回执断链): {e:?}"),
         );
     }
-
 
     /// srv.seg.htod 分相(与客户端同名段对账;差值 = 管道/等待)
     pub(super) fn handle_htod(
@@ -64,24 +68,30 @@ impl GpuServer {
             Err(e) => return ack.take().unwrap().send(Err(e)),
         };
         // 硬预算(与 alloc 同一条闸;权重/上传块也吃设备内存)
-        if let Err(e) = self.vram_guard.check(
-            n,
-            self.diag.vram_activation_reserve << 20,
-            &self.vram,
-        ) {
+        if let Err(e) =
+            self.vram_guard
+                .check(n, self.diag.vram_activation_reserve << 20, &self.vram)
+        {
             self.sink.logf(
                 owl_shared::log::LVL_WARN,
                 "vram-budget",
                 format_args!("硬预算拒发 htod {n}B:{e}"),
             );
-            return ack.take().unwrap_or_else(|| unreachable!("ack 刚取过")).send(Err(e));
+            return ack
+                .take()
+                .unwrap_or_else(|| unreachable!("ack 刚取过"))
+                .send(Err(e));
         }
         match self.try_htod(&stream, &data, name) {
             Ok((id, buf)) => {
                 // 发射账:上传**落定**记 id + 设备地址(A13 类"跨流 UAF"的钥匙:
                 // 该地址的 COMPUTE 读者是否在本次落定**之前**就已发射)
                 if let Some(tr) = self.trace.as_ref() {
-                    let ptr = self.ctx().block_ptr(id, &stream).map(|(p, _)| p).unwrap_or(0);
+                    let ptr = self
+                        .ctx()
+                        .block_ptr(id, &stream)
+                        .map(|(p, _)| p)
+                        .unwrap_or(0);
                     tr.push(
                         crate::trace::TraceEntry::new("htod_landed", "h2d")
                             .bytes(n)
@@ -140,11 +150,10 @@ impl GpuServer {
         // 2. pinned 码头 + 异步 memcpy(流序;host 侧必须 pinned 才真异步)。
         //    码头池化(2026-09-26 尾批:原每次 malloc_host 新分配,大权重
         //    锁页分配是装载耗时大头;finish 回调归还池)
-        let mut buf: Box<dyn owl_iface::contract::PinnedRegion + Send> =
-            match self.pool.take(n) {
-                Some(b) => b,
-                None => Box::new(Staging::alloc(n, "try_htod")?),
-            };
+        let mut buf: Box<dyn owl_iface::contract::PinnedRegion + Send> = match self.pool.take(n) {
+            Some(b) => b,
+            None => Box::new(Staging::alloc(n, "try_htod")?),
+        };
         buf.slice_bytes_mut()[..n].copy_from_slice(data);
         // **清零序**(2026-10-16):H2D 写入设备块前,先等该块的 `alloc{zero}` memset
         // 落地 —— 两流无序时晚到的 memset 会抹掉刚落地的搬运(实测 A_log 32B)。
@@ -227,7 +236,13 @@ impl GpuServer {
         stream_id: u8,
         ack: Ack<Result<(), ModelError>>,
     ) {
-        ack.send(self.enqueue_upload_pinned_on(stream_id as u64, buf, dst, offset_bytes, len_bytes));
+        ack.send(self.enqueue_upload_pinned_on(
+            stream_id as u64,
+            buf,
+            dst,
+            offset_bytes,
+            len_bytes,
+        ));
     }
 
     /// **上传核心**(只入队 DMA + 登记租约归还;不 ack)—— 复合命令
@@ -298,7 +313,11 @@ impl GpuServer {
             // DMA 未发生 —— 块内容缺失由调用方末端 sync 后自查/重试兜底)
             if let Some(buf) = cell.lock().unwrap().take() {
                 pool_err.put(buf);
-                self.sink.logf(owl_shared::log::LVL_DEBUG, "srv", format_args!("upload notify 失败: {e:?}"));
+                self.sink.logf(
+                    owl_shared::log::LVL_DEBUG,
+                    "srv",
+                    format_args!("upload notify 失败: {e:?}"),
+                );
             }
         }
         Ok(()) // 入队即返回(DMA 完成由调用方栅栏/事件序兜底)
@@ -698,7 +717,10 @@ impl GpuServer {
             let st = &mut stags[si];
             let mut cursor = 0usize;
             for (i, p) in pieces[*lo..*hi].iter().enumerate() {
-                if let Err(e) = self.ctx().check_range(p.block, p.dev_off, p.len, "swap-out") {
+                if let Err(e) = self
+                    .ctx()
+                    .check_range(p.block, p.dev_off, p.len, "swap-out")
+                {
                     for s in stags {
                         self.pool.put(s);
                     }
@@ -963,14 +985,22 @@ impl GpuServer {
             self.vram.free_set(free as u64);
         }
         if let Some(t) = t_d2h {
-            self.sink.logf(owl_shared::log::LVL_DEBUG, "d2h-prof", format_args!("序={:?} n={want_bytes}", t.elapsed()));
+            self.sink.logf(
+                owl_shared::log::LVL_DEBUG,
+                "d2h-prof",
+                format_args!("序={:?} n={want_bytes}", t.elapsed()),
+            );
         }
         let t_d2h2 = t_d2h;
         let mut ack = Some(ack);
         match self.try_dtoh(&stream, id, off_bytes, want_bytes) {
             Ok(staging) => {
                 if let Some(t) = t_d2h2 {
-                    self.sink.logf(owl_shared::log::LVL_DEBUG, "d2h-prof", format_args!("issue={:?}", t.elapsed()));
+                    self.sink.logf(
+                        owl_shared::log::LVL_DEBUG,
+                        "d2h-prof",
+                        format_args!("issue={:?}", t.elapsed()),
+                    );
                 }
                 // 完成 → 码头字节直出(传输面字节口径)→ 回执 → 码头归还池;ack 住 cell
                 let ack_cell = std::sync::Arc::new(std::sync::Mutex::new(ack.take()));
@@ -1008,7 +1038,7 @@ impl GpuServer {
         want_bytes: usize,
     ) -> Result<Box<dyn owl_iface::contract::PinnedRegion + Send>, ModelError> {
         let n = self.ctx().block_len(id)?; // 块账本 = 字节(2026-09-26 f16 基线)
-        // 区间校验:偏移 + 长度 ≤ 块字节(越读 = 真错,响亮拒)
+                                           // 区间校验:偏移 + 长度 ≤ 块字节(越读 = 真错,响亮拒)
         let end = off_bytes
             .checked_add(want_bytes)
             .ok_or_else(|| ModelError::Msg("dtoh: 偏移 + 长度溢出".into()))?;
@@ -1036,7 +1066,4 @@ impl GpuServer {
         .map_err(|e| ModelError::Msg(format!("dtoh async: {e:?}")))?;
         Ok(staging)
     }
-
-
-
 }

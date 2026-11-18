@@ -26,8 +26,7 @@ fn main() {
     }
 
     let out_dir = PathBuf::from(std::env::var("OUT_DIR").expect("OUT_DIR"));
-    let cuda_home =
-        std::env::var("CUDA_HOME").unwrap_or_else(|_| "/usr/local/cuda".to_string());
+    let cuda_home = std::env::var("CUDA_HOME").unwrap_or_else(|_| "/usr/local/cuda".to_string());
     let inc = PathBuf::from(&cuda_home).join("include");
     let lib = PathBuf::from(&cuda_home).join("lib64");
 
@@ -45,7 +44,10 @@ fn main() {
         .arg(&obj)
         .status()
         .expect("cupti shim: cc 启动失败");
-    assert!(st.success(), "cupti shim: cc 编译失败(检查 CUDA_HOME/include/cupti_activity.h)");
+    assert!(
+        st.success(),
+        "cupti shim: cc 编译失败(检查 CUDA_HOME/include/cupti_activity.h)"
+    );
 
     // 2) 归档
     let _ = std::fs::remove_file(&ar);
@@ -63,5 +65,8 @@ fn main() {
     println!("cargo:rustc-link-lib=static=owl_cupti_shim");
     println!("cargo:rustc-link-lib=dylib=cupti");
     println!("cargo:rustc-link-arg=-Wl,-rpath,{}", lib.display());
-    println!("cargo:warning=owl-cuda: CUPTI 归因 shim 已编入(feature cupti;{} 头)", inc.display());
+    println!(
+        "cargo:warning=owl-cuda: CUPTI 归因 shim 已编入(feature cupti;{} 头)",
+        inc.display()
+    );
 }

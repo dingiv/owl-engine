@@ -1,4 +1,3 @@
-
 // 符号名按 `GEMM_<格式>` 保留格式原名(与 .cu 的 `owl_gguf_gemm_iq1s` 逐字对应;
 // 改大小写会切断与核符号的肉眼可比性)⇒ 显式豁免,而非改名。
 #![allow(non_upper_case_globals)]
@@ -227,7 +226,6 @@ impl GgmlTy {
             _ => None,
         }
     }
-
 
     /// **M1 验收集**:有数值锚(本机存量模型 / 已下样本)的型。
     ///
@@ -595,14 +593,17 @@ pub fn mmq2_geom(m: usize, n: usize, j: usize) -> ((u32, u32, u32), (u32, u32, u
 /// 单测 `mmq2_smem_matches_formula` 钉住)
 pub const fn mmq2_smem(j: usize) -> usize {
     // I / nthreads 按 J 档(J=16 ⇒ 64/128);与 config 表逐项同源
-    let i = if j == MMQ2_SMALL_J { MMQ2_SMALL_I } else { MMQ2_I };
+    let i = if j == MMQ2_SMALL_J {
+        MMQ2_SMALL_I
+    } else {
+        MMQ2_I
+    };
     let threads = i * 2;
     let nbs_ids = j * 4;
     let nbs_y = j * MMQ2_Q8_1_BLOCK_BYTES;
     let pad_to = threads * 4;
     nbs_ids + i * 76 * 4 + nbs_y.div_ceil(pad_to) * pad_to
 }
-
 
 /// J 档(分派用;与 `mmq2_entry_for` 同一判据)
 /// `owl_mmq2_q8_0_j16`(小 m;J=16)
@@ -667,7 +668,11 @@ pub const fn mmq2_sram_stride_for(ty: GgmlTy) -> usize {
 
 /// smem 字节(**按型**取 X 面 stride;其余项与 [`mmq2_smem`] 同式)。
 pub const fn mmq2_smem_for(ty: GgmlTy, j: usize) -> usize {
-    let i = if j == MMQ2_SMALL_J { MMQ2_SMALL_I } else { MMQ2_I };
+    let i = if j == MMQ2_SMALL_J {
+        MMQ2_SMALL_I
+    } else {
+        MMQ2_I
+    };
     let threads = i * 2;
     let nbs_ids = j * 4;
     let nbs_x = i * mmq2_sram_stride_for(ty) * 4;
@@ -729,7 +734,6 @@ pub const RANGE_Iq2Xs: &str = "owl_gguf_dequant_range_iq2xs";
 pub const RANGE_Iq2S: &str = "owl_gguf_dequant_range_iq2s";
 /// 同上(IQ1_S)
 pub const RANGE_Iq1S: &str = "owl_gguf_dequant_range_iq1s";
-
 
 /// 型 → 行窗解量化入口(`None` = 未移植)
 pub const fn range_entry_for(ty: GgmlTy) -> Option<&'static str> {
@@ -1126,8 +1130,17 @@ mod tests {
     fn codes_are_bijective() {
         for (i, t) in ALL.iter().enumerate() {
             assert_eq!(GgmlTy::from_code(t.code()), Some(*t), "{:?} 反查失败", t);
-            assert_eq!(ALL.iter().filter(|x| x.code() == t.code()).count(), 1, "重码 {:?}", t);
-            assert!(ALL[..i].iter().all(|x| x.code() != t.code()), "编码乱序/重复 {:?}", t);
+            assert_eq!(
+                ALL.iter().filter(|x| x.code() == t.code()).count(),
+                1,
+                "重码 {:?}",
+                t
+            );
+            assert!(
+                ALL[..i].iter().all(|x| x.code() != t.code()),
+                "编码乱序/重复 {:?}",
+                t
+            );
         }
         assert_eq!(GgmlTy::from_code(4), None, "已移除的 Q4_2 必须查不到");
         assert_eq!(GgmlTy::from_code(31), None, "已移除的 Q4_0_4_4 必须查不到");
@@ -1143,14 +1156,21 @@ mod tests {
                 Some(n) => {
                     assert!(PORTED.contains(t), "{:?} 有入口名却不在 PORTED", t);
                     assert!(
-                        PORTED.iter().filter(|x| self::entry_for(**x) == Some(n)).count() == 1,
+                        PORTED
+                            .iter()
+                            .filter(|x| self::entry_for(**x) == Some(n))
+                            .count()
+                            == 1,
                         "入口名 `{n}` 被多型共用"
                     );
                 }
                 None => assert!(!PORTED.contains(t), "{:?} 在 PORTED 却无入口名", t),
             }
         }
-        assert_eq!(PORTED.len(), PORTED.iter().filter(|t| entry_for(**t).is_some()).count());
+        assert_eq!(
+            PORTED.len(),
+            PORTED.iter().filter(|t| entry_for(**t).is_some()).count()
+        );
     }
 
     /// **能力表 ↔ driver 映射不许漂**(2026-10-20;IQ 落地时抓到的第二套规范).
@@ -1230,7 +1250,8 @@ mod tests {
 
     /// 实存两靶位的型都在可跑集;F32/Q6_K 等原生与 K-quant 各归其位
     #[test]
-    fn targets_are_covered() {        for (n, t) in [
+    fn targets_are_covered() {
+        for (n, t) in [
             ("Q4_K", GgmlTy::Q4K),
             ("Q8_0", GgmlTy::Q8_0),
             ("Q6_K", GgmlTy::Q6K),
@@ -1265,7 +1286,14 @@ mod tests {
             );
         }
         // 长尾型(**确实**未移植)抽点:必须无入口
-        for t in [GgmlTy::Tq1_0, GgmlTy::Mxfp4, GgmlTy::Nvfp4, GgmlTy::Q1_0, GgmlTy::Q2_0, GgmlTy::Iq1M] {
+        for t in [
+            GgmlTy::Tq1_0,
+            GgmlTy::Mxfp4,
+            GgmlTy::Nvfp4,
+            GgmlTy::Q1_0,
+            GgmlTy::Q2_0,
+            GgmlTy::Iq1M,
+        ] {
             assert!(entry_for(t).is_none(), "{:?} 不该有入口(未移植)", t);
         }
     }
@@ -1280,24 +1308,50 @@ mod tests {
         for t in ALL {
             match rows_entry_for(*t) {
                 Some(n) => {
-                    assert!(ROWS_PORTED.contains(t), "{:?} 有行入口却不在 ROWS_PORTED", t);
                     assert!(
-                        ROWS_PORTED.iter().filter(|x| rows_entry_for(**x) == Some(n)).count() == 1,
+                        ROWS_PORTED.contains(t),
+                        "{:?} 有行入口却不在 ROWS_PORTED",
+                        t
+                    );
+                    assert!(
+                        ROWS_PORTED
+                            .iter()
+                            .filter(|x| rows_entry_for(**x) == Some(n))
+                            .count()
+                            == 1,
                         "行入口名 `{n}` 被多型共用"
                     );
                 }
-                None => assert!(!ROWS_PORTED.contains(t), "{:?} 在 ROWS_PORTED 却无入口名", t),
+                None => assert!(
+                    !ROWS_PORTED.contains(t),
+                    "{:?} 在 ROWS_PORTED 却无入口名",
+                    t
+                ),
             }
         }
         // ① 线程数(协作式分工的硬约束)
-        assert_eq!(rows_threads(GgmlTy::Q4K), 32, "Q4_K: tid/8 与 tid%8 覆盖 256 元素需 32 线程");
+        assert_eq!(
+            rows_threads(GgmlTy::Q4K),
+            32,
+            "Q4_K: tid/8 与 tid%8 覆盖 256 元素需 32 线程"
+        );
         assert_eq!(rows_threads(GgmlTy::Q5K), 32);
-        assert_eq!(rows_threads(GgmlTy::Q6K), 64, "Q6_K: ip = tid/32 需 64 线程");
+        assert_eq!(
+            rows_threads(GgmlTy::Q6K),
+            64,
+            "Q6_K: ip = tid/32 需 64 线程"
+        );
         // ② 几何(4B token_embd = Q6_K: k=2560 ⇒ 10 块)
         let (g, b) = rows_geom(GgmlTy::Q6K, 5, 2560).expect("Q6_K 行几何");
         assert_eq!((g, b), ((5, 10, 1), (64, 1, 1)));
-        assert!(rows_geom(GgmlTy::Q8_0, 5, 2560).is_none(), "Q8_0 无块解量化函数 ⇒ 行臂拒");
-        assert!(rows_geom(GgmlTy::Q6K, 5, 2500).is_none(), "k 非超块整数倍 ⇒ 拒");
+        assert!(
+            rows_geom(GgmlTy::Q8_0, 5, 2560).is_none(),
+            "Q8_0 无块解量化函数 ⇒ 行臂拒"
+        );
+        assert!(
+            rows_geom(GgmlTy::Q6K, 5, 2500).is_none(),
+            "k 非超块整数倍 ⇒ 拒"
+        );
         assert_eq!(rows_qk(GgmlTy::Q4K), Some(QK_K));
         assert_eq!(rows_qk(GgmlTy::Q8_0), None);
     }
@@ -1306,14 +1360,22 @@ mod tests {
     #[test]
     fn q8_1_block_bytes_matches_cu_struct() {
         // 推导:`half2 ds`(d,s 各 half = 2+2)+ `qs[QK8_1]`(32)
-        assert_eq!(Q8_1_BLOCK_BYTES, 2 * 2 + QK_32, "q8_1 激活块 = half2 + qs[32]");
+        assert_eq!(
+            Q8_1_BLOCK_BYTES,
+            2 * 2 + QK_32,
+            "q8_1 激活块 = half2 + qs[32]"
+        );
         let t = crate::cu_sig::cu_text("cu/gguf/gguf.cuh");
         assert!(
             t.contains("sizeof(block_q8_1) == 2*sizeof(ggml_fp16_t) + QK8_0"),
             "`gguf.cuh` 的 block_q8_1 静态断言行变了 —— 同步 Q8_1_BLOCK_BYTES"
         );
         // 同名不同物:GGUF **张量型** Q8_1 仍是 40 B/块(gguf-py 表;本仓激活缓冲不用它)
-        assert_eq!(GgmlTy::Q8_1.block(), (QK_32, 40), "文件格式的 Q8_1 是另一个布局");
+        assert_eq!(
+            GgmlTy::Q8_1.block(),
+            (QK_32, 40),
+            "文件格式的 Q8_1 是另一个布局"
+        );
     }
 
     /// 跨架构关键常量(QK_K 固定 256;块几何自洽:`block.1 * 8 >= block.0`(≥1bit/元素))

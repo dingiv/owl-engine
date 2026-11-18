@@ -187,7 +187,11 @@ pub struct BatchOutcome {
 impl BatchOutcome {
     /// 空批(全成)。
     pub fn empty() -> Self {
-        Self { outcomes: Vec::new(), first_err: None, segments: 0 }
+        Self {
+            outcomes: Vec::new(),
+            first_err: None,
+            segments: 0,
+        }
     }
 
     /// 全成?
@@ -198,6 +202,10 @@ impl BatchOutcome {
     /// 从逐条结果收口(segments 由调用方给:CPU 面逐条 = N,GPU 原生批 = 1)。
     pub fn collect(outcomes: Vec<Result<Outcome, ModelError>>, segments: usize) -> Self {
         let first_err = outcomes.iter().position(|r| r.is_err());
-        Self { outcomes, first_err, segments }
+        Self {
+            outcomes,
+            first_err,
+            segments,
+        }
     }
 }

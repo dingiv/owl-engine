@@ -41,7 +41,15 @@ pub struct DecoderLayer {
 
 impl DecoderLayer {
     /// full_attention 层容器(`plan` = 量化计划构造期注入)
-    pub fn new_full<'a>(hq: usize, hkv: usize, hd: usize, hidden: usize, inter: usize, eps: f32, plan: impl Into<PlanSource<'a>>) -> Self {
+    pub fn new_full<'a>(
+        hq: usize,
+        hkv: usize,
+        hd: usize,
+        hidden: usize,
+        inter: usize,
+        eps: f32,
+        plan: impl Into<PlanSource<'a>>,
+    ) -> Self {
         let src = plan.into();
         let facts = src.facts();
         DecoderLayer {
@@ -55,7 +63,16 @@ impl DecoderLayer {
 
     /// linear_attention(GDN)层容器(`plan` = 量化计划构造期注入)
     #[allow(clippy::too_many_arguments)]
-    pub fn new_gdn<'a>(nk: usize, hk_dim: usize, nv: usize, hv_dim: usize, hidden: usize, inter: usize, eps: f32, plan: impl Into<PlanSource<'a>>) -> Self {
+    pub fn new_gdn<'a>(
+        nk: usize,
+        hk_dim: usize,
+        nv: usize,
+        hv_dim: usize,
+        hidden: usize,
+        inter: usize,
+        eps: f32,
+        plan: impl Into<PlanSource<'a>>,
+    ) -> Self {
         let src = plan.into();
         let facts = src.facts();
         DecoderLayer {
@@ -110,7 +127,8 @@ impl Loadable for DecoderLayer {
             TokenMixer::Full(a) => a.layout(ctx),
             TokenMixer::Gdn(g) => g.layout(ctx),
         };
-        self.input_ln.layout(ctx)
+        self.input_ln
+            .layout(ctx)
             .chain(self.post_ln.layout(ctx))
             .chain(mixer)
             .chain(self.mlp.layout(ctx))
@@ -180,9 +198,9 @@ const _: Dtype = Dtype::F32;
 
 #[cfg(test)]
 mod tests {
-    use owl_macros::owl_test;
     use super::*;
     use crate::module::QuantPlan;
+    use owl_macros::owl_test;
 
     fn src_map(entries: &[(&str, usize, f32)]) -> std::collections::HashMap<String, Vec<f32>> {
         entries
@@ -190,7 +208,9 @@ mod tests {
             .map(|(k, n, seed)| {
                 (
                     k.to_string(),
-                    (0..*n).map(|i| ((i as f32 + seed) * 0.13).sin() * 0.5).collect::<Vec<f32>>(),
+                    (0..*n)
+                        .map(|i| ((i as f32 + seed) * 0.13).sin() * 0.5)
+                        .collect::<Vec<f32>>(),
                 )
             })
             .collect()
@@ -247,16 +267,28 @@ mod tests {
             conv_k: TensorOps::zeros(Dtype::F32, vec![4, 8, 3]),
             conv_v: TensorOps::zeros(Dtype::F32, vec![4, 8, 3]),
             rec: TensorOps::zeros(Dtype::F32, vec![4, 2, 4, 4]),
-            slots: TensorOps::from_host(Dtype::F32, vec![1, tokens], &crate::testkit::f32b(&[0.0, 2.0])),  // 契约 slots/kv_lens r2(B6 收敛)
+            slots: TensorOps::from_host(
+                Dtype::F32,
+                vec![1, tokens],
+                &crate::testkit::f32b(&[0.0, 2.0]),
+            ), // 契约 slots/kv_lens r2(B6 收敛)
         };
-        let xs6 = TensorOps::from_host(Dtype::F32, vec![tokens, 6], &crate::testkit::f32b(&vec![0.4; tokens * 6]));
+        let xs6 = TensorOps::from_host(
+            Dtype::F32,
+            vec![tokens, 6],
+            &crate::testkit::f32b(&vec![0.4; tokens * 6]),
+        );
         let out = gdn.forward(&xs6, &ForwardCtx::gdn_decode(tokens, &gdn_buf));
         assert!(!out.is_poisoned(), "gdn 层声明不应有毒");
         assert_eq!(out.shape(), &[tokens, 6]);
         assert_eq!(gdn.hidden(), 6);
 
         // Full 声明缺 rope/pos/kv → 毒值(mixer 分支检查透传)
-        let xs3 = TensorOps::from_host(Dtype::F32, vec![tokens, 3], &crate::testkit::f32b(&vec![0.4; tokens * 3]));
+        let xs3 = TensorOps::from_host(
+            Dtype::F32,
+            vec![tokens, 3],
+            &crate::testkit::f32b(&vec![0.4; tokens * 3]),
+        );
         let out2 = full.forward(&xs3, &ForwardCtx::minimal(tokens));
         assert!(out2.is_poisoned(), "full 层 minimal ctx 应毒");
     }
@@ -272,11 +304,19 @@ mod tests {
         let row = &x[0..cols];
         let ms: f32 = row.iter().map(|v| v * v).sum::<f32>() / cols as f32;
         let inv = 1.0 / (ms + EPS).sqrt();
-        row.iter().zip(w).map(|(v, g)| v * inv * (g + 1.0)).collect()
+        row.iter()
+            .zip(w)
+            .map(|(v, g)| v * inv * (g + 1.0))
+            .collect()
     }
 
     /// mlp:silu(gate·x) ⊙ (up·x) → down
-    fn host_mlp(s: &std::collections::HashMap<String, Vec<f32>>, x: &[f32], inter: usize, hidden: usize) -> Vec<f32> {
+    fn host_mlp(
+        s: &std::collections::HashMap<String, Vec<f32>>,
+        x: &[f32],
+        inter: usize,
+        hidden: usize,
+    ) -> Vec<f32> {
         let lin = |w: &[f32]| {
             (0..w.len() / hidden)
                 .map(|o| (0..hidden).map(|i| x[i] * w[o * hidden + i]).sum::<f32>())
@@ -290,16 +330,26 @@ mod tests {
             h[o] = silu * up[o];
         }
         (0..hidden)
-            .map(|o| (0..inter).map(|i| h[i] * s["down_proj"][o * inter + i]).sum::<f32>())
+            .map(|o| {
+                (0..inter)
+                    .map(|i| h[i] * s["down_proj"][o * inter + i])
+                    .sum::<f32>()
+            })
             .collect()
     }
 
     fn gen(seed: f32, n: usize) -> Vec<f32> {
-        (0..n).map(|i| ((i as f32 + seed) * 0.13).sin() * 0.5).collect()
+        (0..n)
+            .map(|i| ((i as f32 + seed) * 0.13).sin() * 0.5)
+            .collect()
     }
 
     /// 零块(htod 清零;勿用裸 alloc —— 垃圾内存会进 conv/rec 状态)
-    async fn zero_block(client: &mut owl_cuda::GpuClient, n: usize, shape: Vec<usize>) -> (crate::contract::Bytes, TensorOps) {
+    async fn zero_block(
+        client: &mut owl_cuda::GpuClient,
+        n: usize,
+        shape: Vec<usize>,
+    ) -> (crate::contract::Bytes, TensorOps) {
         let b = crate::interpreters::eval_ops(
             TensorOps::from_host(Dtype::F32, vec![n], &crate::testkit::f32b(&vec![0.0; n])).step(),
             client,
@@ -328,14 +378,18 @@ mod tests {
         eprintln!("[probe] block {} alloc'd", b.id);
         for round in 0..3 {
             eprintln!("[probe] round {round}: alloc_pinned...");
-            let mut lease = owl_iface::alloc_pinned!(gpu, elems * 4).await.expect("alloc_pinned");
+            let mut lease = owl_iface::alloc_pinned!(gpu, elems * 4)
+                .await
+                .expect("alloc_pinned");
             eprintln!("[probe] round {round}: fill...");
             // 字节口径租约(F5 尾批):f32 LE 直写
             for (i, d) in lease.slice_bytes_mut().chunks_exact_mut(4).enumerate() {
                 d.copy_from_slice(&((round * 1000 + i % 1000) as f32).to_le_bytes());
             }
             eprintln!("[probe] round {round}: upload...");
-            gpu.upload_pinned(lease, &b, 0, elems * 4).await.expect("upload_pinned");
+            gpu.upload_pinned(lease, &b, 0, elems * 4)
+                .await
+                .expect("upload_pinned");
             eprintln!("[probe] round {round}: dtoh...");
             let mut out = vec![0u8; elems * 4];
             gpu.dtoh(&b, &mut out).await.expect("dtoh");
@@ -369,9 +423,13 @@ mod tests {
             ("up_proj", inter * hidden, 10.0),
             ("down_proj", hidden * inter, 11.0),
         ]);
-        crate::interpreters::eval_load(&layer, &mut gpu, &src, &Default::default()).await.expect("load");
+        crate::interpreters::eval_load(&layer, &mut gpu, &src, &Default::default())
+            .await
+            .expect("load");
         let rp = Rope::new(64, hd, hd, 10_000.0).expect("rope"); // 全旋转(rotary = head_dim)
-        crate::interpreters::eval_load(&rp, &mut gpu, &rp.tables(), &Default::default()).await.expect("rope 表");
+        crate::interpreters::eval_load(&rp, &mut gpu, &rp.tables(), &Default::default())
+            .await
+            .expect("rope 表");
         let (_, kc) = zero_block(&mut gpu, 8 * hkv * hd, vec![8, hkv, hd]).await;
         let (_, vc) = zero_block(&mut gpu, 8 * hkv * hd, vec![8, hkv, hd]).await;
 
@@ -381,14 +439,19 @@ mod tests {
         let kv = KvBuffers {
             k_cache: kc,
             v_cache: vc,
-            slots: TensorOps::from_host(Dtype::F32, vec![1, tokens], &crate::testkit::f32b(&[0.0])),  // 契约 slots/kv_lens r2(B6 收敛)
-            kv_lens: TensorOps::from_host(Dtype::F32, vec![1, tokens], &crate::testkit::f32b(&[1.0])),  // 契约 slots/kv_lens r2(B6 收敛)
+            slots: TensorOps::from_host(Dtype::F32, vec![1, tokens], &crate::testkit::f32b(&[0.0])), // 契约 slots/kv_lens r2(B6 收敛)
+            kv_lens: TensorOps::from_host(
+                Dtype::F32,
+                vec![1, tokens],
+                &crate::testkit::f32b(&[1.0]),
+            ), // 契约 slots/kv_lens r2(B6 收敛)
             block_tables: TensorOps::zeros(Dtype::F32, vec![1]), // 哑表(legacy 路径不解引用)
 
             int8: None,
         };
-        let pos = TensorOps::from_host(Dtype::F32, vec![1, tokens], &crate::testkit::f32b(&pos_v));  // 契约 pos r2
-        let xs_t = TensorOps::from_host(Dtype::F32, vec![tokens, hidden], &crate::testkit::f32b(&xs));
+        let pos = TensorOps::from_host(Dtype::F32, vec![1, tokens], &crate::testkit::f32b(&pos_v)); // 契约 pos r2
+        let xs_t =
+            TensorOps::from_host(Dtype::F32, vec![tokens, hidden], &crate::testkit::f32b(&xs));
         let ctx = ForwardCtx::decode(tokens, &pos, &kv, &rp);
         let decl = layer.forward(&xs_t, &ctx);
         let got = crate::testkit::harvest(&mut gpu, &decl).await;
@@ -417,7 +480,10 @@ mod tests {
             let rms = |x: &[f32], g: &[f32]| {
                 let ms: f32 = x.iter().map(|v| v * v).sum::<f32>() / hd as f32;
                 let inv = 1.0 / (ms + EPS).sqrt();
-                x.iter().zip(g).map(|(v, gg)| v * inv * (gg + 1.0)).collect::<Vec<f32>>()
+                x.iter()
+                    .zip(g)
+                    .map(|(v, gg)| v * inv * (gg + 1.0))
+                    .collect::<Vec<f32>>()
             };
             let rope = |x: &[f32], heads: usize, p: f32| -> Vec<f32> {
                 let half = hd / 2;
@@ -436,10 +502,12 @@ mod tests {
             let mut qn = vec![0.0f32; hq * hd];
             let mut kn = vec![0.0f32; hkv * hd];
             for h in 0..hq {
-                qn[h * hd..(h + 1) * hd].copy_from_slice(&rms(&q[h * hd..(h + 1) * hd], &src["q_norm"]));
+                qn[h * hd..(h + 1) * hd]
+                    .copy_from_slice(&rms(&q[h * hd..(h + 1) * hd], &src["q_norm"]));
             }
             for h in 0..hkv {
-                kn[h * hd..(h + 1) * hd].copy_from_slice(&rms(&k_raw[h * hd..(h + 1) * hd], &src["k_norm"]));
+                kn[h * hd..(h + 1) * hd]
+                    .copy_from_slice(&rms(&k_raw[h * hd..(h + 1) * hd], &src["k_norm"]));
             }
             let q = rope(&qn, hq, pos_v[0]);
             let k = rope(&kn, hkv, pos_v[0]);
@@ -449,7 +517,12 @@ mod tests {
                 let kvh = h / (hq / hkv);
                 let qs = &q[h * hd..(h + 1) * hd];
                 let scale = 1.0 / (hd as f32).sqrt();
-                let acc: f32 = qs.iter().zip(&k[kvh * hd..(kvh + 1) * hd]).map(|(a2, b2)| a2 * b2).sum::<f32>() * scale;
+                let acc: f32 = qs
+                    .iter()
+                    .zip(&k[kvh * hd..(kvh + 1) * hd])
+                    .map(|(a2, b2)| a2 * b2)
+                    .sum::<f32>()
+                    * scale;
                 let wgt = 1.0; // 单窗 softmax 恒 1
                 let _ = acc;
                 for d in 0..hd {
@@ -479,11 +552,13 @@ mod tests {
     #[owl_test(gpu)]
     async fn gpu_gdn_layer_matches_host() {
         use crate::layers::gdn::GdnBuffers;
-        let (nk, hk_dim, nv, hv_dim, hidden, inter) = (2usize, 4usize, 2usize, 4usize, 6usize, 5usize);
+        let (nk, hk_dim, nv, hv_dim, hidden, inter) =
+            (2usize, 4usize, 2usize, 4usize, 6usize, 5usize);
         let key_dim = nk * hk_dim;
         let value_dim = nv * hv_dim;
         let conv_dim = 2 * key_dim + value_dim;
-        let layer = DecoderLayer::new_gdn(nk, hk_dim, nv, hv_dim, hidden, inter, EPS, QuantPlan::F16);
+        let layer =
+            DecoderLayer::new_gdn(nk, hk_dim, nv, hv_dim, hidden, inter, EPS, QuantPlan::F16);
         eprintln!("[gdn] boot...");
         let mut gpu = crate::testkit::gpu_client().await;
         eprintln!("[gdn] booted; eval_load...");
@@ -502,25 +577,45 @@ mod tests {
             ("up_proj", inter * hidden, 13.0),
             ("down_proj", hidden * inter, 14.0),
         ]);
-        crate::interpreters::eval_load(&layer, &mut gpu, &src, &Default::default()).await.expect("load");
+        crate::interpreters::eval_load(&layer, &mut gpu, &src, &Default::default())
+            .await
+            .expect("load");
         eprintln!("[gdn] loaded; buffers...");
         let tokens = 1usize;
         let xs = gen(2.0, hidden);
         let slots_v = [1.0f32];
-        let xs_t = TensorOps::from_host(Dtype::F32, vec![tokens, hidden], &crate::testkit::f32b(&xs));
+        let xs_t =
+            TensorOps::from_host(Dtype::F32, vec![tokens, hidden], &crate::testkit::f32b(&xs));
         // 五段各配全新零状态,**每轮只 harvest 目标段**(第 i 轮的第一次
         // eval 是唯一干净态:状态副作用下,同树二次 eval = 滑过态,不可比)
         let mut harvested = Vec::new();
         for i in 0..5 {
             eprintln!("[gdn] round {i}");
             let buf = GdnBuffers {
-                conv_q: zero_block(&mut gpu, 4 * key_dim * 3, vec![4, key_dim, 3]).await.1,
-                conv_k: zero_block(&mut gpu, 4 * key_dim * 3, vec![4, key_dim, 3]).await.1,
-                conv_v: zero_block(&mut gpu, 4 * value_dim * 3, vec![4, value_dim, 3]).await.1,
-                rec: zero_block(&mut gpu, 4 * nv * hk_dim * hv_dim, vec![4, nv, hk_dim, hv_dim]).await.1,
-                slots: TensorOps::from_host(Dtype::F32, vec![1, tokens], &crate::testkit::f32b(&slots_v)),  // 契约 slots/kv_lens r2(B6 收敛)
+                conv_q: zero_block(&mut gpu, 4 * key_dim * 3, vec![4, key_dim, 3])
+                    .await
+                    .1,
+                conv_k: zero_block(&mut gpu, 4 * key_dim * 3, vec![4, key_dim, 3])
+                    .await
+                    .1,
+                conv_v: zero_block(&mut gpu, 4 * value_dim * 3, vec![4, value_dim, 3])
+                    .await
+                    .1,
+                rec: zero_block(
+                    &mut gpu,
+                    4 * nv * hk_dim * hv_dim,
+                    vec![4, nv, hk_dim, hv_dim],
+                )
+                .await
+                .1,
+                slots: TensorOps::from_host(
+                    Dtype::F32,
+                    vec![1, tokens],
+                    &crate::testkit::f32b(&slots_v),
+                ), // 契约 slots/kv_lens r2(B6 收敛)
             };
-            let (m, hd, n2d, md, fd) = layer.forward_stages(&xs_t, &ForwardCtx::gdn_decode(tokens, &buf));
+            let (m, hd, n2d, md, fd) =
+                layer.forward_stages(&xs_t, &ForwardCtx::gdn_decode(tokens, &buf));
             // 每轮只 harvest 目标段:本段 eval = 该轮第一次 = 唯一干净态
             // (状态副作用下,同树二次 eval 已滑状态,不可作对拍锚)
             let t = [m, hd, n2d, md, fd][i].clone();
@@ -541,10 +636,18 @@ mod tests {
         let z = &qkvz[conv_dim..];
         let b_v = lin(&n1, &src["in_proj_b"], nv, hidden);
         let _a_v = lin(&n1, &src["in_proj_a"], nv, hidden);
-        let segs = [&qkv[0..key_dim], &qkv[key_dim..2 * key_dim], &qkv[2 * key_dim..]];
+        let segs = [
+            &qkv[0..key_dim],
+            &qkv[key_dim..2 * key_dim],
+            &qkv[2 * key_dim..],
+        ];
         let seg_dim = [key_dim, key_dim, value_dim];
         let seg_off = [0usize, key_dim, 2 * key_dim];
-        let mut post = [vec![0.0f32; key_dim], vec![0.0f32; key_dim], vec![0.0f32; value_dim]];
+        let mut post = [
+            vec![0.0f32; key_dim],
+            vec![0.0f32; key_dim],
+            vec![0.0f32; value_dim],
+        ];
         for (seg, inp) in segs.iter().enumerate() {
             for ch in 0..seg_dim[seg] {
                 let wb = (seg_off[seg] + ch) * 4;
@@ -562,8 +665,10 @@ mod tests {
         let mut qn = vec![0.0f32; key_dim];
         let mut kn = vec![0.0f32; key_dim];
         for h in 0..nk {
-            qn[h * hk_dim..(h + 1) * hk_dim].copy_from_slice(&l2(&post[0][h * hk_dim..(h + 1) * hk_dim]));
-            kn[h * hk_dim..(h + 1) * hk_dim].copy_from_slice(&l2(&post[1][h * hk_dim..(h + 1) * hk_dim]));
+            qn[h * hk_dim..(h + 1) * hk_dim]
+                .copy_from_slice(&l2(&post[0][h * hk_dim..(h + 1) * hk_dim]));
+            kn[h * hk_dim..(h + 1) * hk_dim]
+                .copy_from_slice(&l2(&post[1][h * hk_dim..(h + 1) * hk_dim]));
         }
         let beta_v: Vec<f32> = b_v.iter().map(|v| 1.0 / (1.0 + (-v).exp())).collect();
         let q_scale = 1.0 / (hk_dim as f32).sqrt();
@@ -585,7 +690,8 @@ mod tests {
         let mut gated = vec![0.0f32; value_dim];
         for vh in 0..nv {
             let base = vh * hv_dim;
-            let ms: f32 = (0..hv_dim).map(|i| y[base + i] * y[base + i]).sum::<f32>() / hv_dim as f32;
+            let ms: f32 =
+                (0..hv_dim).map(|i| y[base + i] * y[base + i]).sum::<f32>() / hv_dim as f32;
             let inv = 1.0 / (ms.max(0.0) + EPS).sqrt();
             for i in 0..hv_dim {
                 let zv = z[base + i];
@@ -609,18 +715,29 @@ mod tests {
             let (cqb, cq_t) = zero_block(&mut gpu, 4 * key_dim * 3, vec![4, key_dim, 3]).await;
             let (ckb, ck_t) = zero_block(&mut gpu, 4 * key_dim * 3, vec![4, key_dim, 3]).await;
             let (cvb, cv_t) = zero_block(&mut gpu, 4 * value_dim * 3, vec![4, value_dim, 3]).await;
-            let (rcb, rc_t) = zero_block(&mut gpu, 4 * nv * hk_dim * hv_dim, vec![4, nv, hk_dim, hv_dim]).await;
+            let (rcb, rc_t) = zero_block(
+                &mut gpu,
+                4 * nv * hk_dim * hv_dim,
+                vec![4, nv, hk_dim, hv_dim],
+            )
+            .await;
             let _ = (&cqb, &ckb, &cvb, &rcb);
             let buf5 = GdnBuffers {
                 conv_q: cq_t,
                 conv_k: ck_t,
                 conv_v: cv_t,
                 rec: rc_t,
-                slots: TensorOps::from_host(Dtype::F32, vec![1, tokens], &crate::testkit::f32b(&slots_v)),  // 契约 slots/kv_lens r2(B6 收敛)
+                slots: TensorOps::from_host(
+                    Dtype::F32,
+                    vec![1, tokens],
+                    &crate::testkit::f32b(&slots_v),
+                ), // 契约 slots/kv_lens r2(B6 收敛)
             };
-            let (_, _, _, _, f1) = layer.forward_stages(&xs_t, &ForwardCtx::gdn_decode(tokens, &buf5));
+            let (_, _, _, _, f1) =
+                layer.forward_stages(&xs_t, &ForwardCtx::gdn_decode(tokens, &buf5));
             let g1 = crate::testkit::harvest(&mut gpu, &f1).await;
-            let (_, _, _, _, f2) = layer.forward_stages(&xs_t, &ForwardCtx::gdn_decode(tokens, &buf5));
+            let (_, _, _, _, f2) =
+                layer.forward_stages(&xs_t, &ForwardCtx::gdn_decode(tokens, &buf5));
             let g2 = crate::testkit::harvest(&mut gpu, &f2).await;
             println!("  [final] fresh-buf full #1 = {g1:?}");
             println!("  [final] fresh-buf full #2 = {g2:?}");

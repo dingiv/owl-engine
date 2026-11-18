@@ -189,31 +189,35 @@ pub fn plan_span(
         (WeightRule::SegmentedCol(_), WantAxis::KMajor) => Split::Dim1Seg,
     };
     let mut out_shape = shape.to_vec();
-    let seg_split = |segs: &[usize], dim: usize| -> Result<(Vec<(usize, usize, usize)>, usize), String> {
-        if segs.is_empty() {
-            return Err("plan_span: 分段切的段长为空(调用方须按 SegKind 展开)".into());
-        }
-        let total: usize = segs.iter().sum();
-        if total != shape[dim] {
-            return Err(format!(
-                "plan_span: 段长合计 {total} ≠ 第 {dim} 维 {}(shape {shape:?})",
-                shape[dim]
-            ));
-        }
-        let mut spans = Vec::with_capacity(segs.len());
-        let (mut off, mut shard) = (0usize, 0usize);
-        for &seg in segs {
-            let r = plan.shard_range(seg)?;
-            spans.push((off, r.start, r.len()));
-            off += seg;
-            shard += r.len();
-        }
-        Ok((spans, shard))
-    };
+    let seg_split =
+        |segs: &[usize], dim: usize| -> Result<(Vec<(usize, usize, usize)>, usize), String> {
+            if segs.is_empty() {
+                return Err("plan_span: 分段切的段长为空(调用方须按 SegKind 展开)".into());
+            }
+            let total: usize = segs.iter().sum();
+            if total != shape[dim] {
+                return Err(format!(
+                    "plan_span: 段长合计 {total} ≠ 第 {dim} 维 {}(shape {shape:?})",
+                    shape[dim]
+                ));
+            }
+            let mut spans = Vec::with_capacity(segs.len());
+            let (mut off, mut shard) = (0usize, 0usize);
+            for &seg in segs {
+                let r = plan.shard_range(seg)?;
+                spans.push((off, r.start, r.len()));
+                off += seg;
+                shard += r.len();
+            }
+            Ok((spans, shard))
+        };
     match split {
         Split::Dim0 => {
             let r = plan.shard_range(shape[0])?;
-            let span = SourceSpan::Rows { row_start: r.start, rows: r.len() };
+            let span = SourceSpan::Rows {
+                row_start: r.start,
+                rows: r.len(),
+            };
             out_shape[0] = r.len();
             Ok(Some((span, out_shape)))
         }
@@ -224,7 +228,10 @@ pub fn plan_span(
                 ));
             }
             let r = plan.shard_range(shape[1])?;
-            let span = SourceSpan::Cols { col_start: r.start, cols: r.len() };
+            let span = SourceSpan::Cols {
+                col_start: r.start,
+                cols: r.len(),
+            };
             out_shape[1] = r.len();
             Ok(Some((span, out_shape)))
         }
@@ -236,9 +243,7 @@ pub fn plan_span(
         }
         Split::Dim1Seg => {
             if shape.len() < 2 {
-                return Err(format!(
-                    "plan_span: 列段切需要 ≥2 维(得 {shape:?})"
-                ));
+                return Err(format!("plan_span: 列段切需要 ≥2 维(得 {shape:?})"));
             }
             let (segs_span, shard_cols) = seg_split(segs, 1)?;
             let span = SourceSpan::ColsSeg { segs: segs_span };
@@ -320,7 +325,13 @@ mod tests {
         )
         .unwrap()
         .unwrap();
-        assert_eq!(span, SourceSpan::Cols { col_start: 8704, cols: 8704 });
+        assert_eq!(
+            span,
+            SourceSpan::Cols {
+                col_start: 8704,
+                cols: 8704
+            }
+        );
         assert_eq!(shape, vec![160, 8704], "KMajor 切 out = 切第 1 维");
 
         // 同一键若是 Row 规则(down_proj):切第 0 维(k 侧)
@@ -333,7 +344,13 @@ mod tests {
         )
         .unwrap()
         .unwrap();
-        assert_eq!(span, SourceSpan::Rows { row_start: 0, rows: 272 });
+        assert_eq!(
+            span,
+            SourceSpan::Rows {
+                row_start: 0,
+                rows: 272
+            }
+        );
         assert_eq!(shape, vec![272, 5120], "KMajor 切 k = 切第 0 维");
     }
 
@@ -355,7 +372,12 @@ mod tests {
         .unwrap();
         assert_eq!(
             span,
-            SourceSpan::ColsSeg { segs: vec![(0, q_gate / 2, q_gate / 2), (q_gate, q_gate / 2, q_gate / 2)] }
+            SourceSpan::ColsSeg {
+                segs: vec![
+                    (0, q_gate / 2, q_gate / 2),
+                    (q_gate, q_gate / 2, q_gate / 2)
+                ]
+            }
         );
         assert_eq!(out_shape, vec![k / 32, q_gate], "列段:第 1 维 = 段各半之和");
         // 逐行映射自证(rank1 ⇒ 段内窗口起点 = 段长/2 = 1536):
@@ -372,9 +394,15 @@ mod tests {
     #[test]
     fn rows_span_is_contiguous() {
         // 源 [8, 6](out=8, in=6);world=2 ⇒ rank1 取行 4..8
-        let (span, shape) = plan_span(WeightRule::UniformCol, &[8, 6], plan(1, 2), &[], WantAxis::Logical)
-            .unwrap()
-            .unwrap();
+        let (span, shape) = plan_span(
+            WeightRule::UniformCol,
+            &[8, 6],
+            plan(1, 2),
+            &[],
+            WantAxis::Logical,
+        )
+        .unwrap()
+        .unwrap();
         assert_eq!(shape, vec![4, 6]);
         // 目标 [4, 6] 的第 0..12 元素(前两行)→ 源 4*6=24 .. 36(连续!)
         assert_eq!(span.map(0, 12, 6, 6).unwrap(), vec![(24, 12)]);
@@ -388,9 +416,15 @@ mod tests {
     #[test]
     fn cols_span_is_strided_per_row() {
         // 源 [4, 8](in=8);world=2 ⇒ rank1 取列 4..8
-        let (span, shape) = plan_span(WeightRule::UniformRow, &[4, 8], plan(1, 2), &[], WantAxis::Logical)
-            .unwrap()
-            .unwrap();
+        let (span, shape) = plan_span(
+            WeightRule::UniformRow,
+            &[4, 8],
+            plan(1, 2),
+            &[],
+            WantAxis::Logical,
+        )
+        .unwrap()
+        .unwrap();
         assert_eq!(shape, vec![4, 4]);
         // 目标 [4, 4] 的第 0..4(第 0 行)→ 源行 0 的列 4..8 = [4, 4)
         assert_eq!(span.map(0, 4, 4, 8).unwrap(), vec![(4, 4)]);
@@ -405,9 +439,15 @@ mod tests {
     fn segmented_span_covers_each_segment() {
         let shape = [12288usize, 5120];
         let segs = [6144usize, 6144];
-        let (span, out_shape) = plan_span(WeightRule::SegmentedCol(SegKind::QGate), &shape, plan(1, 2), &segs, WantAxis::Logical)
-            .unwrap()
-            .unwrap();
+        let (span, out_shape) = plan_span(
+            WeightRule::SegmentedCol(SegKind::QGate),
+            &shape,
+            plan(1, 2),
+            &segs,
+            WantAxis::Logical,
+        )
+        .unwrap()
+        .unwrap();
         assert_eq!(out_shape, vec![6144, 5120], "两段各取半 ⇒ 总行数 = 12288/2");
         // 目标行 0(段 0 的第 0 行)→ 源行 3072;目标行 3072(段 1 的第 0 行)→ 源行 6144+3072
         let m = span.map(0, 4, 5120, 5120).unwrap();
@@ -415,13 +455,28 @@ mod tests {
         let m2 = span.map(3072 * 5120, 4, 5120, 5120).unwrap();
         assert_eq!(m2, vec![(9216 * 5120, 4)], "第二段起点 = 6144 + 3072");
         // 段长合计不符 = 拒
-        assert!(plan_span(WeightRule::SegmentedCol(SegKind::QGate), &shape, plan(0, 2), &[6144, 6143], WantAxis::Logical).is_err());
+        assert!(plan_span(
+            WeightRule::SegmentedCol(SegKind::QGate),
+            &shape,
+            plan(0, 2),
+            &[6144, 6143],
+            WantAxis::Logical
+        )
+        .is_err());
     }
 
     /// 一维权重(PerHead:A_log [16])按行切
     #[test]
     fn per_head_1d_is_rows() {
-        let (span, shape) = plan_span(WeightRule::PerHead, &[16], plan(1, 2), &[], WantAxis::Logical).unwrap().unwrap();
+        let (span, shape) = plan_span(
+            WeightRule::PerHead,
+            &[16],
+            plan(1, 2),
+            &[],
+            WantAxis::Logical,
+        )
+        .unwrap()
+        .unwrap();
         assert_eq!(shape, vec![8]);
         // 行宽 = 1(一维)
         assert_eq!(span.map(0, 8, 1, 1).unwrap(), vec![(8, 8)]);
@@ -430,8 +485,24 @@ mod tests {
     /// world=1 / Replicate ⇒ 不切(None)
     #[test]
     fn single_and_replicate_are_none() {
-        assert!(plan_span(WeightRule::UniformCol, &[8, 6], TpPlan::single(), &[], WantAxis::Logical).unwrap().is_none());
-        assert!(plan_span(WeightRule::Replicate, &[8, 6], plan(1, 2), &[], WantAxis::Logical).unwrap().is_none());
+        assert!(plan_span(
+            WeightRule::UniformCol,
+            &[8, 6],
+            TpPlan::single(),
+            &[],
+            WantAxis::Logical
+        )
+        .unwrap()
+        .is_none());
+        assert!(plan_span(
+            WeightRule::Replicate,
+            &[8, 6],
+            plan(1, 2),
+            &[],
+            WantAxis::Logical
+        )
+        .unwrap()
+        .is_none());
     }
 
     /// 分片 rows 与"全量后切"等价(纯算术自洽:两 rank 映射的行集拼接 = 全域)
@@ -440,7 +511,15 @@ mod tests {
         let shape = [8usize, 6];
         let mut got: Vec<usize> = Vec::new();
         for r in 0..2 {
-            let (span, _) = plan_span(WeightRule::UniformCol, &shape, plan(r, 2), &[], WantAxis::Logical).unwrap().unwrap();
+            let (span, _) = plan_span(
+                WeightRule::UniformCol,
+                &shape,
+                plan(r, 2),
+                &[],
+                WantAxis::Logical,
+            )
+            .unwrap()
+            .unwrap();
             // 目标 4 行 × 行宽 6 → 源读序列展开成源行号
             for (src_off, len) in span.map(0, 4 * 6, 6, 6).unwrap() {
                 for i in 0..len {

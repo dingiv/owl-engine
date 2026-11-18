@@ -17,7 +17,8 @@
 use crate::client::xqa::{parse_verify, DECODE_XQA, PREFILL_XQA, VERIFY_XQA};
 use crate::contract::{Bytes, Dtype, LaunchMsg, OpError, OpId};
 use crate::family::xqa::{
-    KVCacheList, XqaArgs, XqaConsts, ASSET_DECODE, ASSET_VERIFY, CONSTS_SLOTS, SYM_CONSTS, SYM_KERNEL,
+    KVCacheList, XqaArgs, XqaConsts, ASSET_DECODE, ASSET_VERIFY, CONSTS_SLOTS, SYM_CONSTS,
+    SYM_KERNEL,
 };
 use crate::registry::{FamilyGuard, KernelFamily};
 use std::sync::Arc;
@@ -117,14 +118,14 @@ fn emit_geom(
     let c = parse_verify(msg)?;
     // 逐参命名解析(失败即报"哪一个参 + 哪个块 id" —— DeadBlock 定谳用)
     let r = |name: &'static str, b: &crate::client::xqa::BlockRef| {
-        res.resolve(b.id).map(|p| p + b.byte_offset).map_err(|e| {
-            OpError::Contract {
+        res.resolve(b.id)
+            .map(|p| p + b.byte_offset)
+            .map_err(|e| OpError::Contract {
                 op: op.into(),
                 field: name,
                 expect: format!("块 id={} 在本账房可解析", b.id),
                 got: format!("{e}"),
-            }
-        })
+            })
     };
     let q = r("q", &c.q)?;
     let kc = r("k_cache", &c.k_cache)?;
@@ -134,17 +135,27 @@ fn emit_geom(
     let mk = r("mask", &c.mask)?;
     let sem = r("semaphores", &c.semaphores)?;
     let scratch = r("scratch", &c.scratch)?;
-    let out = r("out", &crate::client::xqa::BlockRef { id: c.out.id, byte_offset: 0 })?;
+    let out = r(
+        "out",
+        &crate::client::xqa::BlockRef {
+            id: c.out.id,
+            byte_offset: 0,
+        },
+    )?;
     // F2 入参尺寸自证:scratch 是内核的**持久工作区**(KV-split partial +
     // 行归约),少分配 ⇒ 越界写邻块。精确需求随 geometry 变且住内核
     // `MemSegmenter`(host 推 = 复制内核常量)⇒ 只守下限,公式/拒语住
     // `family::xqa`。
-    let have_scr =
-        res.resolve_len(c.scratch.id)?.saturating_sub(c.scratch.byte_offset as usize);
+    let have_scr = res
+        .resolve_len(c.scratch.id)?
+        .saturating_sub(c.scratch.byte_offset as usize);
     crate::family::xqa::scratch_size_check(have_scr).map_err(|detail| OpError::Contract {
         op: op.to_string(),
         field: "scratch",
-        expect: format!("块账长 ≥ {} B(下限)", crate::family::xqa::XQA_SCRATCH_FLOOR_BYTES),
+        expect: format!(
+            "块账长 ≥ {} B(下限)",
+            crate::family::xqa::XQA_SCRATCH_FLOOR_BYTES
+        ),
         got: detail,
     })?;
 
@@ -194,7 +205,16 @@ fn emit_geom(
         semaphores: sem,
         scratch,
     };
-    exec.launch(res, OpId(op), kernel, crate::family::xqa::SYM_KERNEL, grid, block, smem, &args.vals(consts.head_grp))?;
+    exec.launch(
+        res,
+        OpId(op),
+        kernel,
+        crate::family::xqa::SYM_KERNEL,
+        grid,
+        block,
+        smem,
+        &args.vals(consts.head_grp),
+    )?;
     Ok(Bytes::new(c.out.id, msg.out_elems, Dtype::F16, 2))
 }
 
@@ -202,8 +222,6 @@ impl KernelFamily for XqaRuntime {
     fn id(&self) -> OpId {
         Self::ID
     }
-
-
 
     /// 装配:载 `xqa_verify` 资产 + 探针核读常量(workspace 仍由调用方给)
     fn assemble(
@@ -270,7 +288,15 @@ impl KernelFamily for XqaPrefillRuntime {
         res: &mut dyn crate::device::DeviceRes,
         exec: &mut crate::device::Exec,
     ) -> Result<Bytes, OpError> {
-        emit_geom(msg, res, exec, PREFILL_XQA, &self.kernel, &self.consts, XqaGeom::Single)
+        emit_geom(
+            msg,
+            res,
+            exec,
+            PREFILL_XQA,
+            &self.kernel,
+            &self.consts,
+            XqaGeom::Single,
+        )
     }
 }
 
@@ -284,8 +310,6 @@ impl KernelFamily for XqaDecodeRuntime {
     fn id(&self) -> OpId {
         Self::ID
     }
-
-
 
     fn assemble(
         res: &mut dyn crate::device::DeviceRes,
@@ -301,6 +325,14 @@ impl KernelFamily for XqaDecodeRuntime {
         res: &mut dyn crate::device::DeviceRes,
         exec: &mut crate::device::Exec,
     ) -> Result<Bytes, OpError> {
-        emit_geom(msg, res, exec, DECODE_XQA, &self.kernel, &self.consts, XqaGeom::Auto)
+        emit_geom(
+            msg,
+            res,
+            exec,
+            DECODE_XQA,
+            &self.kernel,
+            &self.consts,
+            XqaGeom::Auto,
+        )
     }
 }

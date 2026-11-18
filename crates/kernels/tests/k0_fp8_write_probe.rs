@@ -3,8 +3,8 @@
 //! 布局 = 生产 x=8(classic [nb, Hkv, hd/8, bs, 8])。
 //! 无 GPU 跳过(OWL_TEST_DEVICE)。
 
-use owl_macros::owl_test;
 use cudarc::driver::{CudaContext, DevicePtr, LaunchConfig, PushKernelArg};
+use owl_macros::owl_test;
 
 const HKV: usize = 2;
 const HD: usize = 256;
@@ -20,7 +20,11 @@ fn e4m3_decode(b: u8) -> f32 {
     if e == 15 && m == 7 {
         return f32::NAN;
     }
-    let v = if e == 0 { (m as f32) * 2f32.powi(-9) } else { (1.0 + m as f32 / 8.0) * 2f32.powi(e - 7) };
+    let v = if e == 0 {
+        (m as f32) * 2f32.powi(-9)
+    } else {
+        (1.0 + m as f32 / 8.0) * 2f32.powi(e - 7)
+    };
     s * v
 }
 
@@ -74,7 +78,8 @@ fn k0_fp8_write_readback() {
     ctx.bind_to_thread().expect("bind");
     let stream = ctx.default_stream();
     let ptx = cudarc::nvrtc::compile_ptx_with_opts(
-        owl_kernels::cu_sig::cu_text(owl_kernels::ops::source("owl_reshape_and_cache_fp8kv")).as_str(),
+        owl_kernels::cu_sig::cu_text(owl_kernels::ops::source("owl_reshape_and_cache_fp8kv"))
+            .as_str(),
         cudarc::nvrtc::CompileOptions {
             arch: Some("compute_86"),
             include_paths: vec!["/usr/local/cuda/include".into()],
@@ -134,7 +139,11 @@ fn k0_fp8_write_readback() {
         .arg(&(BS as i32))
         .arg(&(X as i32))
         .arg(&op);
-    let cfg = LaunchConfig { grid_dim: (T as u32, 1, 1), block_dim: (256, 1, 1), shared_mem_bytes: 0 };
+    let cfg = LaunchConfig {
+        grid_dim: (T as u32, 1, 1),
+        block_dim: (256, 1, 1),
+        shared_mem_bytes: 0,
+    };
     unsafe { b.launch(cfg) }.expect("k0 fp8 launch");
     stream.synchronize().unwrap();
 
@@ -154,14 +163,23 @@ fn k0_fp8_write_readback() {
                 let src = t * HKV * HD + h * HD + d;
                 let x_idx = d / X;
                 let x_off = d % X;
-                let ki = blk * HKV * (HD / X) * BS * X + h * (HD / X) * BS * X + x_idx * BS * X + off * X + x_off;
+                let ki = blk * HKV * (HD / X) * BS * X
+                    + h * (HD / X) * BS * X
+                    + x_idx * BS * X
+                    + off * X
+                    + x_off;
                 let vi = blk * HKV * HD * BS + h * HD * BS + d * BS + off;
                 let want_k = e4m3_encode(f16_to_f32(key[src]));
                 let want_v = e4m3_encode(f16_to_f32(value[src]));
                 if kc[ki] != want_k {
                     bad += 1;
                     if bad < 4 {
-                        eprintln!("K mismatch t{t} h{h} d{d}: got {} want {} ({})", kc[ki], want_k, e4m3_decode(kc[ki]));
+                        eprintln!(
+                            "K mismatch t{t} h{h} d{d}: got {} want {} ({})",
+                            kc[ki],
+                            want_k,
+                            e4m3_decode(kc[ki])
+                        );
                     }
                 }
                 if vc[vi] != want_v {

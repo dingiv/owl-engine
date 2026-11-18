@@ -103,7 +103,14 @@ impl Eq for LogSink {}
 impl LogSink {
     /// 空口(全部丢弃;测试/无宿主场景)
     pub const fn none() -> Self {
-        Self { log: None, enabled: None, timer: None, count: None, gpu: None, timing: None }
+        Self {
+            log: None,
+            enabled: None,
+            timer: None,
+            count: None,
+            gpu: None,
+            timing: None,
+        }
     }
 
     /// 显式组装(各面可单独给)
@@ -115,7 +122,14 @@ impl LogSink {
         gpu: Option<fn() -> bool>,
         timing: Option<fn() -> bool>,
     ) -> Self {
-        Self { log, enabled, timer, count, gpu, timing }
+        Self {
+            log,
+            enabled,
+            timer,
+            count,
+            gpu,
+            timing,
+        }
     }
 
     /// 是否未接线(免无谓 format)
@@ -230,7 +244,10 @@ mod value_tests {
         let open = LogSink::new(Some(rec_log), Some(yes), None, None, None, None);
         open.logf(LVL_WARN, "t", format_args!("放行"));
         assert_eq!(SEEN.load(std::sync::atomic::Ordering::Relaxed), before + 1);
-        assert_eq!(LAST_LVL.load(std::sync::atomic::Ordering::Relaxed), LVL_WARN);
+        assert_eq!(
+            LAST_LVL.load(std::sync::atomic::Ordering::Relaxed),
+            LVL_WARN
+        );
     }
 
     /// 两个分级门彼此独立

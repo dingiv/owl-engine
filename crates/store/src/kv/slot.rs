@@ -27,7 +27,10 @@ pub(crate) struct SlotPool {
 impl SlotPool {
     /// 全池空闲起步。
     pub(crate) fn new(slots: usize) -> Self {
-        Self { refs: vec![0; slots], free: (0..slots as u32).collect() }
+        Self {
+            refs: vec![0; slots],
+            free: (0..slots as u32).collect(),
+        }
     }
 
     /// 池容量(槽数)。
@@ -42,10 +45,9 @@ impl SlotPool {
 
     /// 取一个槽(**引用置 1**;调用方即成为持有者)。池空 = 响亮拒。
     pub(crate) fn acquire(&mut self) -> StoreResult<u32> {
-        let slot = self
-            .free
-            .pop_front()
-            .ok_or_else(|| StoreError::Exhausted(format!("槽池耗尽(共 {} 槽,无自由槽)", self.refs.len())))?;
+        let slot = self.free.pop_front().ok_or_else(|| {
+            StoreError::Exhausted(format!("槽池耗尽(共 {} 槽,无自由槽)", self.refs.len()))
+        })?;
         self.refs[slot as usize] = 1;
         Ok(slot)
     }
@@ -59,7 +61,9 @@ impl SlotPool {
             .ok_or_else(|| StoreError::Invariant(format!("槽 {slot} 越界(共 {n})")))?;
         if *r == 0 {
             // 自由槽被引用 = 账目已坏(持有者应经 acquire);不许静默吞掉
-            return Err(StoreError::Invariant(format!("槽 {slot} 是自由槽,不能加引用")));
+            return Err(StoreError::Invariant(format!(
+                "槽 {slot} 是自由槽,不能加引用"
+            )));
         }
         *r = r.saturating_add(1);
         Ok(())
@@ -73,7 +77,9 @@ impl SlotPool {
             .get_mut(slot as usize)
             .ok_or_else(|| StoreError::Invariant(format!("槽 {slot} 越界(共 {n})")))?;
         if *r == 0 {
-            return Err(StoreError::Invariant(format!("槽 {slot} 引用已为 0,不能再减")));
+            return Err(StoreError::Invariant(format!(
+                "槽 {slot} 引用已为 0,不能再减"
+            )));
         }
         *r -= 1;
         let freed = *r == 0;
@@ -100,7 +106,10 @@ mod tests {
         let a = p.acquire().expect("槽 A");
         let b = p.acquire().expect("槽 B");
         assert_eq!((a, b), (0, 1), "分配从队首");
-        assert!(matches!(p.acquire(), Err(StoreError::Exhausted(_))), "池空响亮拒");
+        assert!(
+            matches!(p.acquire(), Err(StoreError::Exhausted(_))),
+            "池空响亮拒"
+        );
 
         // 共享:缓存 + 会话各持一份
         p.incref(a).expect("共享加引用");
@@ -116,8 +125,17 @@ mod tests {
     #[test]
     fn free_slot_cannot_be_increfed_and_zero_cannot_be_decrefed() {
         let mut p = SlotPool::new(1);
-        assert!(matches!(p.incref(0), Err(StoreError::Invariant(_))), "自由槽不许加引用");
-        assert!(matches!(p.decref(0), Err(StoreError::Invariant(_))), "0 引用不许再减");
-        assert!(matches!(p.incref(9), Err(StoreError::Invariant(_))), "越界响亮拒");
+        assert!(
+            matches!(p.incref(0), Err(StoreError::Invariant(_))),
+            "自由槽不许加引用"
+        );
+        assert!(
+            matches!(p.decref(0), Err(StoreError::Invariant(_))),
+            "0 引用不许再减"
+        );
+        assert!(
+            matches!(p.incref(9), Err(StoreError::Invariant(_))),
+            "越界响亮拒"
+        );
     }
 }

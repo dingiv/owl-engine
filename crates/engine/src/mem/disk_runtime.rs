@@ -139,10 +139,7 @@ impl DiskRuntime {
             let Some(bytes) = rel.host_block(*h).map(|b| b.as_slice().to_vec()) else {
                 break;
             };
-            if self
-                .spill_bytes(rel, *h, bytes, active_sessions)
-                .await?
-            {
+            if self.spill_bytes(rel, *h, bytes, active_sessions).await? {
                 out.host_blocks += 1;
             } else {
                 break;
@@ -169,10 +166,7 @@ impl DiskRuntime {
                 owl_shared::log_warn!("store", "KV checkpoint 读槽 {i} 失败:{e}");
                 break;
             }
-            if !self
-                .spill_bytes(rel, *h, buf, active_sessions)
-                .await?
-            {
+            if !self.spill_bytes(rel, *h, buf, active_sessions).await? {
                 break;
             }
             out.dev_blocks += 1;
@@ -204,17 +198,16 @@ impl DiskRuntime {
                     break;
                 }
                 Err(StoreError::Exhausted(_)) if attempt < 2 => {
-                    let block = rel.snap_disk_block_bytes().ok_or_else(|| {
-                        ModelError::EngineInvariant {
-                            what: "快照溢写: snap_disk_enabled 但块字节缺失".into(),
-                        }
-                    })?;
+                    let block =
+                        rel.snap_disk_block_bytes()
+                            .ok_or_else(|| ModelError::EngineInvariant {
+                                what: "快照溢写: snap_disk_enabled 但块字节缺失".into(),
+                            })?;
                     let over = rel
                         .snap_disk_used_bytes()
                         .saturating_sub(rel.snap_disk_budget_bytes());
                     let need = over.saturating_add(block);
-                    let evp =
-                        rel.snap_disk_plan_evict_sessions(need, &[], active_sessions);
+                    let evp = rel.snap_disk_plan_evict_sessions(need, &[], active_sessions);
                     if evp.victims.is_empty() {
                         // 账内腾不动 ⇒ 清未入账（坏尺寸/重复/孤儿；删除时机 = 写盘时）
                         let keep = rel.snap_disk_live_paths();
@@ -236,8 +229,7 @@ impl DiskRuntime {
                         }
                         break;
                     }
-                    let paths: Vec<PathBuf> =
-                        evp.victims.iter().map(|(_, p)| p.clone()).collect();
+                    let paths: Vec<PathBuf> = evp.victims.iter().map(|(_, p)| p.clone()).collect();
                     let keys: Vec<SnapKey> = evp.victims.iter().map(|(k, _)| *k).collect();
                     disk_io::remove_files(paths).await;
                     rel.snap_disk_commit_evict(&keys);
@@ -321,8 +313,7 @@ impl DiskRuntime {
         if todo.is_empty() {
             return Ok(0);
         }
-        let items: Vec<(PathBuf, usize)> =
-            todo.iter().map(|(_, p, b)| (p.clone(), *b)).collect();
+        let items: Vec<(PathBuf, usize)> = todo.iter().map(|(_, p, b)| (p.clone(), *b)).collect();
         let bufs = disk_io::read_blocks(items).await;
         let mut n = 0usize;
         for ((c, _, _), r) in todo.iter().zip(bufs) {
@@ -456,17 +447,16 @@ impl DiskRuntime {
                 Ok(p) => return Ok(Some(p)),
                 Err(StoreError::Exhausted(_)) if attempt < 2 => {
                     // 腾够**能写进这一块**的量：超配额部分 + 本次一块。
-                    let block = rel.kv_disk_block_bytes().ok_or_else(|| {
-                        ModelError::EngineInvariant {
-                            what: "KV 溢写: disk_enabled 但块字节缺失".into(),
-                        }
-                    })?;
+                    let block =
+                        rel.kv_disk_block_bytes()
+                            .ok_or_else(|| ModelError::EngineInvariant {
+                                what: "KV 溢写: disk_enabled 但块字节缺失".into(),
+                            })?;
                     let over = rel
                         .disk_used_bytes()
                         .saturating_sub(rel.kv_disk_budget_bytes());
                     let need = over.saturating_add(block);
-                    let evp =
-                        rel.kv_disk_plan_evict_sessions(need, &[], active_sessions);
+                    let evp = rel.kv_disk_plan_evict_sessions(need, &[], active_sessions);
                     if evp.victims.is_empty() {
                         // 账内 LRU 腾不动 ⇒ 清“未入账”的盘上文件
                         let keep = rel.disk_live_paths();
@@ -498,10 +488,8 @@ impl DiskRuntime {
                         }
                         continue; // 腾出来了一点，回到 for 里重试 plan_spill
                     }
-                    let paths: Vec<PathBuf> =
-                        evp.victims.iter().map(|(_, p)| p.clone()).collect();
-                    let keys: Vec<ChainHash> =
-                        evp.victims.iter().map(|(k, _)| *k).collect();
+                    let paths: Vec<PathBuf> = evp.victims.iter().map(|(_, p)| p.clone()).collect();
+                    let keys: Vec<ChainHash> = evp.victims.iter().map(|(k, _)| *k).collect();
                     let n = disk_io::remove_files(paths).await;
                     let freed = rel.kv_disk_commit_evict(&keys);
                     owl_shared::log_info!(

@@ -68,7 +68,6 @@ mod tests {
     fn skip_prefix_is_single_sourced() {
         // 本测试只校验契约文案常量不含前缀（输出面由 cargo test 捕获）
         assert!(!crate::testkit::HF_PARITY_SKIP.starts_with("skip:"));
-        assert!(!crate::testkit::missing_reason("ckpt:definitely-not-listed")
-            .starts_with("skip:"));
+        assert!(!crate::testkit::missing_reason("ckpt:definitely-not-listed").starts_with("skip:"));
     }
 }

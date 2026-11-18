@@ -31,7 +31,10 @@ fn sm_count_is_a_real_attribute() {
         let sm = ffi::device_sm_count(o).unwrap_or_else(|e| panic!("device_sm_count({o}): {e}"));
         eprintln!("[dev-props] ordinal={o} name={:?} SM={sm}", rows[o].name);
         // 量级闸:消费级 GPU 的 SM 数落在 [8, 256];0/1/超大 = 取值面坏了(不静默)
-        assert!((8..=256).contains(&sm), "ordinal={o} 的 SM 数 {sm} 超合理域");
+        assert!(
+            (8..=256).contains(&sm),
+            "ordinal={o} 的 SM 数 {sm} 超合理域"
+        );
         seen.push(sm);
     }
     // 同型卡应给同值(本仓 0/1 = 3090 Ti、2/3 = 3080);不同型允许不同。

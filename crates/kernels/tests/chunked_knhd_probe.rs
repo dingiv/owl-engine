@@ -6,9 +6,9 @@
 //! kv_head_stride = hd(元素序)。判据:f16 vs host max < 2e-2;
 //! fp8 vs host max < 1e-2。无 GPU 跳过(OWL_TEST_DEVICE;卡 = ordinal 1)。
 
+use cudarc::driver::{CudaContext, DevicePtr, LaunchConfig, PushKernelArg};
 use owl_macros::owl_test;
 use std::sync::Arc;
-use cudarc::driver::{CudaContext, DevicePtr, LaunchConfig, PushKernelArg};
 
 const PAGE: usize = 32;
 const NUM_HEADS: usize = 8;
@@ -48,7 +48,11 @@ fn e4m3_decode(b: u8) -> f32 {
     if e == 15 && m == 7 {
         return f32::NAN;
     }
-    let v = if e == 0 { (m as f32) * 2f32.powi(-9) } else { (1.0 + m as f32 / 8.0) * 2f32.powi(e - 7) };
+    let v = if e == 0 {
+        (m as f32) * 2f32.powi(-9)
+    } else {
+        (1.0 + m as f32 / 8.0) * 2f32.powi(e - 7)
+    };
     s * v
 }
 
@@ -75,14 +79,22 @@ fn e4m3_encode(v: f32) -> u8 {
 fn lcg(n: usize, seed: u32) -> Vec<u16> {
     (0..n)
         .map(|i| {
-            let x = seed.wrapping_mul(0x9E37_79B9).wrapping_add((i as u32).wrapping_mul(0x85EB_CA6B));
+            let x = seed
+                .wrapping_mul(0x9E37_79B9)
+                .wrapping_add((i as u32).wrapping_mul(0x85EB_CA6B));
             half_bits(((x & 0xFFFF) as f32 / 65535.0 - 0.5) * 4.0)
         })
         .collect()
 }
 
 /// host 参考(kNHD 寻址:[nb, page, hkv, hd];因果 mask;单序列块链恒等)
-fn host_attn_ref_knhd(q: &[u16], kcache: &[u8], vcache: &[u8], kv_fp8: bool, hd: usize) -> Vec<f32> {
+fn host_attn_ref_knhd(
+    q: &[u16],
+    kcache: &[u8],
+    vcache: &[u8],
+    kv_fp8: bool,
+    hd: usize,
+) -> Vec<f32> {
     let dec = |pool: &[u8], i: usize| -> f32 {
         if kv_fp8 {
             e4m3_decode(pool[i])
@@ -127,7 +139,11 @@ fn host_attn_ref_knhd(q: &[u16], kcache: &[u8], vcache: &[u8], kv_fp8: bool, hd:
     out
 }
 
-fn run_case(stream: &Arc<cudarc::driver::CudaStream>, m: &Arc<cudarc::driver::CudaModule>, hd: usize) {
+fn run_case(
+    stream: &Arc<cudarc::driver::CudaStream>,
+    m: &Arc<cudarc::driver::CudaModule>,
+    hd: usize,
+) {
     let pool_elems = NUM_BLOCKS * NUM_KV_HEADS * hd * PAGE;
     let k_f16 = lcg(pool_elems, 101 + hd as u32);
     let v_f16 = lcg(pool_elems, 202 + hd as u32);
@@ -143,7 +159,8 @@ fn run_case(stream: &Arc<cudarc::driver::CudaStream>, m: &Arc<cudarc::driver::Cu
                 for d in 0..hd {
                     let b = s / PAGE;
                     let bb = s % PAGE;
-                    p[(b * PAGE + bb) * NUM_KV_HEADS * hd + h * hd + d] = lin[s * NUM_KV_HEADS * hd + h * hd + d];
+                    p[(b * PAGE + bb) * NUM_KV_HEADS * hd + h * hd + d] =
+                        lin[s * NUM_KV_HEADS * hd + h * hd + d];
                 }
             }
         }
@@ -159,7 +176,8 @@ fn run_case(stream: &Arc<cudarc::driver::CudaStream>, m: &Arc<cudarc::driver::Cu
                     let b = s / PAGE;
                     let bb = s % PAGE;
                     let li = s * NUM_KV_HEADS * hd + h * hd + d;
-                    p[(b * PAGE + bb) * NUM_KV_HEADS * hd + h * hd + d] = e4m3_encode(f16_to_f32(k_f16[li]));
+                    p[(b * PAGE + bb) * NUM_KV_HEADS * hd + h * hd + d] =
+                        e4m3_encode(f16_to_f32(k_f16[li]));
                 }
             }
         }
@@ -173,7 +191,8 @@ fn run_case(stream: &Arc<cudarc::driver::CudaStream>, m: &Arc<cudarc::driver::Cu
                     let b = s / PAGE;
                     let bb = s % PAGE;
                     let li = s * NUM_KV_HEADS * hd + h * hd + d;
-                    p[(b * PAGE + bb) * NUM_KV_HEADS * hd + h * hd + d] = e4m3_encode(f16_to_f32(v_f16[li]));
+                    p[(b * PAGE + bb) * NUM_KV_HEADS * hd + h * hd + d] =
+                        e4m3_encode(f16_to_f32(v_f16[li]));
                 }
             }
         }
@@ -197,7 +216,9 @@ fn run_case(stream: &Arc<cudarc::driver::CudaStream>, m: &Arc<cudarc::driver::Cu
     let d_v8 = dev_u8(&v_fp8_n);
     let d_bt = {
         let mut d = unsafe { stream.alloc::<f32>(8) }.unwrap();
-        stream.memcpy_htod(&(0..8).map(|i| i as f32).collect::<Vec<_>>(), &mut d).unwrap();
+        stream
+            .memcpy_htod(&(0..8).map(|i| i as f32).collect::<Vec<_>>(), &mut d)
+            .unwrap();
         d
     };
     let d_lens = {
@@ -221,57 +242,73 @@ fn run_case(stream: &Arc<cudarc::driver::CudaStream>, m: &Arc<cudarc::driver::Cu
         d
     };
 
-    let run = |tag: &str, k_name: &str, k_ptr: u64, v_ptr: u64, out: &cudarc::driver::CudaSlice<u16>| {
-        let f = m.load_function(k_name).unwrap_or_else(|e| panic!("[{tag}] load {k_name}: {e:?}"));
-        let o_p = out.device_ptr(stream).0;
-        let q_p = d_q.device_ptr(stream).0;
-        let bt_p = d_bt.device_ptr(stream).0;
-        let ln_p = d_lens.device_ptr(stream).0;
-        let qsl_p = d_qsl.device_ptr(stream).0;
-        let ab_p = d_alibi.device_ptr(stream).0;
-        let sk_p = d_sinks.device_ptr(stream).0;
-        let (nkv, scale, bts, ns, nqh, nqt) =
-            (NUM_KV_HEADS as i32, 1f32 / (hd as f32).sqrt(), 1i32, 1i32, NUM_HEADS as i32, T as i32);
-        let (ss, ost, sw, tnb, kbs, khs, ua, us) =
-            (1f32, (NUM_HEADS * hd) as i32, -1i32, NUM_BLOCKS as i32,
-             (PAGE * NUM_KV_HEADS * hd) as i32, (hd) as i32, 0i32, 0i32);
-        let mut b = stream.launch_builder(&f);
-        b.arg(&q_p)
-            .arg(&k_ptr)
-            .arg(&v_ptr)
-            .arg(&bt_p)
-            .arg(&ln_p)
-            .arg(&qsl_p)
-            .arg(&ab_p)
-            .arg(&sk_p)
-            .arg(&nkv)
-            .arg(&scale)
-            .arg(&bts)
-            .arg(&ns)
-            .arg(&nqh)
-            .arg(&nqt)
-            .arg(&ss)
-            .arg(&ost)
-            .arg(&sw)
-            .arg(&tnb)
-            .arg(&kbs)
-            .arg(&khs)
-            .arg(&ua)
-            .arg(&us)
-            .arg(&o_p);
-        let cfg = LaunchConfig {
-            grid_dim: ((NUM_HEADS / NUM_KV_HEADS) as u32, NUM_KV_HEADS as u32, 1),
-            block_dim: (256, 1, 1),
-            shared_mem_bytes: (64 + 2 * hd * PAGE * 2) as u32,
+    let run =
+        |tag: &str, k_name: &str, k_ptr: u64, v_ptr: u64, out: &cudarc::driver::CudaSlice<u16>| {
+            let f = m
+                .load_function(k_name)
+                .unwrap_or_else(|e| panic!("[{tag}] load {k_name}: {e:?}"));
+            let o_p = out.device_ptr(stream).0;
+            let q_p = d_q.device_ptr(stream).0;
+            let bt_p = d_bt.device_ptr(stream).0;
+            let ln_p = d_lens.device_ptr(stream).0;
+            let qsl_p = d_qsl.device_ptr(stream).0;
+            let ab_p = d_alibi.device_ptr(stream).0;
+            let sk_p = d_sinks.device_ptr(stream).0;
+            let (nkv, scale, bts, ns, nqh, nqt) = (
+                NUM_KV_HEADS as i32,
+                1f32 / (hd as f32).sqrt(),
+                1i32,
+                1i32,
+                NUM_HEADS as i32,
+                T as i32,
+            );
+            let (ss, ost, sw, tnb, kbs, khs, ua, us) = (
+                1f32,
+                (NUM_HEADS * hd) as i32,
+                -1i32,
+                NUM_BLOCKS as i32,
+                (PAGE * NUM_KV_HEADS * hd) as i32,
+                (hd) as i32,
+                0i32,
+                0i32,
+            );
+            let mut b = stream.launch_builder(&f);
+            b.arg(&q_p)
+                .arg(&k_ptr)
+                .arg(&v_ptr)
+                .arg(&bt_p)
+                .arg(&ln_p)
+                .arg(&qsl_p)
+                .arg(&ab_p)
+                .arg(&sk_p)
+                .arg(&nkv)
+                .arg(&scale)
+                .arg(&bts)
+                .arg(&ns)
+                .arg(&nqh)
+                .arg(&nqt)
+                .arg(&ss)
+                .arg(&ost)
+                .arg(&sw)
+                .arg(&tnb)
+                .arg(&kbs)
+                .arg(&khs)
+                .arg(&ua)
+                .arg(&us)
+                .arg(&o_p);
+            let cfg = LaunchConfig {
+                grid_dim: ((NUM_HEADS / NUM_KV_HEADS) as u32, NUM_KV_HEADS as u32, 1),
+                block_dim: (256, 1, 1),
+                shared_mem_bytes: (64 + 2 * hd * PAGE * 2) as u32,
+            };
+            if let Err(e) = unsafe { b.launch(cfg) } {
+                panic!("[{tag}] chunked launch {k_name}: {e:?}");
+            }
+            if let Err(e) = stream.synchronize() {
+                panic!("[{tag}] sync 后 ILLEGAL: {e:?}");
+            }
+            println!("[hd{hd} {tag}] launch+sync OK");
         };
-        if let Err(e) = unsafe { b.launch(cfg) } {
-            panic!("[{tag}] chunked launch {k_name}: {e:?}");
-        }
-        if let Err(e) = stream.synchronize() {
-            panic!("[{tag}] sync 后 ILLEGAL: {e:?}");
-        }
-        println!("[hd{hd} {tag}] launch+sync OK");
-    };
 
     let d_out16 = dev_u16(&vec![0u16; T * NUM_HEADS * hd]);
     let d_out8 = dev_u16(&vec![0u16; T * NUM_HEADS * hd]);
@@ -320,11 +357,16 @@ fn run_case(stream: &Arc<cudarc::driver::CudaStream>, m: &Arc<cudarc::driver::Cu
         (sum / a.len() as f32, mx, at, ah, ad)
     };
     let (m16, x16, t16, h16, d16) = maxdiff(&o16, &ref_f16);
-    println!("① hd{hd} gpu_f16(knhd) vs host — mean={m16:.6} max={x16:.6} @ t={t16} h={h16} d={d16}");
+    println!(
+        "① hd{hd} gpu_f16(knhd) vs host — mean={m16:.6} max={x16:.6} @ t={t16} h={h16} d={d16}"
+    );
     assert!(x16 < 2e-2, "hd{hd} chunked knhd f16 超门(max {x16})");
     let (m8, x8, t8, h8, d8) = maxdiff(&o8, &ref_fp8);
     println!("② hd{hd} gpu_fp8(knhd) vs host — mean={m8:.6} max={x8:.6} @ t={t8} h={h8} d={d8}");
-    assert!(m8 < 2e-3 && x8 < 1e-2, "hd{hd} chunked knhd fp8 超门(mean {m8}, max {x8})");
+    assert!(
+        m8 < 2e-3 && x8 < 1e-2,
+        "hd{hd} chunked knhd fp8 超门(mean {m8}, max {x8})"
+    );
 }
 
 #[owl_test(gpu)]
@@ -333,7 +375,10 @@ fn chunked_knhd_parity() {
     ctx.bind_to_thread().expect("bind");
     let stream = ctx.default_stream();
     let ptx = cudarc::nvrtc::compile_ptx_with_opts(
-        owl_kernels::cu_sig::cu_text(owl_kernels::ops::source("vllm_chunked_prefill_paged_attn_opt_fp8_knhd_hd256")).as_str(),
+        owl_kernels::cu_sig::cu_text(owl_kernels::ops::source(
+            "vllm_chunked_prefill_paged_attn_opt_fp8_knhd_hd256",
+        ))
+        .as_str(),
         cudarc::nvrtc::CompileOptions {
             arch: Some("compute_86"),
             include_paths: vec!["/usr/local/cuda/include".into()],

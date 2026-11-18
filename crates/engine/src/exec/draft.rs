@@ -1,9 +1,9 @@
 //! 草稿器面(DFlash2 单图 encode+propose / eager / MTP 链 / verify 前向)
-use crate::spec_runtime::DraftHead as _;
 use super::lookup::{fuse_lookup, suffix_lookup, LookupCfg, LookupProposal};
 use super::mtp_ring::MtpRingPlan;
 use super::mtp_window::{MtpWindowCfg, MtpWindowPlan};
 use super::*;
+use crate::spec_runtime::DraftHead as _;
 use owl_models::ModelError;
 
 /// **两段式 propose 的现场**（发射 → 收割之间携带的最小事实集）。
@@ -36,11 +36,12 @@ fn mtp_table_for_session(
     cover: usize,
 ) -> Result<Vec<u32>> {
     let parts = bank.parts_mut();
-    let s = parts.sessions.get_mut(sid).ok_or_else(|| {
-        ModelError::EngineInvariant {
+    let s = parts
+        .sessions
+        .get_mut(sid)
+        .ok_or_else(|| ModelError::EngineInvariant {
             what: format!("MTP 链页表: 会话 {sid:#x} 不在账"),
-        }
-    })?;
+        })?;
     if let Some(ring) = ring {
         let pages = cover.div_ceil(page.max(1));
         let table = ring.table(pages);
@@ -48,7 +49,9 @@ fn mtp_table_for_session(
         Ok(table)
     } else {
         // MTP 腿 cache=Off ⇒ 纯分配；长度由 generation_target 配对覆盖。
-        parts.leg_mtp.ensure_for_len(&mut s.mtp_block_table, cover)?;
+        parts
+            .leg_mtp
+            .ensure_for_len(&mut s.mtp_block_table, cover)?;
         Ok(s.mtp_block_table.clone())
     }
 }
@@ -130,7 +133,8 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
             let s = bank.sessions.session_mut(sid)?;
             let before = s.block_table.len();
             // **P0-4**：消费本 turn 的准入 Grant。
-            bank.rel.ensure_for_len(grant, &mut s.block_table, fp + block)?;
+            bank.rel
+                .ensure_for_len(grant, &mut s.block_table, fp + block)?;
             (sid, s.block_table.len() != before)
         };
         if grew {
@@ -237,14 +241,14 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
         // drain = 排水（吸收上一相的残余，不算 propose 成本）/
         // first = 首读（含本图首次执行）/ pure = 同步后再 replay（图独占 GPU）。
         if let (Some(t_drain), Some(t0v)) = (t_drain0, t0) {
-            let pg = self
-                .dev
-                .graphs
-                .dflash
-                .as_mut()
-                .ok_or_else(|| ModelError::EngineInvariant {
-                    what: "dflash_graph 缺席(档位不一致)".into(),
-                })?;
+            let pg =
+                self.dev
+                    .graphs
+                    .dflash
+                    .as_mut()
+                    .ok_or_else(|| ModelError::EngineInvariant {
+                        what: "dflash_graph 缺席(档位不一致)".into(),
+                    })?;
             let _ = pg.read_output_f32("sel").await?;
             let t1 = std::time::Instant::now();
             pg.replay().await?;
@@ -484,7 +488,8 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
             let s = bank.sessions.session_mut(sid)?;
             let before = s.block_table.len();
             // **P0-4**：消费本 turn 的准入 Grant。
-            bank.rel.ensure_for_len(grant, &mut s.block_table, pos + block)?;
+            bank.rel
+                .ensure_for_len(grant, &mut s.block_table, pos + block)?;
             (sid, s.block_table.len() != before)
         };
         if grew {
@@ -1110,37 +1115,35 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
             self.dev.pool.geom.dims.dtype,
             vec![1, self.dev.pool.geom.dims.hidden],
         );
-        let drafts =
-            {
-                let env = self.dev.spec_rt.draft_env;
-                let vocab = self.dev.boot.model.vocab_size();
-                let rope = self.dev.boot.rope.clone();
-                // 链步 decode 读核跟池布局:kNH 池必须走 v2(否则落 v1 classic
-                // ↠ 布局错位、草稿全垃圾;2026-10-13 布局守卫捕获)
-                match self
-                    .dev
-                    .spec_rt
-                    .drafter
-                    .as_ref()
-                    .and_then(|d| d.as_mtp())
-                    .ok_or_else(|| ModelError::EngineInvariant {
-                        what: "propose_first 需要 MTP 草稿头(DFlash2 走 dflash_propose)".into(),
-                    })?
-                {
-                    mtp => mtp.propose(
-                        &anchor_t,
-                        &seed_view,
-                        depth,
-                        &self.dev.boot.model.embed,
-                        &rope,
-                        &kvs,
-                        &pos_ts,
-                        vocab,
-                        env,
-                        attn_v2,
-                    ),
-                }
-            };
+        let drafts = {
+            let env = self.dev.spec_rt.draft_env;
+            let vocab = self.dev.boot.model.vocab_size();
+            let rope = self.dev.boot.rope.clone();
+            // 链步 decode 读核跟池布局:kNH 池必须走 v2(否则落 v1 classic
+            // ↠ 布局错位、草稿全垃圾;2026-10-13 布局守卫捕获)
+            match self
+                .dev
+                .spec_rt
+                .drafter
+                .as_ref()
+                .and_then(|d| d.as_mtp())
+                .ok_or_else(|| ModelError::EngineInvariant {
+                    what: "propose_first 需要 MTP 草稿头(DFlash2 走 dflash_propose)".into(),
+                })? {
+                mtp => mtp.propose(
+                    &anchor_t,
+                    &seed_view,
+                    depth,
+                    &self.dev.boot.model.embed,
+                    &rope,
+                    &kvs,
+                    &pos_ts,
+                    vocab,
+                    env,
+                    attn_v2,
+                ),
+            }
+        };
         let (b, arena) = {
             let face = self.dev.graphs.session.face_mut();
             owl_models::interpreters::eval_ops_scoped_env(
@@ -1298,40 +1301,38 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
                 .flat_map(|f| f.to_le_bytes())
                 .collect::<Vec<u8>>(),
         );
-        let drafts =
-            {
-                let env = self.dev.spec_rt.draft_env;
-                let vocab = self.dev.boot.model.vocab_size();
-                let rope = self.dev.boot.rope.clone();
-                match self
-                    .dev
-                    .spec_rt
-                    .drafter
-                    .as_ref()
-                    .and_then(|d| d.as_mtp())
-                    .ok_or_else(|| ModelError::EngineInvariant {
-                        what: "propose_ext 需要 MTP 草稿头(DFlash2 走 dflash_propose)".into(),
-                    })?
-                {
-                    mtp => mtp.propose_ext(
-                        &tokens_t,
-                        &hiddens,
-                        &extend_pos,
-                        &extend_kv,
-                        &extend_slots,
-                        &extend_lens,
-                        &cu_t,
-                        &chain_refs,
-                        &self.dev.boot.model.embed,
-                        &rope,
-                        vocab,
-                        env,
-                        attn_v2,
-                        extend_v2,
-                        Some(&bt8_t),
-                    ),
-                }
-            };
+        let drafts = {
+            let env = self.dev.spec_rt.draft_env;
+            let vocab = self.dev.boot.model.vocab_size();
+            let rope = self.dev.boot.rope.clone();
+            match self
+                .dev
+                .spec_rt
+                .drafter
+                .as_ref()
+                .and_then(|d| d.as_mtp())
+                .ok_or_else(|| ModelError::EngineInvariant {
+                    what: "propose_ext 需要 MTP 草稿头(DFlash2 走 dflash_propose)".into(),
+                })? {
+                mtp => mtp.propose_ext(
+                    &tokens_t,
+                    &hiddens,
+                    &extend_pos,
+                    &extend_kv,
+                    &extend_slots,
+                    &extend_lens,
+                    &cu_t,
+                    &chain_refs,
+                    &self.dev.boot.model.embed,
+                    &rope,
+                    vocab,
+                    env,
+                    attn_v2,
+                    extend_v2,
+                    Some(&bt8_t),
+                ),
+            }
+        };
         mrec("spec.propose.build", ts_build.elapsed());
         let ts_eval = std::time::Instant::now();
         let (b, arena) = {
@@ -1588,19 +1589,13 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
                 let mcand = pg.read_output_f32("mcand").await?;
                 if mcand.len() != 2 * rows * k {
                     return Err(ModelError::EngineInvariant {
-                        what: format!(
-                            "select 图 mcand 槽长 {} ≠ 2·{}·{}",
-                            mcand.len(),
-                            rows,
-                            k
-                        ),
+                        what: format!("select 图 mcand 槽长 {} ≠ 2·{}·{}", mcand.len(), rows, k),
                     });
                 }
                 let scores = &sel[rows..rows + rows * k * k];
                 let (vals, cands_f) = (&mcand[..rows * k], &mcand[rows * k..]);
                 let cands: Vec<u32> = cands_f.iter().map(|&v| v as u32).collect();
-                let (alpha, floor) =
-                    (self.dev.spec_rt.q_alpha, self.dev.spec_rt.q_floor);
+                let (alpha, floor) = (self.dev.spec_rt.q_alpha, self.dev.spec_rt.q_floor);
                 let mut q = super::proposal_q::DraftQ::from_scores(super::proposal_q::QInput {
                     scores,
                     cand: &cands,
@@ -1642,12 +1637,7 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
             let mcand = pg.read_output_f32("mcand").await?;
             if mcand.len() != 2 * rows * k {
                 return Err(ModelError::EngineInvariant {
-                    what: format!(
-                        "select 图 mcand 槽长 {} ≠ 2·{}·{}",
-                        mcand.len(),
-                        rows,
-                        k
-                    ),
+                    what: format!("select 图 mcand 槽长 {} ≠ 2·{}·{}", mcand.len(), rows, k),
                 });
             }
             let scores = &sel[rows..rows + rows * k * k];
@@ -2012,18 +2002,9 @@ impl<D: DeviceClient> crate::engine::RankDev<D> {
         self.pending_dflash_tokens = 0;
         let mut first_err: Option<ModelError> = None;
         for p in pending {
-            let root = TensorOps::of_block(
-                p.root.id,
-                p.dtype,
-                vec![(p.n_tp + 1) * p.t, p.d_model],
-            );
+            let root = TensorOps::of_block(p.root.id, p.dtype, vec![(p.n_tp + 1) * p.t, p.d_model]);
             let tap_views: Vec<TensorOps> = (0..p.n_tp)
-                .map(|i| {
-                    root.slice_view(
-                        (i + 1) * p.t * p.d_model,
-                        vec![p.t, p.d_model],
-                    )
-                })
+                .map(|i| root.slice_view((i + 1) * p.t * p.d_model, vec![p.t, p.d_model]))
                 .collect();
             let root_id = p.root.id;
             let enc = self
@@ -2169,13 +2150,7 @@ impl<D: DeviceClient> crate::engine::RankDev<D> {
         }
         let d = self.pool.geom.dims;
         let page = self.pool.geom.page;
-        let bt = mtp_table_for_session(
-            bank,
-            self.spec_rt.mtp_ring,
-            page,
-            sid,
-            base + t_rows,
-        )?;
+        let bt = mtp_table_for_session(bank, self.spec_rt.mtp_ring, page, sid, base + t_rows)?;
         let (kc, vc) = self
             .pool
             .mtp_kv_leaf()

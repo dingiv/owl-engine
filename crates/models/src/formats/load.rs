@@ -21,7 +21,7 @@
 //! 微 crate profile 覆盖后,装载已 **DMA-bound**(0.8B 模型 1.75GB ≈
 //! 0.72s;server 全程仅 ~355ms,详见 roadmap.local/f5-switch-workorder.md)。
 
-use crate::contract::{Dtype, DeviceClient, ModelError};
+use crate::contract::{DeviceClient, Dtype, ModelError};
 use crate::module::{Layout, LoadEntry, LoadManifest, LoaderOps, WeightSource};
 use std::path::Path;
 use std::sync::Mutex;
@@ -80,7 +80,18 @@ impl LoadOpts {
     /// 非量化/固定档(无设备重排 + 零探针):裸 safetensors f16 直拷、
     /// W4A16-CPU 重排等"不需要能力裁决"的装载点。
     pub fn plain(dtype: crate::contract::Dtype) -> Self {
-        Self { dtype, shard: 1, slice_id: 0, head_split: false, device_repack: Some(false), verify: false, debug_tap: false, staging_mb: 128, dump: false, gguf_dequant: false }
+        Self {
+            dtype,
+            shard: 1,
+            slice_id: 0,
+            head_split: false,
+            device_repack: Some(false),
+            verify: false,
+            debug_tap: false,
+            staging_mb: 128,
+            dump: false,
+            gguf_dequant: false,
+        }
     }
 
     /// **应用 `[load]` 配置**(唯一映射点:诊断/校验/暂存/dump/重排三态)。
@@ -169,7 +180,10 @@ fn quant_family(dir: &Path) -> Result<crate::formats::kind::QuantScheme, ModelEr
             )
         })?;
     let group_size = w.get("group_size").and_then(|x| x.as_u64()).unwrap_or(0) as usize;
-    let symmetric = w.get("symmetric").and_then(|x| x.as_bool()).unwrap_or(false);
+    let symmetric = w
+        .get("symmetric")
+        .and_then(|x| x.as_bool())
+        .unwrap_or(false);
     let num_bits = w.get("num_bits").and_then(|x| x.as_u64()).unwrap_or(0) as usize;
     // 三轴同判:**位数也必须在位**(W8/FP8 家族与 W4 同 g128-sym ⇒ 只盯
     // group_size/symmetric 会把 8bit 当 4bit 解,静默错值)
@@ -225,9 +239,9 @@ pub fn open_source(
 ) -> Result<Box<dyn crate::module::WeightSource>, ModelError> {
     use crate::formats::kind::CheckpointKind;
     Ok(match kind {
-        CheckpointKind::SafeTensors => {
-            Box::new(crate::formats::safetensors::SafeTensorsSource::open_dir(path)?)
-        }
+        CheckpointKind::SafeTensors => Box::new(
+            crate::formats::safetensors::SafeTensorsSource::open_dir(path)?,
+        ),
         CheckpointKind::PackQuantized | CheckpointKind::AwqGemm => match quant_family(path)? {
             crate::formats::kind::QUANT_G32_ASYM => {
                 let src = crate::formats::awq::AwqSource::open_dir(path)?;
@@ -285,12 +299,12 @@ where
     S: WeightSource + ?Sized,
 {
     let mut want = layer.layout(ctx); // 声明:层产出需求清单(ctx 引用透传)
-    // ★ S4 ② **确定性分片**(用户裁决 2026-10-16):按 `(slice_id, shard)` 就地
-    // 改写 want 形状(→ 分片形状;DeviceRearrange 的 rows/cols 同步),并把源
-    // 包成"只读本片"的视图 —— 6 条装载路径**零改动**(它们只经 WeightSource 取数)。
-    // `shard = 1` 时 pass 返回空表、源直通(零开销)。
-    // **源自担分片**的源(GGUF):跳过通用 pass —— 源已按 `(slice_id, world)`
-    // 交付本 rank 的数据(`WeightSource::owns_shard`)。
+                                      // ★ S4 ② **确定性分片**(用户裁决 2026-10-16):按 `(slice_id, shard)` 就地
+                                      // 改写 want 形状(→ 分片形状;DeviceRearrange 的 rows/cols 同步),并把源
+                                      // 包成"只读本片"的视图 —— 6 条装载路径**零改动**(它们只经 WeightSource 取数)。
+                                      // `shard = 1` 时 pass 返回空表、源直通(零开销)。
+                                      // **源自担分片**的源(GGUF):跳过通用 pass —— 源已按 `(slice_id, world)`
+                                      // 交付本 rank 的数据(`WeightSource::owns_shard`)。
     let spans = if src.owns_shard() {
         debug_assert!(ctx.shard > 1, "owns_shard 却单卡装载:源会按 world=1 交付");
         std::collections::HashMap::new()
@@ -308,10 +322,23 @@ where
         src.prefetch(&keys);
     }
     let sharded = crate::formats::shard::ShardedSource::new(src, spans);
-    let tap = if ctx.debug_tap { Some(std::sync::Mutex::new(Box::new(StderrTap) as Box<dyn LoadTap>)) } else { None }; // 观测:ctx.debug_tap 门控,缺省零开销
+    let tap = if ctx.debug_tap {
+        Some(std::sync::Mutex::new(
+            Box::new(StderrTap) as Box<dyn LoadTap>
+        ))
+    } else {
+        None
+    }; // 观测:ctx.debug_tap 门控,缺省零开销
     let t0 = std::time::Instant::now();
-    let load_result =
-        eval_want(&want, face, &sharded, tap.as_ref(), ctx.verify, ctx.staging_mb).await;
+    let load_result = eval_want(
+        &want,
+        face,
+        &sharded,
+        tap.as_ref(),
+        ctx.verify,
+        ctx.staging_mb,
+    )
+    .await;
     // 预取线程必须在装载返回前收口(装载后不得继续占盘/占线程);
     // 错误也 join,避免后台线程在失败路径上泄漏。
     src.prefetch_finish();
@@ -455,7 +482,9 @@ impl LoadStaging {
             let native = src.native_dtype(&w.key)?;
             let arm = match w.layout {
                 // 设备重排臂:源 packed 整键上卡(rows × cols × 4B)
-                Layout::DeviceRearrange { rows, cols, .. } => Some((&mut nostream, StageArm::RawIn, rows * cols * 4)),
+                Layout::DeviceRearrange { rows, cols, .. } => {
+                    Some((&mut nostream, StageArm::RawIn, rows * cols * 4))
+                }
                 // 设备 cast 臂:want F16 而源天然 BF16 ⇒ 原始字节上卡落槽(2B/元素)
                 Layout::Direct if w.dtype == Dtype::F16 && native == Some(Dtype::BF16) => {
                     Some((&mut stream, StageArm::RawIn, n * 2))
@@ -481,7 +510,11 @@ impl LoadStaging {
             if declared == 0 {
                 continue; // 本档不用该臂
             }
-            let cap = if cap_bytes == 0 { declared } else { arm.cap_bytes(cap_bytes) };
+            let cap = if cap_bytes == 0 {
+                declared
+            } else {
+                arm.cap_bytes(cap_bytes)
+            };
             // **槽规**(2026-10-16 第二修):
             //  - 有"不可流式"键(重排臂)⇒ 槽**必须**容下它 —— 该臂没有分段流式路,
             //    超槽 = 装不进(响亮拒);⇒ 这里**不能**用旋钮削它。
@@ -491,9 +524,22 @@ impl LoadStaging {
             //  - 只有可流式键 ⇒ `min(声明峰值, 上限)`,超槽键走段流(槽不随键长)。
             let slot_bytes = if ns > 0 { ns } else { st.min(cap) }.max(1);
             per_arm.push((arm, declared, slot_bytes));
-            rings.insert(arm, SlotRing { slot_bytes, slots: Vec::new(), next: 0 });
+            rings.insert(
+                arm,
+                SlotRing {
+                    slot_bytes,
+                    slots: Vec::new(),
+                    next: 0,
+                },
+            );
         }
-        Ok((Self { rings, inflight_bytes: 0 }, StagingPlan { per_arm, cap_bytes }))
+        Ok((
+            Self {
+                rings,
+                inflight_bytes: 0,
+            },
+            StagingPlan { per_arm, cap_bytes },
+        ))
     }
 
     /// **在飞字节入账**(上传口调用;返回 true = 该排空了)。
@@ -541,9 +587,17 @@ impl LoadStaging {
         owl_shared::log_info!(
             "load",
             "暂存区(固定预算):{};合计 {:.1}MB(上限 {})",
-            if rows.is_empty() { "(本档无暂存臂)".to_string() } else { rows.join(" | ") },
+            if rows.is_empty() {
+                "(本档无暂存臂)".to_string()
+            } else {
+                rows.join(" | ")
+            },
             total as f64 / 1e6,
-            if plan.cap_bytes == 0 { "无(取声明峰值)".to_string() } else { format!("{}MB", plan.cap_bytes >> 20) }
+            if plan.cap_bytes == 0 {
+                "无(取声明峰值)".to_string()
+            } else {
+                format!("{}MB", plan.cap_bytes >> 20)
+            }
         );
     }
 
@@ -580,7 +634,10 @@ impl LoadStaging {
                     .await
                     .map_err(|e| ModelError::Msg(format!("暂存区 {}: alloc {e}", arm.tag())))?
                     .id;
-                ring.slots.push(Slot { id, bytes: ring.slot_bytes });
+                ring.slots.push(Slot {
+                    id,
+                    bytes: ring.slot_bytes,
+                });
             }
         }
         let slot = ring.slots[ring.next % ring.slots.len()];
@@ -619,9 +676,7 @@ impl LoadStaging {
         }
         match face.mem_pool_trim().await {
             Ok(0) => {}
-            Ok(n) => owl_shared::log_info!(
-                "load",
-                "装载收尾池回收:还 OS {:.1}MB", n as f64 / 1e6),
+            Ok(n) => owl_shared::log_info!("load", "装载收尾池回收:还 OS {:.1}MB", n as f64 / 1e6),
             Err(e) => owl_shared::log_warn!("load", "装载收尾池回收失败(显存面降级): {e}"),
         }
         Ok(())
@@ -662,31 +717,31 @@ fn cast_msg<D: DeviceClient>(
         aux: &[],
         scalars: &[],
     });
-    let msg = LaunchMsg {
-        kernel: KernelSource {
-            name: pick.name.to_string(),
-            source: crate::kernel::source(pick.name).to_string(),
-        },
-        // 参数序 = elems.cast_bf16_f16 线契约:(x: BF16, n: i32, out: F16)
-        args: vec![
-            Arg::block(raw, Dtype::BF16, 1),
-            Arg::I32(
-                i32::try_from(elems)
-                    .map_err(|_| ModelError::Msg(format!("Weight '{key}': 元素数 {elems} 超 i32")))?,
-            ),
-            Arg::block(out.id, Dtype::F16, 1),
-        ],
-        // 哨兵展开(全零 grid = runtime 自持;native 路展开规则 =
-        // `models::ops::auto_grid` —— 手发 LaunchMsg 必须自己展开)
-        grid: if pick.shape.grid == (0, 0, 0) {
-            crate::ops::auto_grid(elems)
-        } else {
-            pick.shape.grid
-        },
-        block: pick.shape.block,
-        shared_mem: pick.shape.smem,
-        out_elems: elems,
-    };
+    let msg =
+        LaunchMsg {
+            kernel: KernelSource {
+                name: pick.name.to_string(),
+                source: crate::kernel::source(pick.name).to_string(),
+            },
+            // 参数序 = elems.cast_bf16_f16 线契约:(x: BF16, n: i32, out: F16)
+            args: vec![
+                Arg::block(raw, Dtype::BF16, 1),
+                Arg::I32(i32::try_from(elems).map_err(|_| {
+                    ModelError::Msg(format!("Weight '{key}': 元素数 {elems} 超 i32"))
+                })?),
+                Arg::block(out.id, Dtype::F16, 1),
+            ],
+            // 哨兵展开(全零 grid = runtime 自持;native 路展开规则 =
+            // `models::ops::auto_grid` —— 手发 LaunchMsg 必须自己展开)
+            grid: if pick.shape.grid == (0, 0, 0) {
+                crate::ops::auto_grid(elems)
+            } else {
+                pick.shape.grid
+            },
+            block: pick.shape.block,
+            shared_mem: pick.shape.smem,
+            out_elems: elems,
+        };
     Ok(msg)
 }
 
@@ -736,7 +791,9 @@ async fn eval_want_sequential<D: DeviceClient, S: WeightSource + ?Sized>(
     let mut t_group = std::time::Duration::ZERO;
     for group in &groups {
         let tg = std::time::Instant::now();
-        manifest.0.extend(load_group(face, group, src, tap, staging, verify).await?);
+        manifest
+            .0
+            .extend(load_group(face, group, src, tap, staging, verify).await?);
         t_group += tg.elapsed();
     }
     // 键循环分账(≈0.5s 时差 = 分组/分派壳成本;大时说明有未入账段)
@@ -866,7 +923,12 @@ pub async fn verify_loaded<D: DeviceClient>(
             .map_err(|err| ModelError::Msg(format!("verify '{}': {err}", e.key)))?;
         h = fnv1a(&buf, h);
         owl_shared::metrics::with_metrics_store(|s| {
-            s.counter_add(&format!("loadv.{}", e.key), h & 0x7fff_ffff_ffff_ffff, file!(), line!());
+            s.counter_add(
+                &format!("loadv.{}", e.key),
+                h & 0x7fff_ffff_ffff_ffff,
+                file!(),
+                line!(),
+            );
         });
         if h != e.csum {
             bad.push(e.key.clone());
@@ -924,7 +986,7 @@ async fn load_direct<D: DeviceClient, S: WeightSource + ?Sized>(
     };
     let chunk_elems = (CHUNK_BYTES / esz).max(1);
     let mut off = 0usize;
-    
+
     let mut csum = 0xcbf29ce484222325u64;
     while off < n {
         let len = chunk_elems.min(n - off);
@@ -946,12 +1008,21 @@ async fn load_direct<D: DeviceClient, S: WeightSource + ?Sized>(
                     .chunks_exact(2)
                     .map(|c| {
                         let b = u16::from_le_bytes([c[0], c[1]]);
-                        format!("{:04X}(f16={:.5},bf16={:.5})", b, half::f16::from_bits(b).to_f32(), half::bf16::from_bits(b).to_f32())
+                        format!(
+                            "{:04X}(f16={:.5},bf16={:.5})",
+                            b,
+                            half::f16::from_bits(b).to_f32(),
+                            half::bf16::from_bits(b).to_f32()
+                        )
                     })
                     .collect();
                 owl_shared::log_debug!(
                     "dump",
-                    "key={} want_dtype={:?} head={:?}", w.key, w.dtype, head);
+                    "key={} want_dtype={:?} head={:?}",
+                    w.key,
+                    w.dtype,
+                    head
+                );
             }
         }
         if verify {
@@ -1030,7 +1101,9 @@ async fn load_direct_device_cast<D: DeviceClient, S: WeightSource + ?Sized>(
                 // (原 `face.sync()` 全排空 ≈1.9ms/键)
                 face.upload_and_launch(&in_bytes, chunks, msg)
                     .await
-                    .map_err(|e| ModelError::Msg(format!("Weight '{}': 复合上传 + 发射 {e}", w.key)))?;
+                    .map_err(|e| {
+                        ModelError::Msg(format!("Weight '{}': 复合上传 + 发射 {e}", w.key))
+                    })?;
             }
         }
         // ② **超槽键流式**:段 ≤ 槽;输入切片 → 段输出槽 → D2D 贴回目标块中段
@@ -1043,11 +1116,23 @@ async fn load_direct_device_cast<D: DeviceClient, S: WeightSource + ?Sized>(
             let in_slot = staging
                 .acquire(face, StageArm::RawIn, seg_cap * esz)
                 .await?
-                .ok_or_else(|| ModelError::Msg(LoadStaging::over_cap_msg(StageArm::RawIn, seg_cap * esz, in_cap)))?;
+                .ok_or_else(|| {
+                    ModelError::Msg(LoadStaging::over_cap_msg(
+                        StageArm::RawIn,
+                        seg_cap * esz,
+                        in_cap,
+                    ))
+                })?;
             let seg_slot = staging
                 .acquire(face, StageArm::CastSegOut, seg_cap * w.dtype.size_bytes())
                 .await?
-                .ok_or_else(|| ModelError::Msg(LoadStaging::over_cap_msg(StageArm::CastSegOut, seg_cap * w.dtype.size_bytes(), out_cap)))?;
+                .ok_or_else(|| {
+                    ModelError::Msg(LoadStaging::over_cap_msg(
+                        StageArm::CastSegOut,
+                        seg_cap * w.dtype.size_bytes(),
+                        out_cap,
+                    ))
+                })?;
             owl_shared::log_info!(
                 "load",
                 "超槽键流式:{} {:.1}MB > 槽 {:.1}MB ⇒ {} 段",
@@ -1073,9 +1158,15 @@ async fn load_direct_device_cast<D: DeviceClient, S: WeightSource + ?Sized>(
                     .map_err(|e| ModelError::Msg(format!("Weight '{}': 段复合 {e}", w.key)))?;
                 {
                     let _s = probe.span("copyback");
-                    face.copy_block_at(&seg_out, 0, &out_bytes, off * w.dtype.size_bytes(), seg * w.dtype.size_bytes())
-                        .await
-                        .map_err(|e| ModelError::Msg(format!("Weight '{}': 段贴回 {e}", w.key)))?;
+                    face.copy_block_at(
+                        &seg_out,
+                        0,
+                        &out_bytes,
+                        off * w.dtype.size_bytes(),
+                        seg * w.dtype.size_bytes(),
+                    )
+                    .await
+                    .map_err(|e| ModelError::Msg(format!("Weight '{}': 段贴回 {e}", w.key)))?;
                 }
                 off += seg;
             }
@@ -1248,7 +1339,8 @@ async fn load_device_rearrange<D: DeviceClient, S: WeightSource + ?Sized>(
         })?;
     let raw = crate::contract::Bytes::new(raw_slot.id, raw_elems, crate::contract::Dtype::U32, 2);
     // 源 packed 分块填租约(不上传;序交给复合口 —— E3 起不再逐键 host 排空)
-    let chunks = fill_packed_chunks(face, src, &w.key, raw_elems, &mut probe, &mut packed_host).await?;
+    let chunks =
+        fill_packed_chunks(face, src, &w.key, raw_elems, &mut probe, &mut packed_host).await?;
     // 2) 重排核(语义拾取:driver::resolve(OpEnv 必传,被动律);
     //    grid/block 契约公式住 driver(load::ct_repack))
     let out_block = {
@@ -1308,7 +1400,8 @@ async fn load_device_rearrange<D: DeviceClient, S: WeightSource + ?Sized>(
             .map_err(|e| ModelError::Msg(format!("Weight '{}': 复合重排 {e}", w.key)))?;
         // 端到端校验(OWL_LOAD_VERIFY;前 4 层):GPU 重排输出 vs CPU fused 逐位
         if let Some(ph) = &packed_host {
-            static VERIFY_N: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+            static VERIFY_N: std::sync::atomic::AtomicUsize =
+                std::sync::atomic::AtomicUsize::new(0);
             let vi = VERIFY_N.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             if vi < 9999 {
                 face.sync().await?;
@@ -1321,22 +1414,30 @@ async fn load_device_rearrange<D: DeviceClient, S: WeightSource + ?Sized>(
                     .map(|c| i32::from_le_bytes([c[0], c[1], c[2], c[3]]))
                     .collect();
                 let mut b_ref: Vec<i32> = Vec::new();
-                owl_kernels::family::marlin::repack::pack_marlin_b_fused(&p32, &idx, rows * k / 8, &mut b_ref);
+                owl_kernels::family::marlin::repack::pack_marlin_b_fused(
+                    &p32,
+                    &idx,
+                    rows * k / 8,
+                    &mut b_ref,
+                );
                 // 现场账(2026-10-17):GPU 块字数 n vs CPU 参考字数 b_ref.len()
                 // —— 分片档实测两者不等(⇒ 索引表/字数口径在分片维上错位)
                 owl_shared::log_info!(
                     "load-verify",
                     "{} rows={rows} cols={cols} k={k} n={n} p32={} idx={} b_ref={}",
-                    w.key, p32.len(), idx.len(), b_ref.len()
+                    w.key,
+                    p32.len(),
+                    idx.len(),
+                    b_ref.len()
                 );
                 let mut bad = 0usize;
                 for (i, w) in gbuf.chunks_exact(4).enumerate() {
                     let got = i32::from_le_bytes([w[0], w[1], w[2], w[3]]);
-                    if got != b_ref[i] { bad += 1; }
+                    if got != b_ref[i] {
+                        bad += 1;
+                    }
                 }
-                owl_shared::log_info!(
-                    "load-verify",
-                    "{vi} {} 坏字 {bad}/{}", w.key, b_ref.len());
+                owl_shared::log_info!("load-verify", "{vi} {} 坏字 {bad}/{}", w.key, b_ref.len());
                 assert_eq!(bad, 0, "GPU repack 端到端校验失败: {}", w.key);
             }
         }
@@ -1413,11 +1514,19 @@ async fn load_nvfp4<D: DeviceClient, S: WeightSource + ?Sized>(
     // 3) 选臂
     let entries = if face.device_kernels()
         && face.op_env().is_some()
-        && matches!(src_dt, crate::formats::source::SrcDtype::F16 | crate::formats::source::SrcDtype::BF16)
-    {
-        load_nvfp4_device(face, w, rows, cols, &src_bytes, src_dt, &slots, &mut probe, verify).await?
+        && matches!(
+            src_dt,
+            crate::formats::source::SrcDtype::F16 | crate::formats::source::SrcDtype::BF16
+        ) {
+        load_nvfp4_device(
+            face, w, rows, cols, &src_bytes, src_dt, &slots, &mut probe, verify,
+        )
+        .await?
     } else {
-        load_nvfp4_host(face, w, rows, cols, src_bytes, src_dt, &slots, &mut probe, verify).await?
+        load_nvfp4_host(
+            face, w, rows, cols, src_bytes, src_dt, &slots, &mut probe, verify,
+        )
+        .await?
     };
     probe.done();
     Ok(entries)
@@ -1580,9 +1689,9 @@ async fn load_nvfp4_device<D: DeviceClient>(
         (q, sf, g)
     };
     // 3) 按名选核(装载域的重排/量化也走 `KernelPick`,不在装载器里自拼执行面)
-    let env = face.op_env().ok_or_else(|| {
-        ModelError::Msg(format!("Weight '{}': 设备打包需 GPU 环境", w.key))
-    })?;
+    let env = face
+        .op_env()
+        .ok_or_else(|| ModelError::Msg(format!("Weight '{}': 设备打包需 GPU 环境", w.key)))?;
     let pick = owl_kernels::driver::resolve(owl_kernels::driver::OpReq {
         op: crate::ops::SemanticKernel::NvFp4PackWeight.op_id(),
         env: &env,
@@ -1707,14 +1816,13 @@ async fn load_nvfp4_device<D: DeviceClient>(
 
     // 7) 交付两槽 + 落账(主槽 = `w.sink`;`sf` 走 `w.extra[0]`)
     let mut entries = Vec::with_capacity(2);
-    for (i, (blk, csum)) in [(&q_blk, csum_q), (&sf_blk, csum_sf)].into_iter().enumerate() {
+    for (i, (blk, csum)) in [(&q_blk, csum_q), (&sf_blk, csum_sf)]
+        .into_iter()
+        .enumerate()
+    {
         let slot = &slots[i];
-        let block = crate::contract::Bytes::new(
-            blk.id,
-            slot.bytes(),
-            slot.dtype,
-            slot.shape.len() as u8,
-        );
+        let block =
+            crate::contract::Bytes::new(blk.id, slot.bytes(), slot.dtype, slot.shape.len() as u8);
         if i == 0 {
             w.sink.deliver(block.clone());
         } else {
@@ -1789,10 +1897,7 @@ fn fetch_source_bytes<S: WeightSource + ?Sized>(
 ) -> Result<(Vec<u8>, crate::formats::source::SrcDtype), ModelError> {
     use crate::formats::source::SrcDtype;
 
-    if let Some(dt) = src
-        .native_dtype(key)?
-        .and_then(SrcDtype::from_dtype)
-    {
+    if let Some(dt) = src.native_dtype(key)?.and_then(SrcDtype::from_dtype) {
         let esz = dt.size_bytes();
         let mut buf = vec![0u8; elems * esz];
         if src.copy_native_into(key, 0, elems, &mut buf)?.is_some() {
@@ -1897,7 +2002,11 @@ async fn load_transposed<D: DeviceClient, S: WeightSource + ?Sized>(
         shape: w.shape.clone(),
         layout: Layout::Transposed,
         block: crate::contract::Bytes::new(b.id, n, w.dtype, w.shape.len() as u8),
-        csum: if verify { fnv1a(&bytes, 0xcbf29ce484222325) } else { 0 },
+        csum: if verify {
+            fnv1a(&bytes, 0xcbf29ce484222325)
+        } else {
+            0
+        },
     })
 }
 
@@ -1907,7 +2016,11 @@ async fn load_transposed<D: DeviceClient, S: WeightSource + ?Sized>(
 
 /// TILE² 分块转置 → 新 Vec(源 [rows, cols] → 目标 [cols, rows] f32)。
 /// 大矩阵按输出行分 4 带并行(out.chunks_mut(rows) 天然不相交;小矩阵串行)。
-fn transpose_into_vec(data: &[f32], w: &crate::module::Want, n: usize) -> Result<Vec<f32>, ModelError> {
+fn transpose_into_vec(
+    data: &[f32],
+    w: &crate::module::Want,
+    n: usize,
+) -> Result<Vec<f32>, ModelError> {
     const TILE: usize = 64;
     let (cols, rows) = (w.shape[0], w.shape[1]);
     if data.len() != n {
@@ -2078,7 +2191,13 @@ impl Drop for SpanGuard<'_, '_> {
         owl_shared::metrics::with_metrics_store(|s| {
             s.timer_record_tag(&format!("load.{}", self.name), d, file!(), line!())
         });
-        match self.probe.rec.phases.iter_mut().find(|(n, _)| *n == self.name) {
+        match self
+            .probe
+            .rec
+            .phases
+            .iter_mut()
+            .find(|(n, _)| *n == self.name)
+        {
             Some(e) => e.1 += d,
             None => self.probe.rec.phases.push((self.name, d)),
         }
@@ -2107,7 +2226,11 @@ pub fn manifest_mem_ledger(manifest: &crate::module::LoadManifest, tag: &str) {
     }
     for (k, (n, b)) in agg {
         // tag 字面量契约:组件名进正文(调用方给 "draft-mem"/"gguf-draft-mem")
-        owl_shared::log_info!("load-ledger", "[{tag}] {k}: {n} 项 {b} ({:.2} GB)", b as f64 / 1e9);
+        owl_shared::log_info!(
+            "load-ledger",
+            "[{tag}] {k}: {n} 项 {b} ({:.2} GB)",
+            b as f64 / 1e9
+        );
     }
 }
 
@@ -2116,9 +2239,7 @@ fn attribution<S: WeightSource + ?Sized>(src: &S, key: &str, n: usize) -> ModelE
     // **错误报告期不许再失败**(2026-10-17 审查 §③-N1):`elem_len` 现返回 `Taken`,
     // 但这里已在造错误消息 ⇒ 探测失败退化为"归因不可用",绝不叠第二个错误
     match src.elem_len(key).unwrap_or(None) {
-        Some(l) => ModelError::Msg(format!(
-            "Weight '{key}': 元素 {l} != 期望 {n}"
-        )),
+        Some(l) => ModelError::Msg(format!("Weight '{key}': 元素 {l} != 期望 {n}")),
         None => ModelError::Msg(format!("Weight '{key}': 数据源缺键")),
     }
 }
@@ -2146,7 +2267,8 @@ mod generic_entry_tests {
                 Qwen35Convention::new("model.language_model"),
                 crate::module::QuantPlan::F16,
                 crate::module::QuantPlan::F16,
-            ).expect("Model::new")
+            )
+            .expect("Model::new")
         };
         let mut face = owl_cpu::CpuFace::new();
         let opts = LoadOpts {
@@ -2164,7 +2286,9 @@ mod generic_entry_tests {
 
         // 对照臂:同一声明 + 同一源,直接 eval_load(不经起点探测/开箱)
         let src = crate::formats::safetensors::SafeTensorsSource::open_dir(&dir).expect("源开箱");
-        let old = eval_load(&mk(), &mut face, &src, &opts.ctx()).await.expect("eval_load");
+        let old = eval_load(&mk(), &mut face, &src, &opts.ctx())
+            .await
+            .expect("eval_load");
 
         // 新路(起点探测 + 通用入口)
         let new = load_from_dir(&dir, &mut face, &mk(), opts)
@@ -2196,12 +2320,15 @@ mod generic_entry_tests {
     /// 是另一个门的事)。
     #[tokio::test]
     async fn unseen_size_loads_without_code() {
-        let dir = std::path::PathBuf::from(
-            owl_shared::testkit::resource("ckpt:new")
-                .unwrap_or_else(|| concat!(env!("CARGO_MANIFEST_DIR"), "/../../models/Qwen/Qwen3.5-9B").into()),
-        );
+        let dir =
+            std::path::PathBuf::from(owl_shared::testkit::resource("ckpt:new").unwrap_or_else(
+                || concat!(env!("CARGO_MANIFEST_DIR"), "/../../models/Qwen/Qwen3.5-9B").into(),
+            ));
         if !dir.is_dir() {
-            owl_shared::testkit::report::skip(format_args!("新档检查点不在({};ckpt:new 可指路)", dir.display()));
+            owl_shared::testkit::report::skip(format_args!(
+                "新档检查点不在({};ckpt:new 可指路)",
+                dir.display()
+            ));
             return;
         }
         // ① 起点探测(纯索引嗅探)
@@ -2231,12 +2358,20 @@ mod generic_entry_tests {
             !rep.keys_base.is_empty() && rep.keys_base.ends_with('.'),
             "键基座应由索引实测定位"
         );
-        assert!(rep.mismatches.is_empty(), "config↔形状应一致: {:?}", rep.mismatches);
+        assert!(
+            rep.mismatches.is_empty(),
+            "config↔形状应一致: {:?}",
+            rep.mismatches
+        );
         assert!(spec.layer_types.len() >= 8, "层数应成规模");
         for (i, full) in spec.layer_types.iter().enumerate() {
             assert_eq!(*full, i % 4 == 3, "层 {i} 层型不符 3:1 周期");
         }
-        assert_eq!(spec.full_heads.0 * spec.full_heads.2 % spec.hidden, 0, "FA 头维守恒");
+        assert_eq!(
+            spec.full_heads.0 * spec.full_heads.2 % spec.hidden,
+            0,
+            "FA 头维守恒"
+        );
         if !owl_shared::testkit::resource_flag("flag:new-ckpt-load") {
             eprintln!("[new-ckpt] 起点侧全绿(整装门 ckpt:new_LOAD=1 开启)");
             return;
@@ -2247,7 +2382,8 @@ mod generic_entry_tests {
             Qwen35Convention::new(rep.keys_base.trim_end_matches('.')),
             crate::module::QuantPlan::F16,
             crate::module::QuantPlan::F16,
-        ).expect("Model::new");
+        )
+        .expect("Model::new");
         let mut face = owl_cpu::CpuFace::new();
         let t0 = std::time::Instant::now();
         let manifest = load_from_dir(&dir, &mut face, &model, LoadOpts::plain(spec.dtype))
@@ -2266,8 +2402,13 @@ mod generic_entry_tests {
     #[tokio::test]
     async fn generic_entry_covers_quantized_family() {
         let dir = std::path::PathBuf::from(
-            owl_shared::testkit::resource("ckpt:27b-awq")
-                .unwrap_or_else(|| concat!(env!("CARGO_MANIFEST_DIR"), "/../../models/cyankiwi/Qwen3.8-27B-AWQ-INT4").into()),
+            owl_shared::testkit::resource("ckpt:27b-awq").unwrap_or_else(|| {
+                concat!(
+                    env!("CARGO_MANIFEST_DIR"),
+                    "/../../models/cyankiwi/Qwen3.8-27B-AWQ-INT4"
+                )
+                .into()
+            }),
         );
         if !dir.is_dir() {
             owl_shared::testkit::report::skip("27B AWQ 检查点不在");
@@ -2291,7 +2432,8 @@ mod generic_entry_tests {
                 Qwen35Convention::new("model.language_model"),
                 crate::module::QuantPlan::W4A16,
                 crate::module::QuantPlan::F16,
-            ).expect("Model::new")
+            )
+            .expect("Model::new")
         };
         let mut face = crate::testkit::gpu_client().await;
         let opts = LoadOpts {
@@ -2307,8 +2449,12 @@ mod generic_entry_tests {
             gguf_dequant: false,
         };
         let src = crate::formats::awq::AwqSource::open_dir(&dir).expect("awq 源");
-        let old = eval_load(&mk(), &mut face, &src, &opts.ctx()).await.expect("eval_load(awq)");
-        let new = load_from_dir(&dir, &mut face, &mk(), opts).await.expect("load_from_dir(awq)");
+        let old = eval_load(&mk(), &mut face, &src, &opts.ctx())
+            .await
+            .expect("eval_load(awq)");
+        let new = load_from_dir(&dir, &mut face, &mk(), opts)
+            .await
+            .expect("load_from_dir(awq)");
         let norm = |m: &LoadManifest| {
             let mut v: Vec<(String, String, Vec<usize>)> = m
                 .entries()
@@ -2321,7 +2467,10 @@ mod generic_entry_tests {
         let (a, b) = (norm(&old), norm(&new));
         assert_eq!(a.len(), b.len(), "量化族清单条目数");
         assert_eq!(a, b, "量化族键/dtype/形状逐条相等");
-        eprintln!("[L2] 量化族通用入口 ≡ AwqSource 直开:{} 条逐项相等 ✓", a.len());
+        eprintln!(
+            "[L2] 量化族通用入口 ≡ AwqSource 直开:{} 条逐项相等 ✓",
+            a.len()
+        );
     }
 
     /// **转置臂按声明 dtype 交付**(2026-10-19 立案):原实现对非 F16 走 F32 分支,
@@ -2346,7 +2495,12 @@ mod generic_entry_tests {
             fn take(&self, _key: &str) -> crate::module::Taken<Vec<f32>> {
                 Ok(Some(self.0.clone()))
             }
-            fn take_range(&self, _key: &str, off: usize, len: usize) -> crate::module::Taken<Vec<f32>> {
+            fn take_range(
+                &self,
+                _key: &str,
+                off: usize,
+                len: usize,
+            ) -> crate::module::Taken<Vec<f32>> {
                 Ok(self.0.get(off..off + len).map(<[f32]>::to_vec))
             }
             fn elem_len(&self, _key: &str) -> crate::module::Taken<usize> {
@@ -2373,8 +2527,12 @@ mod generic_entry_tests {
                 .expect("eval_load(transposed)");
             assert_eq!(layer.0.dtype(), dt, "声明 dtype 必须落为装载 dtype");
             let got = match dt {
-                crate::contract::Dtype::BF16 => crate::testkit::harvest_bf16(&mut face, &layer.0.decl()).await,
-                crate::contract::Dtype::F16 => crate::testkit::harvest_f16(&mut face, &layer.0.decl()).await,
+                crate::contract::Dtype::BF16 => {
+                    crate::testkit::harvest_bf16(&mut face, &layer.0.decl()).await
+                }
+                crate::contract::Dtype::F16 => {
+                    crate::testkit::harvest_f16(&mut face, &layer.0.decl()).await
+                }
                 _ => unreachable!(),
             };
             // 期望:目标 [c*rows + r] = 源 [r*cols + c]
@@ -2395,7 +2553,6 @@ mod generic_entry_tests {
         eprintln!("[loader] 转置臂 dtype 交付门:bf16/f16 逐元素 ✓");
     }
 }
-
 
 #[cfg(test)]
 mod load_opts_tests {
@@ -2419,16 +2576,25 @@ mod load_opts_tests {
         assert_eq!(o.staging_mb, 7);
         assert_eq!(o.device_repack, Some(false), "显式 cpu 覆盖 base");
 
-        let bad = owl_shared::config::LoadCfg { repack: "nope".into(), ..cfg };
+        let bad = owl_shared::config::LoadCfg {
+            repack: "nope".into(),
+            ..cfg
+        };
         assert!(
             LoadOpts::plain(Dtype::F16).with_cfg(&bad).is_err(),
             "非法 repack 必须响亮拒(不许静默按 auto)"
         );
 
         // auto 保留 base 的能力裁决
-        let auto = owl_shared::config::LoadCfg { repack: "auto".into(), ..Default::default() };
+        let auto = owl_shared::config::LoadCfg {
+            repack: "auto".into(),
+            ..Default::default()
+        };
         assert_eq!(
-            LoadOpts::plain(Dtype::F16).with_cfg(&auto).expect("auto 合法").device_repack,
+            LoadOpts::plain(Dtype::F16)
+                .with_cfg(&auto)
+                .expect("auto 合法")
+                .device_repack,
             Some(false)
         );
     }

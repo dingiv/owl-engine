@@ -17,9 +17,9 @@
 //! feature = "device"(cudarc driver/nvrtc;独立于已退役的 cuda_ops 预编链;
 //! `nvrtc` feature 仅提供 `Ptx::from_binary` 数据类型包装,零编译)。
 
-use crate::contract::{FieldStats, InvariantBox, Law, OpError, OpId, Stage};
 /// 发射参数值(权威定义在 [`crate::contract`] —— 自检面(零 feature 门)也要用它)
 pub use crate::contract::LaunchVal;
+use crate::contract::{FieldStats, InvariantBox, Law, OpError, OpId, Stage};
 use cudarc::driver::{CudaContext, CudaFunction, CudaStream};
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -202,7 +202,6 @@ pub trait DeviceRes {
     }
 }
 
-
 /// 设备码块身份(**缓存键的唯一真源**)。
 ///
 /// 为什么不能只用"资产名":`gdn_chunked` 一族**六个 Triton cubin 共用一个
@@ -219,7 +218,11 @@ struct BlobKey {
 
 impl BlobKey {
     fn of(tag: &'static str, bytes: &[u8]) -> Self {
-        Self { tag, ptr: bytes.as_ptr() as usize, len: bytes.len() }
+        Self {
+            tag,
+            ptr: bytes.as_ptr() as usize,
+            len: bytes.len(),
+        }
     }
 }
 
@@ -339,7 +342,10 @@ impl Exec {
         };
         let f = module.load_function(symbol).map_err(|e| OpError::Asset {
             op: op.0.to_string(),
-            detail: format!("符号 {symbol} 不在资产 {}({e:?})——资产/代码代际失配", asset.id),
+            detail: format!(
+                "符号 {symbol} 不在资产 {}({e:?})——资产/代码代际失配",
+                asset.id
+            ),
         })?;
         let f = Arc::new(f);
         self.fns.insert((key, symbol), f.clone());
@@ -368,14 +374,18 @@ impl Exec {
                 let ctx = res.context()?;
                 let m = ctx
                     .load_module(cudarc::nvrtc::Ptx::from_binary(bytes.to_vec()))
-                    .map_err(|e| OpError::Asset { op: op.0.to_string(), detail: format!("cubin {asset}: {e:?}") })?;
+                    .map_err(|e| OpError::Asset {
+                        op: op.0.to_string(),
+                        detail: format!("cubin {asset}: {e:?}"),
+                    })?;
                 self.modules.insert(key, m.clone());
                 m
             }
         };
-        let f = module
-            .load_function(symbol)
-            .map_err(|e| OpError::Asset { op: op.0.to_string(), detail: format!("符号 {symbol} 不在 {asset}({e:?})——资产/代码代际失配,manifest 门拦截") })?;
+        let f = module.load_function(symbol).map_err(|e| OpError::Asset {
+            op: op.0.to_string(),
+            detail: format!("符号 {symbol} 不在 {asset}({e:?})——资产/代码代际失配,manifest 门拦截"),
+        })?;
         let f = Arc::new(f);
         self.fns.insert((key, symbol), f.clone());
         Ok(f)
@@ -384,8 +394,14 @@ impl Exec {
     /// 动态 sharedmem 上限预置(>48K 核的 opt-in;handler 同名单由家族自管)
     pub fn set_shared_limit(f: &CudaFunction, bytes: u32) -> Result<(), OpError> {
         use cudarc::driver::sys::CUfunction_attribute_enum as Attr;
-        f.set_attribute(Attr::CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES, bytes as i32)
-            .map_err(|e| OpError::Asset { op: OpId("exec").0.to_string(), detail: format!("setattr {bytes}: {e:?}") })
+        f.set_attribute(
+            Attr::CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES,
+            bytes as i32,
+        )
+        .map_err(|e| OpError::Asset {
+            op: OpId("exec").0.to_string(),
+            detail: format!("setattr {bytes}: {e:?}"),
+        })
     }
 
     /// 捕获窗守卫 + 登记的统一入口(横切纪律一次写成)。
@@ -408,7 +424,13 @@ impl Exec {
         vals: &[LaunchVal],
     ) -> Result<(), OpError> {
         if res.capturing()? {
-            res.record_capture(LaunchNote { op: op.0.to_string(), kernel, grid, block, shared_mem })?;
+            res.record_capture(LaunchNote {
+                op: op.0.to_string(),
+                kernel,
+                grid,
+                block,
+                shared_mem,
+            })?;
         }
         // >48K 动态 smem 需按函数 opt-in（与生产 `launch.rs` 同律；
         // 自检/测试走本入口，漏这一步 = CUDA_ERROR_INVALID_VALUE）。
@@ -416,12 +438,10 @@ impl Exec {
             Self::set_shared_limit(f, shared_mem)?;
         }
         let stream = res.stream()?;
-        launch_vals(&stream, f, grid, block, shared_mem, vals).map_err(|e| {
-            OpError::Launch {
-                op: op.0.to_string(),
-                stage: Stage::Compute,
-                detail: format!("{kernel}: {e:?}"),
-            }
+        launch_vals(&stream, f, grid, block, shared_mem, vals).map_err(|e| OpError::Launch {
+            op: op.0.to_string(),
+            stage: Stage::Compute,
+            detail: format!("{kernel}: {e:?}"),
         })?;
         // **家族面入账**(2026-10-15 A13 补漏;审查后修正两点):本函数是
         // gdn_chunked / gdn_scalar / xqa / flashinfer 四族核发射的唯一出口 ——
@@ -453,7 +473,11 @@ impl Exec {
         let stream = res.stream()?;
         stream
             .memcpy_htod(src.as_bytes(), dst)
-            .map_err(|e| OpError::Launch { op: op.0.to_string(), stage: Stage::Store, detail: format!("htod: {e:?}") })
+            .map_err(|e| OpError::Launch {
+                op: op.0.to_string(),
+                stage: Stage::Store,
+                detail: format!("htod: {e:?}"),
+            })
     }
 
     /// 数值体检:取回样本算 FieldStats(违例证据自带数值)。
@@ -466,10 +490,18 @@ impl Exec {
         law: Law,
     ) -> Result<FieldStats, OpError> {
         if res.capturing()? {
-            return Err(OpError::Launch { op: op.0.to_string(), stage: Stage::Epilogue, detail: "sample_stats 禁入捕获段(EagerOnly)".into() });
+            return Err(OpError::Launch {
+                op: op.0.to_string(),
+                stage: Stage::Epilogue,
+                detail: "sample_stats 禁入捕获段(EagerOnly)".into(),
+            });
         }
         let stream = res.stream()?;
-        let host = stream.clone_dtoh(src).map_err(|e| OpError::Launch { op: op.0.to_string(), stage: Stage::Epilogue, detail: format!("sample dtoh: {e:?}") })?;
+        let host = stream.clone_dtoh(src).map_err(|e| OpError::Launch {
+            op: op.0.to_string(),
+            stage: Stage::Epilogue,
+            detail: format!("sample dtoh: {e:?}"),
+        })?;
         let (mut min, mut max, mut nan, mut inf) = (f32::INFINITY, f32::NEG_INFINITY, 0u64, 0u64);
         for v in &host {
             if v.is_nan() {
@@ -481,14 +513,27 @@ impl Exec {
                 max = max.max(*v);
             }
         }
-        let stats = FieldStats { min, max, nan_count: nan, inf_count: inf };
+        let stats = FieldStats {
+            min,
+            max,
+            nan_count: nan,
+            inf_count: inf,
+        };
         // 律判定(此处只产 Err;处置归引擎策略层)
         let violated = match law {
-            Law::GateCumsumNonPositive => stats.max > 1e-6 || stats.nan_count > 0 || stats.inf_count > 0,
-            Law::IntermediateFinite | Law::OutputFinite => stats.nan_count > 0 || stats.inf_count > 0,
+            Law::GateCumsumNonPositive => {
+                stats.max > 1e-6 || stats.nan_count > 0 || stats.inf_count > 0
+            }
+            Law::IntermediateFinite | Law::OutputFinite => {
+                stats.nan_count > 0 || stats.inf_count > 0
+            }
         };
         if violated {
-            return Err(OpError::Invariant { op: op.0.to_string(), law, stats });
+            return Err(OpError::Invariant {
+                op: op.0.to_string(),
+                law,
+                stats,
+            });
         }
         Ok(stats)
     }

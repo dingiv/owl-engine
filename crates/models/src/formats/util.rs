@@ -65,8 +65,7 @@ pub(crate) fn bf16_par(bytes: &[u8]) -> Vec<f32> {
         .for_each(|(t, chunk)| {
             for (i, cell) in chunk.iter_mut().enumerate() {
                 let o = (t * (1 << 16) + i) * 2;
-                *cell =
-                    f32::from_bits((u16::from_le_bytes([bytes[o], bytes[o + 1]]) as u32) << 16);
+                *cell = f32::from_bits((u16::from_le_bytes([bytes[o], bytes[o + 1]]) as u32) << 16);
             }
         });
     v

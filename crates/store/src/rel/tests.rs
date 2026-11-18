@@ -64,12 +64,40 @@ fn rel(turns: usize) -> Rel {
     r
 }
 
+/// 无宿主档（`host_enabled = false`）：用于钉“纯 GPU 出序”。
+fn rel_no_host(turns: usize) -> Rel {
+    let mut i = inputs();
+    i.host_bytes = 0;
+    let mut cfg = kv_cfg(64, 32);
+    cfg.host_bytes = 0;
+    let mut r = Rel::open(
+        i,
+        AdmissionPolicy::new(turns, QueuePolicy::Reject),
+        cfg,
+        cell_for(&i),
+    )
+    .expect("装配");
+    r.leg
+        .attach_pool(crate::leg::PoolLayout {
+            class: crate::leg::BlockClass::KvPage,
+            epoch: 0,
+            pieces: vec![crate::leg::PieceSpec {
+                buf: owl_iface::contract::Bytes::new(0, 1, owl_iface::contract::Dtype::F32, 1),
+                stride_bytes: BLOCK_BYTES,
+            }],
+        })
+        .expect("布局");
+    r
+}
+
 fn toks(n: usize) -> Vec<u32> {
     (0..n as u32).collect()
 }
 
 /// 装配带盘层的 Rel(测试辅助)。
 fn rel_with_disk(i: &mut BudgetInputs, kv_bytes: usize, snap_bytes: usize) -> Rel {
+    // 2026-11-18：盘层 = 一层一个总池；测试把两腿旧配额合并成总账。
+    i.disk_bytes = kv_bytes.saturating_add(snap_bytes);
     let mut r = Rel::open(
         *i,
         AdmissionPolicy::new(2, QueuePolicy::Reject),
@@ -87,8 +115,7 @@ fn rel_with_disk(i: &mut BudgetInputs, kv_bytes: usize, snap_bytes: usize) -> Re
             }],
         })
         .expect("布局");
-    r.attach_disk("/tmp/owl-disk-test-adopt", kv_bytes, snap_bytes)
-        .expect("接盘");
+    r.attach_disk("/tmp/owl-disk-test-adopt").expect("接盘");
     r
 }
 

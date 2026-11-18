@@ -6,9 +6,8 @@
 use crate::contract::{Bytes, Dtype, LaunchMsg, OpError, OpId};
 
 use crate::client::cublas::{parse_gemm, parse_gemm_dst, GEMM_BF16, GEMM_F16, GEMM_F16_DST};
-use crate::registry::{FamilyGuard, KernelFamily};
 use crate::family::cublas::OwlCublas;
-
+use crate::registry::{FamilyGuard, KernelFamily};
 
 pub struct CublasRuntime {
     blas: Option<OwlCublas>,
@@ -27,13 +26,10 @@ impl CublasRuntime {
     // 本族算子表:由 `KernelSpec::FAMILY` 派生(`KernelFamily::ops()` 缺省实现)
 }
 
-
 impl KernelFamily for CublasRuntime {
     fn id(&self) -> OpId {
         Self::ID
     }
-
-
 
     /// 构造函数:OwlCublas 句柄预钉(ensure_blas 律:构造期急切,
     /// 捕获内首次初始化事故类结构性消灭)
@@ -42,20 +38,36 @@ impl KernelFamily for CublasRuntime {
         _exec: &mut crate::device::Exec,
     ) -> Result<Box<dyn KernelFamily>, OpError> {
         let stream = res.stream()?;
-        let blas = OwlCublas::new(stream.clone())
-            .map_err(|e| OpError::Asset { op: GEMM_F16.into(), detail: format!("cublas handle: {e}") })?;
+        let blas = OwlCublas::new(stream.clone()).map_err(|e| OpError::Asset {
+            op: GEMM_F16.into(),
+            detail: format!("cublas handle: {e}"),
+        })?;
         // C1 刀1.5 律:**装配期预绑私有工作区**,避免 cuBLAS 首次 gemv splitK
         // 在捕获/首次 gemm 时内部再分配(~0.8 GiB 实测未入账)。工作区由
         // runtime 持有(旧实现分配后丢弃 = 悬垂指针,k-probe 失败真因候选)。
         let ws = res
             .alloc(4 << 20, "cublas.ws")
-            .map_err(|e| OpError::Asset { op: GEMM_F16.into(), detail: format!("cublas ws: {e}") })?;
+            .map_err(|e| OpError::Asset {
+                op: GEMM_F16.into(),
+                detail: format!("cublas ws: {e}"),
+            })?;
         blas.set_workspace(ws.ptr, ws.bytes)
-            .map_err(|e| OpError::Asset { op: GEMM_F16.into(), detail: format!("cublas set ws: {e}") })?;
-        Ok(FamilyGuard::boxed(CublasRuntime { blas: Some(blas), ws: Some(ws) }))
+            .map_err(|e| OpError::Asset {
+                op: GEMM_F16.into(),
+                detail: format!("cublas set ws: {e}"),
+            })?;
+        Ok(FamilyGuard::boxed(CublasRuntime {
+            blas: Some(blas),
+            ws: Some(ws),
+        }))
     }
 
-    fn run(&mut self, msg: &LaunchMsg, res: &mut dyn crate::device::DeviceRes, _exec: &mut crate::device::Exec) -> Result<Bytes, OpError> {
+    fn run(
+        &mut self,
+        msg: &LaunchMsg,
+        res: &mut dyn crate::device::DeviceRes,
+        _exec: &mut crate::device::Exec,
+    ) -> Result<Bytes, OpError> {
         // 变体(f16/bf16/**写列窗**)按【核名】路由;线内 nt sz = cublas 转置标志
         if msg.kernel.name == GEMM_F16_DST {
             let call = parse_gemm_dst(msg)?;
@@ -67,15 +79,17 @@ impl KernelFamily for CublasRuntime {
                 detail: "cublas 句柄未装配".into(),
             })?;
             res.note_device("fam_ffi_launch", &msg.kernel.name, 0, &[a, b, out]);
-            blas.gemm_f16_dst(a, b, out, call.m, call.k, call.n, call.nt, call.ldc, call.off)
-                .map_err(|e| OpError::Launch {
-                    op: msg.kernel.name.clone(),
-                    stage: crate::contract::Stage::Compute,
-                    detail: format!(
-                        "m={} k={} n={} nt={} ldc={} off={}: {e}",
-                        call.m, call.k, call.n, call.nt, call.ldc, call.off
-                    ),
-                })?;
+            blas.gemm_f16_dst(
+                a, b, out, call.m, call.k, call.n, call.nt, call.ldc, call.off,
+            )
+            .map_err(|e| OpError::Launch {
+                op: msg.kernel.name.clone(),
+                stage: crate::contract::Stage::Compute,
+                detail: format!(
+                    "m={} k={} n={} nt={} ldc={} off={}: {e}",
+                    call.m, call.k, call.n, call.nt, call.ldc, call.off
+                ),
+            })?;
             return Ok(Bytes::new(call.out.id, msg.out_elems, Dtype::F16, 2));
         }
         let bf16 = msg.kernel.name == GEMM_BF16;
@@ -100,6 +114,11 @@ impl KernelFamily for CublasRuntime {
             stage: crate::contract::Stage::Compute,
             detail: format!("m={} k={} n={} nt={}: {e}", call.m, call.k, call.n, call.nt),
         })?;
-        Ok(Bytes::new(call.out.id, msg.out_elems, if bf16 { Dtype::BF16 } else { Dtype::F16 }, 2))
+        Ok(Bytes::new(
+            call.out.id,
+            msg.out_elems,
+            if bf16 { Dtype::BF16 } else { Dtype::F16 },
+            2,
+        ))
     }
 }

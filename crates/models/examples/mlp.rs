@@ -12,9 +12,9 @@
 //! OWL_TEST_DEVICE=3 cargo run -p owl-models --example mlp -- gpu
 //! ```
 
+use owl_cpu::CpuFace;
 use owl_models::contract::DeviceClient;
 use owl_models::contract::ModelError;
-use owl_cpu::CpuFace;
 use owl_models::interpreters::eval;
 use owl_models::module::ForwardCtx;
 use owl_models::tensor::Dtype;
@@ -39,7 +39,8 @@ async fn mlp_pipeline<D: DeviceClient>(face: &mut D) -> Result<Vec<f32>, ModelEr
 
     // new = 准备容器(空包指针);layout = 唯一生命周期钩子(布局声明);
     // eval_load = 执行器(取数 → 物化 → 自动填空包)
-    let mlp = owl_models::layers::mlp::Mlp::new(hidden, intermediate, owl_models::module::QuantPlan::F16);
+    let mlp =
+        owl_models::layers::mlp::Mlp::new(hidden, intermediate, owl_models::module::QuantPlan::F16);
     let src = std::collections::HashMap::from([
         ("gate_proj".to_string(), vec![0.1; hidden * intermediate]),
         ("up_proj".to_string(), vec![0.2; hidden * intermediate]),
@@ -76,7 +77,9 @@ async fn main() {
     let gpu = std::env::args().any(|a| a == "gpu" || a == "--gpu");
 
     // 同一份管线的 CPU 基准(两模式都跑;gpu 模式兼作对拍锚)
-    let cpu_out = mlp_pipeline(&mut CpuFace::new()).await.expect("cpu pipeline");
+    let cpu_out = mlp_pipeline(&mut CpuFace::new())
+        .await
+        .expect("cpu pipeline");
     if !gpu {
         println!("forward 输出 = {cpu_out:?}");
         println!("demo: 声明式 MLP 端到端 ✓(CpuFace;async 边界)");
@@ -85,8 +88,8 @@ async fn main() {
 
     // GPU server face:owl-cuda actor(spawn = 建管道 + 起线程 + boot 握手)
     use owl_cuda::{test_device_ordinal, DeviceSelector, GpuClient};
-    let mut client = GpuClient::spawn(DeviceSelector::Ordinal(test_device_ordinal()))
-        .expect("gpu server boot");
+    let mut client =
+        GpuClient::spawn(DeviceSelector::Ordinal(test_device_ordinal())).expect("gpu server boot");
     let gpu_out = mlp_pipeline(&mut client).await.expect("gpu pipeline");
     client.close().await.expect("server 关机");
 

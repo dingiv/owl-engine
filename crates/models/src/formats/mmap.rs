@@ -88,7 +88,11 @@ impl Mmap {
         let (a, b) = (s.min(self.len), e.min(self.len));
         if a < b {
             unsafe {
-                libc::madvise(self.ptr.as_ptr().add(a) as *mut _, b - a, libc::MADV_DONTNEED);
+                libc::madvise(
+                    self.ptr.as_ptr().add(a) as *mut _,
+                    b - a,
+                    libc::MADV_DONTNEED,
+                );
             }
         }
     }
@@ -131,8 +135,17 @@ impl RawEntry {
             S::F64 | S::I64 | S::U64 => 8,
             S::F32 | S::I32 | S::U32 => 4,
             S::F16 | S::BF16 | S::I16 | S::U16 => 2,
-            S::U8 | S::I8 | S::BOOL | S::F8_E5M2 | S::F8_E4M3 | S::F8_E8M0 | S::F8_E4M3FNUZ
-            | S::F8_E5M2FNUZ | S::F4 | S::F6_E2M3 | S::F6_E3M2 => 1,
+            S::U8
+            | S::I8
+            | S::BOOL
+            | S::F8_E5M2
+            | S::F8_E4M3
+            | S::F8_E8M0
+            | S::F8_E4M3FNUZ
+            | S::F8_E5M2FNUZ
+            | S::F4
+            | S::F6_E2M3
+            | S::F6_E3M2 => 1,
             // safetensors::Dtype 是 #[non_exhaustive]:未列出的窄格式按 1B 兜底。
             // 两条入口(量化源 native_dtype / convert 臂)先经 dtype 白名单筛过,
             // 未支持 dtype 到不了本函数(dtype 白名单失配 = 上游响亮 None)。
@@ -147,7 +160,12 @@ impl RawEntry {
 /// CPU 侧曾是全载最大单相 ⇒ 装载域所有"原样字节"搬运统一走本口
 /// (与 `safetensors::copy_native_into` 同款,2026-10-16 提速同源)。
 pub(crate) fn copy_par(src: &[u8], dst: &mut [u8]) {
-    assert!(dst.len() >= src.len(), "copy_par: 目标缓冲 {} < 源 {}", dst.len(), src.len());
+    assert!(
+        dst.len() >= src.len(),
+        "copy_par: 目标缓冲 {} < 源 {}",
+        dst.len(),
+        src.len()
+    );
     let dst = &mut dst[..src.len()];
     const PAR_THRESHOLD: usize = 8 << 20;
     if src.len() >= PAR_THRESHOLD {
@@ -163,9 +181,6 @@ pub(crate) fn copy_par(src: &[u8], dst: &mut [u8]) {
         dst.copy_from_slice(src);
     }
 }
-
-
-
 
 /// mmap 源共享底座:打开目录下全部 `*.safetensors`(文件名字典序;
 /// 分片键天然互斥,无需 index.json;单文件仓同样适用),登记**全 dtype**
@@ -191,7 +206,12 @@ pub(crate) fn open_raw_index(
     for p in paths {
         let t0 = std::time::Instant::now();
         let mmap = Mmap::open(&p)?;
-        owl_shared::log_info!("st", "{p:?} mmap {}MB ({:.1?})", mmap.len() / 1_000_000, t0.elapsed());
+        owl_shared::log_info!(
+            "st",
+            "{p:?} mmap {}MB ({:.1?})",
+            mmap.len() / 1_000_000,
+            t0.elapsed()
+        );
         let map_ix = maps.len();
         let base = mmap.as_ptr() as usize;
         let st = safetensors::SafeTensors::deserialize(&mmap)
@@ -213,4 +233,3 @@ pub(crate) fn open_raw_index(
     }
     Ok((maps, index))
 }
-

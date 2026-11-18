@@ -507,7 +507,10 @@ impl KernelPick {
     /// **按 `KernelSpec` 拾取**(生产臂用):名字 = 算子关联常量,
     /// 元数据/槽序/检查函数随之而来(编译期耦合,名字不可能写错)。
     pub const fn of<T: crate::spec::KernelSpec>(shape: Shape) -> Self {
-        Self { name: T::ENTRY, shape }
+        Self {
+            name: T::ENTRY,
+            shape,
+        }
     }
 
     /// **本 pick 的 ISA 族**(权重格式侧身份;认不出 = `None` = 不设门)。
@@ -526,7 +529,11 @@ impl KernelPick {
         }
         // Marlin(W4A8 的名字里带 `w4a8`;其余 W4A16)
         if n.contains("marlin") {
-            return Some(if n.contains("w4a8") { F::MarlinW4A8 } else { F::MarlinW4A16 });
+            return Some(if n.contains("w4a8") {
+                F::MarlinW4A8
+            } else {
+                F::MarlinW4A16
+            });
         }
         if n.starts_with("flashinfer") || n.contains("FlashPrefillWithPagedKVCache") {
             return Some(F::FiPrefill);
@@ -538,7 +545,9 @@ impl KernelPick {
         // Triton 六核 `cumsum/kkt/merge/wu/h/o`)与标量(`gdn_scalar_delta_rule_fwd`)。
         // `owl_gdn_*`(conv/gating/norm/decode_step 等)是**两臂共用的子核**,
         // 按臂判族会误判 ⇒ 不设门(臂级门在 boot pre-check 那边覆盖)。
-        if n.starts_with("gdn_chunked_") || matches!(n, "cumsum" | "kkt" | "merge" | "wu" | "h" | "o") {
+        if n.starts_with("gdn_chunked_")
+            || matches!(n, "cumsum" | "kkt" | "merge" | "wu" | "h" | "o")
+        {
             return Some(F::GdnChunked);
         }
         if n.starts_with("gdn_scalar_") {
@@ -559,11 +568,7 @@ impl KernelPick {
     ///
     /// 这是「显卡做门」在**选核面**的落点:调用方(解释器的唯一执行入口)拿到
     /// `Some(Deny)` 必须**拒发**,而不是发出去等驱动报 no kernel image。
-    pub fn admit(
-        &self,
-        env: &OpEnv,
-        spec_depth: usize,
-    ) -> Option<crate::Admit> {
+    pub fn admit(&self, env: &OpEnv, spec_depth: usize) -> Option<crate::Admit> {
         self.isa_family().map(|f| {
             f.admit(crate::AdmitCtx {
                 arch: env.hw.arch,
@@ -579,7 +584,11 @@ impl KernelPick {
 }
 
 /// 哨兵 1D 发射形态(逐元素/批量核的公共形态)
-pub const SENTINEL_1D: Shape = Shape { grid: (0, 0, 0), block: (256, 1, 1), smem: 0 };
+pub const SENTINEL_1D: Shape = Shape {
+    grid: (0, 0, 0),
+    block: (256, 1, 1),
+    smem: 0,
+};
 
 /// **行归约族的块内和 smem 契约**(2026-10-19 §58 刀③):
 /// `owl_rmsnorm_*` / `owl_fused_add_rmsnorm_*` 用**动态 smem**装"每 warp 一个部分和"
@@ -599,7 +608,11 @@ pub const ROW_REDUCE_BLOCK: u32 = 512;
 /// foreign 家族臂发射形态(2026-10-12 用户律:具名算子入词表):grid/
 /// block 由 server 家族 runtime 单源,发射配置层/解释层零感知 ——
 /// (0,0,0) 直通,server 按名分派后自算网格
-pub const FOREIGN: Shape = Shape { grid: (0, 0, 0), block: (0, 0, 0), smem: 0 };
+pub const FOREIGN: Shape = Shape {
+    grid: (0, 0, 0),
+    block: (0, 0, 0),
+    smem: 0,
+};
 
 // ============================================================================
 // §3 算子族(GDN;F5 批 1-5 核 + 工单 G 批核,2026-09-25 语义)
@@ -614,7 +627,11 @@ pub mod gguf {
     /// **激活 → q8_1**(MMVQ 喂料手;几何 = `quant_act_geom`)
     pub fn quant_act(dt: DType, rows: usize, k_padded: usize) -> KernelPick {
         let (grid, block) = fam::quant_act_geom(rows, k_padded);
-        let shape = Shape { grid, block, smem: 0 };
+        let shape = Shape {
+            grid,
+            block,
+            smem: 0,
+        };
         match dt {
             DType::F16 => KernelPick::of::<crate::ops::gguf::GgufQuantActF16>(shape),
             DType::BF16 => KernelPick::of::<crate::ops::gguf::GgufQuantActBf16>(shape),
@@ -626,7 +643,11 @@ pub mod gguf {
     /// 几何与普通臂**逐字相同**(置换不改变发射形状)。
     pub fn quant_act_tiled(dt: DType, rows: usize, k_padded: usize) -> KernelPick {
         let (grid, block) = fam::quant_act_geom(rows, k_padded);
-        let shape = Shape { grid, block, smem: 0 };
+        let shape = Shape {
+            grid,
+            block,
+            smem: 0,
+        };
         match dt {
             DType::F16 => KernelPick::of::<crate::ops::gguf::GgufQuantActF16Tiled>(shape),
             DType::BF16 => KernelPick::of::<crate::ops::gguf::GgufQuantActBf16Tiled>(shape),
@@ -638,7 +659,11 @@ pub mod gguf {
     /// 未移植型 **panic 带可读信息**(picker 契约:编程错误当场炸,不许静默兜底)。
     pub fn gemm(ty: GgmlTy, m: usize, n: usize) -> KernelPick {
         let (grid, block) = fam::gemm_geom(m, n);
-        let shape = Shape { grid, block, smem: 0 };
+        let shape = Shape {
+            grid,
+            block,
+            smem: 0,
+        };
         match ty {
             GgmlTy::Q8_0 => KernelPick::of::<crate::ops::gguf::GgufGemmQ8_0>(shape),
             GgmlTy::Q4K => KernelPick::of::<crate::ops::gguf::GgufGemmQ4K>(shape),
@@ -667,7 +692,11 @@ pub mod gguf {
     /// **权重复用 GEMM**(prefill;W-2):`grid = (ceil(n/n_warps), ceil(m/TILE_MT))`
     pub fn gemm_tile(ty: GgmlTy, m: usize, n: usize) -> KernelPick {
         let (grid, block) = fam::gemm_tile_geom(m, n);
-        let shape = Shape { grid, block, smem: 0 };
+        let shape = Shape {
+            grid,
+            block,
+            smem: 0,
+        };
         match ty {
             GgmlTy::Q8_0 => KernelPick::of::<crate::ops::gguf::GgufTileQ8_0>(shape),
             GgmlTy::Q4K => KernelPick::of::<crate::ops::gguf::GgufTileQ4K>(shape),
@@ -694,7 +723,11 @@ pub mod gguf {
     /// **smem 复用 GEMM**(prefill 的算术杠杆;W-2b):`grid = (ceil(n/NT), ceil(m/MT))` + **动态 smem 66048B**(>48KB ⇒ server 走 opt-in 通道)
     pub fn gemm_smem(ty: GgmlTy, m: usize, n: usize) -> KernelPick {
         let (grid, block) = fam::smem_geom(m, n);
-        let shape = Shape { grid, block, smem: fam::smem_bytes() as u32 };
+        let shape = Shape {
+            grid,
+            block,
+            smem: fam::smem_bytes() as u32,
+        };
         match ty {
             GgmlTy::Q8_0 => KernelPick::of::<crate::ops::gguf::GgufSmemQ8_0>(shape),
             GgmlTy::Q4K => KernelPick::of::<crate::ops::gguf::GgufSmemQ4K>(shape),
@@ -712,22 +745,36 @@ pub mod gguf {
     /// `block = (32, 4)`,`smem = 0`(tile 为静态 `__shared__`)。
     pub fn mmq(ty: GgmlTy, m: usize, n: usize) -> KernelPick {
         let (grid, block) = fam::mmq_geom(ty, m, n);
-        let shape = Shape { grid, block, smem: 0 };
+        let shape = Shape {
+            grid,
+            block,
+            smem: 0,
+        };
         match ty {
             GgmlTy::Q8_0 => KernelPick::of::<crate::ops::gguf::GgufMmqQ8_0>(shape),
             GgmlTy::Q4K => KernelPick::of::<crate::ops::gguf::GgufMmqQ4K>(shape),
             GgmlTy::Q5K => KernelPick::of::<crate::ops::gguf::GgufMmqQ5K>(shape),
             GgmlTy::Q6K => KernelPick::of::<crate::ops::gguf::GgufMmqQ6K>(shape),
-            other => panic!("owl_gguf_mmq: {} 未移植(MMQ 集 = Q4_K/Q5_K/Q6_K/Q8_0)", other.name()),
+            other => panic!(
+                "owl_gguf_mmq: {} 未移植(MMQ 集 = Q4_K/Q5_K/Q6_K/Q8_0)",
+                other.name()
+            ),
         }
     }
 
     /// **行窗解量化**(W-2d;dequant+cuBLAS 的喂料手)
     pub fn dequant_range(ty: GgmlTy, rows: usize, k: usize) -> KernelPick {
         let (grid, block) = fam::range_geom(ty, rows, k).unwrap_or_else(|| {
-            panic!("owl_gguf_dequant_range: {} 未移植或 k={k} 非块整数倍", ty.name())
+            panic!(
+                "owl_gguf_dequant_range: {} 未移植或 k={k} 非块整数倍",
+                ty.name()
+            )
         });
-        let shape = Shape { grid, block, smem: 0 };
+        let shape = Shape {
+            grid,
+            block,
+            smem: 0,
+        };
         match ty {
             GgmlTy::Q8_0 => KernelPick::of::<crate::ops::gguf::GgufRangeQ8_0>(shape),
             GgmlTy::Q4K => KernelPick::of::<crate::ops::gguf::GgufRangeQ4K>(shape),
@@ -751,7 +798,11 @@ pub mod gguf {
     /// **激活量化 → `block_q8_1_mmq`**(W-2f):`grid=(m, ceil(k/512),1)`、`block=(128,1,1)`
     pub fn mmq2_quant(ds4: bool, bf16: bool, m: usize, k: usize) -> KernelPick {
         let (grid, block) = fam::mmq2_quant_geom(m, k);
-        let shape = Shape { grid, block, smem: 0 };
+        let shape = Shape {
+            grid,
+            block,
+            smem: 0,
+        };
         match (ds4, bf16) {
             (true, false) => KernelPick::of::<crate::ops::gguf::GgufMmq2QuantDs4>(shape),
             (false, false) => KernelPick::of::<crate::ops::gguf::GgufMmq2QuantD4>(shape),
@@ -768,7 +819,11 @@ pub mod gguf {
         let smem = fam::mmq2_smem_for(ty, j) as u32;
         let shape = Shape { grid, block, smem };
         let entry = fam::mmq2_entry_for(ty, m).unwrap_or_else(|| {
-            panic!("owl_gguf_mmq2: {} 未移植(已移植集 = {:?})", ty.name(), fam::PORTED)
+            panic!(
+                "owl_gguf_mmq2: {} 未移植(已移植集 = {:?})",
+                ty.name(),
+                fam::PORTED
+            )
         });
         let pick = match entry {
             fam::MMQ2_Q8_0_J16 => KernelPick::of::<crate::ops::gguf::GgufMmq2Q8_0J16>(shape),
@@ -819,7 +874,11 @@ pub mod gguf {
     /// `grid = (rows,1,1)`、`block = (256,1,1)`
     pub fn gather_cols(rows: usize) -> KernelPick {
         let (grid, block) = fam::gather_geom(rows);
-        KernelPick::of::<crate::ops::gguf::GgufGatherCols>(Shape { grid, block, smem: 0 })
+        KernelPick::of::<crate::ops::gguf::GgufGatherCols>(Shape {
+            grid,
+            block,
+            smem: 0,
+        })
     }
 
     /// 型 → 入口名(诊断/门用;与 [`gemm`] 同一映射源)
@@ -838,7 +897,11 @@ pub mod gguf {
                 fam::ROWS_PORTED
             )
         });
-        let shape = Shape { grid, block, smem: 0 };
+        let shape = Shape {
+            grid,
+            block,
+            smem: 0,
+        };
         match ty {
             GgmlTy::Q4K => KernelPick::of::<crate::ops::gguf::GgufRowsQ4K>(shape),
             GgmlTy::Q5K => KernelPick::of::<crate::ops::gguf::GgufRowsQ5K>(shape),
@@ -865,21 +928,35 @@ pub mod gdn {
     /// gdn_chunked 六核编排(FLA fork-bf16;foreign 家族臂):名字 =
     /// family 单源,发射配置 = FOREIGN 哨兵(server 家族 runtime 自算网格)
     pub fn chunked_delta() -> KernelPick {
-        KernelPick { name: crate::family::gdn_chunked::GDN_CHUNKED_FWD, shape: FOREIGN }
+        KernelPick {
+            name: crate::family::gdn_chunked::GDN_CHUNKED_FWD,
+            shape: FOREIGN,
+        }
     }
 
     /// gdn_scalar 单核臂(lmdeploy pre_sm90 port;foreign 家族臂同上)
     pub fn scalar_delta() -> KernelPick {
-        KernelPick { name: crate::family::gdn_scalar::GDN_SCALAR_FWD, shape: FOREIGN }
+        KernelPick {
+            name: crate::family::gdn_scalar::GDN_SCALAR_FWD,
+            shape: FOREIGN,
+        }
     }
 
     /// gating_g:g = softplus(a_log) + dt_bias 门(批 1;哨兵 1D)
     pub fn gating_g(dt: DType) -> KernelPick {
-        KernelPick { name: match dt {
-            DType::F16 => "owl_gdn_gating_g_f16",
-            DType::F32 => "owl_gdn_gating_g_f32",
-            DType::BF16 | DType::U32 | DType::U8 | DType::F8E4M3 | DType::F8E5M2 | DType::I8 => unimplemented!("GDN 族无 U32 变体"),
-        }, shape: SENTINEL_1D }
+        KernelPick {
+            name: match dt {
+                DType::F16 => "owl_gdn_gating_g_f16",
+                DType::F32 => "owl_gdn_gating_g_f32",
+                DType::BF16
+                | DType::U32
+                | DType::U8
+                | DType::F8E4M3
+                | DType::F8E5M2
+                | DType::I8 => unimplemented!("GDN 族无 U32 变体"),
+            },
+            shape: SENTINEL_1D,
+        }
     }
 
     /// l2norm:行末维归一(批 2;一 block 一行,eps 走参数槽)
@@ -888,7 +965,12 @@ pub mod gdn {
             name: match dt {
                 DType::F16 => "owl_gdn_l2norm_f16",
                 DType::F32 => "owl_gdn_l2norm_f32",
-                DType::BF16 | DType::U32 | DType::U8 | DType::F8E4M3 | DType::F8E5M2 | DType::I8 => unimplemented!("GDN 族无 U32 变体"),
+                DType::BF16
+                | DType::U32
+                | DType::U8
+                | DType::F8E4M3
+                | DType::F8E5M2
+                | DType::I8 => unimplemented!("GDN 族无 U32 变体"),
             },
             shape: Shape {
                 // **一 warp 一行、一 block 8 行**(2026-10-19):旧形一 block 一行
@@ -902,11 +984,19 @@ pub mod gdn {
 
     /// conv_upd:decode 槽更新(批 3;state 原地副作用,单流保序;哨兵 1D)
     pub fn conv_upd(dt: DType) -> KernelPick {
-        KernelPick { name: match dt {
-            DType::F16 => "owl_gdn_conv_upd_f16",
-            DType::F32 => "owl_gdn_conv_upd_f32",
-            DType::BF16 | DType::U32 | DType::U8 | DType::F8E4M3 | DType::F8E5M2 | DType::I8 => unimplemented!("GDN 族无 U32 变体"),
-        }, shape: SENTINEL_1D }
+        KernelPick {
+            name: match dt {
+                DType::F16 => "owl_gdn_conv_upd_f16",
+                DType::F32 => "owl_gdn_conv_upd_f32",
+                DType::BF16
+                | DType::U32
+                | DType::U8
+                | DType::F8E4M3
+                | DType::F8E5M2
+                | DType::I8 => unimplemented!("GDN 族无 U32 变体"),
+            },
+            shape: SENTINEL_1D,
+        }
     }
 
     /// 刀3b(2026-10-04):q/k 双段 conv 槽更新单发(哨兵 1D,平面 =
@@ -924,7 +1014,12 @@ pub mod gdn {
             name: match dt {
                 DType::F16 => "owl_gdn_delta_dec_f16",
                 DType::F32 => "owl_gdn_delta_dec_f32",
-                DType::BF16 | DType::U32 | DType::U8 | DType::F8E4M3 | DType::F8E5M2 | DType::I8 => unimplemented!("GDN 族无 U32 变体"),
+                DType::BF16
+                | DType::U32
+                | DType::U8
+                | DType::F8E4M3
+                | DType::F8E5M2
+                | DType::I8 => unimplemented!("GDN 族无 U32 变体"),
             },
             shape: Shape {
                 grid: (vd.div_ceil(64) as u32, (batch * nv) as u32, 1),
@@ -943,8 +1038,15 @@ pub mod gdn {
             "owl_gdn_decode_step 仅有 f16 变体(dt={dt:?})"
         );
         assert_eq!(kd, vd, "decode_step 融合核要求 kd==vd(头方阵);得 {kd}/{vd}");
-        assert!(kd <= 128 && kd.is_multiple_of(32), "decode_step 融合核要求 kd≤128 且 32 对齐,得 {kd}");
-        KernelPick::of::<crate::ops::gdn::GdnDecodeStepF16>(Shape { grid: ((batch * nv) as u32, 1, 1), block: (kd as u32, 1, 1), smem: 0 })
+        assert!(
+            kd <= 128 && kd.is_multiple_of(32),
+            "decode_step 融合核要求 kd≤128 且 32 对齐,得 {kd}"
+        );
+        KernelPick::of::<crate::ops::gdn::GdnDecodeStepF16>(Shape {
+            grid: ((batch * nv) as u32, 1, 1),
+            block: (kd as u32, 1, 1),
+            smem: 0,
+        })
     }
 
     /// D1-v2(2026-10-04 sglang 刺探):delta 相 float4 行组重写(同契约;
@@ -956,8 +1058,15 @@ pub mod gdn {
             "owl_gdn_decode_step_v2 仅有 f16 变体(dt={dt:?})"
         );
         assert_eq!(kd, vd, "decode_step v2 要求 kd==vd(头方阵);得 {kd}/{vd}");
-        assert!(kd <= 128 && kd.is_multiple_of(32) && vd.is_multiple_of(4), "decode_step v2 要求 kd≤128 32 对齐且 vd/4,得 {kd}/{vd}");
-        KernelPick::of::<crate::ops::gdn::DecodeStepV2F16>(Shape { grid: ((batch * nv) as u32, 1, 1), block: (vd as u32, 1, 1), smem: 0 })
+        assert!(
+            kd <= 128 && kd.is_multiple_of(32) && vd.is_multiple_of(4),
+            "decode_step v2 要求 kd≤128 32 对齐且 vd/4,得 {kd}/{vd}"
+        );
+        KernelPick::of::<crate::ops::gdn::DecodeStepV2F16>(Shape {
+            grid: ((batch * nv) as u32, 1, 1),
+            block: (vd as u32, 1, 1),
+            smem: 0,
+        })
     }
 
     /// conv_fwd:**prefill 卷前向**(工单 G;**仅 f16 变体**,f32 请求 =
@@ -977,7 +1086,10 @@ pub mod gdn {
     /// **前置律**:`TILE_ROWS >= 3`(保证 tiles>1 ⇒ ts>=3 ⇒ 只有 tile 0 碰 state);
     /// 取 32。
     pub fn conv_fwd(dt: DType, d: usize, tokens: usize, batch: usize) -> KernelPick {
-        assert!(matches!(dt, DType::F16), "owl_gdn_conv_fwd 仅有 f16 变体(dt={dt:?})");
+        assert!(
+            matches!(dt, DType::F16),
+            "owl_gdn_conv_fwd 仅有 f16 变体(dt={dt:?})"
+        );
         const TILE_ROWS: usize = 32;
         let tiles = tokens.div_ceil(TILE_ROWS).max(1);
         KernelPick::of::<crate::ops::gdn::ConvFwdF16>(Shape {
@@ -1006,7 +1118,13 @@ pub mod gdn {
         kd == 128 && vd.is_multiple_of(2)
     }
 
-    pub fn recurrence_varlen_gqa(dt: DType, vd: usize, nv: usize, kd: usize, batch: usize) -> KernelPick {
+    pub fn recurrence_varlen_gqa(
+        dt: DType,
+        vd: usize,
+        nv: usize,
+        kd: usize,
+        batch: usize,
+    ) -> KernelPick {
         assert!(
             matches!(dt, DType::F16),
             "owl_gdn_recurrence_varlen_gqa 仅有 f16 变体(dt={dt:?})"
@@ -1015,7 +1133,11 @@ pub mod gdn {
         KernelPick::of::<crate::ops::gdn::RecurrenceVarlenGqaF16>(Shape {
             // grid.y = batch × nv(核内 seq_head = blockIdx.y,按 seq_idx = seq_head/nv
             // 取 slots[seq_idx];单序列时与旧形逐位一致)
-            grid: (vd.div_ceil(if fast { 16 } else { 8 }) as u32, (nv * batch.max(1)) as u32, 1),
+            grid: (
+                vd.div_ceil(if fast { 16 } else { 8 }) as u32,
+                (nv * batch.max(1)) as u32,
+                1,
+            ),
             block: (32, 8, 1),
             smem: ((4 * kd + 4) * 4) as u32,
         })
@@ -1028,7 +1150,12 @@ pub mod gdn {
             name: match dt {
                 DType::F16 => "owl_gdn_norm_act_f16",
                 DType::F32 => "owl_gdn_norm_act_f32",
-                DType::BF16 | DType::U32 | DType::U8 | DType::F8E4M3 | DType::F8E5M2 | DType::I8 => unimplemented!("GDN 族无 U32 变体"),
+                DType::BF16
+                | DType::U32
+                | DType::U8
+                | DType::F8E4M3
+                | DType::F8E5M2
+                | DType::I8 => unimplemented!("GDN 族无 U32 变体"),
             },
             shape: Shape {
                 // **一 warp 一单元、一 block 8 个 warp**(2026-10-19):旧形一 block 一单元
@@ -1055,7 +1182,12 @@ pub mod ops {
             name: match dt {
                 DType::F16 => "owl_sigmoid_f16",
                 DType::F32 => "owl_sigmoid_f32",
-                DType::BF16 | DType::U32 | DType::U8 | DType::F8E4M3 | DType::F8E5M2 | DType::I8 => unimplemented!("sigmoid 无 BF16/U32 变体"),
+                DType::BF16
+                | DType::U32
+                | DType::U8
+                | DType::F8E4M3
+                | DType::F8E5M2
+                | DType::I8 => unimplemented!("sigmoid 无 BF16/U32 变体"),
             },
             shape: SENTINEL_1D,
         }
@@ -1068,7 +1200,9 @@ pub mod ops {
                 DType::F32 => "owl_add_f32",
                 DType::F16 => "owl_add_f16",
                 DType::BF16 => "owl_add_bf16",
-                DType::U32 | DType::U8 | DType::F8E4M3 | DType::F8E5M2 | DType::I8 => unimplemented!("add 无 U32 变体"),
+                DType::U32 | DType::U8 | DType::F8E4M3 | DType::F8E5M2 | DType::I8 => {
+                    unimplemented!("add 无 U32 变体")
+                }
             },
             shape: SENTINEL_1D,
         }
@@ -1081,7 +1215,9 @@ pub mod ops {
                 DType::F32 => "owl_mul_f32",
                 DType::F16 => "owl_mul_f16",
                 DType::BF16 => "owl_mul_bf16",
-                DType::U32 | DType::U8 | DType::F8E4M3 | DType::F8E5M2 | DType::I8 => unimplemented!("mul 无 U32 变体"),
+                DType::U32 | DType::U8 | DType::F8E4M3 | DType::F8E5M2 | DType::I8 => {
+                    unimplemented!("mul 无 U32 变体")
+                }
             },
             shape: SENTINEL_1D,
         }
@@ -1093,7 +1229,12 @@ pub mod ops {
             name: match dt {
                 DType::F32 => "owl_silu_f32",
                 DType::F16 => "owl_silu_f16",
-                DType::BF16 | DType::U32 | DType::U8 | DType::F8E4M3 | DType::F8E5M2 | DType::I8 => unimplemented!("silu 无 BF16/U32 变体(MLP 走 silu_and_mul)"),
+                DType::BF16
+                | DType::U32
+                | DType::U8
+                | DType::F8E4M3
+                | DType::F8E5M2
+                | DType::I8 => unimplemented!("silu 无 BF16/U32 变体(MLP 走 silu_and_mul)"),
             },
             shape: SENTINEL_1D,
         }
@@ -1106,17 +1247,29 @@ pub mod ops {
 
     /// 设备侧贪心 argmax(单块两段规约;fixed (1,1,1) × 256)
     pub fn argmax() -> KernelPick {
-        KernelPick::of::<crate::ops::elems::ArgmaxF32IdxF16>(Shape { grid: (1, 1, 1), block: (256, 1, 1), smem: 0 })
+        KernelPick::of::<crate::ops::elems::ArgmaxF32IdxF16>(Shape {
+            grid: (1, 1, 1),
+            block: (256, 1, 1),
+            smem: 0,
+        })
     }
 
     /// (max 值, 索引) 双输出(分布式 argmax;grid/block 与索引版同参)
     pub fn argmax_validx() -> KernelPick {
-        KernelPick::of::<crate::ops::elems::ArgmaxValIdxF16>(Shape { grid: (1, 1, 1), block: (256, 1, 1), smem: 0 })
+        KernelPick::of::<crate::ops::elems::ArgmaxValIdxF16>(Shape {
+            grid: (1, 1, 1),
+            block: (256, 1, 1),
+            smem: 0,
+        })
     }
 
     /// 逐行 top-16(单缓冲 [rows, 32]:值半区降序 + 索引半区;aux = [rows])
     pub fn topk16(rows: usize) -> KernelPick {
-        KernelPick::of::<crate::ops::elems::Topk16F16>(Shape { grid: (rows as u32, 1, 1), block: (256, 1, 1), smem: 0 })
+        KernelPick::of::<crate::ops::elems::Topk16F16>(Shape {
+            grid: (rows as u32, 1, 1),
+            block: (256, 1, 1),
+            smem: 0,
+        })
     }
 
     /// split-K 段一(2026-10-14 D2;grid = rows×nparts,dyn 0)
@@ -1171,7 +1324,9 @@ pub mod ops {
             DType::F32 => "owl_rmsnorm_f32",
             DType::F16 => "owl_rmsnorm_f16",
             DType::BF16 => "owl_rmsnorm_bf16",
-            DType::U32 | DType::U8 | DType::F8E4M3 | DType::F8E5M2 | DType::I8 => unimplemented!("rmsnorm 无 U32 变体"),
+            DType::U32 | DType::U8 | DType::F8E4M3 | DType::F8E5M2 | DType::I8 => {
+                unimplemented!("rmsnorm 无 U32 变体")
+            }
         };
         let x_total: usize = shapes.first().map(|s| s.iter().product()).unwrap_or(0);
         let cols: usize = shapes.get(1).map(|s| s.iter().product()).unwrap_or(1);
@@ -1199,8 +1354,16 @@ pub mod dflash {
     /// 路由不吃 req.dt
     pub fn select(bf16: bool) -> KernelPick {
         KernelPick {
-            name: if bf16 { "owl_dflash_select_bf16" } else { "owl_dflash_select_f16" },
-            shape: Shape { grid: (1, 1, 1), block: (256, 1, 1), smem: 0 },
+            name: if bf16 {
+                "owl_dflash_select_bf16"
+            } else {
+                "owl_dflash_select_f16"
+            },
+            shape: Shape {
+                grid: (1, 1, 1),
+                block: (256, 1, 1),
+                smem: 0,
+            },
         }
     }
 
@@ -1210,7 +1373,9 @@ pub mod dflash {
             name: match dt {
                 DType::F16 => "owl_dflash_conv_f16",
                 DType::BF16 => "owl_dflash_conv_bf16",
-                DType::F32 | DType::U32 | DType::U8 | DType::F8E4M3 | DType::F8E5M2 | DType::I8 => unimplemented!("dflash_conv 仅 f16/bf16"),
+                DType::F32 | DType::U32 | DType::U8 | DType::F8E4M3 | DType::F8E5M2 | DType::I8 => {
+                    unimplemented!("dflash_conv 仅 f16/bf16")
+                }
             },
             shape: SENTINEL_1D,
         }
@@ -1233,18 +1398,30 @@ pub mod attn {
                 DType::BF16 => "vllm_reshape_and_cache_bf16",
                 other => unimplemented!("k0_write 无 {other:?} 变体"),
             },
-            shape: Shape { grid: (tokens as u32, 1, 1), block: (256, 1, 1), smem: 0 },
+            shape: Shape {
+                grid: (tokens as u32, 1, 1),
+                block: (256, 1, 1),
+                smem: 0,
+            },
         }
     }
 
     /// B6.2:K0 写池 fp8 变体(f16/bf16 输入 → e4m3 池;形状无关单核)
     pub fn k0_write_fp8(tokens: usize) -> KernelPick {
-        KernelPick::of::<crate::ops::attn::K0WriteFp8Classic>(Shape { grid: (tokens as u32, 1, 1), block: (256, 1, 1), smem: 0 })
+        KernelPick::of::<crate::ops::attn::K0WriteFp8Classic>(Shape {
+            grid: (tokens as u32, 1, 1),
+            block: (256, 1, 1),
+            smem: 0,
+        })
     }
 
     /// B6:K0 写池 fp8 变体(bf16 输入;草稿侧)
     pub fn k0_write_fp8_bf16(tokens: usize) -> KernelPick {
-        KernelPick::of::<crate::ops::attn::ReshapeAndCacheFp8KvBf16>(Shape { grid: (tokens as u32, 1, 1), block: (256, 1, 1), smem: 0 })
+        KernelPick::of::<crate::ops::attn::ReshapeAndCacheFp8KvBf16>(Shape {
+            grid: (tokens as u32, 1, 1),
+            block: (256, 1, 1),
+            smem: 0,
+        })
     }
 
     /// B6.1:decode v2 fp8 e4m3 KV 读(形状契约同 f16;页配对律同源)
@@ -1315,7 +1492,11 @@ pub mod attn {
         KernelPick {
             name,
             shape: Shape {
-                grid: ((hq / hkv) as u32, hkv as u32, tokens.div_ceil(tokens_per_block) as u32),
+                grid: (
+                    (hq / hkv) as u32,
+                    hkv as u32,
+                    tokens.div_ceil(tokens_per_block) as u32,
+                ),
                 block: (256, 1, 1),
                 smem: (64 + 2 * hd * env.page * 2) as u32,
             },
@@ -1324,7 +1505,12 @@ pub mod attn {
 
     /// kNHD 变体(统一契约 P2;签名/网格同 classic,kernel 名 _knhd)
     pub fn paged_prefill_knhd(
-        env: &OpEnv, dt: DType, hd: usize, hkv: usize, hq: usize, tokens: usize,
+        env: &OpEnv,
+        dt: DType,
+        hd: usize,
+        hkv: usize,
+        hq: usize,
+        tokens: usize,
     ) -> KernelPick {
         let mut p = paged_prefill(env, dt, hd, hkv, hq, tokens);
         p.name = match hd {
@@ -1336,7 +1522,12 @@ pub mod attn {
     }
 
     pub fn paged_prefill_fp8_knhd(
-        env: &OpEnv, dt: DType, hd: usize, hkv: usize, hq: usize, tokens: usize,
+        env: &OpEnv,
+        dt: DType,
+        hd: usize,
+        hkv: usize,
+        hq: usize,
+        tokens: usize,
     ) -> KernelPick {
         let mut p = paged_prefill(env, dt, hd, hkv, hq, tokens);
         p.name = match hd {
@@ -1372,7 +1563,10 @@ pub mod attn {
         _hkv: usize,
         nb: usize,
     ) -> KernelPick {
-        assert!(matches!(dt, DType::F16), "paged v1 仅有 f16 变体(dt={dt:?})");
+        assert!(
+            matches!(dt, DType::F16),
+            "paged v1 仅有 f16 变体(dt={dt:?})"
+        );
         let page = env.page;
         let name = match (hd, page) {
             (128, 32) => "vllm_paged_attention_v1_f16_hd128bs32",
@@ -1425,7 +1619,10 @@ pub mod attn {
         nparts: usize,
         seqs: usize,
     ) -> KernelPick {
-        assert!(matches!(dt, DType::F16), "paged v2 仅有 f16 变体(dt={dt:?})");
+        assert!(
+            matches!(dt, DType::F16),
+            "paged v2 仅有 f16 变体(dt={dt:?})"
+        );
         let page = env.page;
         let name = match (hd, page) {
             (128, 32) => "vllm_paged_attention_v2_f16_hd128bs32",
@@ -1449,17 +1646,32 @@ pub mod attn {
 
     /// kNHD 变体(统一契约 P2;签名同 classic,kernel 名 _knhd)
     pub fn paged_decode_v2_knhd(
-        env: &OpEnv, dt: DType, hd: usize, hq: usize, hkv: usize, nb: usize, nparts: usize,
+        env: &OpEnv,
+        dt: DType,
+        hd: usize,
+        hq: usize,
+        hkv: usize,
+        nb: usize,
+        nparts: usize,
     ) -> KernelPick {
         paged_decode_v2_seq_knhd(env, dt, hd, hq, hkv, nb, nparts, 1)
     }
 
     #[allow(clippy::too_many_arguments)]
     pub fn paged_decode_v2_seq_knhd(
-        env: &OpEnv, dt: DType, hd: usize, hq: usize, _hkv: usize, _nb: usize,
-        nparts: usize, seqs: usize,
+        env: &OpEnv,
+        dt: DType,
+        hd: usize,
+        hq: usize,
+        _hkv: usize,
+        _nb: usize,
+        nparts: usize,
+        seqs: usize,
     ) -> KernelPick {
-        assert!(matches!(dt, DType::F16), "paged v2 knhd 仅有 f16 变体(dt={dt:?})");
+        assert!(
+            matches!(dt, DType::F16),
+            "paged v2 knhd 仅有 f16 变体(dt={dt:?})"
+        );
         let page = env.page;
         let name = match (hd, page) {
             (128, 32) => "vllm_paged_attention_v2_f16_knhd_hd128bs32",
@@ -1480,15 +1692,27 @@ pub mod attn {
     }
 
     pub fn paged_decode_v2_fp8_knhd(
-        env: &OpEnv, dt: DType, hd: usize, hq: usize, hkv: usize, nb: usize, nparts: usize,
+        env: &OpEnv,
+        dt: DType,
+        hd: usize,
+        hq: usize,
+        hkv: usize,
+        nb: usize,
+        nparts: usize,
     ) -> KernelPick {
         paged_decode_v2_fp8_seq_knhd(env, dt, hd, hq, hkv, nb, nparts, 1)
     }
 
     #[allow(clippy::too_many_arguments)]
     pub fn paged_decode_v2_fp8_seq_knhd(
-        env: &OpEnv, _dt: DType, hd: usize, hq: usize, _hkv: usize, _nb: usize,
-        nparts: usize, seqs: usize,
+        env: &OpEnv,
+        _dt: DType,
+        hd: usize,
+        hq: usize,
+        _hkv: usize,
+        _nb: usize,
+        nparts: usize,
+        seqs: usize,
     ) -> KernelPick {
         let page = env.page;
         let name = match (hd, page) {
@@ -1514,7 +1738,13 @@ pub mod attn {
     /// **grid (hq, seqs, 1)**(E16 根治:核 seq_idx=blockIdx.y —— 原硬发
     /// y=1 只归并 seq0,verify 多序行 1.. 从未写出;ctx ≤512 时核内退化
     /// 为 tmp_out 直拷)。
-    pub fn paged_v2_reduce(dt: DType, hd: usize, hq: usize, nparts: usize, seqs: usize) -> KernelPick {
+    pub fn paged_v2_reduce(
+        dt: DType,
+        hd: usize,
+        hq: usize,
+        nparts: usize,
+        seqs: usize,
+    ) -> KernelPick {
         assert!(matches!(dt, DType::F16), "paged v2 reduce 仅有 f16 变体");
         let name = match hd {
             128 => "vllm_paged_attention_v2_reduce_f16_hd128",
@@ -1541,7 +1771,10 @@ pub mod attn {
         hq: usize,
         tokens: usize,
     ) -> KernelPick {
-        assert!(matches!(dt, DType::F16), "chunked prefill 仅有 f16 变体(dt={dt:?})");
+        assert!(
+            matches!(dt, DType::F16),
+            "chunked prefill 仅有 f16 变体(dt={dt:?})"
+        );
         assert!(
             env.page == 32,
             "chunked prefill bs32 契约:页 {} 非法(谓词 paged_prefill_ok 应已拦截)",
@@ -1576,7 +1809,10 @@ pub mod attn {
         tokens: usize,
         nparts: usize,
     ) -> KernelPick {
-        assert!(matches!(dt, DType::F16), "prefill split 仅有 f16 变体(dt={dt:?})");
+        assert!(
+            matches!(dt, DType::F16),
+            "prefill split 仅有 f16 变体(dt={dt:?})"
+        );
         assert!(env.page == 32, "prefill split 页 32 契约,得 {}", env.page);
         // 变体由 models ops 层按 KV 池档位分派(fp8 池必须走 fp8kv 直读:
         // f16 核读 e4m3 字节池 = 字节错位,§二十八埋雷实录);此处名字由
@@ -1615,7 +1851,13 @@ pub mod attn {
     /// kNHD 变体(统一契约 P2;签名/class 同,kernel 名 _knhd;
     /// host stride = page·hkv·hd / hd 由调用侧 op-env 投影,res 元数据不变)
     pub fn prefill_split_knhd(
-        env: &OpEnv, dt: DType, hd: usize, hkv: usize, hq: usize, tokens: usize, nparts: usize,
+        env: &OpEnv,
+        dt: DType,
+        hd: usize,
+        hkv: usize,
+        hq: usize,
+        tokens: usize,
+        nparts: usize,
     ) -> KernelPick {
         assert!(matches!(dt, DType::F16), "prefill split knhd 仅有 f16 变体");
         assert!(env.page == 32, "prefill split 页 32 契约,得 {}", env.page);
@@ -1635,9 +1877,18 @@ pub mod attn {
     }
 
     pub fn prefill_split_fp8kv_knhd(
-        env: &OpEnv, dt: DType, hd: usize, hkv: usize, hq: usize, tokens: usize, nparts: usize,
+        env: &OpEnv,
+        dt: DType,
+        hd: usize,
+        hkv: usize,
+        hq: usize,
+        tokens: usize,
+        nparts: usize,
     ) -> KernelPick {
-        assert!(matches!(dt, DType::F16), "prefill split fp8 knhd 输入 f16(dt={dt:?})");
+        assert!(
+            matches!(dt, DType::F16),
+            "prefill split fp8 knhd 输入 f16(dt={dt:?})"
+        );
         assert!(env.page == 32, "prefill split 页 32 契约,得 {}", env.page);
         let name = match hd {
             256 => "owl_prefill_split_fp8kv_knhd_hd256",
@@ -1657,7 +1908,10 @@ pub mod attn {
     /// prefill split reduce(每 thread 一 (token, head) 合并 nparts;
     /// hd 仅 hd256 核名 —— hd 校验由核名/登记表承担)
     pub fn prefill_split_reduce(dt: DType, tokens: usize, hq: usize) -> KernelPick {
-        assert!(matches!(dt, DType::F16), "prefill split reduce 仅有 f16 变体");
+        assert!(
+            matches!(dt, DType::F16),
+            "prefill split reduce 仅有 f16 变体"
+        );
         KernelPick::of::<crate::ops::attn::PrefillSplitReduceF16Hd256>(Shape {
             grid: ((tokens * hq).div_ceil(256) as u32, 1, 1),
             block: (256, 1, 1),
@@ -1671,7 +1925,12 @@ pub mod attn {
             name: match dt {
                 DType::F16 => "owl_naive_decode_attn_f16",
                 DType::F32 => "owl_naive_decode_attn_f32",
-                DType::BF16 | DType::U32 | DType::U8 | DType::F8E4M3 | DType::F8E5M2 | DType::I8 => unimplemented!("naive attn 无 U32 变体"),
+                DType::BF16
+                | DType::U32
+                | DType::U8
+                | DType::F8E4M3
+                | DType::F8E5M2
+                | DType::I8 => unimplemented!("naive attn 无 U32 变体"),
             },
             shape: SENTINEL_1D,
         }
@@ -1679,7 +1938,10 @@ pub mod attn {
 
     /// 输出门融合(out × sigmoid(gate);**仅 f16**;哨兵 1D)
     pub fn gate_mul(dt: DType) -> KernelPick {
-        assert!(matches!(dt, DType::F16), "owl_sigmoid_gate_mul 仅有 f16 变体");
+        assert!(
+            matches!(dt, DType::F16),
+            "owl_sigmoid_gate_mul 仅有 f16 变体"
+        );
         KernelPick::of::<crate::ops::elems::SigmoidGateMulF16>(SENTINEL_1D)
     }
 
@@ -1689,12 +1951,7 @@ pub mod attn {
     /// `(T, Hkv)`(一个 CTA 覆盖一个 kv-head 的全部 q-head;同组 warp 走 L1 共享
     /// 同一批 K/V 行 ⇒ 流量 ÷ group);旧核 = `(T, Hq)`。block = `(hd)` 恒定。
     /// 标量槽序:`0 = q_heads, 1 = kv_heads, 2 = d_dim, 3 = page, 4 = x`。
-    pub fn naive_nc(
-        dt: DType,
-        fp8kv: bool,
-        shapes: &[Vec<usize>],
-        scalars: &[i64],
-    ) -> KernelPick {
+    pub fn naive_nc(dt: DType, fp8kv: bool, shapes: &[Vec<usize>], scalars: &[i64]) -> KernelPick {
         let t = shapes.first().and_then(|s| s.first().copied()).unwrap_or(1) as u32;
         let hq = scalars.first().copied().unwrap_or(1) as u32;
         let hkv = scalars.get(1).copied().unwrap_or(1) as u32;
@@ -1724,8 +1981,7 @@ pub mod attn {
         // (MTP 链)与 fp8kv 池臂暂不接 —— 探针尚未覆盖,保持旧核不冒险。
         let v3_nwarp = ((hd / 32) * 4).max(1);
         let v3_esz = if fp8kv { 1u64 } else { 2u64 };
-        let v3_smem = 2 * page as u64 * hd as u64 * v3_esz
-            + v3_nwarp as u64 * (hd as u64 + 2) * 4;
+        let v3_smem = 2 * page as u64 * hd as u64 * v3_esz + v3_nwarp as u64 * (hd as u64 + 2) * 4;
         let v3 = !fp8kv
             && matches!(dt, DType::BF16)
             && hd == 128
@@ -1744,7 +2000,12 @@ pub mod attn {
             (DType::BF16, false) => "owl_naive_attn_nc_bf16",
             (DType::F16, true) => "owl_naive_attn_nc_fp8kv_f16",
             (DType::BF16, true) => "owl_naive_attn_nc_fp8kv_bf16",
-            (DType::F32, _) | (DType::U32, _) | (DType::U8, _) | (DType::F8E4M3, _) | (DType::F8E5M2, _) | (DType::I8, _) => {
+            (DType::F32, _)
+            | (DType::U32, _)
+            | (DType::U8, _)
+            | (DType::F8E4M3, _)
+            | (DType::F8E5M2, _)
+            | (DType::I8, _) => {
                 unimplemented!("naive_nc 仅 f16/bf16")
             }
         };
@@ -1764,8 +2025,16 @@ pub mod attn {
         KernelPick {
             name,
             shape: Shape {
-                grid: if v2 || v3 { (t, hkv.max(1), 1) } else { (t, hq, 1) },
-                block: if v2 || v3 { (hd.max(1) * 4, 1, 1) } else { (hd.max(1), 1, 1) },
+                grid: if v2 || v3 {
+                    (t, hkv.max(1), 1)
+                } else {
+                    (t, hq, 1)
+                },
+                block: if v2 || v3 {
+                    (hd.max(1) * 4, 1, 1)
+                } else {
+                    (hd.max(1), 1, 1)
+                },
                 smem,
             },
         }
@@ -1856,7 +2125,10 @@ pub mod attn {
         hd: usize,
         _half: usize,
     ) -> KernelPick {
-        assert!(matches!(dt, DType::F16), "owl_qknorm_rope_kv_insert 仅有 f16 变体");
+        assert!(
+            matches!(dt, DType::F16),
+            "owl_qknorm_rope_kv_insert 仅有 f16 变体"
+        );
         KernelPick::of::<crate::ops::fused::QknormRopeKvInsertF16>(Shape {
             grid: (tokens as u32, (hq + hkv) as u32, 1),
             block: (hd as u32, 1, 1),
@@ -1873,7 +2145,10 @@ pub mod attn {
         hd: usize,
         _half: usize,
     ) -> KernelPick {
-        assert!(matches!(dt, DType::F16), "owl_qknorm_rope_kv_insert_knhd 仅有 f16 变体");
+        assert!(
+            matches!(dt, DType::F16),
+            "owl_qknorm_rope_kv_insert_knhd 仅有 f16 变体"
+        );
         KernelPick::of::<crate::ops::fused::QknormRopeKvInsertF16Knhd>(Shape {
             grid: (tokens as u32, (hq + hkv) as u32, 1),
             block: (hd as u32, 1, 1),
@@ -1918,7 +2193,11 @@ pub mod attn {
                 DType::BF16 => "vllm_reshape_and_cache_bf16_knhd",
                 other => unimplemented!("k0_write_knhd 无 {other:?} 变体"),
             },
-            shape: Shape { grid: (tokens as u32, 1, 1), block: (256, 1, 1), smem: 0 },
+            shape: Shape {
+                grid: (tokens as u32, 1, 1),
+                block: (256, 1, 1),
+                smem: 0,
+            },
         }
     }
 
@@ -2037,7 +2316,9 @@ pub mod attn {
 
     /// paged prefill 的 Hw 占位(谓词用;env 之外不可得时)
     pub fn hw_placeholder() -> Hw {
-        Hw { arch: crate::Arch::Sm86 }
+        Hw {
+            arch: crate::Arch::Sm86,
+        }
     }
 }
 
@@ -2087,7 +2368,11 @@ pub mod mlp {
                 DType::BF16 => "owl_silu_and_mul_merged_bf16",
                 other => panic!("owl_silu_and_mul_merged 无 {other:?} 变体(dt={dt:?})"),
             },
-            shape: Shape { grid: (n.div_ceil(256) as u32, 1, 1), block: (256, 1, 1), smem: 0 },
+            shape: Shape {
+                grid: (n.div_ceil(256) as u32, 1, 1),
+                block: (256, 1, 1),
+                smem: 0,
+            },
         }
     }
 
@@ -2100,7 +2385,11 @@ pub mod mlp {
         KernelPick {
             name,
             shape: Shape {
-                grid: if matches!(dt, DType::F16) { (n.div_ceil(2).div_ceil(256) as u32, 1, 1) } else { (n.div_ceil(256) as u32, 1, 1) },
+                grid: if matches!(dt, DType::F16) {
+                    (n.div_ceil(2).div_ceil(256) as u32, 1, 1)
+                } else {
+                    (n.div_ceil(256) as u32, 1, 1)
+                },
                 block: (256, 1, 1),
                 smem: 0,
             },
@@ -2129,7 +2418,11 @@ pub mod vis {
         };
         KernelPick {
             name,
-            shape: Shape { grid: (rows as u32, 1, 1), block: (256, 1, 1), smem: (256 * 4) as u32 },
+            shape: Shape {
+                grid: (rows as u32, 1, 1),
+                block: (256, 1, 1),
+                smem: (256 * 4) as u32,
+            },
         }
     }
 
@@ -2144,7 +2437,10 @@ pub mod vis {
             (false, DType::BF16) => "owl_gelu_erf_bf16",
             (_, other) => panic!("owl_gelu 无 {other:?} 变体"),
         };
-        KernelPick { name, shape: SENTINEL_1D }
+        KernelPick {
+            name,
+            shape: SENTINEL_1D,
+        }
     }
 
     /// `bias_add`:x [rows, cols] + bias [cols]。grid (rows,1,1);block 256。
@@ -2157,7 +2453,11 @@ pub mod vis {
         };
         KernelPick {
             name,
-            shape: Shape { grid: (rows as u32, 1, 1), block: (256, 1, 1), smem: 0 },
+            shape: Shape {
+                grid: (rows as u32, 1, 1),
+                block: (256, 1, 1),
+                smem: 0,
+            },
         }
     }
 
@@ -2170,7 +2470,11 @@ pub mod vis {
         };
         KernelPick {
             name,
-            shape: Shape { grid: (rows as u32, 1, 1), block: (256, 1, 1), smem: 0 },
+            shape: Shape {
+                grid: (rows as u32, 1, 1),
+                block: (256, 1, 1),
+                smem: 0,
+            },
         }
     }
 
@@ -2184,7 +2488,11 @@ pub mod vis {
         };
         KernelPick {
             name,
-            shape: Shape { grid: (rows as u32, 1, 1), block: (256, 1, 1), smem: 0 },
+            shape: Shape {
+                grid: (rows as u32, 1, 1),
+                block: (256, 1, 1),
+                smem: 0,
+            },
         }
     }
 
@@ -2197,7 +2505,13 @@ pub mod vis {
     /// - 其余 ⇒ native(一 block **32 行** × 一头 = 8 warp × 4 行;
     ///   块内共享 smem K/V tile,每 warp 把同一 K/V 行复用于 4 个 q 行;
     ///   grid = (ceil(rows/32), heads),smem = 2·TILE(64)·head_dim·sizeof(T))。
-    pub fn attn_full(dt: DType, rows: usize, heads: usize, head_dim: usize, _n_seq: i64) -> KernelPick {
+    pub fn attn_full(
+        dt: DType,
+        rows: usize,
+        heads: usize,
+        head_dim: usize,
+        _n_seq: i64,
+    ) -> KernelPick {
         // FI ragged 适配器只实例化 hd=64 ⇒ 条件里必须带上(否则静默按 64 维算)。
         //
         // **`rows >= 64` 也是硬条件(2026-10-21 实测)**:FI 的**规划器**按
@@ -2230,7 +2544,11 @@ pub mod vis {
         let row_blocks = rows.div_ceil(ROWS_PER_BLOCK).max(1) as u32;
         KernelPick {
             name,
-            shape: Shape { grid: (row_blocks, heads.max(1) as u32, 1), block: (256, 1, 1), smem },
+            shape: Shape {
+                grid: (row_blocks, heads.max(1) as u32, 1),
+                block: (256, 1, 1),
+                smem,
+            },
         }
     }
 }
@@ -2244,7 +2562,11 @@ pub mod elems {
     /// f16↔bf16 铸边界(哨兵 1D;to_bf16 = false → f16→bf16)
     pub fn cast_dir(to_f16: bool) -> KernelPick {
         KernelPick {
-            name: if to_f16 { "owl_cast_bf16_f16" } else { "owl_cast_f16_bf16" },
+            name: if to_f16 {
+                "owl_cast_bf16_f16"
+            } else {
+                "owl_cast_f16_bf16"
+            },
             shape: SENTINEL_1D,
         }
     }
@@ -2267,7 +2589,6 @@ pub mod elems {
         assert!(matches!(dt, DType::F16), "cast_f32_f16 出 f16,得 {dt:?}");
         KernelPick::of::<crate::ops::elems::CastF32F16>(SENTINEL_1D)
     }
-
 
     use super::{DType, KernelPick, Shape, SENTINEL_1D};
 
@@ -2293,13 +2614,22 @@ pub mod elems {
 
     /// 跨步窄切视图(q/gate 切分等;哨兵 1D)
     pub fn narrow(dt: DType) -> KernelPick {
-        KernelPick { name: dt_name("narrow", dt), shape: SENTINEL_1D }
+        KernelPick {
+            name: dt_name("narrow", dt),
+            shape: SENTINEL_1D,
+        }
     }
 
     /// 刀3a'(2026-10-04):双权 GEMV 单发(b/a 投影;warp-per-row,
     /// half2 主路 + fp32 累加;decode m=1 专用)。grid (ceil(rows/4), m)
     /// × block 128(4 warp/块 = 4 行/块)。
-    pub fn gemv_dual(dt: DType, rows_b: usize, rows_a: usize, _cols: usize, tokens: usize) -> KernelPick {
+    pub fn gemv_dual(
+        dt: DType,
+        rows_b: usize,
+        rows_a: usize,
+        _cols: usize,
+        tokens: usize,
+    ) -> KernelPick {
         assert!(matches!(dt, DType::F16), "gemv_dual 仅有 f16 变体");
         let rows = (rows_b + rows_a) as u32;
         KernelPick::of::<crate::ops::elems::GemvDualF16>(Shape {
@@ -2376,9 +2706,7 @@ pub mod elems {
         // _cols 只决定 cu 侧 kt,不改变 CTA 几何。
         Shape {
             grid: (
-                rows
-                    .div_ceil(GEMV_I8W_MT_WARPS * GEMV_I8W_MT_ROWS_PER_WARP)
-                    as u32,
+                rows.div_ceil(GEMV_I8W_MT_WARPS * GEMV_I8W_MT_ROWS_PER_WARP) as u32,
                 tokens.div_ceil(tok_tile) as u32,
                 1,
             ),
@@ -2390,34 +2718,45 @@ pub mod elems {
     }
 
     fn gemv_i8w_mt_bf16(rows: usize, cols: usize, tokens: usize) -> KernelPick {
-        KernelPick::of::<crate::ops::elems::GemvI8wMtBf16>(
-            gemv_i8w_mt_shape(rows, cols, tokens, GEMV_I8W_MT_TOK_TILE),
-        )
+        KernelPick::of::<crate::ops::elems::GemvI8wMtBf16>(gemv_i8w_mt_shape(
+            rows,
+            cols,
+            tokens,
+            GEMV_I8W_MT_TOK_TILE,
+        ))
     }
 
     fn gemv_i8w_mt(rows: usize, cols: usize, tokens: usize) -> KernelPick {
-        KernelPick::of::<crate::ops::elems::GemvI8wMtF16>(
-            gemv_i8w_mt_shape(rows, cols, tokens, GEMV_I8W_MT_TOK_TILE),
-        )
+        KernelPick::of::<crate::ops::elems::GemvI8wMtF16>(gemv_i8w_mt_shape(
+            rows,
+            cols,
+            tokens,
+            GEMV_I8W_MT_TOK_TILE,
+        ))
     }
 
     fn gemv_i8w_mt7_bf16(rows: usize, cols: usize, tokens: usize) -> KernelPick {
-        KernelPick::of::<crate::ops::elems::GemvI8wMt7Bf16>(
-            gemv_i8w_mt_shape(rows, cols, tokens, GEMV_I8W_MT7_TOK_TILE),
-        )
+        KernelPick::of::<crate::ops::elems::GemvI8wMt7Bf16>(gemv_i8w_mt_shape(
+            rows,
+            cols,
+            tokens,
+            GEMV_I8W_MT7_TOK_TILE,
+        ))
     }
 
     fn gemv_i8w_mt7(rows: usize, cols: usize, tokens: usize) -> KernelPick {
-        KernelPick::of::<crate::ops::elems::GemvI8wMt7F16>(
-            gemv_i8w_mt_shape(rows, cols, tokens, GEMV_I8W_MT7_TOK_TILE),
-        )
+        KernelPick::of::<crate::ops::elems::GemvI8wMt7F16>(gemv_i8w_mt_shape(
+            rows,
+            cols,
+            tokens,
+            GEMV_I8W_MT7_TOK_TILE,
+        ))
     }
 
     // ---- W8A8 head（2026-10-22）----
     const GEMV_I8W_A8_K_TILE: usize = 512;
     // K_TILE/4 个 group + K_TILE/16 的 swizzle 余量 + 1
-    const GEMV_I8W_A8_XSTRIDE: usize =
-        GEMV_I8W_A8_K_TILE / 4 + GEMV_I8W_A8_K_TILE / 16 + 1;
+    const GEMV_I8W_A8_XSTRIDE: usize = GEMV_I8W_A8_K_TILE / 4 + GEMV_I8W_A8_K_TILE / 16 + 1;
 
     pub fn quant_i8_act_scale_f16(rows: usize, _cols: usize) -> KernelPick {
         KernelPick::of::<crate::ops::elems::QuantI8ActScaleF16>(Shape {
@@ -2454,9 +2793,7 @@ pub mod elems {
     fn gemv_i8w_a8_mt_shape(rows: usize, tokens: usize, tok_tile: usize) -> Shape {
         Shape {
             grid: (
-                rows
-                    .div_ceil(GEMV_I8W_MT_WARPS * GEMV_I8W_MT_ROWS_PER_WARP)
-                    as u32,
+                rows.div_ceil(GEMV_I8W_MT_WARPS * GEMV_I8W_MT_ROWS_PER_WARP) as u32,
                 tokens.div_ceil(tok_tile) as u32,
                 1,
             ),
@@ -2476,13 +2813,17 @@ pub mod elems {
             "W8A8 只接 rows % 32 == 0 的 spec 头"
         );
         if tokens == GEMV_I8W_MT7_TOK_TILE {
-            KernelPick::of::<crate::ops::elems::GemvI8wA8Mt7F16>(
-                gemv_i8w_a8_mt_shape(rows, tokens, GEMV_I8W_MT7_TOK_TILE),
-            )
+            KernelPick::of::<crate::ops::elems::GemvI8wA8Mt7F16>(gemv_i8w_a8_mt_shape(
+                rows,
+                tokens,
+                GEMV_I8W_MT7_TOK_TILE,
+            ))
         } else {
-            KernelPick::of::<crate::ops::elems::GemvI8wA8MtF16>(
-                gemv_i8w_a8_mt_shape(rows, tokens, GEMV_I8W_MT_TOK_TILE),
-            )
+            KernelPick::of::<crate::ops::elems::GemvI8wA8MtF16>(gemv_i8w_a8_mt_shape(
+                rows,
+                tokens,
+                GEMV_I8W_MT_TOK_TILE,
+            ))
         }
     }
 
@@ -2497,13 +2838,17 @@ pub mod elems {
             "W8A8 只接 rows % 32 == 0 的 spec 头"
         );
         if tokens == GEMV_I8W_MT7_TOK_TILE {
-            KernelPick::of::<crate::ops::elems::GemvI8wA8Mt7Bf16>(
-                gemv_i8w_a8_mt_shape(rows, tokens, GEMV_I8W_MT7_TOK_TILE),
-            )
+            KernelPick::of::<crate::ops::elems::GemvI8wA8Mt7Bf16>(gemv_i8w_a8_mt_shape(
+                rows,
+                tokens,
+                GEMV_I8W_MT7_TOK_TILE,
+            ))
         } else {
-            KernelPick::of::<crate::ops::elems::GemvI8wA8MtBf16>(
-                gemv_i8w_a8_mt_shape(rows, tokens, GEMV_I8W_MT_TOK_TILE),
-            )
+            KernelPick::of::<crate::ops::elems::GemvI8wA8MtBf16>(gemv_i8w_a8_mt_shape(
+                rows,
+                tokens,
+                GEMV_I8W_MT_TOK_TILE,
+            ))
         }
     }
 
@@ -2526,11 +2871,7 @@ pub mod elems {
             "W8A8 TC 要求 cols % 32 == 0 且 2 <= tokens <= 8（得 cols={cols}, tokens={tokens}）"
         );
         KernelPick::of::<crate::ops::elems::GemmI8wA8TcF16>(Shape {
-            grid: (
-                rows.div_ceil(GEMM_I8W_A8_TC_ROWS_PER_BLOCK) as u32,
-                1,
-                1,
-            ),
+            grid: (rows.div_ceil(GEMM_I8W_A8_TC_ROWS_PER_BLOCK) as u32, 1, 1),
             block: (256, 1, 1),
             // 核内是 **static shared**(A/B/out 共 43264 B < 48KB 默认顶);
             // 这里不能再报一次 dynamic smem,否则 static+dynamic 双算会越界。
@@ -2544,11 +2885,7 @@ pub mod elems {
             "W8A8 TC 要求 cols % 32 == 0 且 2 <= tokens <= 8（得 cols={cols}, tokens={tokens}）"
         );
         KernelPick::of::<crate::ops::elems::GemmI8wA8TcBf16>(Shape {
-            grid: (
-                rows.div_ceil(GEMM_I8W_A8_TC_ROWS_PER_BLOCK) as u32,
-                1,
-                1,
-            ),
+            grid: (rows.div_ceil(GEMM_I8W_A8_TC_ROWS_PER_BLOCK) as u32, 1, 1),
             block: (256, 1, 1),
             smem: 0,
         })
@@ -2573,11 +2910,7 @@ pub mod elems {
             "W8A16 TC 要求 cols % 16 == 0 且 2 <= tokens <= 8（得 cols={cols}, tokens={tokens}）"
         );
         KernelPick::of::<crate::ops::elems::GemmI8wA16TcF16>(Shape {
-            grid: (
-                rows.div_ceil(GEMM_I8W_A16_TC_ROWS_PER_BLOCK) as u32,
-                1,
-                1,
-            ),
+            grid: (rows.div_ceil(GEMM_I8W_A16_TC_ROWS_PER_BLOCK) as u32, 1, 1),
             block: (256, 1, 1),
             smem: 0,
         })
@@ -2589,11 +2922,7 @@ pub mod elems {
             "W8A16 TC 要求 cols % 16 == 0 且 2 <= tokens <= 8（得 cols={cols}, tokens={tokens}）"
         );
         KernelPick::of::<crate::ops::elems::GemmI8wA16TcBf16>(Shape {
-            grid: (
-                rows.div_ceil(GEMM_I8W_A16_TC_ROWS_PER_BLOCK) as u32,
-                1,
-                1,
-            ),
+            grid: (rows.div_ceil(GEMM_I8W_A16_TC_ROWS_PER_BLOCK) as u32, 1, 1),
             block: (256, 1, 1),
             smem: 0,
         })
@@ -2603,7 +2932,7 @@ pub mod elems {
     /// 几何 = **一 block 一行**(grid = rows,block 256,零动态 smem)。
     pub fn quant_i8_row_w_scale() -> KernelPick {
         KernelPick::of::<crate::ops::load::QuantI8RowWScaleBf16>(Shape {
-            grid: (1, 1, 1),  // 调用方按 rows 覆盖(见 quant_i8_row_w_grid)
+            grid: (1, 1, 1), // 调用方按 rows 覆盖(见 quant_i8_row_w_grid)
             block: (256, 1, 1),
             smem: 0,
         })
@@ -2620,19 +2949,30 @@ pub mod elems {
 
     /// 两步共用的真实几何(grid.x = rows)
     pub fn quant_i8_row_w_grid(rows: usize) -> Shape {
-        Shape { grid: (rows.max(1) as u32, 1, 1), block: (256, 1, 1), smem: 0 }
+        Shape {
+            grid: (rows.max(1) as u32, 1, 1),
+            block: (256, 1, 1),
+            smem: 0,
+        }
     }
 
     /// 行栈 concat(arity ≤ 8;哨兵 1D)
     pub fn concat(dt: DType) -> KernelPick {
-        KernelPick { name: dt_name("concat", dt), shape: SENTINEL_1D }
+        KernelPick {
+            name: dt_name("concat", dt),
+            shape: SENTINEL_1D,
+        }
     }
 
     /// half 部分旋转(rope;一 token 一 block,block 128)
     pub fn rope(dt: DType, tokens: usize) -> KernelPick {
         KernelPick {
             name: dt_name("rope", dt),
-            shape: Shape { grid: (tokens as u32, 1, 1), block: (128, 1, 1), smem: 0 },
+            shape: Shape {
+                grid: (tokens as u32, 1, 1),
+                block: (128, 1, 1),
+                smem: 0,
+            },
         }
     }
 
@@ -2648,7 +2988,11 @@ pub mod elems {
     pub fn quant_int8_row(name: &'static str, rows: usize) -> KernelPick {
         KernelPick {
             name,
-            shape: Shape { grid: (rows as u32, 1, 1), block: (256, 1, 1), smem: 0 },
+            shape: Shape {
+                grid: (rows as u32, 1, 1),
+                block: (256, 1, 1),
+                smem: 0,
+            },
         }
     }
 
@@ -2662,7 +3006,11 @@ pub mod elems {
     pub fn embed(dt: DType, tokens: usize) -> KernelPick {
         KernelPick {
             name: dt_name("embed", dt),
-            shape: Shape { grid: (tokens as u32, 1, 1), block: (512, 1, 1), smem: 0 },
+            shape: Shape {
+                grid: (tokens as u32, 1, 1),
+                block: (512, 1, 1),
+                smem: 0,
+            },
         }
     }
 
@@ -2670,7 +3018,11 @@ pub mod elems {
     pub fn embed_i8(tokens: usize) -> KernelPick {
         KernelPick {
             name: "owl_embed_i8_f16",
-            shape: Shape { grid: (tokens as u32, 1, 1), block: (512, 1, 1), smem: 0 },
+            shape: Shape {
+                grid: (tokens as u32, 1, 1),
+                block: (512, 1, 1),
+                smem: 0,
+            },
         }
     }
 }
@@ -2723,21 +3075,42 @@ mod tests {
         {
             let fa2 = crate::family::flashinfer::FA2_VARLEN_F16;
             assert_eq!(vis::attn_full(DType::F16, 256, 12, 64, 1).name, fa2);
-            assert_eq!(vis::attn_full(DType::F16, 64, 12, 64, 1).name, fa2, "边界 64");
+            assert_eq!(
+                vis::attn_full(DType::F16, 64, 12, 64, 1).name,
+                fa2,
+                "边界 64"
+            );
             assert_eq!(vis::attn_full(DType::F16, 256, 16, 72, 1).name, fa2, "hd72");
-            assert_eq!(vis::attn_full(DType::F16, 256, 12, 64, 2).name, fa2, "多图 hd64");
-            assert_eq!(vis::attn_full(DType::F16, 512, 16, 72, 2).name, fa2, "多图 hd72");
+            assert_eq!(
+                vis::attn_full(DType::F16, 256, 12, 64, 2).name,
+                fa2,
+                "多图 hd64"
+            );
+            assert_eq!(
+                vis::attn_full(DType::F16, 512, 16, 72, 2).name,
+                fa2,
+                "多图 hd72"
+            );
         }
         #[cfg(not(feature = "flashinfer"))]
         {
-            assert_eq!(vis::attn_full(DType::F16, 256, 12, 64, 1).name, "owl_vis_attn_full_f16");
-            assert_eq!(vis::attn_full(DType::F16, 256, 16, 72, 1).name, "owl_vis_attn_full_f16");
+            assert_eq!(
+                vis::attn_full(DType::F16, 256, 12, 64, 1).name,
+                "owl_vis_attn_full_f16"
+            );
+            assert_eq!(
+                vis::attn_full(DType::F16, 256, 16, 72, 1).name,
+                "owl_vis_attn_full_f16"
+            );
         }
         // 小形状 ⇒ native(FI/FA2 的 cta/hdim 约束不划算)
         let p = vis::attn_full(DType::F16, 16, 12, 64, 1);
         assert_eq!(p.name, "owl_vis_attn_full_f16", "rows < 64 必须退 native");
         assert_eq!(p.shape.grid, (1, 12, 1), "native:ceil(16/32) 行块");
-        assert_eq!(vis::attn_full(DType::F32, 256, 12, 64, 1).name, "owl_vis_attn_full_f32");
+        assert_eq!(
+            vis::attn_full(DType::F32, 256, 12, 64, 1).name,
+            "owl_vis_attn_full_f32"
+        );
     }
 
     #[test]
@@ -2748,7 +3121,10 @@ mod tests {
         assert_eq!(p.shape.grid, (2, 32, 1));
         assert_eq!(p.shape.block, (64, 1, 1));
         assert_eq!(p.shape.smem, 1032);
-        assert_eq!(gdn::delta_dec(DType::F32, 64, 1, 8, 96).shape.smem, (2 * 96 + 2) * 4);
+        assert_eq!(
+            gdn::delta_dec(DType::F32, 64, 1, 8, 96).shape.smem,
+            (2 * 96 + 2) * 4
+        );
     }
 
     #[test]
@@ -2769,14 +3145,18 @@ mod tests {
     fn gdn_rec_geometry_matches_route() {
         // 表 = (kd, vd, 快路?, 期望 grid.x):覆盖 0.8B / 27B / TP 两档 / 非 128 头维
         let cases = [
-            (128usize, 128usize, true, 8u32),   // 27B TP2 每 rank nv=24 · 4 行/线
-            (128, 64, true, 4),                 // 假设的窄 v 维(vd 偶数)
-            (128, 1, false, 1),                 // vd 奇 ⇒ 回落 legacy
-            (64, 128, false, 16),               // kd≠128 ⇒ 回落 legacy
+            (128usize, 128usize, true, 8u32), // 27B TP2 每 rank nv=24 · 4 行/线
+            (128, 64, true, 4),               // 假设的窄 v 维(vd 偶数)
+            (128, 1, false, 1),               // vd 奇 ⇒ 回落 legacy
+            (64, 128, false, 16),             // kd≠128 ⇒ 回落 legacy
             (128, 256, true, 16),
         ];
         for (kd, vd, fast, gx) in cases {
-            assert_eq!(gdn::recurrence_varlen_gqa_fast(kd, vd), fast, "判据 kd={kd} vd={vd}");
+            assert_eq!(
+                gdn::recurrence_varlen_gqa_fast(kd, vd),
+                fast,
+                "判据 kd={kd} vd={vd}"
+            );
             let p = gdn::recurrence_varlen_gqa(DType::F16, vd, 16, kd, 1);
             assert_eq!(p.shape.grid.0, gx, "grid.x kd={kd} vd={vd}");
             // 覆盖性:快路须 ≥ vd/2 组(每组 2 列),legacy 须 ≥ vd 列
@@ -2799,18 +3179,36 @@ mod tests {
         assert_eq!(gdn::l2norm(DType::F16, 128).shape.grid, (16, 1, 1));
         // **2026-10-19 norm_act 改一 warp 一单元(8 单元/块)** ⇒ 块数 = ceil(单元数/8)
         // (单元 = rows·value_dim/group_size;旧形块数 = 单元数,一 block 一单元)
-        assert_eq!(gdn::norm_act(DType::F16, 4, 2048, 128).shape.grid, (8, 1, 1));
+        assert_eq!(
+            gdn::norm_act(DType::F16, 4, 2048, 128).shape.grid,
+            (8, 1, 1)
+        );
         // 向上取整律(单元数不整除 8 时不得漏算末尾单元)
         assert_eq!(gdn::norm_act(DType::F16, 1, 128, 128).shape.grid, (1, 1, 1));
         assert_eq!(gdn::norm_act(DType::F16, 9, 128, 128).shape.grid, (2, 1, 1));
-        assert_eq!(gdn::norm_act(DType::F16, 1024, 6144, 128).shape.grid, (6144, 1, 1));
+        assert_eq!(
+            gdn::norm_act(DType::F16, 1024, 6144, 128).shape.grid,
+            (6144, 1, 1)
+        );
         // N1(2026-10-14):grid = (ceil(d/256), tiles=ceil(tokens/32), batch);
         // tiles 只由 tokens 决定 ⇒ 几何自证(含 0/32/33 边界与 batch 维)
         assert_eq!(gdn::conv_fwd(DType::F16, 6144, 0, 1).shape.grid, (24, 1, 1));
-        assert_eq!(gdn::conv_fwd(DType::F16, 6144, 32, 1).shape.grid, (24, 1, 1));
-        assert_eq!(gdn::conv_fwd(DType::F16, 6144, 33, 1).shape.grid, (24, 2, 1));
-        assert_eq!(gdn::conv_fwd(DType::F16, 2048, 461, 1).shape.grid, (8, 15, 1));
-        assert_eq!(gdn::conv_fwd(DType::F16, 6144, 461, 3).shape.grid, (24, 15, 3));
+        assert_eq!(
+            gdn::conv_fwd(DType::F16, 6144, 32, 1).shape.grid,
+            (24, 1, 1)
+        );
+        assert_eq!(
+            gdn::conv_fwd(DType::F16, 6144, 33, 1).shape.grid,
+            (24, 2, 1)
+        );
+        assert_eq!(
+            gdn::conv_fwd(DType::F16, 2048, 461, 1).shape.grid,
+            (8, 15, 1)
+        );
+        assert_eq!(
+            gdn::conv_fwd(DType::F16, 6144, 461, 3).shape.grid,
+            (24, 15, 3)
+        );
         assert_eq!(ops::sigmoid(DType::F16).name, "owl_sigmoid_f16");
         assert_eq!(ops::sigmoid(DType::F32).name, "owl_sigmoid_f32");
     }
@@ -2824,8 +3222,22 @@ mod tests {
     #[test]
     fn attn_paged_decode_pairing_and_smem() {
         use super::attn;
-        let env32 = OpEnv { hw: Hw { arch: crate::Arch::Sm86 }, page: 32, head_dim: 256, grp: 6 };
-        let env16 = OpEnv { hw: Hw { arch: crate::Arch::Sm86 }, page: 16, head_dim: 256, grp: 6 };
+        let env32 = OpEnv {
+            hw: Hw {
+                arch: crate::Arch::Sm86,
+            },
+            page: 32,
+            head_dim: 256,
+            grp: 6,
+        };
+        let env16 = OpEnv {
+            hw: Hw {
+                arch: crate::Arch::Sm86,
+            },
+            page: 16,
+            head_dim: 256,
+            grp: 6,
+        };
         // 页配对律:wrapper 随页(32→bs32/TG1,16→bs16/TG2)
         assert_eq!(
             attn::paged_decode_v1(&env32, DType::F16, 256, 24, 4, 2).name,
@@ -2850,7 +3262,14 @@ mod tests {
         assert!(!attn::paged_decode_ok(256, 8));
         assert!(attn::paged_prefill_ok(256, 32) && !attn::paged_prefill_ok(256, 16));
         assert!(!attn::paged_prefill_ok(64, 32));
-        let env = OpEnv { hw: Hw { arch: crate::Arch::Sm86 }, page: 32, head_dim: 256, grp: 6 };
+        let env = OpEnv {
+            hw: Hw {
+                arch: crate::Arch::Sm86,
+            },
+            page: 32,
+            head_dim: 256,
+            grp: 6,
+        };
         let p = attn::paged_prefill(&env, DType::F16, 256, 4, 24, 300);
         assert_eq!(p.name, "vllm_chunked_prefill_paged_attn_opt_f16_hd256");
         assert_eq!(p.shape.grid, (6, 4, 2)); // ceil(300/256)=2
@@ -2916,7 +3335,10 @@ pub mod marlin {
         } else {
             crate::family::marlin::GEMM_W4A16
         };
-        KernelPick { name, shape: FOREIGN }
+        KernelPick {
+            name,
+            shape: FOREIGN,
+        }
     }
 
     /// W4A8 × AWQ GEMM(int8 激活 × kU4 零偏;W4A8 线 2026-10-16)。

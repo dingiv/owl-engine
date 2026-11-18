@@ -13,9 +13,9 @@
 //! (隐式 float 数值截断,值<1→0/负→UB)= 99.6% 零输出真凶;修 =
 //! `__half_as_ushort` 位拷贝。本探针即当时的复现用例。
 
+use cudarc::driver::{CudaContext, DevicePtr, LaunchConfig, PushKernelArg};
 use owl_macros::owl_test;
 use std::sync::Arc;
-use cudarc::driver::{CudaContext, DevicePtr, LaunchConfig, PushKernelArg};
 
 const PAGE: usize = 32;
 const X: usize = 8;
@@ -56,7 +56,11 @@ fn e4m3_decode(b: u8) -> f32 {
     if e == 15 && m == 7 {
         return f32::NAN;
     }
-    let v = if e == 0 { (m as f32) * 2f32.powi(-9) } else { (1.0 + m as f32 / 8.0) * 2f32.powi(e - 7) };
+    let v = if e == 0 {
+        (m as f32) * 2f32.powi(-9)
+    } else {
+        (1.0 + m as f32 / 8.0) * 2f32.powi(e - 7)
+    };
     s * v
 }
 
@@ -83,7 +87,9 @@ fn e4m3_encode(v: f32) -> u8 {
 fn lcg(n: usize, seed: u32) -> Vec<u16> {
     (0..n)
         .map(|i| {
-            let x = seed.wrapping_mul(0x9E37_79B9).wrapping_add((i as u32).wrapping_mul(0x85EB_CA6B));
+            let x = seed
+                .wrapping_mul(0x9E37_79B9)
+                .wrapping_add((i as u32).wrapping_mul(0x85EB_CA6B));
             half_bits(((x & 0xFFFF) as f32 / 65535.0 - 0.5) * 4.0)
         })
         .collect()
@@ -178,63 +184,75 @@ fn run_case(
     let d_alibi = dev_f32(&[0f32]);
     let d_sinks = dev_f32(&[0f32]);
 
-    let run = |tag: &str,
-               k_name: &str,
-               k_ptr: u64,
-               v_ptr: u64,
-               out: &cudarc::driver::CudaSlice<u16>| {
-        let f = m.load_function(k_name).unwrap_or_else(|e| panic!("[{tag}] load {k_name}: {e:?}"));
-        let o_p = out.device_ptr(stream).0;
-        let q_p = d_q.device_ptr(stream).0;
-        let bt_p = d_bt.device_ptr(stream).0;
-        let ln_p = d_lens.device_ptr(stream).0;
-        let qsl_p = d_qsl.device_ptr(stream).0;
-        let ab_p = d_alibi.device_ptr(stream).0;
-        let sk_p = d_sinks.device_ptr(stream).0;
-        let (nkv, scale, bts, ns, nqh, nqt) =
-            (NUM_KV_HEADS as i32, 1f32 / (hd as f32).sqrt(), 1i32, 1i32, NUM_HEADS as i32, T as i32);
-        let (ss, ost, sw, tnb, kbs, khs, ua, us) =
-            (1f32, (NUM_HEADS * hd) as i32, -1i32, NUM_BLOCKS as i32,
-             (NUM_KV_HEADS * hd * PAGE) as i32, (hd * PAGE) as i32, 0i32, 0i32);
-        // extern 序:q,k_cache,v_cache,bt,seq_lens,qsl,alibi,sinks,
-        // nkv,sm_scale,bts,ns,nqh,nqt,ss,ost,sw,tnb,kbs,khs,ua,us,out(末参)
-        let mut b = stream.launch_builder(&f);
-        b.arg(&q_p)
-            .arg(&k_ptr)
-            .arg(&v_ptr)
-            .arg(&bt_p)
-            .arg(&ln_p)
-            .arg(&qsl_p)
-            .arg(&ab_p)
-            .arg(&sk_p)
-            .arg(&nkv)
-            .arg(&scale)
-            .arg(&bts)
-            .arg(&ns)
-            .arg(&nqh)
-            .arg(&nqt)
-            .arg(&ss)
-            .arg(&ost)
-            .arg(&sw)
-            .arg(&tnb)
-            .arg(&kbs)
-            .arg(&khs)
-            .arg(&ua)
-            .arg(&us)
-            .arg(&o_p);
-        let cfg = LaunchConfig {
-            grid_dim: ((NUM_HEADS / NUM_KV_HEADS) as u32, NUM_KV_HEADS as u32, 1),
-            block_dim: (256, 1, 1),
-            shared_mem_bytes: (64 + 2 * hd * PAGE * 2) as u32,
+    let run =
+        |tag: &str, k_name: &str, k_ptr: u64, v_ptr: u64, out: &cudarc::driver::CudaSlice<u16>| {
+            let f = m
+                .load_function(k_name)
+                .unwrap_or_else(|e| panic!("[{tag}] load {k_name}: {e:?}"));
+            let o_p = out.device_ptr(stream).0;
+            let q_p = d_q.device_ptr(stream).0;
+            let bt_p = d_bt.device_ptr(stream).0;
+            let ln_p = d_lens.device_ptr(stream).0;
+            let qsl_p = d_qsl.device_ptr(stream).0;
+            let ab_p = d_alibi.device_ptr(stream).0;
+            let sk_p = d_sinks.device_ptr(stream).0;
+            let (nkv, scale, bts, ns, nqh, nqt) = (
+                NUM_KV_HEADS as i32,
+                1f32 / (hd as f32).sqrt(),
+                1i32,
+                1i32,
+                NUM_HEADS as i32,
+                T as i32,
+            );
+            let (ss, ost, sw, tnb, kbs, khs, ua, us) = (
+                1f32,
+                (NUM_HEADS * hd) as i32,
+                -1i32,
+                NUM_BLOCKS as i32,
+                (NUM_KV_HEADS * hd * PAGE) as i32,
+                (hd * PAGE) as i32,
+                0i32,
+                0i32,
+            );
+            // extern 序:q,k_cache,v_cache,bt,seq_lens,qsl,alibi,sinks,
+            // nkv,sm_scale,bts,ns,nqh,nqt,ss,ost,sw,tnb,kbs,khs,ua,us,out(末参)
+            let mut b = stream.launch_builder(&f);
+            b.arg(&q_p)
+                .arg(&k_ptr)
+                .arg(&v_ptr)
+                .arg(&bt_p)
+                .arg(&ln_p)
+                .arg(&qsl_p)
+                .arg(&ab_p)
+                .arg(&sk_p)
+                .arg(&nkv)
+                .arg(&scale)
+                .arg(&bts)
+                .arg(&ns)
+                .arg(&nqh)
+                .arg(&nqt)
+                .arg(&ss)
+                .arg(&ost)
+                .arg(&sw)
+                .arg(&tnb)
+                .arg(&kbs)
+                .arg(&khs)
+                .arg(&ua)
+                .arg(&us)
+                .arg(&o_p);
+            let cfg = LaunchConfig {
+                grid_dim: ((NUM_HEADS / NUM_KV_HEADS) as u32, NUM_KV_HEADS as u32, 1),
+                block_dim: (256, 1, 1),
+                shared_mem_bytes: (64 + 2 * hd * PAGE * 2) as u32,
+            };
+            if let Err(e) = unsafe { b.launch(cfg) } {
+                panic!("[{tag}] chunked launch {k_name}: {e:?}");
+            }
+            if let Err(e) = stream.synchronize() {
+                panic!("[{tag}] sync 后 ILLEGAL: {e:?}");
+            }
+            println!("[hd{hd} {tag}] launch+sync OK");
         };
-        if let Err(e) = unsafe { b.launch(cfg) } {
-            panic!("[{tag}] chunked launch {k_name}: {e:?}");
-        }
-        if let Err(e) = stream.synchronize() {
-            panic!("[{tag}] sync 后 ILLEGAL: {e:?}");
-        }
-        println!("[hd{hd} {tag}] launch+sync OK");
-    };
 
     let d_out16 = dev_u16(&vec![0u16; T * NUM_HEADS * hd]);
     let d_out8 = dev_u16(&vec![0u16; T * NUM_HEADS * hd]);
@@ -283,18 +301,27 @@ fn run_case(
     // ① gpu_f16 vs host_f16 = 布局/读序自检(超门 = host 模型错,非核错)
     let (m16, x16, a16) = stat(&to_f32(&o16), &ref_f16);
     println!("① hd{hd} gpu_f16 vs host_f16 — mean={m16:.6} max={x16:.6} @ {a16}");
-    assert!(x16 < 2e-2, "hd{hd} f16 布局自检超门(max {x16})— host 模型或读序错");
+    assert!(
+        x16 < 2e-2,
+        "hd{hd} f16 布局自检超门(max {x16})— host 模型或读序错"
+    );
 
     // ② gpu_fp8 vs host_fp8 = 核计算正确性硬门(e4m3→half 无舍入,差应 ≈ f16 输出 ulp)
     let (m8, x8, a8) = stat(&to_f32(&o8), &ref_fp8);
     let (t8, h8, d8) = (a8 / (NUM_HEADS * hd), (a8 / hd) % NUM_HEADS, a8 % hd);
     println!("② hd{hd} gpu_fp8 vs host_fp8 — mean={m8:.6} max={x8:.6} @ t={t8} h={h8} d={d8}");
-    assert!(m8 < 2e-3 && x8 < 1e-2, "hd{hd} chunked fp8 对 host 参考超门(mean {m8}, max {x8})");
+    assert!(
+        m8 < 2e-3 && x8 < 1e-2,
+        "hd{hd} chunked fp8 对 host 参考超门(mean {m8}, max {x8})"
+    );
 
     // ③ f16 vs fp8 = 量化噪声信息项(数据相关,只作粗罔 tripwire)
     let (mn, xn, _) = stat(&to_f32(&o16), &to_f32(&o8));
     println!("③ hd{hd} f16 vs fp8 量化噪声 — mean={mn:.5} max={xn:.5}");
-    assert!(mn < 5e-2 && xn < 3e-1, "hd{hd} f16/fp8 粗罔 tripwire(mean {mn}, max {xn})");
+    assert!(
+        mn < 5e-2 && xn < 3e-1,
+        "hd{hd} f16/fp8 粗罔 tripwire(mean {mn}, max {xn})"
+    );
 }
 
 #[owl_test(gpu)]
@@ -303,7 +330,10 @@ fn chunked_prefill_fp8_matches_f16() {
     ctx.bind_to_thread().expect("bind");
     let stream = ctx.default_stream();
     let ptx = cudarc::nvrtc::compile_ptx_with_opts(
-        owl_kernels::cu_sig::cu_text(owl_kernels::ops::source("vllm_chunked_prefill_paged_attn_opt_fp8_knhd_hd256")).as_str(),
+        owl_kernels::cu_sig::cu_text(owl_kernels::ops::source(
+            "vllm_chunked_prefill_paged_attn_opt_fp8_knhd_hd256",
+        ))
+        .as_str(),
         cudarc::nvrtc::CompileOptions {
             arch: Some("compute_86"),
             include_paths: vec!["/usr/local/cuda/include".into()],

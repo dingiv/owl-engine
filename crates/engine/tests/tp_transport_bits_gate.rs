@@ -55,13 +55,18 @@ fn knobs() -> EngineKnobs {
 }
 
 fn cfg_of(ordinal: usize) -> EngineConfig {
-    EngineConfig { device_ordinal: ordinal, max_context_length_tokens: 256, prefill_chunk: 64, knobs: knobs() }
+    EngineConfig {
+        device_ordinal: ordinal,
+        max_context_length_tokens: 256,
+        prefill_chunk: 64,
+        knobs: knobs(),
+    }
 }
 
 /// 卡名(型号一致才可比;同 ordinal 会命中同一行 ⇒ 幂等)
 fn card_name(ordinal: usize) -> Result<String, ModelError> {
-    let rows = owl_cuda::ffi::device_rows()
-        .map_err(|e| ModelError::Msg(format!("设备枚举失败:{e}")))?;
+    let rows =
+        owl_cuda::ffi::device_rows().map_err(|e| ModelError::Msg(format!("设备枚举失败:{e}")))?;
     rows.iter()
         .find(|r| r.ordinal == ordinal)
         .map(|r| r.name.clone())
@@ -78,9 +83,19 @@ async fn load_shards(
     Vec<owl_engine::LoadedModel>,
 ) {
     let mut e0 = Engine::new(cfg_of(oa)).expect("engine(rank0)");
-    let l0 = e0.loader().slice(0, 2).load_qwen35_0_8b(dir).await.expect("rank0 分片装载");
+    let l0 = e0
+        .loader()
+        .slice(0, 2)
+        .load_qwen35_0_8b(dir)
+        .await
+        .expect("rank0 分片装载");
     let mut e1 = Engine::new_with_ledger(cfg_of(ob), e0.ledger_cell(), 1).expect("engine(rank1)");
-    let l1 = e1.loader().slice(1, 2).load_qwen35_0_8b(dir).await.expect("rank1 分片装载");
+    let l1 = e1
+        .loader()
+        .slice(1, 2)
+        .load_qwen35_0_8b(dir)
+        .await
+        .expect("rank1 分片装载");
     (vec![e0, e1], vec![l0, l1])
 }
 
@@ -117,15 +132,25 @@ async fn drive(
 }
 
 fn bits_diff(a: &[f32], b: &[f32]) -> (usize, f32) {
-    let n = a.iter().zip(b).filter(|(x, y)| x.to_bits() != y.to_bits()).count();
-    let mx = a.iter().zip(b).map(|(x, y)| (x - y).abs()).fold(0f32, f32::max);
+    let n = a
+        .iter()
+        .zip(b)
+        .filter(|(x, y)| x.to_bits() != y.to_bits())
+        .count();
+    let mx = a
+        .iter()
+        .zip(b)
+        .map(|(x, y)| (x - y).abs())
+        .fold(0f32, f32::max);
     (n, mx)
 }
 
 #[test]
 fn tp_transport_bits_gate() {
     let (Some(oa), Some(ob)) = (dev("OWL_TP_TEST_DEV_A"), dev("OWL_TP_TEST_DEV_B")) else {
-        owl_shared::testkit::report::skip("需 OWL_TP_TEST_DEV_A / OWL_TP_TEST_DEV_B(两张空闲卡的 CUDA ordinal)");
+        owl_shared::testkit::report::skip(
+            "需 OWL_TP_TEST_DEV_A / OWL_TP_TEST_DEV_B(两张空闲卡的 CUDA ordinal)",
+        );
         return;
     };
     assert_ne!(oa, ob, "跨卡档需要两张不同卡");
@@ -152,7 +177,10 @@ fn tp_transport_bits_gate() {
 async fn body(oa: usize, ob: usize, same_dev: usize, dir: PathBuf) -> Result<(), ModelError> {
     // 型号一致 = 位级可比的前提(不同型号的 kernel 实现可能不同)
     let (na, nb, ns) = (card_name(oa)?, card_name(ob)?, card_name(same_dev)?);
-    assert_eq!(na, nb, "跨卡档两卡必须同型号(得 {na} / {nb})—— 不同型号不可位级对拍");
+    assert_eq!(
+        na, nb,
+        "跨卡档两卡必须同型号(得 {na} / {nb})—— 不同型号不可位级对拍"
+    );
     assert_eq!(na, ns, "同卡档卡型号必须与跨卡档一致(得 {ns} vs {na})");
     eprintln!("[g8c] 卡面:跨卡 {oa}/{ob} = {na};同卡档 = {same_dev}");
     // 标记面初始化(AR 注入计数:两档都应看见对称注入)
@@ -160,14 +188,22 @@ async fn body(oa: usize, ob: usize, same_dev: usize, dir: PathBuf) -> Result<(),
 
     // ── ① 跨卡档(生产路径;PCIe/NVLink 窗口)────────────────────────
     let (engines, loadeds) = load_shards(oa, ob, &dir).await;
-    let tp_cross = TpEngine::assemble(engines, loadeds).await.expect("跨卡 TP2 装配");
+    let tp_cross = TpEngine::assemble(engines, loadeds)
+        .await
+        .expect("跨卡 TP2 装配");
     let (gen_cross, logits_cross) = drive(tp_cross, 1).await.expect("跨卡档 turn");
-    eprintln!("[g8c] 跨卡档:{} tok;末步 logits {} 项", gen_cross.len(), logits_cross.len());
+    eprintln!(
+        "[g8c] 跨卡档:{} tok;末步 logits {} 项",
+        gen_cross.len(),
+        logits_cross.len()
+    );
 
     // ── ①' 跨卡档**第二跑**(**配置内 run-to-run 逐位唯一** = §19.3 纪律 4 的
     //    承诺 ①;这是本门**最硬**的一条 —— 同配置重复必须逐位相同)。
     let (engines, loadeds) = load_shards(oa, ob, &dir).await;
-    let tp_cross2 = TpEngine::assemble(engines, loadeds).await.expect("跨卡 TP2 装配(第二跑)");
+    let tp_cross2 = TpEngine::assemble(engines, loadeds)
+        .await
+        .expect("跨卡 TP2 装配(第二跑)");
     let (gen_cross2, logits_cross2) = drive(tp_cross2, 1).await.expect("跨卡档第二跑 turn");
     assert_eq!(
         gen_cross, gen_cross2,
@@ -190,7 +226,11 @@ async fn body(oa: usize, ob: usize, same_dev: usize, dir: PathBuf) -> Result<(),
         .await
         .expect("同卡档 TP2 装配");
     let (gen_same, logits_same) = drive(tp_same, 1).await.expect("同卡档 turn");
-    eprintln!("[g8c] 同卡档:{} tok;末步 logits {} 项", gen_same.len(), logits_same.len());
+    eprintln!(
+        "[g8c] 同卡档:{} tok;末步 logits {} 项",
+        gen_same.len(),
+        logits_same.len()
+    );
 
     // ── ③ 判据:按 §28(**判据不得强于承诺**)────────────────────────
     //
@@ -233,7 +273,11 @@ async fn body(oa: usize, ob: usize, same_dev: usize, dir: PathBuf) -> Result<(),
             logits_cross.len()
         );
     } else {
-        let i = gen_cross.iter().zip(&gen_same).position(|(a, b)| a != b).unwrap_or(0);
+        let i = gen_cross
+            .iter()
+            .zip(&gen_same)
+            .position(|(a, b)| a != b)
+            .unwrap_or(0);
         eprintln!(
             "[g8c] ③ **诊断**(非判据):两臂自第 {i} 个 token 起路径分叉 —— 这是**两种配置的\
              合法差异**(§19.3-4 / §21.4-2「热 ≠ 冷」同律),不是 transport 的错。\n  \

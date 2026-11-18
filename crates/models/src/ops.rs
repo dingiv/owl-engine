@@ -480,7 +480,9 @@ impl SemanticKernel {
 }
 
 /// contract::Dtype → driver::DType(契约类型不过 kernels,转换住消费侧)
-pub(crate) fn ddt(dt: crate::contract::Dtype) -> Result<owl_kernels::driver::DType, crate::contract::ModelError> {
+pub(crate) fn ddt(
+    dt: crate::contract::Dtype,
+) -> Result<owl_kernels::driver::DType, crate::contract::ModelError> {
     use owl_kernels::driver::DType;
     Ok(match dt {
         crate::contract::Dtype::F16 => DType::F16,
@@ -529,7 +531,9 @@ pub enum Op {
     // ---- 源节点 ----
     /// host 数据入块(server 侧 pinned 码头直填 + 池流 htod async+sync;契约 3)。
     /// 值语义:数据随树走(配置面;server 版换成 pinned 码头引用)。
-    Htod { bytes: Vec<u8> },
+    Htod {
+        bytes: Vec<u8>,
+    },
     /// 清零分配
     Zeros,
     /// **无清零分配**(scratch 块;内容未定义)。
@@ -548,10 +552,15 @@ pub enum Op {
     /// 序纪律:各分块节点之间**没有数据边**,靠"单计算流 + 尾序发射"保证先后
     /// (与 `SlotWrite` 的显式边不同 —— 那需要跨节目可导;这里是同一节点树内的
     /// 顺序发射,cuBLAS 与该流同序)。
-    CallDst { op: SemanticKernel, aux: Vec<usize> },
+    CallDst {
+        op: SemanticKernel,
+        aux: Vec<usize>,
+    },
     /// 引用已物化数据(rt::Tensor 的池块;id = 其全局唯一身份证)。
     /// eval 时零操作(数据已在),仅把"真数据"接进声明图的叶子。
-    Block { id: u64 },
+    Block {
+        id: u64,
+    },
 
     // ---- 计算节点(2026-10-12 瘦身:纯算子动作全部折叠进 Call ——
     //      Add/Mul/Silu/Sigmoid/Rmsnorm 已入 SemanticKernel 词表,双词汇
@@ -568,7 +577,9 @@ pub enum Op {
     /// 消费面发射 `Arg::BlockSlice{id, byte_offset: offset·esz}`)。
     /// 节点偏移在声明期已含父链合成(slice_of_slice);仅连续切片
     /// (narrow 的 outer==1 ∨ src_dim==out_dim)入此臂,非连续仍物化。
-    SliceView { offset_elems: usize },
+    SliceView {
+        offset_elems: usize,
+    },
 
     // ---- 语义调用(Driver 立项,2026-10-01;2026-10-12 枚举化):model 层
     //      只描述「要什么」(SemanticKernel 动作词表)+ 张量 + 语义标量;名/
@@ -576,13 +587,15 @@ pub enum Op {
     //      resolve,OpEnv 必传被动律)。aux = 拾取推导常数(层语义几何:
     //      kd/vd/batch…;非核参数,不进签名)。**model 层由此不感知任何
     //      硬件算子的存在**(S2' 定稿;枚举 = 硬件无关动作契约)。
-    Call { op: SemanticKernel, aux: Vec<usize> },
+    Call {
+        op: SemanticKernel,
+        aux: Vec<usize>,
+    },
 
     // ---- 状态节点(唯一显式副作用;SSA 外形,物理原地由 server 解释)----
     /// KV 写槽:声明"本节目写 kv manager 的这些格"——
     /// 跨节目依赖机械可导:同一 kv 格的写/读节目之间插事件边。
     SlotWrite,
-
 }
 
 // ============================================================================
@@ -612,15 +625,24 @@ impl PlanNode for crate::tensor::TensorOps {
     /// 草稿语义:join = 相加(map = silu);正式组合子随声明式算子面扩展
     fn join(&self, another: &Self, op: Op) -> Self {
         match op {
-            Op::Call { op: SemanticKernel::Add, .. } => self.add(another),
+            Op::Call {
+                op: SemanticKernel::Add,
+                ..
+            } => self.add(another),
             _ => self.add(another),
         }
     }
 
     fn map(&self, op: Op) -> Self {
         match op {
-            Op::Call { op: SemanticKernel::Silu, .. } => self.silu(),
-            Op::Call { op: SemanticKernel::Sigmoid, .. } => self.sigmoid(),
+            Op::Call {
+                op: SemanticKernel::Silu,
+                ..
+            } => self.silu(),
+            Op::Call {
+                op: SemanticKernel::Sigmoid,
+                ..
+            } => self.sigmoid(),
             _ => self.clone(),
         }
     }
@@ -631,7 +653,10 @@ impl PlanNode for crate::tensor::TensorOps {
 // ============================================================================
 
 fn spec(name: &'static str) -> KernelSource {
-    KernelSource { name: name.to_string(), source: crate::kernel::source(name).to_string() }
+    KernelSource {
+        name: name.to_string(),
+        source: crate::kernel::source(name).to_string(),
+    }
 }
 
 fn ceil_1d(n: usize) -> (u32, u32, u32) {
@@ -756,7 +781,10 @@ pub fn lower_kernel(
     // 闭包就地推导 —— 事实面检查要与装配序逐槽对齐,两处推导必漂)
     let srcs: Vec<SlotSrc> = kernel.slot_sources();
     // 父张量槽数必须等于父依赖数
-    let t_in = srcs.iter().filter(|s| matches!(s, SlotSrc::Parent(_))).count();
+    let t_in = srcs
+        .iter()
+        .filter(|s| matches!(s, SlotSrc::Parent(_)))
+        .count();
     assert!(
         t_in == ins.len(),
         "lower_kernel({}): 签名 T 槽 {t_in} != 父依赖 {}(检查 .arg 链)",
@@ -782,15 +810,24 @@ pub fn lower_kernel(
                 match *tok {
                     "sz" => match &scalars[si] {
                         KernelArg::Bits(v) => args.push(Arg::U64(*v)),
-                        other => panic!("lower_kernel({}): 槽 {i} 期望 sz,实得 {other:?}", kernel.name),
+                        other => panic!(
+                            "lower_kernel({}): 槽 {i} 期望 sz,实得 {other:?}",
+                            kernel.name
+                        ),
                     },
                     "i32" => match &scalars[si] {
                         KernelArg::I32(v) => args.push(Arg::I32(*v)),
-                        other => panic!("lower_kernel({}): 槽 {i} 期望 i32,实得 {other:?}", kernel.name),
+                        other => panic!(
+                            "lower_kernel({}): 槽 {i} 期望 i32,实得 {other:?}",
+                            kernel.name
+                        ),
                     },
                     "f32" => match &scalars[si] {
                         KernelArg::F32(v) => args.push(Arg::F32(*v)),
-                        other => panic!("lower_kernel({}): 槽 {i} 期望 f32,实得 {other:?}", kernel.name),
+                        other => panic!(
+                            "lower_kernel({}): 槽 {i} 期望 f32,实得 {other:?}",
+                            kernel.name
+                        ),
                     },
                     other => panic!("lower_kernel({}): 非法签名 token `{other}`", kernel.name),
                 }
@@ -799,12 +836,23 @@ pub fn lower_kernel(
         }
     }
     let (grid, block, shared_mem) = if kernel.launch.grid == (0, 0, 0) {
-        (auto_grid(out_elems), kernel.launch.block, kernel.launch.shared_mem)
+        (
+            auto_grid(out_elems),
+            kernel.launch.block,
+            kernel.launch.shared_mem,
+        )
     } else {
-        (kernel.launch.grid, kernel.launch.block, kernel.launch.shared_mem)
+        (
+            kernel.launch.grid,
+            kernel.launch.block,
+            kernel.launch.shared_mem,
+        )
     };
     LaunchMsg {
-        kernel: KernelSource { name: kernel.name.to_string(), source: kernel.src.to_string() },
+        kernel: KernelSource {
+            name: kernel.name.to_string(),
+            source: kernel.src.to_string(),
+        },
         args,
         grid,
         block,
@@ -818,9 +866,6 @@ pub fn auto_grid(out_elems: usize) -> (u32, u32, u32) {
     ceil_1d(out_elems)
 }
 
-
-
-
 // ============================================================================
 // 采样(E3;REQ-DEC-04 每步零大 D2H)
 // ============================================================================
@@ -830,13 +875,17 @@ pub fn auto_grid(out_elems: usize) -> (u32, u32, u32) {
 /// argmax fold 语义一致)。核 = owl_argmax_f32idx_f16(单块两段规约;
 /// cu/owl/argmax_f16.cu 头注)。`offset` = 末行起点(prefill 末块
 /// [T,V] 传 (T-1)·V;decode T=1 传 0)。
-pub fn argmax_f32idx(x: &crate::tensor::TensorOps, n: usize, offset: usize) -> crate::tensor::TensorOps {
+pub fn argmax_f32idx(
+    x: &crate::tensor::TensorOps,
+    n: usize,
+    offset: usize,
+) -> crate::tensor::TensorOps {
     use crate::contract::Dtype;
     crate::tensor::TensorOps::call(SemanticKernel::Argmax)
-    .arg(x)
-    .arg_i32(n as i32)
-    .arg_i32(offset as i32)
-    .with_shape(Dtype::F32, vec![1])
+        .arg(x)
+        .arg_i32(n as i32)
+        .arg_i32(offset as i32)
+        .with_shape(Dtype::F32, vec![1])
 }
 
 /// **逐行 top-32 候选**(K=32;分布式采样用,2026-10-26):两段 split-K,
@@ -885,13 +934,17 @@ pub fn topk32_of_logits(
 /// 用于 TP 词表切的两半表合并:两 rank 各出本半的最大值+索引 ⇒ host 只比较
 /// 2 个数(每行 8B),不再回读 4MB 半表 logits。平局语义与
 /// [`argmax_f32idx`] 一致(最小索引)。
-pub fn argmax_validx(x: &crate::tensor::TensorOps, n: usize, offset: usize) -> crate::tensor::TensorOps {
+pub fn argmax_validx(
+    x: &crate::tensor::TensorOps,
+    n: usize,
+    offset: usize,
+) -> crate::tensor::TensorOps {
     use crate::contract::Dtype;
     crate::tensor::TensorOps::call(SemanticKernel::ArgmaxVal)
-    .arg(x)
-    .arg_i32(n as i32)
-    .arg_i32(offset as i32)
-    .with_shape(Dtype::F32, vec![2])
+        .arg(x)
+        .arg_i32(n as i32)
+        .arg_i32(offset as i32)
+        .with_shape(Dtype::F32, vec![2])
 }
 
 /// **激活 per-token int8 量化声明**(W4A8 喂料手;S1c)。
@@ -941,24 +994,56 @@ pub fn quant_int8_row(
 /// 桥:driver 拾取名 → 本表 → lower_kernel 对位装配)
 pub(crate) fn foreign_sig(name: &str) -> Option<&'static str> {
     match name {
-        x if x == owl_kernels::family::gdn_chunked::GDN_CHUNKED_FWD => Some(owl_kernels::client::gdn_chunked::SIG),
-        x if x == owl_kernels::family::gdn_scalar::GDN_SCALAR_FWD => Some(owl_kernels::client::gdn_scalar::SIG),
+        x if x == owl_kernels::family::gdn_chunked::GDN_CHUNKED_FWD => {
+            Some(owl_kernels::client::gdn_chunked::SIG)
+        }
+        x if x == owl_kernels::family::gdn_scalar::GDN_SCALAR_FWD => {
+            Some(owl_kernels::client::gdn_scalar::SIG)
+        }
         x if x == owl_kernels::family::marlin::GEMM_W4A16 => Some(owl_kernels::client::marlin::SIG),
-        x if x == owl_kernels::family::marlin::GEMM_W4A16_AWQ => Some(owl_kernels::client::marlin::SIG_AWQ),
-        x if x == owl_kernels::family::marlin::GEMM_W4A8_AWQ => Some(owl_kernels::client::marlin::SIG_W4A8),
-        x if x == owl_kernels::family::marlin::GEMM_W4A16_BF16 => Some(owl_kernels::client::marlin::SIG),
-        x if x == owl_kernels::family::flashinfer::PREFILL_FI => Some(owl_kernels::client::fi_sig::SIG),
-        x if x == owl_kernels::family::flashinfer::PREFILL_FI_FP8KV => Some(owl_kernels::client::fi_sig::SIG),
-        x if x == owl_kernels::family::flashinfer::PREFILL_FI_FP8MMA => Some(owl_kernels::client::fi_sig::SIG),
+        x if x == owl_kernels::family::marlin::GEMM_W4A16_AWQ => {
+            Some(owl_kernels::client::marlin::SIG_AWQ)
+        }
+        x if x == owl_kernels::family::marlin::GEMM_W4A8_AWQ => {
+            Some(owl_kernels::client::marlin::SIG_W4A8)
+        }
+        x if x == owl_kernels::family::marlin::GEMM_W4A16_BF16 => {
+            Some(owl_kernels::client::marlin::SIG)
+        }
+        x if x == owl_kernels::family::flashinfer::PREFILL_FI => {
+            Some(owl_kernels::client::fi_sig::SIG)
+        }
+        x if x == owl_kernels::family::flashinfer::PREFILL_FI_FP8KV => {
+            Some(owl_kernels::client::fi_sig::SIG)
+        }
+        x if x == owl_kernels::family::flashinfer::PREFILL_FI_FP8MMA => {
+            Some(owl_kernels::client::fi_sig::SIG)
+        }
         // 通信族(TP2 S4;三 dtype 同 sig —— 槽序不随 dtype 变)
-        x if x == owl_kernels::family::comm::asset::STAGE_F32 => Some(owl_kernels::client::comm::SIG),
-        x if x == owl_kernels::family::comm::asset::STAGE_F16 => Some(owl_kernels::client::comm::SIG),
-        x if x == owl_kernels::family::comm::asset::STAGE_BF16 => Some(owl_kernels::client::comm::SIG),
-        x if x == owl_kernels::family::comm::asset::REDUCE_F32 => Some(owl_kernels::client::comm::SIG_REDUCE),
-        x if x == owl_kernels::family::comm::asset::REDUCE_F16 => Some(owl_kernels::client::comm::SIG_REDUCE),
-        x if x == owl_kernels::family::comm::asset::REDUCE_BF16 => Some(owl_kernels::client::comm::SIG_REDUCE),
-        x if x == owl_kernels::family::xqa::VERIFY_XQA => Some(owl_kernels::family::xqa::VERIFY_XQA_SIG),
-        x if x == owl_kernels::family::xqa::DECODE_XQA => Some(owl_kernels::family::xqa::DECODE_XQA_SIG),
+        x if x == owl_kernels::family::comm::asset::STAGE_F32 => {
+            Some(owl_kernels::client::comm::SIG)
+        }
+        x if x == owl_kernels::family::comm::asset::STAGE_F16 => {
+            Some(owl_kernels::client::comm::SIG)
+        }
+        x if x == owl_kernels::family::comm::asset::STAGE_BF16 => {
+            Some(owl_kernels::client::comm::SIG)
+        }
+        x if x == owl_kernels::family::comm::asset::REDUCE_F32 => {
+            Some(owl_kernels::client::comm::SIG_REDUCE)
+        }
+        x if x == owl_kernels::family::comm::asset::REDUCE_F16 => {
+            Some(owl_kernels::client::comm::SIG_REDUCE)
+        }
+        x if x == owl_kernels::family::comm::asset::REDUCE_BF16 => {
+            Some(owl_kernels::client::comm::SIG_REDUCE)
+        }
+        x if x == owl_kernels::family::xqa::VERIFY_XQA => {
+            Some(owl_kernels::family::xqa::VERIFY_XQA_SIG)
+        }
+        x if x == owl_kernels::family::xqa::DECODE_XQA => {
+            Some(owl_kernels::family::xqa::DECODE_XQA_SIG)
+        }
         _ => None,
     }
 }
@@ -992,7 +1077,14 @@ mod foreign_call_lock {
     use owl_kernels::driver::{OpEnv, OpReq};
 
     fn env() -> OpEnv {
-        OpEnv { hw: owl_kernels::driver::Hw { arch: owl_kernels::Arch::Sm86 }, page: 0, head_dim: 0, grp: 0 }
+        OpEnv {
+            hw: owl_kernels::driver::Hw {
+                arch: owl_kernels::Arch::Sm86,
+            },
+            page: 0,
+            head_dim: 0,
+            grp: 0,
+        }
     }
 
     /// 层声明形态(chunked;与 layers/gdn.rs 逐字同构)
@@ -1000,13 +1092,33 @@ mod foreign_call_lock {
     /// 顺序与 `layers::gdn::chunked_delta` 逐字同源 —— 线格式单源)
     #[allow(clippy::too_many_arguments)]
     fn declare_chunked(
-        q: &TensorOps, k: &TensorOps, v: &TensorOps, beta: &TensorOps,
-        gate: &TensorOps, state: &TensorOps, tables: &TensorOps, nt: usize, slot: usize,
-        t: usize, nv: usize, nk: usize, kd: usize,
+        q: &TensorOps,
+        k: &TensorOps,
+        v: &TensorOps,
+        beta: &TensorOps,
+        gate: &TensorOps,
+        state: &TensorOps,
+        tables: &TensorOps,
+        nt: usize,
+        slot: usize,
+        t: usize,
+        nv: usize,
+        nk: usize,
+        kd: usize,
     ) -> TensorOps {
         TensorOps::call(SemanticKernel::GdnChunkedDelta)
-            .arg(q).arg(k).arg(v).arg(beta).arg(gate).arg(state).arg(tables)
-            .arg_usize(t).arg_usize(slot).arg_usize(nv).arg_usize(nk).arg_usize(kd)
+            .arg(q)
+            .arg(k)
+            .arg(v)
+            .arg(beta)
+            .arg(gate)
+            .arg(state)
+            .arg(tables)
+            .arg_usize(t)
+            .arg_usize(slot)
+            .arg_usize(nv)
+            .arg_usize(nk)
+            .arg_usize(kd)
             .arg_bits((1.0f32 / (kd as f32).sqrt()).to_bits() as u64)
             .arg_usize(nt)
             .with_shape(Dtype::F16, vec![t, nv, kd])
@@ -1016,15 +1128,31 @@ mod foreign_call_lock {
     fn ids_resolve_to_foreign_families() {
         // 词表 ↔ driver 分派表同票(加票不加臂 = 此处红)
         for (op, want) in [
-            (SemanticKernel::GdnChunkedDelta, owl_kernels::family::gdn_chunked::GDN_CHUNKED_FWD),
-            (SemanticKernel::GdnScalarDelta, owl_kernels::family::gdn_scalar::GDN_SCALAR_FWD),
+            (
+                SemanticKernel::GdnChunkedDelta,
+                owl_kernels::family::gdn_chunked::GDN_CHUNKED_FWD,
+            ),
+            (
+                SemanticKernel::GdnScalarDelta,
+                owl_kernels::family::gdn_scalar::GDN_SCALAR_FWD,
+            ),
             // 通信族(TP2 S4;本测试 dt = F16 ⇒ 期望 F16 实例名)
-            (SemanticKernel::CommArStage, owl_kernels::family::comm::asset::STAGE_F16),
-            (SemanticKernel::CommArReduce, owl_kernels::family::comm::asset::REDUCE_F16),
+            (
+                SemanticKernel::CommArStage,
+                owl_kernels::family::comm::asset::STAGE_F16,
+            ),
+            (
+                SemanticKernel::CommArReduce,
+                owl_kernels::family::comm::asset::REDUCE_F16,
+            ),
         ] {
             let pick = owl_kernels::driver::resolve(OpReq {
-                op: op.op_id(), env: &env(), dt: owl_kernels::driver::DType::F16,
-                shapes: &[], aux: &[], scalars: &[],
+                op: op.op_id(),
+                env: &env(),
+                dt: owl_kernels::driver::DType::F16,
+                shapes: &[],
+                aux: &[],
+                scalars: &[],
             });
             assert_eq!(pick.name, want);
             assert_eq!(
@@ -1032,7 +1160,10 @@ mod foreign_call_lock {
                 ((0, 0, 0), (0, 0, 0), 0),
                 "foreign 臂发射配置应直通"
             );
-            assert!(foreign_sig(pick.name).is_some(), "driver 拾取名必须有家族 sig");
+            assert!(
+                foreign_sig(pick.name).is_some(),
+                "driver 拾取名必须有家族 sig"
+            );
         }
     }
 
@@ -1042,8 +1173,16 @@ mod foreign_call_lock {
     #[test]
     fn gemv_i8w_selection_face_is_wired() {
         for (sk, dt, want) in [
-            (SemanticKernel::GemvI8wF16, owl_kernels::driver::DType::F16, "owl_gemv_i8w_f16"),
-            (SemanticKernel::GemvI8wBf16, owl_kernels::driver::DType::BF16, "owl_gemv_i8w_bf16"),
+            (
+                SemanticKernel::GemvI8wF16,
+                owl_kernels::driver::DType::F16,
+                "owl_gemv_i8w_f16",
+            ),
+            (
+                SemanticKernel::GemvI8wBf16,
+                owl_kernels::driver::DType::BF16,
+                "owl_gemv_i8w_bf16",
+            ),
         ] {
             let pick = owl_kernels::driver::resolve(OpReq {
                 op: sk.op_id(),
@@ -1056,7 +1195,11 @@ mod foreign_call_lock {
             });
             assert_eq!(pick.name, want, "{sk:?}: op_id 应直指该档核名");
             let m = pick.meta().expect("必须有准入声明");
-            assert_eq!(m.out_dtype().map(|d| format!("{d:?}")), Some(format!("{dt:?}")), "{sk:?}: 声明输出 dtype");
+            assert_eq!(
+                m.out_dtype().map(|d| format!("{d:?}")),
+                Some(format!("{dt:?}")),
+                "{sk:?}: 声明输出 dtype"
+            );
         }
     }
 
@@ -1084,9 +1227,17 @@ mod foreign_call_lock {
                 "{sk:?}: 几何 = 一 token 一 block(aux[0] = rows)"
             );
             let m = pick.meta().expect("必须有准入声明");
-            assert_eq!(m.out_dtype(), Some(crate::contract::Dtype::I8), "{sk:?}: 出槽 I8(int8)");
+            assert_eq!(
+                m.out_dtype(),
+                Some(crate::contract::Dtype::I8),
+                "{sk:?}: 出槽 I8(int8)"
+            );
             assert_eq!(m.param_names()[0], "x");
-            assert_eq!(m.param_names().last().copied(), Some("q"), "{sk:?}: 出槽末位");
+            assert_eq!(
+                m.param_names().last().copied(),
+                Some("q"),
+                "{sk:?}: 出槽末位"
+            );
         }
         // ddt:I8 放行(否则本臂的节点 dtype 过不了 eval)
         assert_eq!(
@@ -1138,18 +1289,26 @@ mod foreign_call_lock {
         let nt = 1usize;
         let tbl_words = (owl_kernels::family::gdn_chunked::IDX_OFF / 4) + 4 * nt;
         let tables = TensorOps::of_block(7, Dtype::U32, vec![tbl_words]);
-        let node = declare_chunked(&q, &k, &v, &beta, &gate, &state, &tables, nt, 3, 64, 48, 16, 128);
+        let node = declare_chunked(
+            &q, &k, &v, &beta, &gate, &state, &tables, nt, 3, 64, 48, 16, 128,
+        );
 
         // 解释器 Call 臂同款:pick → foreign sig kernel → lower_kernel
         let pick = owl_kernels::driver::resolve(OpReq {
-            op: SemanticKernel::GdnChunkedDelta.op_id(), env: &env(), dt: owl_kernels::driver::DType::F16,
-            shapes: &[], aux: &[], scalars: &[],
+            op: SemanticKernel::GdnChunkedDelta.op_id(),
+            env: &env(),
+            dt: owl_kernels::driver::DType::F16,
+            shapes: &[],
+            aux: &[],
+            scalars: &[],
         });
         let kernel = crate::kernel::Kernel::new(pick.name, "")
             .with_sig(foreign_sig(pick.name).expect("foreign sig"));
         let out = Bytes::new(99, 64 * 48 * 128, Dtype::F16, 3); // [t, nv, kd]
         let ins: Vec<Arg> = [&q, &k, &v, &beta, &gate, &state, &tables]
-            .iter().map(|t| Arg::block(t.id, t.dtype, t.shape.len() as u8)).collect();
+            .iter()
+            .map(|t| Arg::block(t.id, t.dtype, t.shape.len() as u8))
+            .collect();
         let msg = lower_kernel(&kernel, &node.args, &ins, &out, 64 * 48 * 128);
 
         // server 面 parse 逐位对拍(线格式四点锁的最后一环)
@@ -1170,7 +1329,11 @@ mod foreign_call_lock {
         assert_eq!(call.shape().nk, 16);
         assert_eq!(call.shape().kd, 128);
         // 槽序数:8 Block(含 tables)+ 7 sz(lower_kernel 对位 sig 全额)
-        let blocks = msg.args.iter().filter(|a| matches!(a, Arg::Block { .. })).count();
+        let blocks = msg
+            .args
+            .iter()
+            .filter(|a| matches!(a, Arg::Block { .. }))
+            .count();
         assert_eq!(blocks, 8);
         assert_eq!(msg.args.len(), 15);
     }
@@ -1184,21 +1347,36 @@ mod foreign_call_lock {
         let beta = TensorOps::of_block(5, Dtype::F32, vec![32, 8]);
         let state = TensorOps::of_block(6, Dtype::F32, vec![2, 8, 64, 64]);
         let node = TensorOps::call(SemanticKernel::GdnScalarDelta)
-            .arg(&q).arg(&k).arg(&v).arg(&g).arg(&beta).arg(&state)
-            .arg_usize(32).arg_usize(1).arg_usize(1)
-            .arg_usize(8).arg_usize(4).arg_usize(64)
+            .arg(&q)
+            .arg(&k)
+            .arg(&v)
+            .arg(&g)
+            .arg(&beta)
+            .arg(&state)
+            .arg_usize(32)
+            .arg_usize(1)
+            .arg_usize(1)
+            .arg_usize(8)
+            .arg_usize(4)
+            .arg_usize(64)
             .arg_bits((1.0f32 / (64f32).sqrt()).to_bits() as u64)
             .with_shape(Dtype::F16, vec![32, 8, 64]);
 
         let pick = owl_kernels::driver::resolve(OpReq {
-            op: SemanticKernel::GdnScalarDelta.op_id(), env: &env(), dt: owl_kernels::driver::DType::F32,
-            shapes: &[], aux: &[], scalars: &[],
+            op: SemanticKernel::GdnScalarDelta.op_id(),
+            env: &env(),
+            dt: owl_kernels::driver::DType::F32,
+            shapes: &[],
+            aux: &[],
+            scalars: &[],
         });
         let kernel = crate::kernel::Kernel::new(pick.name, "")
             .with_sig(foreign_sig(pick.name).expect("foreign sig"));
         let out = Bytes::new(99, 32 * 8 * 64, Dtype::F16, 3);
         let ins: Vec<Arg> = [&q, &k, &v, &g, &beta, &state]
-            .iter().map(|t| Arg::block(t.id, t.dtype, t.shape.len() as u8)).collect();
+            .iter()
+            .map(|t| Arg::block(t.id, t.dtype, t.shape.len() as u8))
+            .collect();
         let msg = lower_kernel(&kernel, &node.args, &ins, &out, 32 * 8 * 64);
 
         let (call, out2) = fc_scalar::GdnScalarCall::parse(&msg).expect("server parse");

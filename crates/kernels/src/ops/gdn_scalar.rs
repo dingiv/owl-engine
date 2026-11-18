@@ -3,11 +3,11 @@
 //! 与 [`crate::ops::gdn_chunked`] 同形:两者都是 **GDN 前向的编排入口**,
 //! 共享 `GDN_STATE` 状态池(rw / f32)。槽序权威历史 = `client::gdn_scalar::SIG`。
 
-use owl_macros::kernel_tags;
-use crate::contract::{Arg, Dtype, Law, OpError};
 use crate::bootcheck::CheckCtx;
+use crate::contract::{Arg, Dtype, Law, OpError};
 use crate::spec::check_from_params;
 use crate::spec::{meta_of, CaptureEvidence, Determinism, KernelMeta, KernelSpec, Param, ScalarTy};
+use owl_macros::kernel_tags;
 
 /// `gdn_scalar_delta_rule_fwd` —— GDN scalar 前向(单核 + cast 编排入口)
 pub struct GdnScalarDeltaRuleFwd;
@@ -15,7 +15,8 @@ pub struct GdnScalarDeltaRuleFwd;
 #[kernel_tags("dom.gdn", "role.attn", "phase.prefill")]
 impl KernelSpec for GdnScalarDeltaRuleFwd {
     /// 执行家族(声明驱动路由;见 `KernelSpec::FAMILY`)
-    const FAMILY: crate::contract::OpId = crate::contract::OpId(crate::family::gdn_scalar::GDN_SCALAR_FWD);
+    const FAMILY: crate::contract::OpId =
+        crate::contract::OpId(crate::family::gdn_scalar::GDN_SCALAR_FWD);
     const ENTRY: &'static str = crate::family::gdn_scalar::GDN_SCALAR_FWD;
     /// foreign(AOT cubin + cast 编排):无单一 `.cu` 源
     const SRC: &'static str = "";
@@ -47,8 +48,10 @@ impl KernelSpec for GdnScalarDeltaRuleFwd {
         // kd^-0.5 位型走私(显式 token)
         Param::s("scale_bits", ScalarTy::F32Bits),
     ];
-    const POOL: &'static [crate::spec::PoolAccess] =
-        &[crate::spec::PoolAccess::rw(crate::spec::pools::GDN_STATE, Dtype::F32)];
+    const POOL: &'static [crate::spec::PoolAccess] = &[crate::spec::PoolAccess::rw(
+        crate::spec::pools::GDN_STATE,
+        Dtype::F32,
+    )];
     const LAWS: &'static [Law] = &[Law::OutputFinite];
     const CAPTURE: CaptureEvidence = CaptureEvidence::NoHostWork;
     const DETERMINISM: Determinism = Determinism::Deterministic;
@@ -63,14 +66,15 @@ impl KernelSpec for GdnScalarDeltaRuleFwd {
     fn check(ctx: &CheckCtx<'_>) -> Result<(), OpError> {
         check_from_params(Self::ENTRY, Self::PARAMS, ctx)?;
         let idx = |name: &'static str| -> Result<usize, OpError> {
-            Self::PARAMS.iter().position(|p| p.name == name).ok_or_else(|| {
-                OpError::Contract {
+            Self::PARAMS
+                .iter()
+                .position(|p| p.name == name)
+                .ok_or_else(|| OpError::Contract {
                     op: Self::ENTRY.into(),
                     field: "PARAMS",
                     expect: "槽名在声明表".into(),
                     got: name.to_string(),
-                }
-            })
+                })
         };
         let sz = |name: &'static str| -> Result<u64, OpError> {
             let i = idx(name)?;
@@ -85,12 +89,14 @@ impl KernelSpec for GdnScalarDeltaRuleFwd {
                 }),
             }
         };
-        let n = ctx.arg_len(idx("state")?).ok_or_else(|| OpError::Contract {
-            op: Self::ENTRY.into(),
-            field: "state",
-            expect: "状态块在账本(可查账长)".into(),
-            got: "未知块/不在账本".into(),
-        })?;
+        let n = ctx
+            .arg_len(idx("state")?)
+            .ok_or_else(|| OpError::Contract {
+                op: Self::ENTRY.into(),
+                field: "state",
+                expect: "状态块在账本(可查账长)".into(),
+                got: "未知块/不在账本".into(),
+            })?;
         let (hv, kd) = (sz("nv")?, sz("kd")?);
         let stride = hv
             .checked_mul(kd)
@@ -125,7 +131,6 @@ impl KernelSpec for GdnScalarDeltaRuleFwd {
 }
 
 pub static GDN_SCALAR_FWD: KernelMeta = meta_of::<GdnScalarDeltaRuleFwd>();
-
 
 #[cfg(test)]
 mod tests {

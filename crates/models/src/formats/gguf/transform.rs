@@ -86,9 +86,19 @@ pub enum RowPerm {
     /// **整张量按 v-head 重排**(行 = v-head 连续段)
     VHead { nk: usize, nv: usize, hd: usize },
     /// **仅 V 段**重排(q/k 段直拷;`attn_qkv`)
-    VSegOnly { nk: usize, nv: usize, hd: usize, seg_off: usize },
+    VSegOnly {
+        nk: usize,
+        nv: usize,
+        hd: usize,
+        seg_off: usize,
+    },
     /// **仅 V 通道段**重排(`conv1d`;F32 host)
-    VChanOnly { nk: usize, nv: usize, hd: usize, seg_off: usize },
+    VChanOnly {
+        nk: usize,
+        nv: usize,
+        hd: usize,
+        seg_off: usize,
+    },
     /// **列**(内维)重排 —— 跨块 ⇒ 由**激活侧**负责(`ssm_out`);源不动字节
     ColVHead { nk: usize, nv: usize, hd: usize },
 }
@@ -101,7 +111,10 @@ pub struct KeyXf {
 }
 
 impl KeyXf {
-    pub const IDENTITY: KeyXf = KeyXf { value: ValueXf::None, row_perm: RowPerm::No };
+    pub const IDENTITY: KeyXf = KeyXf {
+        value: ValueXf::None,
+        row_perm: RowPerm::No,
+    };
     /// 源是否需要动字节(行置换)
     pub fn touches_bytes(&self) -> bool {
         !matches!(self.row_perm, RowPerm::No | RowPerm::ColVHead { .. })
@@ -181,43 +194,71 @@ pub fn classify(name: &str) -> KeyClass {
 pub fn xf_for(name: &str, d: &GgufDims) -> Result<KeyXf, ModelError> {
     let active = d.vhead_active();
     let (_, _, v) = d.seg();
-    let ok = |p: RowPerm| KeyXf { value: ValueXf::None, row_perm: p };
+    let ok = |p: RowPerm| KeyXf {
+        value: ValueXf::None,
+        row_perm: p,
+    };
     let out = match classify(name) {
         KeyClass::Embed | KeyClass::Head | KeyClass::Norm | KeyClass::Unknown => KeyXf::IDENTITY,
         KeyClass::Plain => KeyXf::IDENTITY,
         KeyClass::Gdn(GdnPart::Norm) => KeyXf::IDENTITY,
         KeyClass::Gdn(GdnPart::A) => {
             let row = if active {
-                RowPerm::VHead { nk: d.nk, nv: d.nv, hd: 1 }
+                RowPerm::VHead {
+                    nk: d.nk,
+                    nv: d.nv,
+                    hd: 1,
+                }
             } else {
                 RowPerm::No
             };
-            KeyXf { value: ValueXf::LnNeg, row_perm: row }
+            KeyXf {
+                value: ValueXf::LnNeg,
+                row_perm: row,
+            }
         }
         KeyClass::Gdn(GdnPart::Dt) | KeyClass::Gdn(GdnPart::Ab) => {
             if active {
-                ok(RowPerm::VHead { nk: d.nk, nv: d.nv, hd: 1 })
+                ok(RowPerm::VHead {
+                    nk: d.nk,
+                    nv: d.nv,
+                    hd: 1,
+                })
             } else {
                 KeyXf::IDENTITY
             }
         }
         KeyClass::Gdn(GdnPart::Z) => {
             if active {
-                ok(RowPerm::VHead { nk: d.nk, nv: d.nv, hd: d.hv })
+                ok(RowPerm::VHead {
+                    nk: d.nk,
+                    nv: d.nv,
+                    hd: d.hv,
+                })
             } else {
                 KeyXf::IDENTITY
             }
         }
         KeyClass::Gdn(GdnPart::Qkv) => {
             if active {
-                ok(RowPerm::VSegOnly { nk: d.nk, nv: d.nv, hd: d.hv, seg_off: d.nk * d.hk * 2 })
+                ok(RowPerm::VSegOnly {
+                    nk: d.nk,
+                    nv: d.nv,
+                    hd: d.hv,
+                    seg_off: d.nk * d.hk * 2,
+                })
             } else {
                 KeyXf::IDENTITY
             }
         }
         KeyClass::Gdn(GdnPart::Conv) => {
             if active {
-                ok(RowPerm::VChanOnly { nk: d.nk, nv: d.nv, hd: d.hv, seg_off: d.nk * d.hk * 2 })
+                ok(RowPerm::VChanOnly {
+                    nk: d.nk,
+                    nv: d.nv,
+                    hd: d.hv,
+                    seg_off: d.nk * d.hk * 2,
+                })
             } else {
                 KeyXf::IDENTITY
             }
@@ -226,7 +267,11 @@ pub fn xf_for(name: &str, d: &GgufDims) -> Result<KeyXf, ModelError> {
             // 列重排:源不动字节,**调用方**在激活侧做(`owl_gguf_gather_cols`)
             let _ = v;
             if active {
-                ok(RowPerm::ColVHead { nk: d.nk, nv: d.nv, hd: d.hv })
+                ok(RowPerm::ColVHead {
+                    nk: d.nk,
+                    nv: d.nv,
+                    hd: d.hv,
+                })
             } else {
                 KeyXf::IDENTITY
             }
@@ -446,7 +491,10 @@ pub fn vhead_q8_blocks_rank(
 }
 
 /// 全模型逐键变换清单(诊断/门:列出所有**非恒等**键)
-pub fn non_identity_keys(g: &crate::formats::gguf::reader::Gguf, d: &GgufDims) -> Vec<(String, KeyXf)> {
+pub fn non_identity_keys(
+    g: &crate::formats::gguf::reader::Gguf,
+    d: &GgufDims,
+) -> Vec<(String, KeyXf)> {
     let mut out = Vec::new();
     for t in &g.tensors {
         if let Ok(xf) = xf_for(&t.name, d) {
@@ -468,10 +516,24 @@ mod tests {
     use super::*;
 
     fn dims_4b() -> GgufDims {
-        GgufDims { nk: 16, nv: 32, hk: 128, hv: 128, nq: 16, nkv: 4 }
+        GgufDims {
+            nk: 16,
+            nv: 32,
+            hk: 128,
+            hv: 128,
+            nq: 16,
+            nkv: 4,
+        }
     }
     fn dims_27b() -> GgufDims {
-        GgufDims { nk: 16, nv: 48, hk: 128, hv: 128, nq: 24, nkv: 4 }
+        GgufDims {
+            nk: 16,
+            nv: 48,
+            hk: 128,
+            hv: 128,
+            nq: 24,
+            nkv: 4,
+        }
     }
 
     /// **逆重排公式自证**:`perm` 与写侧公式互逆(往返 = 恒等)
@@ -500,14 +562,96 @@ mod tests {
     fn xf_table_4b() {
         let d = dims_4b();
         let cases: &[(&str, KeyXf)] = &[
-            ("blk.0.attn_qkv.weight", KeyXf { value: ValueXf::None, row_perm: RowPerm::VSegOnly { nk: 16, nv: 32, hd: 128, seg_off: 4096 } }),
-            ("blk.0.attn_gate.weight", KeyXf { value: ValueXf::None, row_perm: RowPerm::VHead { nk: 16, nv: 32, hd: 128 } }),
-            ("blk.0.ssm_out.weight", KeyXf { value: ValueXf::None, row_perm: RowPerm::ColVHead { nk: 16, nv: 32, hd: 128 } }),
-            ("blk.0.ssm_alpha.weight", KeyXf { value: ValueXf::None, row_perm: RowPerm::VHead { nk: 16, nv: 32, hd: 1 } }),
-            ("blk.0.ssm_beta.weight", KeyXf { value: ValueXf::None, row_perm: RowPerm::VHead { nk: 16, nv: 32, hd: 1 } }),
-            ("blk.0.ssm_dt.bias", KeyXf { value: ValueXf::None, row_perm: RowPerm::VHead { nk: 16, nv: 32, hd: 1 } }),
-            ("blk.0.ssm_a", KeyXf { value: ValueXf::LnNeg, row_perm: RowPerm::VHead { nk: 16, nv: 32, hd: 1 } }),
-            ("blk.0.ssm_conv1d.weight", KeyXf { value: ValueXf::None, row_perm: RowPerm::VChanOnly { nk: 16, nv: 32, hd: 128, seg_off: 4096 } }),
+            (
+                "blk.0.attn_qkv.weight",
+                KeyXf {
+                    value: ValueXf::None,
+                    row_perm: RowPerm::VSegOnly {
+                        nk: 16,
+                        nv: 32,
+                        hd: 128,
+                        seg_off: 4096,
+                    },
+                },
+            ),
+            (
+                "blk.0.attn_gate.weight",
+                KeyXf {
+                    value: ValueXf::None,
+                    row_perm: RowPerm::VHead {
+                        nk: 16,
+                        nv: 32,
+                        hd: 128,
+                    },
+                },
+            ),
+            (
+                "blk.0.ssm_out.weight",
+                KeyXf {
+                    value: ValueXf::None,
+                    row_perm: RowPerm::ColVHead {
+                        nk: 16,
+                        nv: 32,
+                        hd: 128,
+                    },
+                },
+            ),
+            (
+                "blk.0.ssm_alpha.weight",
+                KeyXf {
+                    value: ValueXf::None,
+                    row_perm: RowPerm::VHead {
+                        nk: 16,
+                        nv: 32,
+                        hd: 1,
+                    },
+                },
+            ),
+            (
+                "blk.0.ssm_beta.weight",
+                KeyXf {
+                    value: ValueXf::None,
+                    row_perm: RowPerm::VHead {
+                        nk: 16,
+                        nv: 32,
+                        hd: 1,
+                    },
+                },
+            ),
+            (
+                "blk.0.ssm_dt.bias",
+                KeyXf {
+                    value: ValueXf::None,
+                    row_perm: RowPerm::VHead {
+                        nk: 16,
+                        nv: 32,
+                        hd: 1,
+                    },
+                },
+            ),
+            (
+                "blk.0.ssm_a",
+                KeyXf {
+                    value: ValueXf::LnNeg,
+                    row_perm: RowPerm::VHead {
+                        nk: 16,
+                        nv: 32,
+                        hd: 1,
+                    },
+                },
+            ),
+            (
+                "blk.0.ssm_conv1d.weight",
+                KeyXf {
+                    value: ValueXf::None,
+                    row_perm: RowPerm::VChanOnly {
+                        nk: 16,
+                        nv: 32,
+                        hd: 128,
+                        seg_off: 4096,
+                    },
+                },
+            ),
             // 恒等:norm 族(ssm_norm **不 +1**;两个 layernorm 走语义法)/ ffn / full-attn / 顶层
             ("blk.0.ssm_norm.weight", KeyXf::IDENTITY),
             ("blk.0.attn_norm.weight", KeyXf::IDENTITY),
@@ -533,11 +677,20 @@ mod tests {
         let d27 = dims_27b();
         assert_eq!(
             xf_for("blk.1.attn_gate.weight", &d27).unwrap().row_perm,
-            RowPerm::VHead { nk: 16, nv: 48, hd: 128 }
+            RowPerm::VHead {
+                nk: 16,
+                nv: 48,
+                hd: 128
+            }
         );
         assert_eq!(
             xf_for("blk.1.attn_qkv.weight", &d27).unwrap().row_perm,
-            RowPerm::VSegOnly { nk: 16, nv: 48, hd: 128, seg_off: 4096 }
+            RowPerm::VSegOnly {
+                nk: 16,
+                nv: 48,
+                hd: 128,
+                seg_off: 4096
+            }
         );
     }
 
@@ -550,27 +703,45 @@ mod tests {
     fn rank_head_order_27b_two_atom_regimes() {
         let (nk, nv, hv) = (16, 48, 128);
         let o0 = rank_head_order(nk, nv, hv, 32, 2, 0).expect("order");
-        assert_eq!(o0, (0..24).collect::<Vec<_>>(), "32 块量子 rank0 = grouped 窗口");
+        assert_eq!(
+            o0,
+            (0..24).collect::<Vec<_>>(),
+            "32 块量子 rank0 = grouped 窗口"
+        );
         let o1 = rank_head_order(nk, nv, hv, 32, 2, 1).expect("order");
-        assert_eq!(o1, (24..48).collect::<Vec<_>>(), "32 块量子 rank1 = grouped 窗口");
+        assert_eq!(
+            o1,
+            (24..48).collect::<Vec<_>>(),
+            "32 块量子 rank1 = grouped 窗口"
+        );
         // 原子序 = 文件头 [0..7] ∪ [16..23] ∪ [32..39] 各自的 grouped 头
         let a0 = rank_head_order(nk, nv, hv, 256, 2, 0).expect("order");
         assert_eq!(
             a0,
-            vec![0, 3, 6, 9, 12, 15, 18, 21, 1, 4, 7, 10, 13, 16, 19, 22, 2, 5, 8, 11, 14, 17, 20, 23]
+            vec![
+                0, 3, 6, 9, 12, 15, 18, 21, 1, 4, 7, 10, 13, 16, 19, 22, 2, 5, 8, 11, 14, 17, 20,
+                23
+            ]
         );
         let a1 = rank_head_order(nk, nv, hv, 256, 2, 1).expect("order");
         assert_eq!(a1.len(), 24);
         let mut all = a0.clone();
         all.extend(&a1);
         all.sort_unstable();
-        assert_eq!(all, (0..48).collect::<Vec<_>>(), "两 rank 头序并集 = 全量、无重");
+        assert_eq!(
+            all,
+            (0..48).collect::<Vec<_>>(),
+            "两 rank 头序并集 = 全量、无重"
+        );
         // 互不整除 ⇒ 响亮拒(不许静默 pad)
         assert!(
             rank_head_order(nk, nv, 96, 256, 2, 0).is_err(),
             "hv=96 vs atom=256 应拒"
         );
-        assert!(rank_head_order(nk, nv, hv, 256, 0, 0).is_err(), "world=0 应拒");
+        assert!(
+            rank_head_order(nk, nv, hv, 256, 0, 0).is_err(),
+            "world=0 应拒"
+        );
     }
 
     /// **per-rank 表**:与头序同源;`atom | hv` ⇒ 窗口恒等;是局部块置换
@@ -602,11 +773,27 @@ mod tests {
     /// 且 GDN 的 `nk == nv` 档(如 0.8B nv=16=nk)也恒等(转换器 early-return)
     #[test]
     fn no_perm_when_not_needed() {
-        let d = GgufDims { nk: 16, nv: 16, hk: 128, hv: 128, nq: 8, nkv: 2 };
+        let d = GgufDims {
+            nk: 16,
+            nv: 16,
+            hk: 128,
+            hv: 128,
+            nq: 8,
+            nkv: 2,
+        };
         assert!(!d.vhead_active());
-        assert_eq!(xf_for("blk.0.attn_gate.weight", &d).unwrap(), KeyXf::IDENTITY);
+        assert_eq!(
+            xf_for("blk.0.attn_gate.weight", &d).unwrap(),
+            KeyXf::IDENTITY
+        );
         assert_eq!(xf_for("blk.0.ssm_out.weight", &d).unwrap(), KeyXf::IDENTITY);
-        assert_eq!(xf_for("blk.0.ssm_a", &d).unwrap(), KeyXf { value: ValueXf::LnNeg, row_perm: RowPerm::No });
+        assert_eq!(
+            xf_for("blk.0.ssm_a", &d).unwrap(),
+            KeyXf {
+                value: ValueXf::LnNeg,
+                row_perm: RowPerm::No
+            }
+        );
     }
 
     /// **列(内维)置换**(原生件装载期扭回;设计 §11.4 落点 `ColVHead`)
@@ -625,8 +812,8 @@ mod tests {
         assert_eq!(
             v,
             vec![
-                0.0, 1.0, 8.0, 9.0, 2.0, 3.0, 10.0, 11.0, 4.0, 5.0, 12.0, 13.0, 6.0, 7.0,
-                14.0, 15.0
+                0.0, 1.0, 8.0, 9.0, 2.0, 3.0, 10.0, 11.0, 4.0, 5.0, 12.0, 13.0, 6.0, 7.0, 14.0,
+                15.0
             ],
             "列置换顺序不符(文件 head 0,4,1,5,… 应落到 HF head 0,1,2,3,…)"
         );
@@ -643,7 +830,11 @@ mod tests {
         for (j, s) in inv.iter().enumerate() {
             back[j] = src[*s as usize];
         }
-        assert_eq!(back, (0..inner).map(|i| i as f32).collect::<Vec<_>>(), "往返 ≠ 恒等");
+        assert_eq!(
+            back,
+            (0..inner).map(|i| i as f32).collect::<Vec<_>>(),
+            "往返 ≠ 恒等"
+        );
         // 多行同表(行间独立)
         let mut v2: Vec<f32> = (0..2 * inner).map(|i| i as f32).collect();
         col_deperm_in_place(&mut v2, 2, inner, nk, nv, hd).expect("两行");
@@ -652,7 +843,9 @@ mod tests {
         assert_eq!(&v2[inner..], &v2_want[..], "第二行未按同表置换(行间应独立)");
         // 形态门:内维不是 nv·hd ⇒ 响亮拒
         let mut bad = vec![0f32; rows * inner];
-        let e = col_deperm_in_place(&mut bad, rows, inner - 1, nk, nv, hd).unwrap_err().to_string();
+        let e = col_deperm_in_place(&mut bad, rows, inner - 1, nk, nv, hd)
+            .unwrap_err()
+            .to_string();
         assert!(e.contains("形态不符"), "{e}");
     }
 
@@ -695,8 +888,12 @@ mod tests {
     #[test]
     fn xf_flags() {
         let d = dims_4b();
-        assert!(xf_for("blk.0.attn_gate.weight", &d).unwrap().touches_bytes());
-        assert!(xf_for("blk.0.ssm_alpha.weight", &d).unwrap().touches_bytes());
+        assert!(xf_for("blk.0.attn_gate.weight", &d)
+            .unwrap()
+            .touches_bytes());
+        assert!(xf_for("blk.0.ssm_alpha.weight", &d)
+            .unwrap()
+            .touches_bytes());
         // 列置换**不碰字节**(激活侧做)
         assert!(!xf_for("blk.0.ssm_out.weight", &d).unwrap().touches_bytes());
         // 恒等

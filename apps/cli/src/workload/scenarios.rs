@@ -27,7 +27,11 @@ fn session(pid: u32, tag: &str) -> String {
 }
 
 fn ensure(cond: bool, msg: impl Into<String>) -> Result<(), String> {
-    if cond { Ok(()) } else { Err(msg.into()) }
+    if cond {
+        Ok(())
+    } else {
+        Err(msg.into())
+    }
 }
 
 fn lower(s: &str) -> String {
@@ -141,8 +145,14 @@ pub(crate) fn gui_agent_screenshots(
             names.iter().filter(|n| *n == "click").count() >= 2,
             format!("点击次数不足: {names:?}"),
         )?;
-        ensure(names.iter().any(|n| n == "type"), format!("没有 type: {names:?}"))?;
-        ensure(names.iter().any(|n| n == "key"), format!("没有 key: {names:?}"))?;
+        ensure(
+            names.iter().any(|n| n == "type"),
+            format!("没有 type: {names:?}"),
+        )?;
+        ensure(
+            names.iter().any(|n| n == "key"),
+            format!("没有 key: {names:?}"),
+        )?;
         ensure(
             names.len() >= 6,
             format!("工具调用少于 6 次,不足以触发图片窗口: {names:?}"),
@@ -152,8 +162,10 @@ pub(crate) fn gui_agent_screenshots(
         let max_images = ctx.turns.iter().map(|t| t.images).max().unwrap_or(0);
         ensure(
             max_images <= 3,
-            format!("请求里图片数超过 3: {max_images}(turns={:?})",
-                ctx.turns.iter().map(|t| t.images).collect::<Vec<_>>()),
+            format!(
+                "请求里图片数超过 3: {max_images}(turns={:?})",
+                ctx.turns.iter().map(|t| t.images).collect::<Vec<_>>()
+            ),
         )?;
         ensure(
             ctx.image_prunes.len() >= 3,
@@ -170,7 +182,9 @@ pub(crate) fn gui_agent_screenshots(
                 absorbed >= 3,
                 format!(
                     "服务端只吸收 {absorbed} 次旧图删除(期望 ≥3);img-evict={:?}",
-                    log.lines().filter(|l| l.contains("img-evict")).collect::<Vec<_>>()
+                    log.lines()
+                        .filter(|l| l.contains("img-evict"))
+                        .collect::<Vec<_>>()
                 ),
             )?;
         }
@@ -187,8 +201,15 @@ pub(crate) fn gui_agent_screenshots(
             warm >= 30.0,
             format!("三图窗口下 cached 最高只有 {warm:.1}%(前缀/删图吸收失败)"),
         )?;
-        ensure(has(&reply, "yellow"), format!("最终颜色不是 yellow: {:?}", reply.text()))?;
-        let screen = ctx.gui.as_ref().map(gui::GuiAgent::screen).unwrap_or((0, 0, 0));
+        ensure(
+            has(&reply, "yellow"),
+            format!("最终颜色不是 yellow: {:?}", reply.text()),
+        )?;
+        let screen = ctx
+            .gui
+            .as_ref()
+            .map(gui::GuiAgent::screen)
+            .unwrap_or((0, 0, 0));
         ensure(
             screen == crate::workload::png::YELLOW,
             format!("GUI 终态颜色 {screen:?} != yellow"),
@@ -233,7 +254,10 @@ pub(crate) fn gui_capability_prompt(
         ws.path(),
     );
     ctx.log_path = args.server_log.as_ref().map(std::path::PathBuf::from);
-    ctx.system(&format!("{SYS_GUI} {SYS_GUI_TOOL_GUARD} Run tag: {}.", nonce(pid)));
+    ctx.system(&format!(
+        "{SYS_GUI} {SYS_GUI_TOOL_GUARD} Run tag: {}.",
+        nonce(pid)
+    ));
     ctx.gui = Some(gui::GuiAgent::new());
     ctx.image_limit = Some(3);
     let result = (|| -> Result<String, String> {
@@ -295,7 +319,10 @@ pub(crate) fn text_multiturn(
         let r2 = ctx.send(json!(
             "What is the codeword? Answer with the codeword only."
         ))?;
-        ensure(has(&r2, "BLUE-OTTER-42"), format!("第二轮丢码字: {:?}", r2.text()))?;
+        ensure(
+            has(&r2, "BLUE-OTTER-42"),
+            format!("第二轮丢码字: {:?}", r2.text()),
+        )?;
         let r3 = ctx.send(json!(
             "Write one short sentence that contains the codeword and the word owl."
         ))?;
@@ -303,11 +330,11 @@ pub(crate) fn text_multiturn(
         ensure(has(&r3, "owl"), "第三轮没有 owl")?;
         let t2 = &ctx.turns[1];
         let t3 = &ctx.turns[2];
-        ensure(t2.cached > 0, format!("第二轮 cached=0(前缀守卫失败): {t2:?}"))?;
         ensure(
-            t2.prompt > 0 && t3.prompt > 0,
-            "usage.prompt_tokens 未上报",
+            t2.cached > 0,
+            format!("第二轮 cached=0(前缀守卫失败): {t2:?}"),
         )?;
+        ensure(t2.prompt > 0 && t3.prompt > 0, "usage.prompt_tokens 未上报")?;
         Ok(format!(
             "2nd cached {:.1}% / 3rd cached {:.1}%",
             t2.cached_pct(),
@@ -342,7 +369,10 @@ pub(crate) fn tool_roundtrip(
         ))?;
         let names = tool_names(&ctx);
         ensure(!names.is_empty(), "模型没有调用任何工具")?;
-        ensure(names.iter().any(|n| n == "write"), format!("没有 write 调用: {names:?}"))?;
+        ensure(
+            names.iter().any(|n| n == "write"),
+            format!("没有 write 调用: {names:?}"),
+        )?;
         ensure(
             names.iter().any(|n| n == "read" || n == "bash"),
             format!("没有 read/bash 验证: {names:?}"),
@@ -353,7 +383,10 @@ pub(crate) fn tool_roundtrip(
             content == "owl-tool-ok",
             format!("文件内容不符: {content:?}"),
         )?;
-        ensure(has(&reply, "11"), format!("最终答复没报 11: {:?}", reply.text()))?;
+        ensure(
+            has(&reply, "11"),
+            format!("最终答复没报 11: {:?}", reply.text()),
+        )?;
         Ok(format!("tools={names:?}, bytes=11"))
     })();
     Ok(report("tool_roundtrip", ctx, result))
@@ -384,8 +417,14 @@ pub(crate) fn vision_chat(
             image_part(&red, false),
             image_part(&blue, false),
         ]))?;
-        ensure(has(&reply, "red"), format!("没识别红色: {:?}", reply.text()))?;
-        ensure(has(&reply, "blue"), format!("没识别蓝色: {:?}", reply.text()))?;
+        ensure(
+            has(&reply, "red"),
+            format!("没识别红色: {:?}", reply.text()),
+        )?;
+        ensure(
+            has(&reply, "blue"),
+            format!("没识别蓝色: {:?}", reply.text()),
+        )?;
         Ok("red + blue".to_string())
     })();
     Ok(report("vision_chat", ctx, result))
@@ -445,10 +484,10 @@ pub(crate) fn image_content_identity(
             let v: Value = serde_json::from_str(s).ok()?;
             Some((v.get("x")?.as_f64()?, v.get("y")?.as_f64()?))
         };
-        let (ax, ay) = json_point(a1.text())
-            .ok_or_else(|| format!("A 答复不解析: {:?}", a1.text()))?;
-        let (bx, by) = json_point(b1.text())
-            .ok_or_else(|| format!("B 答复不解析: {:?}", b1.text()))?;
+        let (ax, ay) =
+            json_point(a1.text()).ok_or_else(|| format!("A 答复不解析: {:?}", a1.text()))?;
+        let (bx, by) =
+            json_point(b1.text()).ok_or_else(|| format!("B 答复不解析: {:?}", b1.text()))?;
         // ① 坐标必须**随图变**(修前逐字节相同 = 复用了上一张图的 KV)
         ensure(
             (ax, ay) != (bx, by),
@@ -496,14 +535,20 @@ pub(crate) fn mixed_tool_image(
             {"type": "text", "text": "This is a screenshot. Create a file named color.txt containing the dominant colour of the image as one lowercase English word (no newline). Then read it back. Finally answer with the colour."},
         ]))?;
         let names = tool_names(&ctx);
-        ensure(names.iter().any(|n| n == "write"), format!("没有 write: {names:?}"))?;
+        ensure(
+            names.iter().any(|n| n == "write"),
+            format!("没有 write: {names:?}"),
+        )?;
         let path = ws.path().join("color.txt");
         let color = std::fs::read_to_string(&path)
             .map_err(|e| format!("color.txt: {e}"))?
             .trim()
             .to_lowercase();
         ensure(color == "red", format!("color.txt={color:?}"))?;
-        ensure(has(&reply, "red"), format!("最终答复没红: {:?}", reply.text()))?;
+        ensure(
+            has(&reply, "red"),
+            format!("最终答复没红: {:?}", reply.text()),
+        )?;
         Ok(format!("tools={names:?}, color=red"))
     })();
     Ok(report("mixed_tool_image", ctx, result))
@@ -521,13 +566,18 @@ fn assert_image_delete_absorbed(
             log_has_absorbed(log),
             format!(
                 "{label}: server log 未出现吸收;img-evict 行: {:?}",
-                log.lines().filter(|l| l.contains("img-evict")).collect::<Vec<_>>()
+                log.lines()
+                    .filter(|l| l.contains("img-evict"))
+                    .collect::<Vec<_>>()
             ),
         )?;
     }
     ensure(
         last.cached > 0,
-        format!("{label}: cached=0(删点之后重算;log 吸收证据={})", log_has_absorbed(log)),
+        format!(
+            "{label}: cached=0(删点之后重算;log 吸收证据={})",
+            log_has_absorbed(log)
+        ),
     )?;
     ensure(
         last.cached_pct() >= min_cached_pct,
@@ -582,7 +632,10 @@ fn delete_arm(
     ))?;
     let log = ctx.log_since(log_mark);
     let log_absorbed = log_has_absorbed(&log);
-    ensure(has(&reply, "blue"), format!("保留图没答蓝: {:?}", reply.text()))?;
+    ensure(
+        has(&reply, "blue"),
+        format!("保留图没答蓝: {:?}", reply.text()),
+    )?;
     let last = ctx.last();
     if marked {
         // Release builds compile counter_add! out (zero overhead); the info log is
@@ -590,8 +643,12 @@ fn delete_arm(
         if log_path.is_some() {
             ensure(
                 log_absorbed,
-                format!("server log 未出现吸收(marked);img-evict 行: {:?}",
-                    log.lines().filter(|l| l.contains("img-evict")).collect::<Vec<_>>()),
+                format!(
+                    "server log 未出现吸收(marked);img-evict 行: {:?}",
+                    log.lines()
+                        .filter(|l| l.contains("img-evict"))
+                        .collect::<Vec<_>>()
+                ),
             )?;
         }
         ensure(
@@ -606,15 +663,22 @@ fn delete_arm(
         if log_path.is_some() {
             ensure(
                 !log_absorbed,
-                format!("control 臂不应吸收,但日志出现前缀无感删除: {:?}",
-                    log.lines().filter(|l| l.contains("img-evict")).collect::<Vec<_>>()),
+                format!(
+                    "control 臂不应吸收,但日志出现前缀无感删除: {:?}",
+                    log.lines()
+                        .filter(|l| l.contains("img-evict"))
+                        .collect::<Vec<_>>()
+                ),
             )?;
         }
         // 无日志时的弱判据:只靠前缀(删点之前)命中。不同 prompt 形状下
         // 这份前缀可以到 30%+;有日志时上面的 `!log_absorbed` 才是硬判据。
         ensure(
             last.cached_pct() < 50.0,
-            format!("control 臂 cached={:.1}%(删点之后不应命中)", last.cached_pct()),
+            format!(
+                "control 臂 cached={:.1}%(删点之后不应命中)",
+                last.cached_pct()
+            ),
         )?;
     }
     let detail = format!(
@@ -650,7 +714,16 @@ pub(crate) fn image_delete_marked(
     let log_path = args.server_log.as_ref().map(std::path::Path::new);
     let nonce = nonce(pid);
     for (tag, sess, marked) in arms {
-        match delete_arm(client, max_tokens, ws.path(), tag, &nonce, sess, marked, log_path) {
+        match delete_arm(
+            client,
+            max_tokens,
+            ws.path(),
+            tag,
+            &nonce,
+            sess,
+            marked,
+            log_path,
+        ) {
             Ok((t, d)) => {
                 turns.extend(t);
                 details.push(d);
@@ -711,9 +784,18 @@ pub(crate) fn image_delete_middle(
              in order, separated by a comma. Use one lowercase English colour word per image."
         ))?;
         let log = ctx.log_since(log_mark);
-        ensure(has(&reply, "red"), format!("剩余图没答红: {:?}", reply.text()))?;
-        ensure(has(&reply, "blue"), format!("剩余图没答蓝: {:?}", reply.text()))?;
-        ensure(!has(&reply, "green"), format!("删掉的绿图又被提到: {:?}", reply.text()))?;
+        ensure(
+            has(&reply, "red"),
+            format!("剩余图没答红: {:?}", reply.text()),
+        )?;
+        ensure(
+            has(&reply, "blue"),
+            format!("剩余图没答蓝: {:?}", reply.text()),
+        )?;
+        ensure(
+            !has(&reply, "green"),
+            format!("删掉的绿图又被提到: {:?}", reply.text()),
+        )?;
         assert_image_delete_absorbed("middle", ctx.last(), &log, ctx.log_path.is_some(), 55.0)?;
         Ok(format!(
             "middle removed; remaining=red+blue; cached={:.1}%",
@@ -767,7 +849,10 @@ pub(crate) fn image_delete_last_image(
              answer with one lowercase English colour word."
         ))?;
         let log = ctx.log_since(log_mark);
-        ensure(has(&reply, "red"), format!("没回忆出红色: {:?}", reply.text()))?;
+        ensure(
+            has(&reply, "red"),
+            format!("没回忆出红色: {:?}", reply.text()),
+        )?;
         assert_image_delete_absorbed("last", ctx.last(), &log, ctx.log_path.is_some(), 55.0)?;
         Ok(format!(
             "only image removed; history has no images; recalled=red; cached={:.1}%",
@@ -835,7 +920,10 @@ pub(crate) fn image_delete_with_tool_round(
             post_tools.iter().any(|n| n == "read" || n == "bash"),
             format!("删图后的工具轮没有 read/bash: {post_tools:?}"),
         )?;
-        ensure(has(&reply, "red"), format!("最终答复没红: {:?}", reply.text()))?;
+        ensure(
+            has(&reply, "red"),
+            format!("最终答复没红: {:?}", reply.text()),
+        )?;
         ensure(
             std::fs::read_to_string(&path).is_ok_and(|c| c.trim() == "red"),
             "color.txt 在删图后被改坏",
@@ -899,7 +987,10 @@ pub(crate) fn image_sliding_window(
                 {"type": "text", "text": "Describe the screenshot in one short sentence."},
             ]))?;
             let log = ctx.log_since(log_mark);
-            ensure(!reply.text().trim().is_empty(), format!("turn {} 回答为空", k + 1))?;
+            ensure(
+                !reply.text().trim().is_empty(),
+                format!("turn {} 回答为空", k + 1),
+            )?;
             let last = ctx.last();
             if k < 3 {
                 ensure(
@@ -914,7 +1005,9 @@ pub(crate) fn image_sliding_window(
                             "turn {} 删图未吸收(server log);cached={:.1}% img-evict={:?}",
                             k + 1,
                             last.cached_pct(),
-                            log.lines().filter(|l| l.contains("img-evict")).collect::<Vec<_>>()
+                            log.lines()
+                                .filter(|l| l.contains("img-evict"))
+                                .collect::<Vec<_>>()
                         ),
                     )?;
                 }

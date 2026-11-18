@@ -136,10 +136,7 @@ impl TpPlan {
     ///
     /// 为什么必须支持:27B 的 `q_proj [12288, 5120]` 是 `q(24×256) ⊕ gate(24×256)`
     /// 融合,按头切后本 rank 要的是"两段各前 3072 行"—— **不是一段连续行区间**。
-    pub fn segmented_ranges(
-        &self,
-        segments: &[usize],
-    ) -> Result<Vec<Range<usize>>, String> {
+    pub fn segmented_ranges(&self, segments: &[usize]) -> Result<Vec<Range<usize>>, String> {
         segments.iter().map(|&len| self.shard_range(len)).collect()
     }
 
@@ -230,7 +227,9 @@ pub fn slice_last_dim_f32(
         ));
     }
     if cols.start > cols.end || cols.end > in_dim {
-        return Err(format!("slice_last_dim: 列区间 {cols:?} 越界(in_dim={in_dim})"));
+        return Err(format!(
+            "slice_last_dim: 列区间 {cols:?} 越界(in_dim={in_dim})"
+        ));
     }
     let rows = x.len() / in_dim;
     let n = cols.len();
@@ -324,14 +323,20 @@ mod tests {
     fn row_parallel_partial_sums_equal_full_product() {
         let (out_dim, in_dim, world) = (4usize, 6usize, 2usize);
         // 确定性伪随机权重/输入(避免 rand 依赖)
-        let w: Vec<f32> = (0..out_dim * in_dim).map(|i| ((i * 37) % 19) as f32 * 0.25 - 2.0).collect();
-        let x: Vec<f32> = (0..in_dim).map(|i| ((i * 11) % 13) as f32 * 0.5 - 3.0).collect();
+        let w: Vec<f32> = (0..out_dim * in_dim)
+            .map(|i| ((i * 37) % 19) as f32 * 0.25 - 2.0)
+            .collect();
+        let x: Vec<f32> = (0..in_dim)
+            .map(|i| ((i * 11) % 13) as f32 * 0.5 - 3.0)
+            .collect();
         let full = matvec(&w, out_dim, in_dim, &x);
 
         let mut acc = vec![0.0f32; out_dim];
         for rank in 0..world {
             let p = plan(rank, world);
-            let cols = p.weight_cols(TpSplit::RowParallel, out_dim, in_dim).unwrap();
+            let cols = p
+                .weight_cols(TpSplit::RowParallel, out_dim, in_dim)
+                .unwrap();
             let n_cols = cols.len();
             let w_shard = take_cols_f32(&w, in_dim, cols.clone()).unwrap();
             let x_shard = slice_last_dim_f32(&x, in_dim, cols).unwrap();
@@ -352,14 +357,20 @@ mod tests {
     #[test]
     fn col_parallel_row_blocks_concatenate_to_full() {
         let (out_dim, in_dim, world) = (6usize, 4usize, 3usize);
-        let w: Vec<f32> = (0..out_dim * in_dim).map(|i| ((i * 29) % 17) as f32 * 0.1 - 1.0).collect();
-        let x: Vec<f32> = (0..in_dim).map(|i| ((i * 7) % 11) as f32 * 0.3 - 1.5).collect();
+        let w: Vec<f32> = (0..out_dim * in_dim)
+            .map(|i| ((i * 29) % 17) as f32 * 0.1 - 1.0)
+            .collect();
+        let x: Vec<f32> = (0..in_dim)
+            .map(|i| ((i * 7) % 11) as f32 * 0.3 - 1.5)
+            .collect();
         let full = matvec(&w, out_dim, in_dim, &x);
 
         let mut cat: Vec<f32> = Vec::with_capacity(out_dim);
         for rank in 0..world {
             let p = plan(rank, world);
-            let rows = p.weight_rows(TpSplit::ColParallel, out_dim, in_dim).unwrap();
+            let rows = p
+                .weight_rows(TpSplit::ColParallel, out_dim, in_dim)
+                .unwrap();
             let w_shard = take_rows_f32(&w, in_dim, rows.clone()).unwrap();
             // ColParallel:输入不切(全量);输出 = 该 rank 的行块
             let part = matvec(&w_shard, rows.len(), in_dim, &x);
@@ -384,7 +395,10 @@ mod tests {
             let rows = p.weight_rows(TpSplit::Replicate, out_dim, in_dim).unwrap();
             let cols = p.weight_cols(TpSplit::Replicate, out_dim, in_dim).unwrap();
             assert_eq!((rows, cols), (0..out_dim, 0..in_dim));
-            assert_eq!(p.weight_shape(TpSplit::Replicate, out_dim, in_dim).unwrap(), (out_dim, in_dim));
+            assert_eq!(
+                p.weight_shape(TpSplit::Replicate, out_dim, in_dim).unwrap(),
+                (out_dim, in_dim)
+            );
         }
     }
 
@@ -393,20 +407,35 @@ mod tests {
     fn segmented_ranges_split_each_segment() {
         // q_proj:12288 = q(6144) ⊕ gate(6144);world=2 ⇒ 每段取 3072
         let p0 = plan(0, 2);
-        assert_eq!(p0.segmented_ranges(&[6144, 6144]).unwrap(), vec![0..3072, 0..3072]);
+        assert_eq!(
+            p0.segmented_ranges(&[6144, 6144]).unwrap(),
+            vec![0..3072, 0..3072]
+        );
         let p1 = plan(1, 2);
-        assert_eq!(p1.segmented_ranges(&[6144, 6144]).unwrap(), vec![3072..6144, 3072..6144]);
+        assert_eq!(
+            p1.segmented_ranges(&[6144, 6144]).unwrap(),
+            vec![3072..6144, 3072..6144]
+        );
         // 行号拼接视图 = 源坐标系(rank0 = 两段各前半)
         assert_eq!(p0.segmented_rows(&[6144, 6144]).unwrap()[..3], [0, 1, 2]);
-        assert_eq!(&p0.segmented_rows(&[6144, 6144]).unwrap()[3072..3075], [6144, 6145, 6146]);
+        assert_eq!(
+            &p0.segmented_rows(&[6144, 6144]).unwrap()[3072..3075],
+            [6144, 6145, 6146]
+        );
         // in_proj_qkv:10240 = q(2048) ⊕ k(2048) ⊕ v(6144);world=2
         assert_eq!(
             p0.segmented_ranges(&[2048, 2048, 6144]).unwrap(),
             vec![0..1024, 0..1024, 0..3072]
         );
         // 段长不整除 = 响亮拒(不许 pad)
-        assert!(p0.segmented_ranges(&[6144, 6145]).is_err(), "6145 为奇数 ⇒ 拒");
-        assert!(p0.segmented_ranges(&[2049, 6144]).is_err(), "段 2049 不被 2 整除 ⇒ 拒");
+        assert!(
+            p0.segmented_ranges(&[6144, 6145]).is_err(),
+            "6145 为奇数 ⇒ 拒"
+        );
+        assert!(
+            p0.segmented_ranges(&[2049, 6144]).is_err(),
+            "段 2049 不被 2 整除 ⇒ 拒"
+        );
     }
 
     /// 权重形状面:两形态的切分形状正确

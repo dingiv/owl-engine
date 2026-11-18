@@ -113,7 +113,10 @@ impl Default for ChainCursor {
 impl ChainCursor {
     /// 零起点(新链)。
     pub fn new() -> Self {
-        Self { blocks: 0, tail: ChainHash::new(0) }
+        Self {
+            blocks: 0,
+            tail: ChainHash::new(0),
+        }
     }
 
     /// 已哈希的整块数。
@@ -252,7 +255,10 @@ mod tests {
         let mut cur = ChainCursor::new();
         cur.advance(bs, &t, 8, &[]).expect("8 块");
         assert!(cur.advance(bs, &t[..bs], 2, &[]).is_none(), "回退必拒");
-        assert!(cur.advance(bs, &t[..bs], 10, &[]).is_none(), "要 2 块只给 1 块必拒");
+        assert!(
+            cur.advance(bs, &t[..bs], 10, &[]).is_none(),
+            "要 2 块只给 1 块必拒"
+        );
         assert_eq!(cur.blocks(), 8, "被拒后游标不动");
     }
 

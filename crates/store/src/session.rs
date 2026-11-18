@@ -360,7 +360,7 @@ impl AgentSession {
     /// 只由 `commit_turn` 的调用点写(单一产地):spans 与 `tokens` 必须
     /// 描述同一份 prompt —— 两处各写一份 = 下一轮删除识别拿错坐标。
     pub fn set_img_spans(&mut self, spans: Vec<ImgSpan>, pads: Vec<(usize, usize)>) {
-         // FIXME:  不推荐可变范式。
+        // FIXME:  不推荐可变范式。
         self.img_spans = spans;
         self.pads = pads;
     }
@@ -491,8 +491,8 @@ impl SessionTable {
         self.sessions
             .get(&id)
             .ok_or_else(|| owl_iface::contract::ModelError::EngineInvariant {
-            what: format!("会话账缺失(会话 {id} 不在账)"),
-        })
+                what: format!("会话账缺失(会话 {id} 不在账)"),
+            })
     }
 
     /// 同上(可变)。
@@ -501,7 +501,7 @@ impl SessionTable {
             .get_mut(&id)
             .ok_or_else(|| owl_iface::contract::ModelError::EngineInvariant {
                 what: format!("会话账缺失(会话 {id} 不在账)"),
-        })
+            })
     }
 
     /// 把会话从账中取出（所有权转移；用于"销毁旧账 → 新建替换"路径）。
@@ -511,7 +511,7 @@ impl SessionTable {
             .remove(&id)
             .ok_or_else(|| owl_iface::contract::ModelError::EngineInvariant {
                 what: format!("会话账缺失(会话 {id} 不在账)"),
-        })
+            })
     }
 
     /// 把新账放回表中（`take` 的配对口；重复 id = 结构错，响亮拒绝）。
@@ -977,7 +977,7 @@ impl SessionBank {
                 .get(*session)
                 .ok_or_else(|| ModelError::EngineInvariant {
                     what: format!("sync_pool_account: 活跃 turn {turn} 的会话 {session} 不在账"),
-            })?;
+                })?;
             if !self.rel.admission().has_active(*turn) {
                 return Err(ModelError::EngineInvariant {
                     what: format!("sync_pool_account: 活跃 turn {turn} 不在准入账"),
@@ -1101,7 +1101,7 @@ mod tests {
         let p1: Vec<u32> = (0..10).collect();
         assert!(s.guard(&p1));
         assert_eq!(s.delta_range(10), Some((0, 10)));
-        let pos1: Vec<[i32;3]> = (0..12).map(|i| [i,i,i]).collect();
+        let pos1: Vec<[i32; 3]> = (0..12).map(|i| [i, i, i]).collect();
         s.commit_turn(&p1, &[90, 91], &pos1).expect("收口 turn1");
         assert_eq!(s.tokens.len(), 12);
         assert_eq!(s.tokens, [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 90, 91]);
@@ -1112,7 +1112,7 @@ mod tests {
         p2.extend([90, 91, 7, 7]);
         assert!(s.guard(&p2), "历史逐 id 一致应命中");
         assert_eq!(s.delta_range(14), Some((12, 14)));
-        let pos2: Vec<[i32;3]> = (0..15).map(|i| [i,i,i]).collect();
+        let pos2: Vec<[i32; 3]> = (0..15).map(|i| [i, i, i]).collect();
         s.commit_turn(&p2, &[42], &pos2).expect("收口 turn2");
         assert_eq!(s.tokens.len(), 15);
 

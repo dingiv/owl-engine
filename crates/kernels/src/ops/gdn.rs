@@ -4,9 +4,11 @@
 //! GDN 族是"曾出过事"的重灾区(raw g 语义律 E7、同源对拍双错 E8)——本表的
 //! `LAWS` 声明是装配期不变量门的挂点(设计 §5.5)。
 
-use owl_macros::kernel_tags;
 use crate::contract::{Dtype, Law};
-use crate::spec::{meta_of, pools, CaptureEvidence, Determinism, KernelMeta, KernelSpec, Param, PoolAccess};
+use crate::spec::{
+    meta_of, pools, CaptureEvidence, Determinism, KernelMeta, KernelSpec, Param, PoolAccess,
+};
+use owl_macros::kernel_tags;
 
 // ============================================================================
 // 门控 / 归一(前置琐核)
@@ -180,7 +182,7 @@ impl KernelSpec for DecodeStepV2F16 {
         Param::t_in("b_gate", Dtype::F16, 2),
         Param::t_in("a_gate", Dtype::F16, 2),
         Param::t_in("w", Dtype::F16, 2),
-        Param::t_inout("conv_v_state", Dtype::F32, 3),  // 生产叶 [slots, dim, 3] = r3
+        Param::t_inout("conv_v_state", Dtype::F32, 3), // 生产叶 [slots, dim, 3] = r3
         Param::t_in("a_log", Dtype::F16, 1),
         Param::t_in("dt_bias", Dtype::F16, 1),
         Param::t_inout("rec_state", Dtype::F32, 4),
@@ -341,11 +343,11 @@ impl KernelSpec for GdnDecodeStepF16 {
         Param::t_in("b_gate", Dtype::F16, 2),
         Param::t_in("a_gate", Dtype::F16, 2),
         Param::t_in("w", Dtype::F16, 2),
-        Param::t_inout("conv_v_state", Dtype::F32, 3),  // 生产叶 [slots, dim, 3] = r3
-        Param::t_in("a_log", Dtype::F16, 1),      // 权重叶 r1(与 v2/生产对齐)
-        Param::t_in("dt_bias", Dtype::F16, 1),     // 同上
-        Param::t_inout("rec_state", Dtype::F32, 4), // [slots, nv, hk, hv]
-        Param::t_in("slots", Dtype::F32, 0),        // 槽叶/输入槽两种口径 ⇒ 不约束
+        Param::t_inout("conv_v_state", Dtype::F32, 3), // 生产叶 [slots, dim, 3] = r3
+        Param::t_in("a_log", Dtype::F16, 1),           // 权重叶 r1(与 v2/生产对齐)
+        Param::t_in("dt_bias", Dtype::F16, 1),         // 同上
+        Param::t_inout("rec_state", Dtype::F32, 4),    // [slots, nv, hk, hv]
+        Param::t_in("slots", Dtype::F32, 0),           // 槽叶/输入槽两种口径 ⇒ 不约束
         Param::t_in("norm_w", Dtype::F16, 1),
         Param::sz("batch"),
         Param::sz("nv"),
@@ -355,7 +357,7 @@ impl KernelSpec for GdnDecodeStepF16 {
         Param::f32("eps_l2"),
         Param::f32("eps_norm"),
         Param::f32("q_scale"),
-        Param::t_out("out", Dtype::F16, 3),  // 层侧声明 [batch, nv, vd]
+        Param::t_out("out", Dtype::F16, 3), // 层侧声明 [batch, nv, vd]
     ];
     const POOL: &'static [PoolAccess] = &[PoolAccess::rw(pools::GDN_STATE, Dtype::F32)];
     const LAWS: &'static [Law] = &[Law::OutputFinite];

@@ -41,7 +41,11 @@ pub struct PeerCaps {
 
 impl PeerCaps {
     pub fn new(uuid: impl Into<String>, bar1_bytes: u64, p2p_supported: bool) -> Self {
-        Self { uuid: uuid.into(), bar1_bytes, p2p_supported }
+        Self {
+            uuid: uuid.into(),
+            bar1_bytes,
+            p2p_supported,
+        }
     }
 
     /// 本卡是否够宽(BAR1 ≥ [`STATIC_BAR1_MIN`])。
@@ -112,11 +116,7 @@ impl PeerPlan {
     ///
     /// `staging_bytes` 由调用方按 [`super::ar::StagingLayout::total_bytes`] 算出
     /// (两 rank 必须同值 —— 协议对称性前提)。
-    pub fn plan(
-        a: &PeerCaps,
-        b: &PeerCaps,
-        staging_bytes: u64,
-    ) -> Result<Self, CommError> {
+    pub fn plan(a: &PeerCaps, b: &PeerCaps, staging_bytes: u64) -> Result<Self, CommError> {
         let mechanism = classify(a, b);
         let limit = per_alloc_limit(mechanism, a, b);
         if mechanism == PeerMechanism::Rejected {
@@ -144,9 +144,12 @@ impl PeerPlan {
                 mechanism,
             });
         }
-        Ok(Self { mechanism, per_alloc_limit: limit, staging_bytes })
+        Ok(Self {
+            mechanism,
+            per_alloc_limit: limit,
+            staging_bytes,
+        })
     }
-
 }
 
 #[cfg(test)]
@@ -182,7 +185,10 @@ mod tests {
         assert_eq!(per_alloc_limit(m, &narrow(), &narrow()), 192 << 20);
         // 若 BAR1 更窄(如 128MiB):128 − 64 = 64MiB
         let tiny = PeerCaps::new("GPU-tiny", 128 << 20, true);
-        assert_eq!(per_alloc_limit(classify(&tiny, &tiny), &tiny, &tiny), 64 << 20);
+        assert_eq!(
+            per_alloc_limit(classify(&tiny, &tiny), &tiny, &tiny),
+            64 << 20
+        );
     }
 
     #[test]
@@ -194,7 +200,7 @@ mod tests {
     #[test]
     fn plan_rejects_over_limit_and_zero() {
         let m = 2 * (32 << 20) + crate::comm::ar::HEADER_BYTES; // 64MiB + 64B
-        // 正常:3080 对 staging 64MiB 在 192MiB 内
+                                                                // 正常:3080 对 staging 64MiB 在 192MiB 内
         let p = PeerPlan::plan(&narrow(), &narrow(), m).expect("3080 对计划应成立");
         assert_eq!(p.mechanism, PeerMechanism::Window);
         assert_eq!(p.staging_bytes, m);

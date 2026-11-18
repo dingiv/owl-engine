@@ -1101,36 +1101,36 @@ fn order_snap_role_group(
     tail_by_depth: bool,
 ) -> Vec<EvictCandidate> {
     let mut sess_cold: std::collections::BTreeMap<u64, u64> = std::collections::BTreeMap::new();
-        for c in &group {
-            let e = sess_cold.entry(c.session).or_insert(u64::MAX);
-            if c.last_use < *e {
-                *e = c.last_use;
-            }
+    for c in &group {
+        let e = sess_cold.entry(c.session).or_insert(u64::MAX);
+        if c.last_use < *e {
+            *e = c.last_use;
         }
-        let mut by_session: std::collections::BTreeMap<u64, Vec<EvictCandidate>> =
-            std::collections::BTreeMap::new();
-        for c in group {
-            by_session.entry(c.session).or_default().push(c);
-        }
-        let mut keys: Vec<u64> = by_session.keys().copied().collect();
-        keys.sort_by_key(|s| {
+    }
+    let mut by_session: std::collections::BTreeMap<u64, Vec<EvictCandidate>> =
+        std::collections::BTreeMap::new();
+    for c in group {
+        by_session.entry(c.session).or_default().push(c);
+    }
+    let mut keys: Vec<u64> = by_session.keys().copied().collect();
+    keys.sort_by_key(|s| {
         (
             *s == crate::policy::NO_SESSION,
             *sess_cold.get(s).unwrap_or(&u64::MAX),
         )
-        });
+    });
     let mut out = Vec::new();
-        for k in keys {
-            if let Some(mut g) = by_session.remove(&k) {
+    for k in keys {
+        if let Some(mut g) = by_session.remove(&k) {
             if tail_by_depth {
                 // Tail：只从最老的边界开始，最新尾锚点最后。
                 g.sort_by_key(|c| (c.depth, c.last_use));
             } else {
                 policy.order(&mut g);
             }
-                out.extend(g);
-            }
+            out.extend(g);
         }
+    }
     out
 }
 
@@ -1230,8 +1230,8 @@ mod tests {
         let state = StateStore::new(1, 1);
         let policy = EvictPolicyKind::Lru.build();
         let cands = vec![
-            cand(7, 40, 900, 1),  // 热会话
-            cand(9, 2, 10, 2),    // 冷会话
+            cand(7, 40, 900, 1), // 热会话
+            cand(9, 2, 10, 2),   // 冷会话
             cand(7, 80, 950, 3),
         ];
         let order = order_candidates(policy.as_ref(), cands, &state);

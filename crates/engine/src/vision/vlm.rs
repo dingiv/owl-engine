@@ -146,7 +146,12 @@ impl VlmMergedCache {
             None
         };
         self.used_bytes += block_bytes(&block);
-        self.entries.push(VlmMergedEntry { key, rows, block, leaf });
+        self.entries.push(VlmMergedEntry {
+            key,
+            rows,
+            block,
+            leaf,
+        });
         old
     }
 
@@ -171,10 +176,7 @@ fn block_bytes(b: &Bytes) -> usize {
 }
 
 /// 单张图的 merged 行数(塔输出 `[N,D]` 的 N)。
-pub(crate) fn merged_rows(
-    grid: (usize, usize, usize),
-    merge: usize,
-) -> Result<usize, ModelError> {
+pub(crate) fn merged_rows(grid: (usize, usize, usize), merge: usize) -> Result<usize, ModelError> {
     let (t, h, w) = grid;
     if merge == 0 || t == 0 || h == 0 || w == 0 {
         return Err(ModelError::Msg(format!(
@@ -227,7 +229,9 @@ pub(crate) fn combine_merged(
             )));
         }
         if *rows == 0 {
-            return Err(ModelError::Msg("VLM merged 组合:图片 merged 行数为 0".into()));
+            return Err(ModelError::Msg(
+                "VLM merged 组合:图片 merged 行数为 0".into(),
+            ));
         }
         let mut idx = vec![-1.0f32; total];
         for (r, slot) in idx[offset..offset + rows].iter_mut().enumerate() {
@@ -271,7 +275,12 @@ mod tests {
         let mut cache = VlmMergedCache::new(0);
         let block = |id| Bytes::new(id, 16, Dtype::F16, 0);
         for id in 0..3 {
-            cache.insert(key(id), 4, block(id), TensorOps::of_block(id, Dtype::F16, vec![4, 4]));
+            cache.insert(
+                key(id),
+                4,
+                block(id),
+                TensorOps::of_block(id, Dtype::F16, vec![4, 4]),
+            );
         }
         assert_eq!(cache.len(), 3);
         let evicted = cache.evict_to_cap();

@@ -15,16 +15,16 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use cudarc::driver::{CudaContext, CudaSlice, CudaStream};
+use owl_kernels::bootcheck::{BootCheck, CheckRunner};
 use owl_kernels::contract::{Dtype, OpError};
 use owl_kernels::device::{DeviceRes, Exec, LaunchNote, ScratchBuf};
+#[cfg(feature = "marlin")]
+use owl_kernels::ops::oracles::marlin as ml;
 use owl_kernels::ops::oracles::{
     cublas_gemm as cb, k0_fp8_knhd as k0, k0_int8_knhd as k0i8, nc_bf16_v2 as nc,
     qknorm_insert as qk,
 };
-#[cfg(feature = "marlin")]
-use owl_kernels::ops::oracles::marlin as ml;
 use owl_kernels::server::selfcheck::Runner;
-use owl_kernels::bootcheck::{BootCheck, CheckRunner};
 
 /// 测试用资源面(最小实现:分配/上传/回读 —— oracle 的全部需求)
 struct TestRes {
@@ -40,7 +40,12 @@ impl TestRes {
         let ctx = CudaContext::new(ordinal).expect("ctx");
         ctx.bind_to_thread().expect("bind");
         let stream = ctx.default_stream();
-        Some(Self { ctx, stream, blocks: HashMap::new(), next: 1 })
+        Some(Self {
+            ctx,
+            stream,
+            blocks: HashMap::new(),
+            next: 1,
+        })
     }
 }
 
@@ -66,20 +71,24 @@ impl DeviceRes for TestRes {
             })
     }
     fn resolve_len(&self, id: u64) -> Result<usize, OpError> {
-        self.blocks.get(&id).map(|s| s.len()).ok_or_else(|| OpError::Contract {
-            op: "test".into(),
-            field: "resolve_len",
-            expect: "块在册".into(),
-            got: format!("id={}", id),
-        })
+        self.blocks
+            .get(&id)
+            .map(|s| s.len())
+            .ok_or_else(|| OpError::Contract {
+                op: "test".into(),
+                field: "resolve_len",
+                expect: "块在册".into(),
+                got: format!("id={}", id),
+            })
     }
     fn alloc(&mut self, bytes: usize, _tag: &str) -> Result<ScratchBuf, OpError> {
-        let s = unsafe { self.stream.alloc::<u8>(bytes.max(1)) }.map_err(|e| OpError::Contract {
-            op: "test".into(),
-            field: "alloc",
-            expect: "设备分配".into(),
-            got: format!("{e:?}"),
-        })?;
+        let s =
+            unsafe { self.stream.alloc::<u8>(bytes.max(1)) }.map_err(|e| OpError::Contract {
+                op: "test".into(),
+                field: "alloc",
+                expect: "设备分配".into(),
+                got: format!("{e:?}"),
+            })?;
         let id = self.next;
         self.next += 1;
         let ptr = {
@@ -113,12 +122,14 @@ impl DeviceRes for TestRes {
             })?;
         let s = self.blocks.get_mut(&id).expect("刚找到");
         let n = src.len().min(s.len());
-        stream.memcpy_htod(&src[..n], s).map_err(|e| OpError::Contract {
-            op: "test".into(),
-            field: "upload",
-            expect: "htod".into(),
-            got: format!("{e:?}"),
-        })
+        stream
+            .memcpy_htod(&src[..n], s)
+            .map_err(|e| OpError::Contract {
+                op: "test".into(),
+                field: "upload",
+                expect: "htod".into(),
+                got: format!("{e:?}"),
+            })
     }
     fn upload_block(
         &mut self,
@@ -127,20 +138,23 @@ impl DeviceRes for TestRes {
     ) -> Result<(), owl_kernels::contract::OpError> {
         // 测试面:按块 id 直查(账房即 self.blocks)
         let stream = self.stream.clone();
-        let s = self.blocks.get_mut(&b.id).ok_or_else(|| {
-            owl_kernels::contract::OpError::Contract {
+        let s =
+            self.blocks
+                .get_mut(&b.id)
+                .ok_or_else(|| owl_kernels::contract::OpError::Contract {
+                    op: "test".into(),
+                    field: "upload_block",
+                    expect: "块在册".into(),
+                    got: format!("id={}", b.id),
+                })?;
+        stream
+            .memcpy_htod(src, s)
+            .map_err(|e| owl_kernels::contract::OpError::Contract {
                 op: "test".into(),
                 field: "upload_block",
-                expect: "块在册".into(),
-                got: format!("id={}", b.id),
-            }
-        })?;
-        stream.memcpy_htod(src, s).map_err(|e| owl_kernels::contract::OpError::Contract {
-            op: "test".into(),
-            field: "upload_block",
-            expect: "htod".into(),
-            got: format!("{e:?}"),
-        })
+                expect: "htod".into(),
+                got: format!("{e:?}"),
+            })
     }
 
     fn alloc_block(
@@ -148,12 +162,13 @@ impl DeviceRes for TestRes {
         bytes: usize,
         _tag: &str,
     ) -> Result<owl_kernels::contract::Bytes, OpError> {
-        let s = unsafe { self.stream.alloc::<u8>(bytes.max(1)) }.map_err(|e| OpError::Contract {
-            op: "test".into(),
-            field: "alloc_block",
-            expect: "设备分配".into(),
-            got: format!("{e:?}"),
-        })?;
+        let s =
+            unsafe { self.stream.alloc::<u8>(bytes.max(1)) }.map_err(|e| OpError::Contract {
+                op: "test".into(),
+                field: "alloc_block",
+                expect: "设备分配".into(),
+                got: format!("{e:?}"),
+            })?;
         let id = self.next;
         self.next += 1;
         self.blocks.insert(id, s);
@@ -175,12 +190,14 @@ impl DeviceRes for TestRes {
             })?;
         let s = self.blocks.get(&id).expect("刚找到");
         let mut tmp = vec![0u8; s.len()];
-        stream.memcpy_dtoh(s, &mut tmp).map_err(|e| OpError::Contract {
-            op: "test".into(),
-            field: "download",
-            expect: "dtoh".into(),
-            got: format!("{e:?}"),
-        })?;
+        stream
+            .memcpy_dtoh(s, &mut tmp)
+            .map_err(|e| OpError::Contract {
+                op: "test".into(),
+                field: "download",
+                expect: "dtoh".into(),
+                got: format!("{e:?}"),
+            })?;
         dst.copy_from_slice(&tmp[..dst.len()]);
         Ok(())
     }
@@ -193,7 +210,11 @@ fn with_runner<R>(f: impl FnOnce(&mut dyn CheckRunner) -> R) -> Option<R> {
     let mut res = TestRes::new()?;
     let mut exec = Exec::new();
     // 自检面(仅 native oracle:launch_aot 路径;foreign 需 registry 注入)
-    let mut r = Runner { res: &mut res, exec: &mut exec, registry: None };
+    let mut r = Runner {
+        res: &mut res,
+        exec: &mut exec,
+        registry: None,
+    };
     Some(f(&mut r))
 }
 
@@ -208,7 +229,11 @@ fn with_registry_runner<R>(f: impl FnOnce(&mut dyn CheckRunner) -> R) -> Option<
     )
     .expect("注册表装配");
     let out = {
-        let mut r = Runner { res: &mut res, exec: &mut exec, registry: Some(&mut reg) };
+        let mut r = Runner {
+            res: &mut res,
+            exec: &mut exec,
+            registry: Some(&mut reg),
+        };
         f(&mut r)
     };
     let _ = reg.close();
@@ -226,7 +251,10 @@ fn foreign_oracle_cublas_gemm_passes() {
     let c = cb::case();
     let want = cb::reference(&c, false);
     let (worst, bad) = cb::rel_worst(&got, &want);
-    println!("[oracle] cublas GEMM ✓ max|err|={worst:.3e}(相对阈值 {})", 1e-2);
+    println!(
+        "[oracle] cublas GEMM ✓ max|err|={worst:.3e}(相对阈值 {})",
+        1e-2
+    );
     assert!(bad.is_none(), "cublas 输出越界:{bad:?}");
 }
 
@@ -260,14 +288,21 @@ fn marlin_oracle_is_sensitive() {
     let c = ml::case();
     let (n_right, _, bad_right) =
         ml::noise_metrics_floor(&got, &ml::reference(&c, false, false), ml::TOL_FLOOR);
-    let (n_sym, _, _) = ml::noise_metrics_floor(&got, &ml::reference(&c, true, false), ml::TOL_FLOOR);
+    let (n_sym, _, _) =
+        ml::noise_metrics_floor(&got, &ml::reference(&c, true, false), ml::TOL_FLOOR);
     let (n_t, _, _) = ml::noise_metrics_floor(&got, &ml::reference(&c, false, true), ml::TOL_FLOOR);
     println!(
         "[oracle-neg] marlin: 正参考 RMS={n_right:.5} / 忽略零偏 {n_sym:.5} / 布局错 {n_t:.5}"
     );
     assert!(bad_right.is_none(), "正参考不该越界:{bad_right:?}");
-    assert!(n_sym > 2e-2, "忽略零偏的参考竟也通过({n_sym:.5})—— 判据对 zp 不敏感!");
-    assert!(n_t > 2e-2, "布局错的参考竟也通过({n_t:.5})—— 判据对布局不敏感!");
+    assert!(
+        n_sym > 2e-2,
+        "忽略零偏的参考竟也通过({n_sym:.5})—— 判据对 zp 不敏感!"
+    );
+    assert!(
+        n_t > 2e-2,
+        "布局错的参考竟也通过({n_t:.5})—— 判据对布局不敏感!"
+    );
 }
 
 /// **W4A8 × AWQ 对拍**(S1d;2026-10-16):a8 三件套 packer(B 32×32 tile /
@@ -276,7 +311,8 @@ fn marlin_oracle_is_sensitive() {
 #[cfg(feature = "marlin")]
 #[test]
 fn foreign_oracle_marlin_w4a8_passes() {
-    let Some(got) = with_registry_runner(|r| ml::run_case_a8(r, &ml::case_a8(), ml::A8Neg::default()))
+    let Some(got) =
+        with_registry_runner(|r| ml::run_case_a8(r, &ml::case_a8(), ml::A8Neg::default()))
     else {
         owl_shared::testkit::report::skip("OWL_TEST_DEVICE 未设");
         return;
@@ -295,38 +331,68 @@ fn foreign_oracle_marlin_w4a8_passes() {
 #[cfg(feature = "marlin")]
 #[test]
 fn marlin_w4a8_oracle_is_sensitive() {
-    let Some(got) = with_registry_runner(|r| ml::run_case_a8(r, &ml::case_a8(), ml::A8Neg::default()))
+    let Some(got) =
+        with_registry_runner(|r| ml::run_case_a8(r, &ml::case_a8(), ml::A8Neg::default()))
     else {
         owl_shared::testkit::report::skip("OWL_TEST_DEVICE 未设");
         return;
     };
     let got = got.expect("marlin w4a8 dispatch");
     let c = ml::case_a8();
-    let (n_right, _, bad_right) = ml::noise_metrics_floor(&got, &ml::reference_a8(&c), ml::TOL_FLOOR);
+    let (n_right, _, bad_right) =
+        ml::noise_metrics_floor(&got, &ml::reference_a8(&c), ml::TOL_FLOOR);
     // ① 不折因子:同一次核输出 vs 同参考 —— 重跑一次宿主编的负例
     let no_factor = with_registry_runner(|r| {
-        ml::run_case_a8(r, &ml::case_a8(), ml::A8Neg { no_factor: true, ..Default::default() })
+        ml::run_case_a8(
+            r,
+            &ml::case_a8(),
+            ml::A8Neg {
+                no_factor: true,
+                ..Default::default()
+            },
+        )
     })
     .expect("runner")
     .expect("no_factor dispatch");
     let (n_nofac, _, _) = ml::noise_metrics_floor(&no_factor, &ml::reference_a8(&c), ml::TOL_FLOOR);
     // ② zp 全零(忽略零偏)
     let zp0 = with_registry_runner(|r| {
-        ml::run_case_a8(r, &ml::case_a8(), ml::A8Neg { zp_zero: true, ..Default::default() })
+        ml::run_case_a8(
+            r,
+            &ml::case_a8(),
+            ml::A8Neg {
+                zp_zero: true,
+                ..Default::default()
+            },
+        )
     })
     .expect("runner")
     .expect("zp_zero dispatch");
     let (n_zp0, _, _) = ml::noise_metrics_floor(&zp0, &ml::reference_a8(&c), ml::TOL_FLOOR);
     // ③ B 用 a16 布局
     let b16 = with_registry_runner(|r| {
-        ml::run_case_a8(r, &ml::case_a8(), ml::A8Neg { b_a16_layout: true, ..Default::default() })
+        ml::run_case_a8(
+            r,
+            &ml::case_a8(),
+            ml::A8Neg {
+                b_a16_layout: true,
+                ..Default::default()
+            },
+        )
     })
     .expect("runner")
     .expect("b_a16 dispatch");
     let (n_b16, _, _) = ml::noise_metrics_floor(&b16, &ml::reference_a8(&c), ml::TOL_FLOOR);
     // ④ zp 用 a16 布局(8-列组内置换 + 跨组错位)
     let zpa16 = with_registry_runner(|r| {
-        ml::run_case_a8(r, &ml::case_a8(), ml::A8Neg { zp_a16_layout: true, ..Default::default() })
+        ml::run_case_a8(
+            r,
+            &ml::case_a8(),
+            ml::A8Neg {
+                zp_a16_layout: true,
+                ..Default::default()
+            },
+        )
     })
     .expect("runner")
     .expect("zp_a16 dispatch");
@@ -366,7 +432,10 @@ fn cublas_oracle_is_sensitive_to_layout() {
     let (w_wrong, _) = cb::rel_worst(&got, &cb::reference(&c, true));
     println!("[oracle-neg] cublas: 正参考 max|err|={w_right:.3e} / 布局错参考 {w_wrong:.3e}");
     assert!(bad_right.is_none(), "正参考不该越界:{bad_right:?}");
-    assert!(w_wrong > 1.0, "布局错参考竟也通过({w_wrong:.3e})—— 判据对 GEMM 布局不敏感!");
+    assert!(
+        w_wrong > 1.0,
+        "布局错参考竟也通过({w_wrong:.3e})—— 判据对 GEMM 布局不敏感!"
+    );
 }
 
 /// **正例**:两个 oracle 在生产 boot 的同一条路径上通过
@@ -395,7 +464,10 @@ fn oracles_pass_on_real_device() {
         "[oracle] K0 int8 knHD ✓ 毒值未写字节 {:?}",
         k0i8r.poison_untouched
     );
-    println!("[oracle] NC v2 ✓ max|err|={:.3e} ≤ {:.1e}", ncr.worst_abs_err, ncr.tolerance);
+    println!(
+        "[oracle] NC v2 ✓ max|err|={:.3e} ≤ {:.1e}",
+        ncr.worst_abs_err, ncr.tolerance
+    );
     println!(
         "[oracle] 融合插池 ✓ max|err|={:.3e} ≤ {:.1e} 毒值未写字节 {:?}",
         qkr.worst_abs_err, qkr.tolerance, qkr.poison_untouched
@@ -424,8 +496,14 @@ fn qknorm_insert_oracle_is_sensitive() {
         "[oracle-neg] 融合插池: 正参考 q max|err|={w_right:.3e} / rope 互换参考 {w_swap:.3e} / classic 池寻址不符 {bad_classic}"
     );
     assert!(bad_right.is_none(), "正参考不该越界:{bad_right:?}");
-    assert!(w_swap > 2e-3, "rope 互换的参考竟也通过({w_swap:.3e})—— 判据对 rope 配对不敏感!");
-    assert!(bad_classic > 0, "classic 池寻址竟也全对 —— 判据对池寻址不敏感!");
+    assert!(
+        w_swap > 2e-3,
+        "rope 互换的参考竟也通过({w_swap:.3e})—— 判据对 rope 配对不敏感!"
+    );
+    assert!(
+        bad_classic > 0,
+        "classic 池寻址竟也全对 —— 判据对池寻址不敏感!"
+    );
 }
 
 /// **负例 ①**(判据敏感性):NC 参考**关掉滑窗** ⇒ 必须超出容差
@@ -444,7 +522,10 @@ fn nc_oracle_is_sensitive_to_window() {
     let (w_wrong, _) = nc::worst_err(&got, &wrong);
     println!("[oracle-neg] NC: 正参考 max|err|={w_right:.3e} / 关滑窗参考 max|err|={w_wrong:.3e}");
     assert!(bad_right.is_none(), "正参考不该越界:{bad_right:?}");
-    assert!(w_wrong > 2e-2, "关掉滑窗的参考竟也通过(max|err|={w_wrong:.3e})—— 判据对滑窗不敏感!");
+    assert!(
+        w_wrong > 2e-2,
+        "关掉滑窗的参考竟也通过(max|err|={w_wrong:.3e})—— 判据对滑窗不敏感!"
+    );
 }
 
 /// **负例 ②**:K0 参考**换成 classic 寻址** ⇒ 字节必须对不上
@@ -460,7 +541,9 @@ fn k0_oracle_is_sensitive_to_layout() {
     let right = k0::reference(&c, false);
     let wrong = k0::reference(&c, true);
     let hits = |r: &[(usize, u8, u8)]| -> usize {
-        r.iter().filter(|(i, wk, wv)| kc[*i] != *wk || vc[*i] != *wv).count()
+        r.iter()
+            .filter(|(i, wk, wv)| kc[*i] != *wk || vc[*i] != *wv)
+            .count()
     };
     let (bad_right, bad_wrong) = (hits(&right), hits(&wrong));
     println!("[oracle-neg] K0: 正参考不符 {bad_right} / classic 参考不符 {bad_wrong}");
@@ -507,13 +590,25 @@ fn probe_zp_hit_column() {
             "[zp-probe] n0={n0:3} | a8 → 命中 {c8:3} Δ={d8:7.3} | a16 → 命中 {c16:3} Δ={d16:7.3} | n0%8={} 命中%8={} n0/8={} 命中/8={}",
             n0 % 8, c16 % 8, n0 / 8, c16 / 8
         );
-        if c8 == n0 { a8_ok += 1; }
-        if c16 == n0 { a16_ok += 1; }
-        if c16 % 8 == n0 % 8 { same_mod8 += 1; }
+        if c8 == n0 {
+            a8_ok += 1;
+        }
+        if c16 == n0 {
+            a16_ok += 1;
+        }
+        if c16 % 8 == n0 % 8 {
+            same_mod8 += 1;
+        }
     }
     println!("[zp-probe] 自命中:a8 {a8_ok}/8,a16 {a16_ok}/8;错位保持 n%8:{same_mod8}/8");
-    assert_eq!(a8_ok, 8, "a8 布局应每列都自命中(我们的 packer 必须与内核读法一致)");
-    assert!(a16_ok < 8, "a16 布局并非处处等价(本行红 = 两条 zp 布局其实是同一张)");
+    assert_eq!(
+        a8_ok, 8,
+        "a8 布局应每列都自命中(我们的 packer 必须与内核读法一致)"
+    );
+    assert!(
+        a16_ok < 8,
+        "a16 布局并非处处等价(本行红 = 两条 zp 布局其实是同一张)"
+    );
     assert_eq!(
         same_mod8, 8,
         "a16 错位应恒保持 n%8(只动组序号)—— 这正是“zp 只依赖 n%8”的数据会让差异隐形的原因"

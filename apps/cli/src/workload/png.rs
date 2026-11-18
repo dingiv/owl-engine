@@ -97,8 +97,16 @@ fn base64(data: &[u8]) -> String {
         let n = (b0 << 16) | (b1 << 8) | b2;
         out.push(T[((n >> 18) & 63) as usize] as char);
         out.push(T[((n >> 12) & 63) as usize] as char);
-        out.push(if c.len() > 1 { T[((n >> 6) & 63) as usize] as char } else { '=' });
-        out.push(if c.len() > 2 { T[(n & 63) as usize] as char } else { '=' });
+        out.push(if c.len() > 1 {
+            T[((n >> 6) & 63) as usize] as char
+        } else {
+            '='
+        });
+        out.push(if c.len() > 2 {
+            T[(n & 63) as usize] as char
+        } else {
+            '='
+        });
     }
     out
 }
@@ -137,7 +145,10 @@ pub fn png_square(w: u32, h: u32, cx: u32, cy: u32, side: u32) -> Vec<u8> {
 
 /// 方块图 → data URL。
 pub fn data_url_square(w: u32, h: u32, cx: u32, cy: u32, side: u32) -> String {
-    format!("data:image/png;base64,{}", base64(&png_square(w, h, cx, cy, side)))
+    format!(
+        "data:image/png;base64,{}",
+        base64(&png_square(w, h, cx, cy, side))
+    )
 }
 
 pub fn data_url_png(w: u32, h: u32, rgb: (u8, u8, u8)) -> String {

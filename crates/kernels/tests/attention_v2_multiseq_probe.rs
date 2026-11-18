@@ -6,9 +6,8 @@
 //! 门:gpu vs host max < 1e-2;另附 per-seq 误差(定位某 seq 独崩)。
 //! 无 GPU 跳过(OWL_TEST_DEVICE)。
 
-
-use owl_macros::owl_test;
 use cudarc::driver::{CudaContext, DevicePtr, LaunchConfig, PushKernelArg};
+use owl_macros::owl_test;
 
 const S: usize = 8; // 伪序列数
 const CTX0: usize = 600; // 首 seq 的 context_len(递增 +i)
@@ -88,8 +87,21 @@ fn host_ref_f16(q: &[u16], kc: &[u8], vc: &[u8], lens: &[usize]) -> Vec<f32> {
     host_ref_impl(q, kc, vc, lens, false, false)
 }
 
-fn host_ref_impl(q: &[u16], kc: &[u8], vc: &[u8], lens: &[usize], kv_fp8: bool, knhd: bool) -> Vec<f32> {
-    let dec = |pool: &[u8], i: usize| if kv_fp8 { e4m3_decode(pool[i]) } else { f16_to_f32(pool[2*i] as u16 | ((pool[2*i+1] as u16) << 8)) };
+fn host_ref_impl(
+    q: &[u16],
+    kc: &[u8],
+    vc: &[u8],
+    lens: &[usize],
+    kv_fp8: bool,
+    knhd: bool,
+) -> Vec<f32> {
+    let dec = |pool: &[u8], i: usize| {
+        if kv_fp8 {
+            e4m3_decode(pool[i])
+        } else {
+            f16_to_f32(pool[2 * i] as u16 | ((pool[2 * i + 1] as u16) << 8))
+        }
+    };
     let mut out = vec![0f32; S * H * HD];
     let kbs = HKV * HD * PAGE;
     let khs = if knhd { HD } else { HD * PAGE };
@@ -157,7 +169,10 @@ fn v2_multiseq_case(knhd: bool) {
     ctx.bind_to_thread().expect("bind");
     let stream = ctx.default_stream();
     let ptx = cudarc::nvrtc::compile_ptx_with_opts(
-        owl_kernels::cu_sig::cu_text(owl_kernels::ops::source("vllm_paged_attention_v2_fp8_knhd_hd256bs32")).as_str(),
+        owl_kernels::cu_sig::cu_text(owl_kernels::ops::source(
+            "vllm_paged_attention_v2_fp8_knhd_hd256bs32",
+        ))
+        .as_str(),
         cudarc::nvrtc::CompileOptions {
             arch: Some("compute_86"),
             include_paths: vec!["/usr/local/cuda/include".into()],
@@ -201,11 +216,15 @@ fn v2_multiseq_case(knhd: bool) {
     let d_k8: cudarc::driver::CudaSlice<u8> = if f16_mode_pre {
         let kb: Vec<u8> = k_f16.iter().flat_map(|h| h.to_le_bytes()).collect();
         dev_u8(&kb)
-    } else { dev_u8(&k_fp8) };
+    } else {
+        dev_u8(&k_fp8)
+    };
     let d_v8: cudarc::driver::CudaSlice<u8> = if f16_mode_pre {
         let vb: Vec<u8> = v_f16.iter().flat_map(|h| h.to_le_bytes()).collect();
         dev_u8(&vb)
-    } else { dev_u8(&v_fp8) };
+    } else {
+        dev_u8(&v_fp8)
+    };
     // 页表 [S, NB]:每 seq 同一恒等链(0..NB)
     let bt8: Vec<f32> = (0..S)
         .flat_map(|_s| (0..NB).map(move |b| b as f32))
@@ -280,7 +299,11 @@ fn v2_multiseq_case(knhd: bool) {
         let mut es_h = vec![0f32; S * H * NP];
         stream.memcpy_dtoh(&d_es, &mut es_h).unwrap();
         let nz = es_h.iter().filter(|&&x| x != 0.0).count();
-        println!("[diag] exp_sums nonzero = {nz}/{}; 前 6 = {:?}", es_h.len(), &es_h[..6.min(es_h.len())]);
+        println!(
+            "[diag] exp_sums nonzero = {nz}/{}; 前 6 = {:?}",
+            es_h.len(),
+            &es_h[..6.min(es_h.len())]
+        );
     }
 
     // ---- reduce:grid (H, S) ----
@@ -310,8 +333,20 @@ fn v2_multiseq_case(knhd: bool) {
         stream.memcpy_dtoh(&d_partial, &mut pa_h).unwrap();
         let f = |i: usize| f16_to_f32(pa_h[i]);
         let base = 0; // s0(原 `0 * H * NP * HD`;常量 0 触发 clippy::erasing_op)
-        println!("[diag] p0 d0..3 = {:.4} {:.4} {:.4} {:.4}", f(base), f(base+1), f(base+2), f(base+3));
-        println!("[diag] p1 d0..3 = {:.4} {:.4} {:.4} {:.4}", f(base+NP*HD), f(base+NP*HD+1), f(base+NP*HD+2), f(base+NP*HD+3));
+        println!(
+            "[diag] p0 d0..3 = {:.4} {:.4} {:.4} {:.4}",
+            f(base),
+            f(base + 1),
+            f(base + 2),
+            f(base + 3)
+        );
+        println!(
+            "[diag] p1 d0..3 = {:.4} {:.4} {:.4} {:.4}",
+            f(base + NP * HD),
+            f(base + NP * HD + 1),
+            f(base + NP * HD + 2),
+            f(base + NP * HD + 3)
+        );
     }
     let mut o = vec![0u16; S * H * HD];
     stream.memcpy_dtoh(&d_out, &mut o).unwrap();
@@ -361,12 +396,24 @@ fn v2_multiseq_case(knhd: bool) {
     // 零分布:哪些 (s,h) 输出全零(主核没写/reduce 读错槽的指纹)
     let mut zero_by_sh = std::collections::BTreeMap::new();
     let mut zero_total = 0usize;
-    for s in 0..S { for h in 0..H {
-        let mut z = 0usize;
-        for d in 0..HD { if of[(s*H+h)*HD+d] == 0.0 { z += 1; } }
-        if z > 0 { zero_by_sh.insert((s,h), z); zero_total += z; }
-    }}
-    println!("   zero_total={zero_total} by(s,h)={:?} (前 12)", zero_by_sh.iter().take(12).collect::<Vec<_>>());
+    for s in 0..S {
+        for h in 0..H {
+            let mut z = 0usize;
+            for d in 0..HD {
+                if of[(s * H + h) * HD + d] == 0.0 {
+                    z += 1;
+                }
+            }
+            if z > 0 {
+                zero_by_sh.insert((s, h), z);
+                zero_total += z;
+            }
+        }
+    }
+    println!(
+        "   zero_total={zero_total} by(s,h)={:?} (前 12)",
+        zero_by_sh.iter().take(12).collect::<Vec<_>>()
+    );
     assert!(
         per_seq.iter().cloned().fold(0f32, f32::max) < 1e-2,
         "v2 多伪序列对 host 参考超门(knhd={knhd}, max {we:.6} @ s={ws})"

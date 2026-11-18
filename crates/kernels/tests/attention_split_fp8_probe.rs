@@ -168,7 +168,12 @@ fn run_case(
     let d_out8 = dev_u16(&vec![0u16; T * H * HD]);
     let d_dummy = dev_u16(&[0u16; 16]);
 
-    let run_pair = |tag: &str, k_name: &str, k_ptr: u64, v_ptr: u64, scr: &cudarc::driver::CudaSlice<u16>, out: &cudarc::driver::CudaSlice<u16>| {
+    let run_pair = |tag: &str,
+                    k_name: &str,
+                    k_ptr: u64,
+                    v_ptr: u64,
+                    scr: &cudarc::driver::CudaSlice<u16>,
+                    out: &cudarc::driver::CudaSlice<u16>| {
         // ---- K1:split 主核(写 scratch)----
         let f = m
             .load_function(k_name)
@@ -190,10 +195,19 @@ fn run_case(
             v_ptr,
         );
         let s32_p = d_scr32.device_ptr(stream).0;
-        let (nkv, scale, np_i, t_i, ctx0) =
-            (HKV as i32, 1f32 / (HD as f32).sqrt(), nparts as i32, T as i32, 0i32);
-        let (kbs, khs, page, hq) =
-            ((HKV * HD * PAGE) as i32, (HD * PAGE) as i32, PAGE as i32, H as i32);
+        let (nkv, scale, np_i, t_i, ctx0) = (
+            HKV as i32,
+            1f32 / (HD as f32).sqrt(),
+            nparts as i32,
+            T as i32,
+            0i32,
+        );
+        let (kbs, khs, page, hq) = (
+            (HKV * HD * PAGE) as i32,
+            (HD * PAGE) as i32,
+            PAGE as i32,
+            H as i32,
+        );
         // K1 序:q,k,v,bt,scr_out,scr_stat,alibi,scale,hkv,T,ctx_base,
         //        nparts,kbs,khs,page,hq,dummy(末参 = 契约 4 哑输出)
         let mut b = stream.launch_builder(&f);
@@ -335,18 +349,27 @@ fn run_case(
         );
     }
     println!("   hot_count(>4e-3) = {}", hot.len());
-    assert!(m8 < 2e-3 && x8 < 1e-2, "np{nparts} split fp8 对 host 参考超门(mean {m8}, max {x8})");
+    assert!(
+        m8 < 2e-3 && x8 < 1e-2,
+        "np{nparts} split fp8 对 host 参考超门(mean {m8}, max {x8})"
+    );
 
     // ③ f16 vs fp8 = 量化噪声 tripwire
     let (mn, xn, _) = stat(&to_f32(&o16), &to_f32(&o8));
     println!("③ np{nparts} f16 vs fp8 量化噪声 — mean={mn:.5} max={xn:.5}");
-    assert!(mn < 5e-2 && xn < 3e-1, "np{nparts} f16/fp8 tripwire(mean {mn}, max {xn})");
+    assert!(
+        mn < 5e-2 && xn < 3e-1,
+        "np{nparts} f16/fp8 tripwire(mean {mn}, max {xn})"
+    );
 
     // ④ np>1 vs np1 同核对拍(分区合并数学等价全局;隔离「核分区 bug vs host 错」)
     if let Some(r1) = np1_ref {
         let (m4, x4, a4) = stat(&to_f32(&o8), r1);
         println!("④ np{nparts} gpu_fp8 vs np1 同核 — mean={m4:.6} max={x4:.6} @ {a4}");
-        assert!(x4 < 2e-2, "np{nparts} 分区合并对 np1 超门(max {x4})— 核分区路径疑");
+        assert!(
+            x4 < 2e-2,
+            "np{nparts} 分区合并对 np1 超门(max {x4})— 核分区路径疑"
+        );
         // ⑤ scr_stat 逐分区对拍:定位 m/l 哪一环错(仅 np>1)
         let mut gs = vec![0f32; T * H * nparts * 2];
         stream.memcpy_dtoh(&d_scr32, &mut gs).unwrap();
@@ -368,9 +391,13 @@ fn run_case(
                             let bb = b % PAGE;
                             let mut s = 0f32;
                             for d in 0..HD {
-                                let kidx = pb * (HKV * HD * PAGE) + kvh * (HD * PAGE)
-                                    + bb * X + (d / X) * (PAGE * X) + d % X;
-                                s += f16_to_f32(q_f16[(t * H + h) * HD + d]) * e4m3_decode(k_fp8[kidx]);
+                                let kidx = pb * (HKV * HD * PAGE)
+                                    + kvh * (HD * PAGE)
+                                    + bb * X
+                                    + (d / X) * (PAGE * X)
+                                    + d % X;
+                                s += f16_to_f32(q_f16[(t * H + h) * HD + d])
+                                    * e4m3_decode(k_fp8[kidx]);
                             }
                             s *= scale;
                             if s > m {
@@ -394,9 +421,13 @@ fn run_case(
                                 let bb = x % PAGE;
                                 let mut s = 0f32;
                                 for d in 0..HD {
-                                    let kidx = pb * (HKV * HD * PAGE) + kvh * (HD * PAGE)
-                                        + bb * X + (d / X) * (PAGE * X) + d % X;
-                                    s += f16_to_f32(q_f16[(t * H + h) * HD + d]) * e4m3_decode(k_fp8[kidx]);
+                                    let kidx = pb * (HKV * HD * PAGE)
+                                        + kvh * (HD * PAGE)
+                                        + bb * X
+                                        + (d / X) * (PAGE * X)
+                                        + d % X;
+                                    s += f16_to_f32(q_f16[(t * H + h) * HD + d])
+                                        * e4m3_decode(k_fp8[kidx]);
                                 }
                                 s *= scale;
                                 if (s - gm).abs() < 5e-4 {
@@ -420,7 +451,10 @@ fn split_fp8_matches_f16() {
     ctx.bind_to_thread().expect("bind");
     let stream = ctx.default_stream();
     let ptx = cudarc::nvrtc::compile_ptx_with_opts(
-        owl_kernels::cu_sig::cu_text(owl_kernels::ops::source("owl_prefill_split_reduce_f16_hd256")).as_str(),
+        owl_kernels::cu_sig::cu_text(owl_kernels::ops::source(
+            "owl_prefill_split_reduce_f16_hd256",
+        ))
+        .as_str(),
         cudarc::nvrtc::CompileOptions {
             arch: Some("compute_86"),
             include_paths: vec!["/usr/local/cuda/include".into()],

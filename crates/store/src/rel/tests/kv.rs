@@ -131,7 +131,9 @@ fn evict_anchor_snapshot_is_extra_and_evictable() {
 /// `Snap` 票**同序**(事实档 + 策略),且 Transient 永远先走。
 #[test]
 fn snap_victim_order_is_the_plan_order() {
-    let mut r = rel(4);
+    // 本测试钉“纯 GPU 档”的出序；宿主开时 plan 会先出 Host 票，
+    // 与 GPU victim 序不是同一张单（共享池语义见 plan_need 的 Host 分支）。
+    let mut r = rel_no_host(4);
     let k_old = SnapKey::at_boundary(ChainHash::new(1));
     let k_tr = SnapKey::at_boundary(ChainHash::new(2));
     let k_new = SnapKey::at_boundary(ChainHash::new(3));
@@ -180,7 +182,8 @@ fn snap_victim_order_is_the_plan_order() {
 /// 不许 `Exhausted` 硬崩（旧行为：第二个长 turn 直接失败）。
 #[test]
 fn plan_kv_offload_relieves_host_before_lending_slots() {
-    let i = inputs();
+    let mut i = inputs();
+    i.host_bytes = BLOCK_BYTES;
     let mut cfg = kv_cfg(64, 32);
     cfg.host_bytes = BLOCK_BYTES;
     let mut r = Rel::open(
@@ -230,7 +233,8 @@ fn plan_kv_offload_relieves_host_before_lending_slots() {
 /// 会话填满时 `Exhausted` 直接 500。这里钉住"逐块票也能先逐最冷再出票"。
 #[test]
 fn plan_kv_offload_blocks_relieves_host_before_lending_slots() {
-    let i = inputs();
+    let mut i = inputs();
+    i.host_bytes = BLOCK_BYTES;
     let mut cfg = kv_cfg(64, 32);
     // 宿主只容一块 ⇒ B 下沉前必须让位
     cfg.host_bytes = BLOCK_BYTES;

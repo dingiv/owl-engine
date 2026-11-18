@@ -301,9 +301,7 @@ pub fn blocks_json(rows: &[owl_engine::BlockRow]) -> Value {
 }
 
 /// 逐 rank 的块账投影（`/debug/blocks`；单卡档输出与旧形状一致）。
-pub fn blocks_ranks_json(
-    ranks: &[(u8, Result<Vec<owl_engine::BlockRow>, String>)],
-) -> Value {
+pub fn blocks_ranks_json(ranks: &[(u8, Result<Vec<owl_engine::BlockRow>, String>)]) -> Value {
     if ranks.len() == 1 {
         return match &ranks[0].1 {
             Ok(rows) => blocks_json(rows),
@@ -407,9 +405,7 @@ pub fn vram_json(snap: &owl_engine::DiagSnapshot) -> Value {
                 .iter()
                 .find(|(rank, _)| *rank == 0)
                 .and_then(|(_, row)| row.as_ref().ok())
-                .map(|(used, _, reserved, _)| {
-                    (reserved.saturating_sub(*used), *reserved)
-                })
+                .map(|(used, _, reserved, _)| (reserved.saturating_sub(*used), *reserved))
                 .unwrap_or((0, 0));
             let events_rank0: u64 = r
                 .events

@@ -21,7 +21,6 @@
 //! 执行(页表写、re-RoPE、gather/scatter 搬运)仍归 engine —— 与 store 卷 §21
 //! 的「store 不做 I/O,engine 编排」同一条律。
 
-
 use crate::error::{StoreError, StoreResult};
 use crate::id::ChainHash;
 
@@ -80,7 +79,13 @@ impl MeanKIndex {
                 "索引几何非法:dim={dim} layers={layers} kv_heads={kv_heads}"
             )));
         }
-        Ok(Self { dim, layers, kv_heads, blocks: std::collections::HashMap::new(), tick: 0 })
+        Ok(Self {
+            dim,
+            layers,
+            kv_heads,
+            blocks: std::collections::HashMap::new(),
+            tick: 0,
+        })
     }
 
     /// 几何(`(dim, layers, kv_heads)`)。
@@ -175,7 +180,14 @@ impl MeanKIndex {
                 b.last_use = tick;
             }
             None => {
-                self.blocks.insert(block, BlockIndex { k_bar: flat, last_use: tick, hits: 0 });
+                self.blocks.insert(
+                    block,
+                    BlockIndex {
+                        k_bar: flat,
+                        last_use: tick,
+                        hits: 0,
+                    },
+                );
             }
         }
         Ok(())
@@ -344,7 +356,11 @@ impl MeanKCollector {
     pub fn push_pre_rope(&mut self, layer: usize, kv_head: usize, k: &[f32]) -> StoreResult<()> {
         let base = self.offset(layer, kv_head)?;
         if k.len() != self.dim {
-            return Err(StoreError::Invariant(format!("K 行长不符:{} ≠ {}", k.len(), self.dim)));
+            return Err(StoreError::Invariant(format!(
+                "K 行长不符:{} ≠ {}",
+                k.len(),
+                self.dim
+            )));
         }
         for (i, v) in k.iter().enumerate() {
             self.sums[base + i] += *v as f64;
@@ -367,7 +383,10 @@ impl MeanKCollector {
     ) -> StoreResult<()> {
         let half = self.dim / 2;
         if !self.dim.is_multiple_of(2) {
-            return Err(StoreError::Invariant(format!("dim {} 必须为偶数(RoPE 半维)", self.dim)));
+            return Err(StoreError::Invariant(format!(
+                "dim {} 必须为偶数(RoPE 半维)",
+                self.dim
+            )));
         }
         if k.len() != self.dim || cos.len() != half || sin.len() != half {
             return Err(StoreError::Invariant(format!(
@@ -408,7 +427,10 @@ impl MeanKCollector {
         sin: &[f32],
     ) -> StoreResult<()> {
         if !self.dim.is_multiple_of(2) {
-            return Err(StoreError::Invariant(format!("dim {} 必须为偶数(RoPE 半维)", self.dim)));
+            return Err(StoreError::Invariant(format!(
+                "dim {} 必须为偶数(RoPE 半维)",
+                self.dim
+            )));
         }
         // **partial 感知**(核内同律:`rotary_dim ≤ head_dim`,尾维直通):
         // cos/sin 长 = `rotary_dim/2`,只旋转 `[0, rotary_dim)`,其余原样累加。
@@ -470,7 +492,11 @@ impl MeanKCollector {
                     .iter()
                     .map(|v| f32_to_f16((*v / n) as f32))
                     .collect();
-                out.push(MeanKEntry { layer: l as u16, kv_head: h as u16, k_bar });
+                out.push(MeanKEntry {
+                    layer: l as u16,
+                    kv_head: h as u16,
+                    k_bar,
+                });
             }
         }
         Ok(out)
@@ -505,7 +531,12 @@ pub struct QueryFace {
 impl QueryFace {
     /// 构造(几何须与索引一致)。
     pub fn new(dim: usize, layers: usize, q_heads: usize) -> Self {
-        Self { layers, q_heads, dim, tokens: Vec::new() }
+        Self {
+            layers,
+            q_heads,
+            dim,
+            tokens: Vec::new(),
+        }
     }
 
     /// 追加一个 query token 的面(长度必须 = 层×头×dim)。
@@ -585,7 +616,10 @@ pub struct ScoreTuning {
 
 impl Default for ScoreTuning {
     fn default() -> Self {
-        Self { scale: 0.0, mode: ScoreMode::default() }
+        Self {
+            scale: 0.0,
+            mode: ScoreMode::default(),
+        }
     }
 }
 
@@ -691,7 +725,11 @@ pub fn score_blocks(
     if cands.is_empty() || face.is_empty() {
         return Ok(vec![0.0; cands.len()]);
     }
-    let scale = if tuning.scale > 0.0 { tuning.scale } else { 1.0 / (dim as f32).sqrt() };
+    let scale = if tuning.scale > 0.0 {
+        tuning.scale
+    } else {
+        1.0 / (dim as f32).sqrt()
+    };
     let mut r = vec![0.0f32; cands.len()];
     // **热路(LogitMean)**:**两层线性折叠** —— 论文口径的分数
     // `mean_{l,h} logit` 对 query 与头都是线性的,故
@@ -717,7 +755,9 @@ pub fn score_blocks(
         for (h, g_raw) in gqa.iter().enumerate() {
             let g = *g_raw as usize;
             if g >= kv_heads {
-                return Err(StoreError::Invariant(format!("GQA 映射越界:{g} ≥ {kv_heads}")));
+                return Err(StoreError::Invariant(format!(
+                    "GQA 映射越界:{g} ≥ {kv_heads}"
+                )));
             }
             q_heads_of[g].push(h);
         }
@@ -769,7 +809,11 @@ pub fn score_blocks(
                     if hs.is_empty() {
                         continue;
                     }
-                    let w = if gqa_max { 1.0 } else { hs.len() as f32 / hq as f32 };
+                    let w = if gqa_max {
+                        1.0
+                    } else {
+                        hs.len() as f32 / hq as f32
+                    };
                     let ql = &qbar[(l * kv_heads + g) * dim..(l * kv_heads + g + 1) * dim];
                     let qnorm = dot8(ql, ql).sqrt();
                     // max 档:组内每个 query head 的 (向量, 模长);mean 档为空
@@ -831,11 +875,7 @@ pub fn score_blocks(
             let index_ref = index;
             std::thread::scope(|scope| {
                 let mut hs = Vec::with_capacity(nthreads);
-                for (ti, (a_out, sn_out)) in a
-                    .chunks_mut(per)
-                    .zip(sn.chunks_mut(per))
-                    .enumerate()
-                {
+                for (ti, (a_out, sn_out)) in a.chunks_mut(per).zip(sn.chunks_mut(per)).enumerate() {
                     let lo = ti * per;
                     let sub = &cands[lo..lo + a_out.len()];
                     let err = &parallel_err;
@@ -847,15 +887,19 @@ pub fn score_blocks(
                                 if hsv.is_empty() {
                                     continue;
                                 }
-                                let w = if gqa_max { 1.0 } else { hsv.len() as f32 / hq as f32 };
-                                let ql = &qbar_ref[(l * kv_heads + g) * dim
-                                    ..(l * kv_heads + g + 1) * dim];
+                                let w = if gqa_max {
+                                    1.0
+                                } else {
+                                    hsv.len() as f32 / hq as f32
+                                };
+                                let ql = &qbar_ref
+                                    [(l * kv_heads + g) * dim..(l * kv_heads + g + 1) * dim];
                                 let qnorm = dot8(ql, ql).sqrt();
                                 let qmax: Vec<(&[f32], f32)> = if gqa_max {
                                     hsv.iter()
                                         .map(|h| {
-                                            let qh = &q_ref[(l * hq + *h) * dim
-                                                ..(l * hq + *h + 1) * dim];
+                                            let qh = &q_ref
+                                                [(l * hq + *h) * dim..(l * hq + *h + 1) * dim];
                                             (qh, dot8(qh, qh).sqrt())
                                         })
                                         .collect()
@@ -884,9 +928,7 @@ pub fn score_blocks(
                                         let s = if gqa_max {
                                             let knorm = dot8(row, row).sqrt();
                                             qmax.iter()
-                                                .map(|(qh, qn)| {
-                                                    dot8(row, qh) / (qn * knorm + 1e-6)
-                                                })
+                                                .map(|(qh, qn)| dot8(row, qh) / (qn * knorm + 1e-6))
                                                 .fold(f32::NEG_INFINITY, f32::max)
                                         } else if cosine {
                                             let knorm = dot8(row, row).sqrt();
@@ -910,7 +952,9 @@ pub fn score_blocks(
                 }
             });
             if parallel_err.get() {
-                return Err(StoreError::Invariant("打分并行线程 panic(结果不可信)".into()));
+                return Err(StoreError::Invariant(
+                    "打分并行线程 panic(结果不可信)".into(),
+                ));
             }
             acc = a;
             seen = sn;
@@ -940,14 +984,18 @@ pub fn score_blocks(
             for (h, g_raw) in gqa.iter().enumerate() {
                 let g = *g_raw as usize;
                 if g >= kv_heads {
-                    return Err(StoreError::Invariant(format!("GQA 映射越界:{g} ≥ {kv_heads}")));
+                    return Err(StoreError::Invariant(format!(
+                        "GQA 映射越界:{g} ≥ {kv_heads}"
+                    )));
                 }
                 let q_off = (l * face.q_heads + h) * dim;
                 // ① 逐候选块的点积(**规范序直取**:`entry_at` 零扫描;
                 // 未登记块 = -inf ⇒ 任何口径都不会把它当正常块)
                 let mut logits = vec![f32::NEG_INFINITY; cands.len()];
                 for (i, b) in cands.iter().enumerate() {
-                    let Some(row) = index.entry_at(*b, l, g) else { continue };
+                    let Some(row) = index.entry_at(*b, l, g) else {
+                        continue;
+                    };
                     let mut dot = 0.0f32;
                     for (d, bits) in row.iter().enumerate() {
                         dot += t[q_off + d] * f16_to_f32(*bits);
@@ -990,7 +1038,11 @@ pub fn score_blocks(
         if tuning.mode == ScoreMode::LogitMean {
             // 逐候选自己的有效 (层,头) 数作分母;一个都没 = -inf(永不入选)
             for (i, v) in acc.iter().enumerate() {
-                r[i] += if seen[i] == 0 { f32::NEG_INFINITY } else { *v / seen[i] as f32 };
+                r[i] += if seen[i] == 0 {
+                    f32::NEG_INFINITY
+                } else {
+                    *v / seen[i] as f32
+                };
             }
             continue;
         }
@@ -1119,7 +1171,9 @@ pub fn coverage_curve(attn_mass: &[f32], scores: &[f32], ks: &[usize]) -> Vec<(u
     }
     let mut order: Vec<usize> = (0..n).collect();
     order.sort_by(|a, b| {
-        scores[*b].partial_cmp(&scores[*a]).unwrap_or(std::cmp::Ordering::Equal)
+        scores[*b]
+            .partial_cmp(&scores[*a])
+            .unwrap_or(std::cmp::Ordering::Equal)
     });
     let mut out = Vec::with_capacity(ks.len());
     for k in ks {
@@ -1177,7 +1231,13 @@ pub struct SelectBudget {
 impl SelectBudget {
     /// 构造(预算为 0 = 选择层关;调用方据此走 dense 路径)。
     pub fn new(blocks: usize, sink: usize, recent: usize) -> Self {
-        Self { blocks, sink, recent, stratified: 0, graph_alpha: 0.0 }
+        Self {
+            blocks,
+            sink,
+            recent,
+            stratified: 0,
+            graph_alpha: 0.0,
+        }
     }
 
     /// 追加一跳邻接传播(构建器写法;`0` = 关)。
@@ -1299,18 +1359,18 @@ pub fn select_recency(order: &[ChainHash], budget: SelectBudget) -> BlockSet {
         .filter(|(i, _)| picked[*i])
         .map(|(_, b)| *b)
         .collect();
-    BlockSet { blocks, dropped, reserved }
+    BlockSet {
+        blocks,
+        dropped,
+        reserved,
+    }
 }
 
 /// **选择**(论文 §4.3):sink + recent 保底 → 按分补足 → **按时间序重排**。
 ///
 /// `order` = 候选块的**时间序**(论文的 chronology;不在 `order` 里的候选被忽略)。
 /// `scored` = [`score_blocks`] 的输出(与 `cands` 同序,本函数内部转 map)。
-pub fn select(
-    scored: &[(ChainHash, f32)],
-    order: &[ChainHash],
-    budget: SelectBudget,
-) -> BlockSet {
+pub fn select(scored: &[(ChainHash, f32)], order: &[ChainHash], budget: SelectBudget) -> BlockSet {
     if budget.blocks == 0 {
         return BlockSet::default();
     }
@@ -1378,7 +1438,11 @@ pub fn select(
         .filter(|i| !picked[*i])
         .map(|i| (i, score_of(&order[i])))
         .collect();
-    rest.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal).then(b.0.cmp(&a.0)));
+    rest.sort_by(|a, b| {
+        b.1.partial_cmp(&a.1)
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then(b.0.cmp(&a.0))
+    });
     let room = budget.blocks.saturating_sub(reserved);
     for (i, _) in rest.iter().take(room) {
         picked[*i] = true;
@@ -1391,7 +1455,11 @@ pub fn select(
         .filter(|(i, _)| picked[*i])
         .map(|(_, b)| *b)
         .collect();
-    BlockSet { blocks, dropped, reserved }
+    BlockSet {
+        blocks,
+        dropped,
+        reserved,
+    }
 }
 
 // ───────────────────────────── 装配计划 ─────────────────────────────
@@ -1478,7 +1546,11 @@ pub fn assemble_view(
                 }
             }
         };
-        plan.frames.push(PosFrame { block: *b, pos, action });
+        plan.frames.push(PosFrame {
+            block: *b,
+            pos,
+            action,
+        });
         pos = pos.saturating_add(block_tokens);
     }
     plan.pos_span = pos.saturating_sub(base_pos);
@@ -1495,7 +1567,11 @@ mod tests {
     }
 
     fn entry(layer: u16, kv_head: u16, v: [f32; 2]) -> MeanKEntry {
-        MeanKEntry { layer, kv_head, k_bar: v.iter().map(|x| f32_to_f16(*x)).collect() }
+        MeanKEntry {
+            layer,
+            kv_head,
+            k_bar: v.iter().map(|x| f32_to_f16(*x)).collect(),
+        }
     }
 
     /// **GPU Mean-K 出口**:扁平段与逐条 `register` 同账同形状；段长错 = 响亮拒。
@@ -1505,7 +1581,10 @@ mod tests {
         let mut b = idx();
         let h = ChainHash::new(7);
         let entries = vec![entry(0, 0, [1.0, 2.0]), entry(0, 1, [3.0, 4.0])];
-        let flat: Vec<u16> = entries.iter().flat_map(|e| e.k_bar.iter().copied()).collect();
+        let flat: Vec<u16> = entries
+            .iter()
+            .flat_map(|e| e.k_bar.iter().copied())
+            .collect();
         a.register(h, entries).expect("逐条");
         b.register_flat(h, flat).expect("扁平");
         assert_eq!(a.block_k_bar(h), b.block_k_bar(h));
@@ -1539,7 +1618,8 @@ mod tests {
             k1[2] * c1 - k1[3] * s1,
             k1[2] * s1 + k1[3] * c1,
         ];
-        c.push_post_rope(0, 0, &rotated, &[c0, c1], &[s0, s1]).expect("post");
+        c.push_post_rope(0, 0, &rotated, &[c0, c1], &[s0, s1])
+            .expect("post");
         assert_eq!(c.len(), 2);
         let entries = c.finish().expect("收口");
         assert_eq!(entries.len(), 1);
@@ -1547,10 +1627,16 @@ mod tests {
         let mean = [0.75f32, 0.5, 2.5, 2.125]; // (k0 + k1) / 2
         for (i, m) in mean.iter().enumerate() {
             let got = f16_to_f32(entries[0].k_bar[i]);
-            assert!((got - m).abs() < 1e-2, "第 {i} 维:逆 RoPE 后应回原值 {m},得 {got}");
+            assert!(
+                (got - m).abs() < 1e-2,
+                "第 {i} 维:逆 RoPE 后应回原值 {m},得 {got}"
+            );
         }
         // 空采集 = 结构性拒
-        assert!(MeanKCollector::new(dim, 1, 1).expect("采集器").finish().is_err());
+        assert!(MeanKCollector::new(dim, 1, 1)
+            .expect("采集器")
+            .finish()
+            .is_err());
         // 形状错 = 响亮拒
         let mut c2 = MeanKCollector::new(dim, 1, 1).expect("采集器");
         assert!(c2.push_pre_rope(0, 0, &[1.0, 2.0]).is_err());
@@ -1573,7 +1659,8 @@ mod tests {
             k[0] * s0 + k[2] * c0,
             k[1] * s1 + k[3] * c1,
         ];
-        c.push_post_rope_halves(0, 0, &rot, &[c0, c1], &[s0, s1]).expect("逆");
+        c.push_post_rope_halves(0, 0, &rot, &[c0, c1], &[s0, s1])
+            .expect("逆");
         let e = c.finish().expect("收口");
         for (i, want) in k.iter().enumerate() {
             let got = f16_to_f32(e[0].k_bar[i]);
@@ -1585,22 +1672,33 @@ mod tests {
     fn index_registers_and_validates_shape() {
         let mut ix = idx();
         let a = ChainHash::new(1);
-        ix.register(a, vec![entry(0, 0, [1.0, 0.0]), entry(0, 1, [0.0, 1.0])]).expect("登记");
+        ix.register(a, vec![entry(0, 0, [1.0, 0.0]), entry(0, 1, [0.0, 1.0])])
+            .expect("登记");
         assert!(ix.contains(a));
         assert_eq!(ix.len(), 1);
         assert_eq!(ix.stats().entries_per_block, 2);
         assert_eq!(ix.block_bytes(), 2 * 2 * 2);
         // 形状错 = 响亮拒
-        assert!(ix.register(ChainHash::new(2), vec![entry(0, 0, [1.0, 0.0])]).is_err());
-        assert!(ix.register(ChainHash::new(3), vec![entry(1, 0, [1.0, 0.0]), entry(0, 0, [1.0, 0.0])]).is_err());
+        assert!(ix
+            .register(ChainHash::new(2), vec![entry(0, 0, [1.0, 0.0])])
+            .is_err());
+        assert!(ix
+            .register(
+                ChainHash::new(3),
+                vec![entry(1, 0, [1.0, 0.0]), entry(0, 0, [1.0, 0.0])]
+            )
+            .is_err());
     }
 
     #[test]
     fn evict_order_is_recency_then_hits() {
         let mut ix = idx();
         for k in 1..=3u64 {
-            ix.register(ChainHash::new(k), vec![entry(0, 0, [1.0, 0.0]), entry(0, 1, [0.0, 1.0])])
-                .expect("登记");
+            ix.register(
+                ChainHash::new(k),
+                vec![entry(0, 0, [1.0, 0.0]), entry(0, 1, [0.0, 1.0])],
+            )
+            .expect("登记");
         }
         ix.touch(ChainHash::new(1)); // 1 变最新 + 1 次命中
         let cands = ix.evict_candidates(&[ChainHash::new(2)]);
@@ -1614,8 +1712,10 @@ mod tests {
         let mut ix = idx();
         let a = ChainHash::new(1);
         let b = ChainHash::new(2);
-        ix.register(a, vec![entry(0, 0, [1.0, 0.0]), entry(0, 1, [0.0, 0.0])]).expect("A");
-        ix.register(b, vec![entry(0, 0, [0.0, 1.0]), entry(0, 1, [0.0, 0.0])]).expect("B");
+        ix.register(a, vec![entry(0, 0, [1.0, 0.0]), entry(0, 1, [0.0, 0.0])])
+            .expect("A");
+        ix.register(b, vec![entry(0, 0, [0.0, 1.0]), entry(0, 1, [0.0, 0.0])])
+            .expect("B");
         // query:1 token,1 查询头 → KV 头 0;q = [1, 0](与 A 同向)
         let mut face = QueryFace::new(2, 1, 1);
         face.push_token(vec![1.0, 0.0]).expect("面");
@@ -1625,8 +1725,14 @@ mod tests {
         assert!((s[1] - 0.332).abs() < 0.01, "B = {}", s[1]);
         assert!((s[0] + s[1] - 1.0).abs() < 1e-5, "softmax 归一到 1");
         // 未登记的块 = 0 分
-        let s2 = score_blocks(&ix, &face, &[ChainHash::new(9)], &[0], ScoreTuning::default())
-            .expect("打分");
+        let s2 = score_blocks(
+            &ix,
+            &face,
+            &[ChainHash::new(9)],
+            &[0],
+            ScoreTuning::default(),
+        )
+        .expect("打分");
         assert_eq!(s2[0], 0.0);
     }
 
@@ -1649,13 +1755,25 @@ mod tests {
         let mut face = QueryFace::new(2, 2, 1);
         face.push_token(vec![1.0, 0.0, 1.0, 0.0]).expect("面");
         let soft = score_blocks(
-            &ix, &face, &cands, &[0],
-            ScoreTuning { scale: 0.0, mode: ScoreMode::SoftmaxMean },
+            &ix,
+            &face,
+            &cands,
+            &[0],
+            ScoreTuning {
+                scale: 0.0,
+                mode: ScoreMode::SoftmaxMean,
+            },
         )
         .expect("softmax 面");
         let logit = score_blocks(
-            &ix, &face, &cands, &[0],
-            ScoreTuning { scale: 0.0, mode: ScoreMode::LogitMean },
+            &ix,
+            &face,
+            &cands,
+            &[0],
+            ScoreTuning {
+                scale: 0.0,
+                mode: ScoreMode::LogitMean,
+            },
         )
         .expect("logit 面");
         // ① 排序等价
@@ -1665,7 +1783,11 @@ mod tests {
             idx.sort_by(|a, b| v[*b].total_cmp(&v[*a]));
             idx
         };
-        assert_eq!(rank(&soft), rank(&logit), "softmax 单调 ⇒ 两种口径的排序必须一致");
+        assert_eq!(
+            rank(&soft),
+            rank(&logit),
+            "softmax 单调 ⇒ 两种口径的排序必须一致"
+        );
         // ② 幅度:softmax 均值总和 ≈ 1/n_tokens(逐 token 归一)
         let ssum: f32 = soft.iter().sum();
         assert!((ssum - 1.0).abs() < 1e-4, "softmax 口径総和≈1,得 {ssum}");
@@ -1675,17 +1797,36 @@ mod tests {
             soft.iter().cloned().fold(f32::MIN, f32::max)
         );
         // logit 口径能够出负数(自然展开;阈值/预算面才是可信值)
-        assert!(logit.iter().any(|v| *v < 0.0), "logit 口径应自然展开: {logit:?}");
+        assert!(
+            logit.iter().any(|v| *v < 0.0),
+            "logit 口径应自然展开: {logit:?}"
+        );
         // 未登记候选:softmax = 0,logit = -inf(两者都不得当“正常块”)
-        let miss = score_blocks(&ix, &face, &[ChainHash::new(77)], &[0], ScoreTuning::default())
-            .expect("缺块");
-        assert_eq!(miss[0], 0.0);
-        let miss2 = score_blocks(
-            &ix, &face, &[ChainHash::new(77)], &[0],
-            ScoreTuning { scale: 0.0, mode: ScoreMode::LogitMean },
+        let miss = score_blocks(
+            &ix,
+            &face,
+            &[ChainHash::new(77)],
+            &[0],
+            ScoreTuning::default(),
         )
         .expect("缺块");
-        assert_eq!(miss2[0], f32::NEG_INFINITY, "logit 口径下缺块 = -inf ⇒ 永不入选");
+        assert_eq!(miss[0], 0.0);
+        let miss2 = score_blocks(
+            &ix,
+            &face,
+            &[ChainHash::new(77)],
+            &[0],
+            ScoreTuning {
+                scale: 0.0,
+                mode: ScoreMode::LogitMean,
+            },
+        )
+        .expect("缺块");
+        assert_eq!(
+            miss2[0],
+            f32::NEG_INFINITY,
+            "logit 口径下缺块 = -inf ⇒ 永不入选"
+        );
     }
 
     /// **CosineMean**:key 模长归一后,同方向不同范数的块必须同分。
@@ -1703,18 +1844,37 @@ mod tests {
         let mut face = QueryFace::new(2, 1, 1);
         face.push_token(vec![1.0, 0.0]).expect("面");
         let cos = score_blocks(
-            &ix, &face, &[a, b], &[0],
-            ScoreTuning { scale: 0.0, mode: ScoreMode::CosineMean },
+            &ix,
+            &face,
+            &[a, b],
+            &[0],
+            ScoreTuning {
+                scale: 0.0,
+                mode: ScoreMode::CosineMean,
+            },
         )
         .expect("cosine");
         assert!((cos[0] - 1.0).abs() < 1e-4, "A cos = {}", cos[0]);
-        assert!((cos[1] - 1.0).abs() < 1e-4, "B cos = {} (模长必须被归一)", cos[1]);
+        assert!(
+            (cos[1] - 1.0).abs() < 1e-4,
+            "B cos = {} (模长必须被归一)",
+            cos[1]
+        );
         let logit = score_blocks(
-            &ix, &face, &[a, b], &[0],
-            ScoreTuning { scale: 0.0, mode: ScoreMode::LogitMean },
+            &ix,
+            &face,
+            &[a, b],
+            &[0],
+            ScoreTuning {
+                scale: 0.0,
+                mode: ScoreMode::LogitMean,
+            },
         )
         .expect("logit");
-        assert!(logit[1] > logit[0] * 5.0, "对照:logit 面被模长放大 {logit:?}");
+        assert!(
+            logit[1] > logit[0] * 5.0,
+            "对照:logit 面被模长放大 {logit:?}"
+        );
     }
 
     /// **GQA max**:两个 query head 分别对准 A/B 时,mean 会把两者都拉平;
@@ -1735,7 +1895,10 @@ mod tests {
             &face,
             &[a, b],
             &gqa,
-            ScoreTuning { scale: 0.0, mode: ScoreMode::CosineMean },
+            ScoreTuning {
+                scale: 0.0,
+                mode: ScoreMode::CosineMean,
+            },
         )
         .expect("mean");
         let max = score_blocks(
@@ -1743,13 +1906,24 @@ mod tests {
             &face,
             &[a, b],
             &gqa,
-            ScoreTuning { scale: 0.0, mode: ScoreMode::CosineMax },
+            ScoreTuning {
+                scale: 0.0,
+                mode: ScoreMode::CosineMax,
+            },
         )
         .expect("max");
         // 两个正交单位向量的余弦均值 = 1/√2(用常量,别写近似字面量)
         let frac_1_sqrt_2 = std::f64::consts::FRAC_1_SQRT_2 as f32;
-        assert!((mean[0] - frac_1_sqrt_2).abs() < 1e-3, "mean A = {}", mean[0]);
-        assert!((mean[1] - frac_1_sqrt_2).abs() < 1e-3, "mean B = {}", mean[1]);
+        assert!(
+            (mean[0] - frac_1_sqrt_2).abs() < 1e-3,
+            "mean A = {}",
+            mean[0]
+        );
+        assert!(
+            (mean[1] - frac_1_sqrt_2).abs() < 1e-3,
+            "mean B = {}",
+            mean[1]
+        );
         assert!((max[0] - 1.0).abs() < 1e-4, "max A = {}", max[0]);
         assert!((max[1] - 1.0).abs() < 1e-4, "max B = {}", max[1]);
         assert!(max[0] > mean[0] + 0.2 && max[1] > mean[1] + 0.2);
@@ -1773,12 +1947,17 @@ mod tests {
         let (dim, layers, kv_heads, hq) = (256usize, 16usize, 4usize, 24usize);
         let gqa: Vec<u16> = (0..hq).map(|h| (h / (hq / kv_heads)) as u16).collect();
         let win = 8usize; // query 窗(与探针同口径)
-        let sizes: &[usize] =
-            if cfg!(debug_assertions) { &[256, 512] } else { &[512, 2048, 8192] };
+        let sizes: &[usize] = if cfg!(debug_assertions) {
+            &[256, 512]
+        } else {
+            &[512, 2048, 8192]
+        };
         let mut out = Vec::new();
         for n_blocks in sizes.iter().copied() {
             let mut ix = MeanKIndex::new(dim, layers, kv_heads).expect("索引");
-            let cands: Vec<ChainHash> = (0..n_blocks as u64).map(|i| ChainHash::new(i + 1)).collect();
+            let cands: Vec<ChainHash> = (0..n_blocks as u64)
+                .map(|i| ChainHash::new(i + 1))
+                .collect();
             for b in &cands {
                 let mut ent = Vec::with_capacity(layers * kv_heads);
                 for l in 0..layers {
@@ -1788,7 +1967,11 @@ mod tests {
                             let x = (((l * 31 + h * 7 + d) as f32) * 0.017).sin();
                             *v = f32_to_f16(x);
                         }
-                        ent.push(MeanKEntry { layer: l as u16, kv_head: h as u16, k_bar: row });
+                        ent.push(MeanKEntry {
+                            layer: l as u16,
+                            kv_head: h as u16,
+                            k_bar: row,
+                        });
                     }
                 }
                 ix.register(*b, ent).expect("登记");
@@ -1802,8 +1985,8 @@ mod tests {
                 face.push_token(flat).expect("面");
             }
             let t0 = std::time::Instant::now();
-            let scores = score_blocks(&ix, &face, &cands, &gqa, ScoreTuning::default())
-                .expect("打分");
+            let scores =
+                score_blocks(&ix, &face, &cands, &gqa, ScoreTuning::default()).expect("打分");
             let set = select(
                 &cands
                     .iter()
@@ -1821,11 +2004,18 @@ mod tests {
                 &face,
                 &cands,
                 &gqa,
-                ScoreTuning { scale: 0.0, mode: ScoreMode::LogitMean },
+                ScoreTuning {
+                    scale: 0.0,
+                    mode: ScoreMode::LogitMean,
+                },
             )
             .expect("快路打分");
             let _ = select(
-                &cands.iter().copied().zip(fast.iter().copied()).collect::<Vec<_>>(),
+                &cands
+                    .iter()
+                    .copied()
+                    .zip(fast.iter().copied())
+                    .collect::<Vec<_>>(),
                 &cands,
                 SelectBudget::new(64, 2, 4),
             );
@@ -1855,7 +2045,10 @@ mod tests {
         //  + 扁平索引/dot8;共 24×~47×)
         let fast_worst = out.iter().map(|(_, _, f)| *f).fold(0.0f64, f64::max);
         if cfg!(debug_assertions) {
-            assert!(fast_worst < 20_000.0, "debug 档快路 512 块 >20s(复杂度或扫描错了?): {out:?}");
+            assert!(
+                fast_worst < 20_000.0,
+                "debug 档快路 512 块 >20s(复杂度或扫描错了?): {out:?}"
+            );
         } else {
             assert!(
                 fast_worst <= 400.0,
@@ -1877,17 +2070,30 @@ mod tests {
         // 完美排序 ⇒ 覆盖率 = 前缀和
         let perfect = [mass[0], mass[1], mass[2], mass[3]];
         let curve = coverage_curve(&mass, &perfect, &[1, 2, 4]);
-        assert!((curve[0].1 - mass[0] as f64).abs() < 1e-6, "top-1 = 块0 质量");
+        assert!(
+            (curve[0].1 - mass[0] as f64).abs() < 1e-6,
+            "top-1 = 块0 质量"
+        );
         assert!((curve[1].1 - (mass[0] + mass[1]) as f64).abs() < 1e-6);
         assert!((curve[2].1 - 1.0).abs() < 1e-6, "top-4 = 全量");
         // **排序错 ⇒ 掉到随机**:反序打分 ⇒ top-1 = 最差块
         let reversed = [mass[3], mass[2], mass[1], mass[0]];
         let bad = coverage_curve(&mass, &reversed, &[1]);
-        assert!((bad[0].1 - mass[3] as f64).abs() < 1e-6, "反序 ⇒ 只捞到最差块");
+        assert!(
+            (bad[0].1 - mass[3] as f64).abs() < 1e-6,
+            "反序 ⇒ 只捞到最差块"
+        );
         assert!(bad[0].1 < curve[0].1, "约定错/打分噪声一眼可辨");
         // 全 -inf / 空 = 零(不 panic)
-        assert_eq!(block_mass(&[f32::NEG_INFINITY; 3], &[0, 1, 2], 3).iter().sum::<f32>(), 0.0);
-        assert!(coverage_curve(&[], &[], &[1]).iter().all(|(_, c)| *c == 0.0));
+        assert_eq!(
+            block_mass(&[f32::NEG_INFINITY; 3], &[0, 1, 2], 3)
+                .iter()
+                .sum::<f32>(),
+            0.0
+        );
+        assert!(coverage_curve(&[], &[], &[1])
+            .iter()
+            .all(|(_, c)| *c == 0.0));
     }
 
     /// **一跳邻接传播**(参照实现 `propagate_query_scores` 邻接通道)。
@@ -1909,7 +2115,11 @@ mod tests {
         // **可以接收**邻居的正证据,且下界 = 自身负值 ⇒ 永远抬不到 0 以上。
         let s2 = [-5.0f32, 10.0, 0.0];
         let g2 = propagate_adjacent(&s2, 0.2);
-        assert!((g2[0] + 4.5).abs() < 1e-6, "负块应只被抬 δ=0.5(下界 −5),实得 {}", g2[0]);
+        assert!(
+            (g2[0] + 4.5).abs() < 1e-6,
+            "负块应只被抬 δ=0.5(下界 −5),实得 {}",
+            g2[0]
+        );
         assert!(g2[0] <= 0.0, "负证据不得越过 0(否则排序信息被抹平)");
         // 全非正 ⇒ 原样
         let s3 = [-1.0f32, -2.0, -3.0];
@@ -1928,8 +2138,11 @@ mod tests {
         let n = 100usize;
         let order: Vec<ChainHash> = (0..n as u64).map(ChainHash::new).collect();
         // 分数故意做成"只有尾段高"(模拟 top-k 只爱近处)⇒ 纯 top-k 会整段跳过开头
-        let scored: Vec<(ChainHash, f32)> =
-            order.iter().enumerate().map(|(i, b)| (*b, i as f32)).collect();
+        let scored: Vec<(ChainHash, f32)> = order
+            .iter()
+            .enumerate()
+            .map(|(i, b)| (*b, i as f32))
+            .collect();
         let b = SelectBudget::new(12, 1, 1);
         let plain = select(&scored, &order, b);
         assert_eq!(plain.blocks.len(), 12);
@@ -1962,15 +2175,24 @@ mod tests {
     fn select_reserves_sink_recent_then_topk_then_reorders() {
         let order: Vec<ChainHash> = (1..=8u64).map(ChainHash::new).collect();
         // 分数:越靠后的越高(便于观察"保底 + 补足"的组合)
-        let scored: Vec<(ChainHash, f32)> =
-            order.iter().enumerate().map(|(i, b)| (*b, i as f32)).collect();
+        let scored: Vec<(ChainHash, f32)> = order
+            .iter()
+            .enumerate()
+            .map(|(i, b)| (*b, i as f32))
+            .collect();
         let set = select(&scored, &order, SelectBudget::new(4, 1, 1));
         // 保底 = 块1(sink) + 块8(recent);再按分补 2 个 ⇒ 7, 6
-        assert_eq!(set.blocks, vec![order[0], order[5], order[6], order[7]], "时间序 + 保底 + 补足");
+        assert_eq!(
+            set.blocks,
+            vec![order[0], order[5], order[6], order[7]],
+            "时间序 + 保底 + 补足"
+        );
         assert_eq!(set.reserved, 2);
         assert_eq!(set.dropped, 4);
         // 预算 0 = 选择层关
-        assert!(select(&scored, &order, SelectBudget::new(0, 1, 1)).blocks.is_empty());
+        assert!(select(&scored, &order, SelectBudget::new(0, 1, 1))
+            .blocks
+            .is_empty());
     }
 
     #[test]
@@ -1978,7 +2200,11 @@ mod tests {
         let a = ChainHash::new(1);
         let b = ChainHash::new(2);
         let c = ChainHash::new(3);
-        let set = BlockSet { blocks: vec![a, b, c], dropped: 0, reserved: 0 };
+        let set = BlockSet {
+            blocks: vec![a, b, c],
+            dropped: 0,
+            reserved: 0,
+        };
         // 上一步:a 在同位置(Keep)、b 位置变了且已 delta 3 次(超限 ⇒ Rebuild)
         let prev = vec![(a, 0u32, 0u32), (b, 64u32, 3u32)];
         let plan = assemble_view(&set, &prev, 0, 32, 3);

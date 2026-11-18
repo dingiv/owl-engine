@@ -204,8 +204,7 @@ fn bench_shape_a8(
 #[ignore = "bench: marlin W4A8 vs W4A16 杠杆(bench 全线前置判据)"]
 #[test]
 fn marlin_w4a8_vs_w4a16_lever() {
-    let Some(dev) = owl_cuda::test_device_ordinal_opt()
-    else {
+    let Some(dev) = owl_cuda::test_device_ordinal_opt() else {
         owl_shared::testkit::report::skip("OWL_TEST_DEVICE 未设");
         return;
     };
@@ -250,8 +249,7 @@ fn marlin_w4a8_vs_w4a16_lever() {
 #[ignore = "bench: marlin 带宽微基准(E5 性能会战)"]
 #[test]
 fn marlin_bandwidth_27b_shapes() {
-    let Some(dev) = owl_cuda::test_device_ordinal_opt()
-    else {
+    let Some(dev) = owl_cuda::test_device_ordinal_opt() else {
         owl_shared::testkit::report::skip("OWL_TEST_DEVICE 未设");
         return;
     };
@@ -304,10 +302,14 @@ fn marlin_w4a8_m8_parity() {
     let groups = k / g;
 
     // 非退化数据:A 有正负、q∈[8,15]、zp∈[0,7]、s 幅值真实。
-    let a_i8: Vec<i8> = (0..m * k).map(|i| (((i * 13 + 7) % 255) as i32 - 127) as i8).collect();
+    let a_i8: Vec<i8> = (0..m * k)
+        .map(|i| (((i * 13 + 7) % 255) as i32 - 127) as i8)
+        .collect();
     let a_s: Vec<f32> = (0..m).map(|i| 0.02 + i as f32 * 0.0031).collect();
     let q: Vec<u8> = (0..n * k).map(|i| ((i * 7 + 3) % 8 + 8) as u8).collect();
-    let s: Vec<f32> = (0..n * groups).map(|i| 0.02 + ((i * 13) % 13) as f32 * 0.004).collect();
+    let s: Vec<f32> = (0..n * groups)
+        .map(|i| 0.02 + ((i * 13) % 13) as f32 * 0.004)
+        .collect();
     let zp: Vec<u8> = (0..n * groups).map(|i| ((i * 5 + 2) % 8) as u8).collect();
 
     let b_packed = owl_kernels::family::marlin::repack::pack_marlin_b_a8(&q, k, n);
@@ -415,7 +417,11 @@ fn marlin_w4a8_m8_parity() {
     );
     assert!(e8 < 2e-2, "W4A8 m8 与 host 参考偏差过大:{e8}");
     assert!(e16 < 2e-2, "W4A8 16-row 与 host 参考偏差过大:{e16}");
-    assert!(diff / ref_max < 2e-2, "W4A8 m8 与 16-row 偏差过大:{:.3e}", diff / ref_max);
+    assert!(
+        diff / ref_max < 2e-2,
+        "W4A8 m8 与 16-row 偏差过大:{:.3e}",
+        diff / ref_max
+    );
 }
 
 /// **MLP gate+up 合并 A/B**(2026-10-23 verify 算子优化):
@@ -496,16 +502,31 @@ fn marlin_tile_sweep() {
             std::env::set_var("MARLIN_THREADS", th);
             let launch = || unsafe {
                 owl_kernels::family::marlin::gemm_v2_awq_raw_cfg(
-                    a_p as *const u16, b_p as *const i32, c_p as *mut u16,
-                    s_p as *const u16, z_p as *const i32,
-                    m as i32, n as i32, k as i32, ws_p as *mut i32, G,
-                    dev as i32, cu, tk, tn,
-                ).expect("tile launch")
+                    a_p as *const u16,
+                    b_p as *const i32,
+                    c_p as *mut u16,
+                    s_p as *const u16,
+                    z_p as *const i32,
+                    m as i32,
+                    n as i32,
+                    k as i32,
+                    ws_p as *mut i32,
+                    G,
+                    dev as i32,
+                    cu,
+                    tk,
+                    tn,
+                )
+                .expect("tile launch")
             };
-            for _ in 0..5 { launch(); }
+            for _ in 0..5 {
+                launch();
+            }
             stream.synchronize().unwrap();
             let t0 = std::time::Instant::now();
-            for _ in 0..50 { launch(); }
+            for _ in 0..50 {
+                launch();
+            }
             stream.synchronize().unwrap();
             t0.elapsed().as_secs_f64() * 1e6 / 50.0
         };
@@ -671,11 +692,18 @@ fn marlin_w4a8_tile_sweep() {
                 match bench_w4a8_cfg(&ctx, &stream, n, k, m, tk, tn, th) {
                     Ok((us, tf, gbs)) => println!(
                         "{:>14} {:>6} {:>10} {:>9.1} {:>9.1} {:>10.1}",
-                        format!("{n}x{k}"), m, label, us, tf, gbs
+                        format!("{n}x{k}"),
+                        m,
+                        label,
+                        us,
+                        tf,
+                        gbs
                     ),
                     Err(e) => println!(
                         "{:>14} {:>6} {:>10}   n/a(err {e})",
-                        format!("{n}x{k}"), m, label
+                        format!("{n}x{k}"),
+                        m,
+                        label
                     ),
                 }
             }
@@ -700,17 +728,33 @@ fn marlin_w4a8_narrow_n_sweep() {
     let stream = ctx.default_stream();
     let shapes: &[(usize, usize)] = &[(2560, 17408), (2560, 6144), (4096, 5120)];
     let cfgs: &[(i32, i32, i32)] = &[(-1, -1, -1), (64, 128, 128), (128, 64, 128)];
-    println!("{:>14} {:>6} {:>13} {:>9} {:>9}", "shape", "m", "cfg", "µs", "TFLOPS");
+    println!(
+        "{:>14} {:>6} {:>13} {:>9} {:>9}",
+        "shape", "m", "cfg", "µs", "TFLOPS"
+    );
     for &(n, k) in shapes {
         for m in [128usize, 256, 384, 512, 768, 1024] {
             for &(tk, tn, th) in cfgs {
-                let label = if tk < 0 { "auto=64,256".to_string() } else { format!("{tk},{tn}/{th}") };
+                let label = if tk < 0 {
+                    "auto=64,256".to_string()
+                } else {
+                    format!("{tk},{tn}/{th}")
+                };
                 match bench_w4a8_cfg(&ctx, &stream, n, k, m, tk, tn, th) {
                     Ok((us, tf, _)) => println!(
                         "{:>14} {:>6} {:>13} {:>9.1} {:>9.1}",
-                        format!("{n}x{k}"), m, label, us, tf
+                        format!("{n}x{k}"),
+                        m,
+                        label,
+                        us,
+                        tf
                     ),
-                    Err(e) => println!("{:>14} {:>6} {:>13}  n/a({e})", format!("{n}x{k}"), m, label),
+                    Err(e) => println!(
+                        "{:>14} {:>6} {:>13}  n/a({e})",
+                        format!("{n}x{k}"),
+                        m,
+                        label
+                    ),
                 }
             }
         }
@@ -738,7 +782,9 @@ fn marlin_w4a8_m_split_tail_parity() {
     let a_i8: Vec<i8> = (0..m_full * k)
         .map(|i| (((i * 13 + 7) % 255) as i32 - 127) as i8)
         .collect();
-    let a_s: Vec<f32> = (0..m_full).map(|i| 0.02 + (i % 37) as f32 * 0.001).collect();
+    let a_s: Vec<f32> = (0..m_full)
+        .map(|i| 0.02 + (i % 37) as f32 * 0.001)
+        .collect();
     let q: Vec<u8> = (0..n * k).map(|i| ((i * 7 + 3) % 8 + 8) as u8).collect();
     let s: Vec<f32> = (0..n * groups)
         .map(|i| 0.02 + ((i * 13) % 13) as f32 * 0.004)
@@ -777,16 +823,28 @@ fn marlin_w4a8_m_split_tail_parity() {
         let mut dws = stream.alloc::<i32>(ws.len()).unwrap();
         stream.memcpy_htod(&a_i8, &mut da_full).unwrap();
         stream.memcpy_htod(&as_full, &mut das_full).unwrap();
-        stream.memcpy_htod(&vec![0u16; m_full * n], &mut dc_full).unwrap();
+        stream
+            .memcpy_htod(&vec![0u16; m_full * n], &mut dc_full)
+            .unwrap();
         stream.memcpy_htod(a_head, &mut da_head).unwrap();
         stream.memcpy_htod(&as_head, &mut das_head).unwrap();
-        stream.memcpy_htod(&vec![0u16; m_head * n], &mut dc_head).unwrap();
+        stream
+            .memcpy_htod(&vec![0u16; m_head * n], &mut dc_head)
+            .unwrap();
         stream.memcpy_htod(a_tail, &mut da_tail).unwrap();
         stream.memcpy_htod(&as_tail, &mut das_tail).unwrap();
-        stream.memcpy_htod(&vec![0u16; m_tail * n], &mut dc_tail).unwrap();
-        stream.memcpy_htod(&a_i8[..m_small * k], &mut da_small).unwrap();
-        stream.memcpy_htod(&as_full[..m_small], &mut das_small).unwrap();
-        stream.memcpy_htod(&vec![0u16; m_small * n], &mut dc_small).unwrap();
+        stream
+            .memcpy_htod(&vec![0u16; m_tail * n], &mut dc_tail)
+            .unwrap();
+        stream
+            .memcpy_htod(&a_i8[..m_small * k], &mut da_small)
+            .unwrap();
+        stream
+            .memcpy_htod(&as_full[..m_small], &mut das_small)
+            .unwrap();
+        stream
+            .memcpy_htod(&vec![0u16; m_small * n], &mut dc_small)
+            .unwrap();
         stream.memcpy_htod(&b_packed, &mut db).unwrap();
         stream.memcpy_htod(&s_bits, &mut ds).unwrap();
         stream.memcpy_htod(&z_packed, &mut dz).unwrap();

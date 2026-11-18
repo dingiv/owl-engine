@@ -329,7 +329,10 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
             let _seeded = self.seed_turn_start_view(b.session_id, seed)?;
         }
         let table = self
-            .bank.parts().sessions.session(b.session_id)?
+            .bank
+            .parts()
+            .sessions
+            .session(b.session_id)?
             .block_table
             .clone();
         // 设备半(两 rank **并发**推进):GDN 重置/快照恢复 + 持久块表重写
@@ -564,10 +567,7 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
                 prompt_len,
                 self.boot.cfg.prefill_chunk,
                 crate::engine::PREFILL_TAIL_MERGE,
-                Self::prefill_align_page(
-                    self.boot.cfg.knobs.prefix_cache,
-                    self.dev.pool.geom.page,
-                ),
+                Self::prefill_align_page(self.boot.cfg.knobs.prefix_cache, self.dev.pool.geom.page),
                 msg_snaps.as_slice(),
                 evict_snaps.as_slice(),
                 crate::engine::SNAP_MSG_MIN_SPAN,
@@ -668,10 +668,7 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
                 prompt_len,
                 self.boot.cfg.prefill_chunk,
                 crate::engine::PREFILL_TAIL_MERGE,
-                Self::prefill_align_page(
-                    self.boot.cfg.knobs.prefix_cache,
-                    self.dev.pool.geom.page,
-                ),
+                Self::prefill_align_page(self.boot.cfg.knobs.prefix_cache, self.dev.pool.geom.page),
                 msg_snaps.as_slice(),
                 evict_snaps.as_slice(),
                 crate::engine::SNAP_MSG_MIN_SPAN,
@@ -989,19 +986,17 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
         // **B-3e-2**:视图在场时**不写**(本步页表走 `sel_pt` 输入槽;而链上可能有
         // 洞 = 占位符,写进设备块表就是把 u32::MAX 当页号 —— 守卫会响亮拒且白跑)。
         // 设备半(每 rank 各自写)在 `decode_dev` 里;这里只算出表内容。
-        let grow_bt = if grew && !self.sel.has_view() {
-            let s = self
-                .bank
-                .parts()
-                .sessions
-                .get(sid)
-                .ok_or_else(|| ModelError::EngineInvariant {
-                    what: format!("decode: 会话 {sid:#x} 不在账"),
+        let grow_bt =
+            if grew && !self.sel.has_view() {
+                let s = self.bank.parts().sessions.get(sid).ok_or_else(|| {
+                    ModelError::EngineInvariant {
+                        what: format!("decode: 会话 {sid:#x} 不在账"),
+                    }
                 })?;
-            Some(s.block_table.clone())
-        } else {
-            None
-        };
+                Some(s.block_table.clone())
+            } else {
+                None
+            };
         // XQA 裸 decode 臂(2026-10-13 ②):`xqa_seq` = kv_len 的 **u32 位型**
         // (核按 `const uint32_t*` 读;`(pos+1) as f32` 会拿到浮点位型);
         // `xqa_sem` 每轮清零(KV-split 归约计数 —— 参考实现 `sem.zero_()`)。
@@ -1368,9 +1363,7 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
             true
         } else {
             let a = self.tspec_ref()?;
-            let s = a.spec_steps_degraded;
-            let p = a.spec_probe_every.max(1);
-            s % 8 == 0 || s + 1 >= p
+            crate::exec::degraded_sync_due(a.spec_steps_degraded, a.spec_probe_every)
         };
         if (degraded || seeding) && sync_due && self.dev.spec_rt.dflash_tap_count > 0 {
             // 降级步分相(2026-10-12 探针完善):sync encode 单独计时 ——
@@ -1389,11 +1382,6 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
                     .await?;
             }
             mrec("decode.sync", t_syn.elapsed());
-            if degraded {
-                let t = self.tspec()?;
-                t.spec_steps_degraded += 1;
-                t.spec_degraded_steps += 1;
-            }
             // 滚动裸步成本 ewma(动态盈亏线分母;α=0.15)
             {
                 let bc = t_step.elapsed().as_secs_f32() * 1000.0;
@@ -1411,15 +1399,19 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
                     );
                 }
             }
-            mrec(
-                if degraded {
-                    "decode.step.deg"
-                } else {
-                    "decode.step.seed"
-                },
-                t_step.elapsed(),
-            );
+            if seeding {
+                mrec("decode.step.seed", t_step.elapsed());
+            }
             self.tspec()?.bare_seed_step = false;
+        }
+        // **降级步进计数器必须每一步自增**（2026-11-12 修）：
+        // 同步节流只看它，但推进不能藏在同步分支里 —— 否则第一次同步后
+        // 计数恒为 1，`probe_every` 永远到不了，降级态再也不探测/恢复。
+        if degraded {
+            let t = self.tspec()?;
+            t.spec_steps_degraded = t.spec_steps_degraded.saturating_add(1);
+            t.spec_degraded_steps = t.spec_degraded_steps.saturating_add(1);
+            mrec("decode.step.deg", t_step.elapsed());
         }
         // P2.2 侦察(2026-10-19):`sample_and_emit` = tokenizer 解码差分 + stop 检查
         // + 事件构造 —— "函数外 1.55ms" 的主嫌疑(它在 exec-main 打点之后)。
@@ -1453,7 +1445,10 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
         let mut tables: Vec<Vec<u32>> = Vec::with_capacity(t_rows);
         for r in &rows {
             tables.push(
-                self.bank.parts().sessions.session(r.session_id)?
+                self.bank
+                    .parts()
+                    .sessions
+                    .session(r.session_id)?
                     .block_table
                     .clone(),
             );
@@ -1523,11 +1518,13 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
                     // TP2：两 rank 的批图必须**同时**推进（图内含 allreduce；
                     // 只跑 rank0 会等 peer 的 AR 信号）。读数只取主 rank。
                     Some(p) => {
-                        let g1 = p.graphs.batch.as_mut().ok_or_else(|| {
-                            ModelError::EngineInvariant {
-                                what: "TP 合批：peer 批图缺席(调度门失守)".into(),
-                            }
-                        })?;
+                        let g1 =
+                            p.graphs
+                                .batch
+                                .as_mut()
+                                .ok_or_else(|| ModelError::EngineInvariant {
+                                    what: "TP 合批：peer 批图缺席(调度门失守)".into(),
+                                })?;
                         let (r0, r1) = crate::exec::join2(g0.step(&refs), g1.step(&refs)).await;
                         r1?;
                         r0?;

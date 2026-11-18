@@ -62,11 +62,7 @@ async fn load_tp2(oa: usize, ob: usize) -> TpEngine<owl_cuda::GpuClient> {
         .expect("TP2 装配")
 }
 
-async fn serial(
-    r: &mut RunningEngine<owl_engine::GpuFace>,
-    sid: u64,
-    prompt: &str,
-) -> String {
+async fn serial(r: &mut RunningEngine<owl_engine::GpuFace>, sid: u64, prompt: &str) -> String {
     let (_, turn) = r
         .submit_session_ex(Some(sid), prompt, MAX_NEW, true)
         .expect("submit");
@@ -128,7 +124,10 @@ fn tp2_batch_decode_matches_serial() {
         assert!(r.batch_steps() > 0, "并发臂必须真走到 BatchDecode");
         assert_eq!(a1, b1, "会话 A：批 decode 与串行不一致");
         assert_eq!(a2, b2, "会话 B：批 decode 与串行不一致");
-        eprintln!("[tp-batch] ✅ TP2 批 decode 逐字一致；批步数 = {}", r.batch_steps());
+        eprintln!(
+            "[tp-batch] ✅ TP2 批 decode 逐字一致；批步数 = {}",
+            r.batch_steps()
+        );
         r.shutdown_tp().await.expect("TP2 收尾");
     });
 }

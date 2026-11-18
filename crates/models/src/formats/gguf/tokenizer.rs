@@ -121,7 +121,9 @@ fn pre_regex(pre: Option<&str>) -> Result<&'static str, ModelError> {
     match pre {
         None => Ok(DEFAULT),
         Some("qwen35") => Ok(QWEN35),
-        Some("qwen2" | "stablelm2" | "hunyuan" | "solar-open" | "deepseek-r1-qwen" | "kormo") => Ok(QWEN2),
+        Some("qwen2" | "stablelm2" | "hunyuan" | "solar-open" | "deepseek-r1-qwen" | "kormo") => {
+            Ok(QWEN2)
+        }
         Some(other) => Err(ModelError::Msg(format!(
             "gguf tokenizer: 预分词规则 `{other}` 未覆盖(llama.cpp LLAMA_VOCAB_PRE_TYPE 表里没登记\
              ⇒ 拒建,禁拿默认正则猜;设计 R7)"
@@ -171,7 +173,10 @@ pub fn build_vocab(g: &Gguf) -> Result<GgufVocab, ModelError> {
     if tokens.is_empty() {
         return Err(bad("`tokenizer.ggml.tokens` 为空".into()));
     }
-    let pre = kv.opt_str("tokenizer.ggml.pre").map_err(map)?.map(|s| s.to_string());
+    let pre = kv
+        .opt_str("tokenizer.ggml.pre")
+        .map_err(map)?
+        .map(|s| s.to_string());
     let token_type = kv.opt_u32s("tokenizer.ggml.token_type").map_err(map)?;
     if let Some(tt) = &token_type {
         if tt.len() != tokens.len() {
@@ -188,22 +193,38 @@ pub fn build_vocab(g: &Gguf) -> Result<GgufVocab, ModelError> {
         unk: kv.opt_u32("tokenizer.ggml.unknown_token_id").map_err(map)?,
         pad: kv.opt_u32("tokenizer.ggml.padding_token_id").map_err(map)?,
     };
-    for (name, id) in [("bos", specials.bos), ("eos", specials.eos), ("unk", specials.unk), ("pad", specials.pad)] {
+    for (name, id) in [
+        ("bos", specials.bos),
+        ("eos", specials.eos),
+        ("unk", specials.unk),
+        ("pad", specials.pad),
+    ] {
         if let Some(i) = id {
             if i as usize >= tokens.len() {
-                return Err(bad(format!("`{name}_token_id` = {i} 越界(词表 {} 项)", tokens.len())));
+                return Err(bad(format!(
+                    "`{name}_token_id` = {i} 越界(词表 {} 项)",
+                    tokens.len()
+                )));
             }
         }
     }
-    let add_bos = kv.opt_bool("tokenizer.ggml.add_bos_token").map_err(map)?.unwrap_or(false);
-    let template = kv.opt_str("tokenizer.chat_template").map_err(map)?.map(|s| s.to_string());
+    let add_bos = kv
+        .opt_bool("tokenizer.ggml.add_bos_token")
+        .map_err(map)?
+        .unwrap_or(false);
+    let template = kv
+        .opt_str("tokenizer.chat_template")
+        .map_err(map)?
+        .map(|s| s.to_string());
 
     let t_kv = t0.elapsed();
     let inner = match model {
         VocabModel::Bpe => build_bpe(&tokens, kv, &specials, pre.as_deref(), &bad)?,
         VocabModel::Unigram => build_unigram(&tokens, kv, &specials, &bad)?,
         VocabModel::Other(ref o) => {
-            return Err(bad(format!("词表模型 `{o}` 未覆盖(本仓支持 gpt2/llama/t5)")))
+            return Err(bad(format!(
+                "词表模型 `{o}` 未覆盖(本仓支持 gpt2/llama/t5)"
+            )))
         }
     };
     // 分相上屏(启动时间是生产指标;`tokenizers` 建 BPE 是已知重相)
@@ -234,11 +255,11 @@ fn build_bpe(
     pre: Option<&str>,
     bad: &dyn Fn(String) -> ModelError,
 ) -> Result<tokenizers::Tokenizer, ModelError> {
-    use tokenizers::pre_tokenizers::byte_level::ByteLevel;
-    use tokenizers::pre_tokenizers::split::{Split, SplitPattern};
-    use tokenizers::pre_tokenizers::sequence::Sequence;
-    use tokenizers::pre_tokenizers::PreTokenizerWrapper;
     use tokenizers::models::bpe::BpeBuilder;
+    use tokenizers::pre_tokenizers::byte_level::ByteLevel;
+    use tokenizers::pre_tokenizers::sequence::Sequence;
+    use tokenizers::pre_tokenizers::split::{Split, SplitPattern};
+    use tokenizers::pre_tokenizers::PreTokenizerWrapper;
     use tokenizers::tokenizer::SplitDelimiterBehavior;
     use tokenizers::AddedToken;
 
@@ -267,7 +288,9 @@ fn build_bpe(
     if let Some(unk) = specials.unk {
         builder = builder.unk_token(tokens[unk as usize].clone());
     }
-    let bpe = builder.build().map_err(|e| bad(format!("BPE 构造失败: {e}")))?;
+    let bpe = builder
+        .build()
+        .map_err(|e| bad(format!("BPE 构造失败: {e}")))?;
     let tb2 = tb0.elapsed();
 
     let byte_level = ByteLevel::new(false, false, false);
@@ -304,7 +327,10 @@ fn build_bpe(
     }
     let mut added: Vec<AddedToken> = Vec::new();
     for (i, t) in tokens.iter().enumerate() {
-        let tt = tts.as_ref().and_then(|v| v.get(i).copied()).map(|v| v as u8);
+        let tt = tts
+            .as_ref()
+            .and_then(|v| v.get(i).copied())
+            .map(|v| v as u8);
         if matches!(tt, Some(TT_CONTROL) | Some(TT_USER_DEFINED)) || tt == Some(TT_UNKNOWN) {
             added.push(AddedToken::from(t.clone(), true));
         }
@@ -352,7 +378,9 @@ fn build_unigram(
 #[allow(dead_code)] // 小词表/诊断面用;热路径已改为一次读完
 fn tt_of(kv: &super::reader::KvTable, i: usize) -> Result<Option<u8>, ModelError> {
     let tt = kv.opt_u32s("tokenizer.ggml.token_type").map_err(|e| {
-        ModelError::Msg(format!("gguf tokenizer: 读 `tokenizer.ggml.token_type`: {e}"))
+        ModelError::Msg(format!(
+            "gguf tokenizer: 读 `tokenizer.ggml.token_type`: {e}"
+        ))
     })?;
     Ok(tt.map(|v| v[i] as u8))
 }
@@ -426,7 +454,12 @@ mod tests {
                 v.template.as_ref().map(|t| t.len()).unwrap_or(0)
             );
             for text in cases {
-                let mine = v.inner.encode(*text, false).expect("encode").get_ids().to_vec();
+                let mine = v
+                    .inner
+                    .encode(*text, false)
+                    .expect("encode")
+                    .get_ids()
+                    .to_vec();
                 let out = Command::new(&bin)
                     .arg("-m")
                     .arg(&path)
@@ -451,7 +484,11 @@ mod tests {
                     "[{key}] tokenize 不一致,文本 {text:?}\n我方: {mine:?}\nllama: {theirs:?}"
                 );
                 // 往返:decode 回原文(byte-level BPE 应无损)
-                assert_eq!(v.inner.decode(&mine, false).expect("decode"), *text, "[{key}] 往返 {text:?}");
+                assert_eq!(
+                    v.inner.decode(&mine, false).expect("decode"),
+                    *text,
+                    "[{key}] 往返 {text:?}"
+                );
             }
             eprintln!("[{key}] tokenize 对拍绿({} 例)", cases.len());
         }
@@ -471,15 +508,28 @@ mod tests {
             assert_eq!(v.model, VocabModel::Bpe, "[{key}] Qwen 系 = gpt2/BPE");
             assert_eq!(v.pre.as_deref(), Some("qwen35"));
             assert!(!v.add_bos, "[{key}] add_bos_token=false");
-            assert!(v.template.as_ref().is_some_and(|t| t.contains("add_generation_prompt")), "[{key}] 内嵌模板");
+            assert!(
+                v.template
+                    .as_ref()
+                    .is_some_and(|t| t.contains("add_generation_prompt")),
+                "[{key}] 内嵌模板"
+            );
             // eos = ChatML `<|im_end|>`(家族事实;id 由文件自带)
             let eos = v.specials.eos.expect("qwen35 必有 eos_token_id");
             assert_eq!(v.token_str(eos).unwrap(), "<|im_end|>", "[{key}] eos 词面");
             assert_eq!(v.token_str(248046).unwrap(), "<|im_end|>");
             assert_eq!(v.token_str(248044).unwrap(), "<|endoftext|>");
             // eos 判定链:encode 后 token id 落在 eos 集
-            let ids = v.inner.encode("hi<|im_end|>", false).unwrap().get_ids().to_vec();
-            assert!(ids.contains(&248046), "[{key}] <|im_end|> 应编码为 control token: {ids:?}");
+            let ids = v
+                .inner
+                .encode("hi<|im_end|>", false)
+                .unwrap()
+                .get_ids()
+                .to_vec();
+            assert!(
+                ids.contains(&248046),
+                "[{key}] <|im_end|> 应编码为 control token: {ids:?}"
+            );
             assert!(v.eos_ids().contains(&248046));
         }
     }

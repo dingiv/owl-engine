@@ -55,7 +55,10 @@ pub fn map_params(params: &str, name: &str, kind: &str) -> String {
                 "f32".to_string()
             } else if p.contains("int") {
                 // 含 unsigned int:4 字节无符号 —— Arg 无此宽度,登记表禁止
-                assert!(!p.contains("unsigned"), "{name}: 禁止 unsigned int 形参(用 size_t;Arg::U64 8 字节对位)");
+                assert!(
+                    !p.contains("unsigned"),
+                    "{name}: 禁止 unsigned int 形参(用 size_t;Arg::U64 8 字节对位)"
+                );
                 "i32".to_string()
             } else {
                 panic!("{name}: 无法识别的{kind}形参 `{p}`(args 词表:T/sz/i32/f32)");
@@ -121,7 +124,9 @@ pub fn cu_params_of(src: &str, name: &str) -> Option<(String, &'static str)> {
     //   `void <首形参>(…)` 里:按定义体取参,与字面核同口径(名字门不弱化)
     for line in clean.lines() {
         let t = line.trim();
-        let Some((mac, rest)) = t.split_once('(') else { continue };
+        let Some((mac, rest)) = t.split_once('(') else {
+            continue;
+        };
         if mac.is_empty() || !mac.chars().all(|c| c.is_ascii_alphanumeric() || c == '_') {
             continue;
         }
@@ -129,10 +134,18 @@ pub fn cu_params_of(src: &str, name: &str) -> Option<(String, &'static str)> {
             continue;
         }
         let def_anchor = format!("#define {mac}(");
-        let Some(d) = clean.find(&def_anchor) else { continue };
-        let formal = clean[d + def_anchor.len()..].split(',').next()?.trim().to_string();
+        let Some(d) = clean.find(&def_anchor) else {
+            continue;
+        };
+        let formal = clean[d + def_anchor.len()..]
+            .split(',')
+            .next()?
+            .trim()
+            .to_string();
         let body_anchor = format!("void {formal}(");
-        let Some(s) = clean[d..].find(&body_anchor) else { continue };
+        let Some(s) = clean[d..].find(&body_anchor) else {
+            continue;
+        };
         let start = d + s + body_anchor.len();
         let end = clean[start..].find(')')? + start;
         return Some((clean[start..end].to_string(), "宏"));
@@ -196,13 +209,27 @@ mod tests {
     fn every_declared_op_has_asset_and_symbols() {
         let mut n = 0;
         for m in ops::all() {
-            if m.src.is_empty() { continue; }   // foreign(FFI):无 `.cu`
-            assert!(m.src.starts_with("cu/") && m.src.ends_with(".cu"),
-                    "{}: 资产 id 非法 {}", m.entry, m.src);
-            assert!(cu_text(m.src).contains("extern \"C\" __global__"),
-                    "{}: 资产 {} 不是核源码", m.entry, m.src);
-            assert!(source_defines(m.src, m.entry),
-                    "{}: 不在资产 {} 的构建期符号清单里", m.entry, m.src);
+            if m.src.is_empty() {
+                continue;
+            } // foreign(FFI):无 `.cu`
+            assert!(
+                m.src.starts_with("cu/") && m.src.ends_with(".cu"),
+                "{}: 资产 id 非法 {}",
+                m.entry,
+                m.src
+            );
+            assert!(
+                cu_text(m.src).contains("extern \"C\" __global__"),
+                "{}: 资产 {} 不是核源码",
+                m.entry,
+                m.src
+            );
+            assert!(
+                source_defines(m.src, m.entry),
+                "{}: 不在资产 {} 的构建期符号清单里",
+                m.entry,
+                m.src
+            );
             n += 1;
         }
         eprintln!("[list] {n} 张原生表的资产 + 符号清单在场 ✓");
@@ -212,8 +239,11 @@ mod tests {
     #[test]
     fn every_compiled_symbol_is_declared() {
         let und = ops::undeclared_symbols();
-        assert!(und.is_empty(), "编出但未声明的核符号 {} 条:{und:?}", und.len());
+        assert!(
+            und.is_empty(),
+            "编出但未声明的核符号 {} 条:{und:?}",
+            und.len()
+        );
         eprintln!("[R1] 编出符号集 ⊆ 声明集 ✓(登记表已退役,判据换源)");
     }
-
 }

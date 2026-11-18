@@ -395,11 +395,7 @@ impl Admission {
             (usable / per_turn).min(n_host)
         };
         // `running` 的用途 = 诊断（最大在跑 turn 的尺寸;门/日志读）
-        let largest_running = running
-            .iter()
-            .map(|t| t.need_pages(l))
-            .max()
-            .unwrap_or(0);
+        let largest_running = running.iter().map(|t| t.need_pages(l)).max().unwrap_or(0);
         glue(capacity_result(
             n_slots,
             n_mem,
@@ -734,11 +730,20 @@ mod tests {
     #[test]
     fn lazy_pending_keep_clamps_both_sides() {
         let (m, sink, recent_lo) = (2094usize, 2usize, 2062usize);
-        assert!(!lazy_pending_keep(m, m, sink, recent_lo), "上界:超出复用面一律不收");
+        assert!(
+            !lazy_pending_keep(m, m, sink, recent_lo),
+            "上界:超出复用面一律不收"
+        );
         assert!(!lazy_pending_keep(m + 1, m, sink, recent_lo));
-        assert!(lazy_pending_keep(m - 1, m, sink, recent_lo), "recent 窗内收");
+        assert!(
+            lazy_pending_keep(m - 1, m, sink, recent_lo),
+            "recent 窗内收"
+        );
         assert!(lazy_pending_keep(0, m, sink, recent_lo), "sink 收");
-        assert!(!lazy_pending_keep(sink, m, sink, recent_lo), "sink 与 recent 之间是洞");
+        assert!(
+            !lazy_pending_keep(sink, m, sink, recent_lo),
+            "sink 与 recent 之间是洞"
+        );
         assert!(!lazy_pending_keep(recent_lo - 1, m, sink, recent_lo));
         assert!(lazy_pending_keep(recent_lo, m, sink, recent_lo));
         // 短链退化:m = 4 页时 recent 窗覆盖全链 ⇒ 全部收(退化为旧全量回灌)
@@ -972,12 +977,20 @@ mod tests {
         };
         match a.decide(&l, &s1, &[ta], &tb, 0) {
             Verdict::Reject {
-                reason: Reason::NoMemory { need_pages, free_pages },
+                reason:
+                    Reason::NoMemory {
+                        need_pages,
+                        free_pages,
+                    },
                 ..
             } => {
                 assert_eq!((need_pages, free_pages), (266, 242));
                 assert_eq!(
-                    Reason::NoMemory { need_pages, free_pages }.code(),
+                    Reason::NoMemory {
+                        need_pages,
+                        free_pages
+                    }
+                    .code(),
                     "no_memory"
                 );
             }
@@ -1118,11 +1131,7 @@ mod scenario_tests {
 
         /// store 事实（页账单源 = 活跃 turn 的 grant 总量；模拟 store 账）
         fn store(&self) -> StoreFacts {
-            let used: usize = self
-                .actives
-                .iter()
-                .map(|t| t.need_pages(&self.l))
-                .sum();
+            let used: usize = self.actives.iter().map(|t| t.need_pages(&self.l)).sum();
             StoreFacts {
                 free_pages: self.total_pages.saturating_sub(used),
                 reserved_pages: used,

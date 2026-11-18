@@ -13,13 +13,10 @@ use crate::registry::{FamilyGuard, KernelFamily};
 #[derive(Default)]
 pub struct MarlinRuntime;
 
-
 impl KernelFamily for MarlinRuntime {
     fn id(&self) -> OpId {
         Self::ID
     }
-
-
 
     /// 构造函数:纯 FFI 零句柄;链接期已解析(装配门 = 无)
     fn assemble(
@@ -29,7 +26,12 @@ impl KernelFamily for MarlinRuntime {
         Ok(FamilyGuard::boxed(MarlinRuntime))
     }
 
-    fn run(&mut self, msg: &LaunchMsg, res: &mut dyn crate::device::DeviceRes, exec: &mut crate::device::Exec) -> Result<Bytes, OpError> {
+    fn run(
+        &mut self,
+        msg: &LaunchMsg,
+        res: &mut dyn crate::device::DeviceRes,
+        exec: &mut crate::device::Exec,
+    ) -> Result<Bytes, OpError> {
         // AWQ 臂:kU4 has_zp,7 块(独立 FFI);W4A8×AWQ 臂:再加 a_scales,
         // 8 块(int8 激活;独立 FFI);f16/bf16 走 6 块通用臂
         if msg.kernel.name == GEMM_W4A16_AWQ {
@@ -39,9 +41,7 @@ impl KernelFamily for MarlinRuntime {
             return self.run_w4a8_awq(msg, res, exec);
         }
         let call = parse_gemm(msg, msg.kernel.name == marlin::GEMM_W4A16_BF16)?;
-        let r = |b: &crate::client::marlin::BlockRef| {
-            res.resolve(b.id).map(|p| p + b.byte_offset)
-        };
+        let r = |b: &crate::client::marlin::BlockRef| res.resolve(b.id).map(|p| p + b.byte_offset);
         let a = r(&call.a)?;
         let b = r(&call.b)?;
         let out = r(&call.out)?;
@@ -57,23 +57,35 @@ impl KernelFamily for MarlinRuntime {
         let rr = if call.bf16 {
             unsafe {
                 marlin::gemm_v2_raw_bf16(
-                    a as *const u16, b as *const i32, out as *mut u16,
-                    scales as *const u16, c_tmp as *const std::ffi::c_void,
-                    m, n, k,
-                    ws as *mut i32, call.groupsize, dev,
+                    a as *const u16,
+                    b as *const i32,
+                    out as *mut u16,
+                    scales as *const u16,
+                    c_tmp as *const std::ffi::c_void,
+                    m,
+                    n,
+                    k,
+                    ws as *mut i32,
+                    call.groupsize,
+                    dev,
                     stream.cu_stream() as usize,
                 )
             }
-            .map_err(|code| {
-                format!("err={code}({})", marlin::v2_err_str(code))
-            })
+            .map_err(|code| format!("err={code}({})", marlin::v2_err_str(code)))
         } else {
             unsafe {
                 marlin::gemm_v2_raw(
-                    a as *const u16, b as *const i32, out as *mut u16,
-                    scales as *const u16, c_tmp as *const std::ffi::c_void,
-                    m, n, k,
-                    ws as *mut i32, call.groupsize, dev,
+                    a as *const u16,
+                    b as *const i32,
+                    out as *mut u16,
+                    scales as *const u16,
+                    c_tmp as *const std::ffi::c_void,
+                    m,
+                    n,
+                    k,
+                    ws as *mut i32,
+                    call.groupsize,
+                    dev,
                     stream.cu_stream() as usize,
                 )
             }
@@ -84,7 +96,12 @@ impl KernelFamily for MarlinRuntime {
             stage: Stage::Compute,
             detail,
         })?;
-        Ok(Bytes::new(call.out.id, msg.out_elems, if call.bf16 { Dtype::BF16 } else { Dtype::F16 }, 2))
+        Ok(Bytes::new(
+            call.out.id,
+            msg.out_elems,
+            if call.bf16 { Dtype::BF16 } else { Dtype::F16 },
+            2,
+        ))
     }
 }
 
@@ -93,11 +110,14 @@ impl MarlinRuntime {
     /// —— 声明面 `ops/<域>::FAMILY` 与执行面 `id()` 引用**同一字面量**。
     pub const ID: OpId = OpId(crate::family::marlin::GEMM_W4A16);
     /// AWQ kU4 臂(7 块;zeros 槽 FFI 实参位 4,ws 位 5,c_tmp 位 6)
-    fn run_awq(&mut self, msg: &LaunchMsg, res: &mut dyn crate::device::DeviceRes, _exec: &mut crate::device::Exec) -> Result<Bytes, OpError> {
+    fn run_awq(
+        &mut self,
+        msg: &LaunchMsg,
+        res: &mut dyn crate::device::DeviceRes,
+        _exec: &mut crate::device::Exec,
+    ) -> Result<Bytes, OpError> {
         let call = crate::client::marlin::parse_gemm_awq(msg)?;
-        let r = |b: &crate::client::marlin::BlockRef| {
-            res.resolve(b.id).map(|p| p + b.byte_offset)
-        };
+        let r = |b: &crate::client::marlin::BlockRef| res.resolve(b.id).map(|p| p + b.byte_offset);
         let a = r(&call.a)?;
         let b = r(&call.b)?;
         let out = r(&call.out)?;
@@ -120,10 +140,18 @@ impl MarlinRuntime {
         let (m, n, k) = call.ffi_mnk(); // 槽序 m,k,n → C 形参序 m,n,k(单源)
         let rr = unsafe {
             marlin::gemm_v2_awq_raw(
-                a as *const u16, b as *const i32, out as *mut u16,
-                scales as *const u16, zeros as *const i32, c_tmp as *const std::ffi::c_void,
-                m, n, k,
-                ws as *mut i32, call.groupsize, dev,
+                a as *const u16,
+                b as *const i32,
+                out as *mut u16,
+                scales as *const u16,
+                zeros as *const i32,
+                c_tmp as *const std::ffi::c_void,
+                m,
+                n,
+                k,
+                ws as *mut i32,
+                call.groupsize,
+                dev,
                 stream.cu_stream() as usize,
             )
         };
@@ -132,7 +160,12 @@ impl MarlinRuntime {
             stage: Stage::Compute,
             detail: format!("err {e}: {}", marlin::v2_err_str(e)),
         })?;
-        Ok(Bytes::new(call.out.id, msg.out_elems, if call.bf16 { Dtype::BF16 } else { Dtype::F16 }, 2))
+        Ok(Bytes::new(
+            call.out.id,
+            msg.out_elems,
+            if call.bf16 { Dtype::BF16 } else { Dtype::F16 },
+            2,
+        ))
     }
 
     /// **W4A8 × AWQ 臂**(7 块 = AWQ 槽表后插 `a_scales`;int8 已量化激活 +
@@ -142,11 +175,14 @@ impl MarlinRuntime {
     /// 强制 `use_fp32_reduce`,c_tmp 由 host 发射器流序自管(槽位仍须在
     /// 线格式里、仍有实体 —— F2 账长门照旧,见 [`check_pack_sizes`])
     /// —— 暗雷面在 C 侧已焊缝(见 `marlin_gemm_v2_awq_w4a8_ffi` 注)。
-    fn run_w4a8_awq(&mut self, msg: &LaunchMsg, res: &mut dyn crate::device::DeviceRes, _exec: &mut crate::device::Exec) -> Result<Bytes, OpError> {
+    fn run_w4a8_awq(
+        &mut self,
+        msg: &LaunchMsg,
+        res: &mut dyn crate::device::DeviceRes,
+        _exec: &mut crate::device::Exec,
+    ) -> Result<Bytes, OpError> {
         let call = crate::client::marlin::parse_gemm_w4a8_awq(msg)?;
-        let r = |b: &crate::client::marlin::BlockRef| {
-            res.resolve(b.id).map(|p| p + b.byte_offset)
-        };
+        let r = |b: &crate::client::marlin::BlockRef| res.resolve(b.id).map(|p| p + b.byte_offset);
         let a = r(&call.a)?;
         let b = r(&call.b)?;
         let out = r(&call.out)?;
@@ -172,11 +208,19 @@ impl MarlinRuntime {
         let (m, n, k) = call.ffi_mnk(); // 槽序 m,k,n → C 形参序 m,n,k(单源)
         let rr = unsafe {
             marlin::gemm_v2_awq_w4a8_raw(
-                a as *const i8, b as *const i32, out as *mut u16,
-                scales as *const u16, zeros as *const i32, a_scales as *const f32,
+                a as *const i8,
+                b as *const i32,
+                out as *mut u16,
+                scales as *const u16,
+                zeros as *const i32,
+                a_scales as *const f32,
                 std::ptr::null(), // c_tmp:host 自管(C 侧 a_is_s8 ⇒ use_fp32_reduce)
-                m, n, k,
-                ws as *mut i32, call.groupsize, dev,
+                m,
+                n,
+                k,
+                ws as *mut i32,
+                call.groupsize,
+                dev,
                 stream.cu_stream() as usize,
                 false, // w4a8_m8:配置档已退役(2026-10-27;16-row 恒为生产档)
             )
@@ -202,14 +246,18 @@ fn check_pack_sizes(
     res: &dyn crate::device::DeviceRes,
 ) -> Result<(), OpError> {
     // BlockSlice 兼容:可用字节 = 账长 − 块内偏移
-    let have_ws = res.resolve_len(call.ws.id)?.saturating_sub(call.ws.byte_offset as usize);
+    let have_ws = res
+        .resolve_len(call.ws.id)?
+        .saturating_sub(call.ws.byte_offset as usize);
     marlin::ws_size_check(call.n, have_ws).map_err(|detail| OpError::Contract {
         op: op.to_string(),
         field: "ws",
         expect: format!("块账长 ≥ {} B", marlin::v2_workspace_bytes(call.n)),
         got: detail,
     })?;
-    let have_ct = res.resolve_len(call.c_tmp.id)?.saturating_sub(call.c_tmp.byte_offset as usize);
+    let have_ct = res
+        .resolve_len(call.c_tmp.id)?
+        .saturating_sub(call.c_tmp.byte_offset as usize);
     marlin::c_tmp_size_check(have_ct).map_err(|detail| OpError::Contract {
         op: op.to_string(),
         field: "c_tmp",
@@ -218,7 +266,6 @@ fn check_pack_sizes(
     })?;
     Ok(())
 }
-
 
 #[cfg(all(test, feature = "device"))]
 mod f2_gate {
@@ -291,10 +338,22 @@ mod f2_gate {
     fn awq_msg() -> crate::contract::LaunchMsg {
         let blk = |id: u64| Arg::block(id, Dtype::F16, 2);
         crate::contract::LaunchMsg {
-            kernel: KernelSource { name: crate::family::marlin::GEMM_W4A16_AWQ.into(), source: String::new() },
+            kernel: KernelSource {
+                name: crate::family::marlin::GEMM_W4A16_AWQ.into(),
+                source: String::new(),
+            },
             args: vec![
-                blk(1), blk(2), blk(3), blk(4), blk(5), blk(6), blk(7),
-                Arg::U64(64), Arg::U64(2560), Arg::U64(2560), Arg::U64(32),
+                blk(1),
+                blk(2),
+                blk(3),
+                blk(4),
+                blk(5),
+                blk(6),
+                blk(7),
+                Arg::U64(64),
+                Arg::U64(2560),
+                Arg::U64(2560),
+                Arg::U64(32),
             ],
             grid: (0, 0, 0),
             block: (0, 0, 0),
@@ -307,32 +366,58 @@ mod f2_gate {
     fn short_ws_is_rejected_before_ffi() {
         let need = marlin::v2_workspace_bytes(2560);
         // 够长 ⇒ 门放行(随后撞在替身的 stream() 上 —— 证明拦它的不是门)
-        let mut ok = FixedRes { ws_len: need, c_tmp_len: 4 };
+        let mut ok = FixedRes {
+            ws_len: need,
+            c_tmp_len: 4,
+        };
         let mut rt = MarlinRuntime;
         let e = rt
             .run(&awq_msg(), &mut ok, &mut crate::device::Exec::new())
             .expect_err("替身无 GPU 面,门后必拒");
-        assert!(matches!(&e, OpError::Contract { field: "unexpected", .. }), "门不该拦够长的 ws: {e}");
+        assert!(
+            matches!(
+                &e,
+                OpError::Contract {
+                    field: "unexpected",
+                    ..
+                }
+            ),
+            "门不该拦够长的 ws: {e}"
+        );
 
         // 短 1 B ⇒ 门在 FFI 前拒,且指名槽位与两边尺寸
-        let mut short = FixedRes { ws_len: need - 1, c_tmp_len: 4 };
+        let mut short = FixedRes {
+            ws_len: need - 1,
+            c_tmp_len: 4,
+        };
         let e = rt
             .run(&awq_msg(), &mut short, &mut crate::device::Exec::new())
             .expect_err("ws 短一截必拒");
         match &e {
-            OpError::Contract { field, expect, got, .. } => {
+            OpError::Contract {
+                field, expect, got, ..
+            } => {
                 assert_eq!(*field, "ws");
-                assert!(expect.contains(&need.to_string()), "expect 须带需求字节: {expect}");
+                assert!(
+                    expect.contains(&need.to_string()),
+                    "expect 须带需求字节: {expect}"
+                );
                 assert!(got.contains("ws 块账长"), "got 须保留 family 拒语: {got}");
             }
             other => panic!("期望结构化 Contract,得 {other:?}"),
         }
 
         // c_tmp 零容量 ⇒ 同样在 FFI 前拒(公式语义在 family 单源)
-        let mut no_ct = FixedRes { ws_len: need, c_tmp_len: 0 };
+        let mut no_ct = FixedRes {
+            ws_len: need,
+            c_tmp_len: 0,
+        };
         let e = rt
             .run(&awq_msg(), &mut no_ct, &mut crate::device::Exec::new())
             .expect_err("c_tmp 零容量必拒");
-        assert!(matches!(&e, OpError::Contract { field: "c_tmp", .. }), "{e}");
+        assert!(
+            matches!(&e, OpError::Contract { field: "c_tmp", .. }),
+            "{e}"
+        );
     }
 }

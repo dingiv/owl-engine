@@ -100,7 +100,10 @@ impl KernelFamily for Nvfp4Runtime {
         _exec: &mut crate::device::Exec,
     ) -> Result<Box<dyn KernelFamily>, OpError> {
         // FFI 零句柄:链接期已解析(banner 在 boot 打过 = 链接已验)
-        Ok(FamilyGuard::boxed(Nvfp4Runtime { plans: HashMap::new(), ws: None }))
+        Ok(FamilyGuard::boxed(Nvfp4Runtime {
+            plans: HashMap::new(),
+            ws: None,
+        }))
     }
 
     fn run(
@@ -131,7 +134,10 @@ impl Nvfp4Runtime {
     ) -> Result<Bytes, OpError> {
         let call = parse_pack(msg)?;
         self.ensure_plan(1, call.n, call.k)?;
-        let plan = self.plans.get(&(1, call.k, call.n)).expect("ensure_plan 刚插入");
+        let plan = self
+            .plans
+            .get(&(1, call.k, call.n))
+            .expect("ensure_plan 刚插入");
         // **入参/产物尺寸自证**(FFI 越界不报错,只会踩邻块)
         let need = [
             // 源是不透明字节(f16/bf16)
@@ -192,7 +198,10 @@ impl Nvfp4Runtime {
     ) -> Result<Bytes, OpError> {
         let call = parse_gemm(msg)?;
         self.ensure_plan(call.m, call.n, call.k)?;
-        let plan = self.plans.get(&(call.m, call.k, call.n)).expect("ensure_plan 刚插入");
+        let plan = self
+            .plans
+            .get(&(call.m, call.k, call.n))
+            .expect("ensure_plan 刚插入");
         // **入参尺寸自证**(FFI 越界不报错,只会踩邻块)
         let need = [
             ("aq", call.aq.id, plan.a_q_bytes()),
@@ -229,7 +238,10 @@ impl Nvfp4Runtime {
             let b = res.alloc(ws_bytes, "nvfp4.ws")?;
             self.ws = Some(b);
         }
-        let ws = self.ws.as_ref().map_or(std::ptr::null_mut(), |b| b.ptr as *mut std::ffi::c_void);
+        let ws = self
+            .ws
+            .as_ref()
+            .map_or(std::ptr::null_mut(), |b| b.ptr as *mut std::ffi::c_void);
 
         res.note_device("fam_ffi_launch", &msg.kernel.name, 0, &[a, bq, out]);
         // ① 设备侧量化(三发:清 dg → amax → g/alpha + quantize)

@@ -88,8 +88,12 @@ impl GuiAgent {
     }
 
     pub(crate) fn execute(&mut self, call: &ToolCall) -> Result<ToolOutput, String> {
-        let args: Value = serde_json::from_str(&call.arguments)
-            .map_err(|e| format!("gui {} arguments 非法 JSON: {e}: {}", call.name, call.arguments))?;
+        let args: Value = serde_json::from_str(&call.arguments).map_err(|e| {
+            format!(
+                "gui {} arguments 非法 JSON: {e}: {}",
+                call.name, call.arguments
+            )
+        })?;
         let text = match call.name.as_str() {
             "screenshot" => "Captured the current screen.".to_string(),
             "click" => {

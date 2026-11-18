@@ -22,7 +22,10 @@ pub fn manifest_dir() -> PathBuf {
 }
 
 pub fn tmp_path(name: &str) -> PathBuf {
-    std::env::temp_dir().join(format!("owl_testkit_{name}_{}.safetensors", std::process::id()))
+    std::env::temp_dir().join(format!(
+        "owl_testkit_{name}_{}.safetensors",
+        std::process::id()
+    ))
 }
 
 pub fn f32b(v: &[f32]) -> Vec<u8> {

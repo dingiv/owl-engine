@@ -18,8 +18,8 @@
 //! 运行纪律:OWL_TEST_DEVICE 钉卡 + `--test-threads=1`(pitfall §16);
 //! 校准模式 OWL_GOLDEN_CALIBRATE=1 只打印偏差不断言。
 
-use owl_macros::owl_test;
 use cudarc::driver::{CudaContext, DevicePtr, LaunchConfig, PushKernelArg};
+use owl_macros::owl_test;
 
 const CASES: &[(&str, usize, bool)] = &[
     // (tag, T, tight) tight = fork 同源金标(紧容差);false = pip-fla f32 金标(宽)
@@ -51,7 +51,9 @@ const RCP_LN2: f32 = std::f32::consts::LOG2_E;
 /// - c5(fork 权威 golden,[.., V,K]):**直比**。
 ///   (c5 首跑曾现"chunk0 需转置 chunk1 不需"奇象 = gen 喂 s0 未转置 +
 ///   深谷 chunk 边界 exp 下溢精确抹零 s0 贡献的合谋,gen 已修为 [V,K] 喂入。)
-fn needs_transpose(tight: bool) -> bool { !tight }
+fn needs_transpose(tight: bool) -> bool {
+    !tight
+}
 
 struct Case {
     q: Vec<f32>,
@@ -145,8 +147,7 @@ fn transpose_kv_nt(src: &[f32], nt: usize, hv: usize, x: usize, y: usize) -> Vec
         for hi in 0..hv {
             for xi in 0..x {
                 for yi in 0..y {
-                    out[base + hi * x * y + yi * x + xi] =
-                        src[base + hi * x * y + xi * y + yi];
+                    out[base + hi * x * y + yi * x + xi] = src[base + hi * x * y + xi * y + yi];
                 }
             }
         }
@@ -168,8 +169,15 @@ fn assert_close(name: &str, tag: &str, got: &[f32], want: &[f32], atol: f32, rto
             ww = *b;
         }
     }
-    eprintln!("  [{tag}] {name}: max|Δ|={:.3e} @{} (got={wg:.4e} want={ww:.4e}) 预算内 ×{worst:.2}", wg - ww, wi);
-    assert!(worst <= 1.0, "{tag}/{name}: 超容差 ×{worst:.2} @ {wi}({wg} vs {ww})");
+    eprintln!(
+        "  [{tag}] {name}: max|Δ|={:.3e} @{} (got={wg:.4e} want={ww:.4e}) 预算内 ×{worst:.2}",
+        wg - ww,
+        wi
+    );
+    assert!(
+        worst <= 1.0,
+        "{tag}/{name}: 超容差 ×{worst:.2} @ {wi}({wg} vs {ww})"
+    );
 }
 
 #[owl_test(gpu)]
@@ -193,12 +201,30 @@ fn gdn_chunked_golden_stage_by_stage() {
     use owl_kernels::family::gdn_chunked::cubins::launch as LC;
     // ⚠️ 符号名 = fork 六核(2026-10-11 资产换血后);pip-fla 旧名
     // (chunk_gated_delta_rule_fwd_kkt_solve_kernel)已随资产退役。
-    let f_cum = load_fn(cubins::cumsum().expect("构建期 AOT 资产缺失(GDN_TRITON_BUILD=0?)"), "chunk_local_cumsum_scalar_kernel");
-    let f_kkt = load_fn(cubins::kkt().expect("构建期 AOT 资产缺失(GDN_TRITON_BUILD=0?)"), "chunk_scaled_dot_kkt_fwd_kernel");
-    let f_merge = load_fn(cubins::merge().expect("构建期 AOT 资产缺失(GDN_TRITON_BUILD=0?)"), "merge_16x16_to_64x64_inverse_kernel");
-    let f_wu = load_fn(cubins::wu().expect("构建期 AOT 资产缺失(GDN_TRITON_BUILD=0?)"), "recompute_w_u_fwd_kernel");
-    let f_h = load_fn(cubins::h().expect("构建期 AOT 资产缺失(GDN_TRITON_BUILD=0?)"), "chunk_gated_delta_rule_fwd_kernel_h_blockdim64");
-    let f_o = load_fn(cubins::o().expect("构建期 AOT 资产缺失(GDN_TRITON_BUILD=0?)"), "chunk_fwd_kernel_o");
+    let f_cum = load_fn(
+        cubins::cumsum().expect("构建期 AOT 资产缺失(GDN_TRITON_BUILD=0?)"),
+        "chunk_local_cumsum_scalar_kernel",
+    );
+    let f_kkt = load_fn(
+        cubins::kkt().expect("构建期 AOT 资产缺失(GDN_TRITON_BUILD=0?)"),
+        "chunk_scaled_dot_kkt_fwd_kernel",
+    );
+    let f_merge = load_fn(
+        cubins::merge().expect("构建期 AOT 资产缺失(GDN_TRITON_BUILD=0?)"),
+        "merge_16x16_to_64x64_inverse_kernel",
+    );
+    let f_wu = load_fn(
+        cubins::wu().expect("构建期 AOT 资产缺失(GDN_TRITON_BUILD=0?)"),
+        "recompute_w_u_fwd_kernel",
+    );
+    let f_h = load_fn(
+        cubins::h().expect("构建期 AOT 资产缺失(GDN_TRITON_BUILD=0?)"),
+        "chunk_gated_delta_rule_fwd_kernel_h_blockdim64",
+    );
+    let f_o = load_fn(
+        cubins::o().expect("构建期 AOT 资产缺失(GDN_TRITON_BUILD=0?)"),
+        "chunk_fwd_kernel_o",
+    );
     // shared opt-in(与 handler 同名单:wu/h/o;fork 选中变体 h=49412 超 48K 顶)
     for (f, sz) in [
         (&f_wu, LC::WU_SHARED as i32),
@@ -212,7 +238,9 @@ fn gdn_chunked_golden_stage_by_stage() {
 
     let dir = concat!(env!("CARGO_MANIFEST_DIR"), "/../../testdata/gdn_fla/cases");
     if !std::path::Path::new(dir).join("c1_t64.q.bin").is_file() {
-        owl_shared::testkit::report::skip(format_args!("金标 bin 不在({dir};`gen.py` 生成,或从主树 testdata/gdn_fla/cases 链接)"));
+        owl_shared::testkit::report::skip(format_args!(
+            "金标 bin 不在({dir};`gen.py` 生成,或从主树 testdata/gdn_fla/cases 链接)"
+        ));
         return;
     }
 
@@ -227,8 +255,8 @@ fn gdn_chunked_golden_stage_by_stage() {
         let v_b = f32_to_bf16(&case.v);
         let beta_b = f32_to_bf16(&case.beta);
         let g_e = g_engine_view(&case.g); // f16 量化(引擎 g 路径)
-        // state:池排布 [HV,KD,VD] → fork [HV,VD,KD](FORK_LAYOUT_VK);零初态 = 零块
-        // s0 上传:恒为核期望 [V,K](引擎 kv_to_vk 同款;与金标代际无关)
+                                          // state:池排布 [HV,KD,VD] → fork [HV,VD,KD](FORK_LAYOUT_VK);零初态 = 零块
+                                          // s0 上传:恒为核期望 [V,K](引擎 kv_to_vk 同款;与金标代际无关)
         let state_in = match &case.s0 {
             Some(s) => transpose_kv(s, NV, KD, VD),
             None => vec![0f32; NV * KD * VD],
@@ -254,7 +282,7 @@ fn gdn_chunked_golden_stage_by_stage() {
         let gcum = stream.alloc_zeros::<f32>(t * NV).unwrap();
         let a = stream.alloc_zeros::<f32>(t * NV * BT).unwrap();
         let ai = stream.alloc_zeros::<u8>(t * NV * BT * 2).unwrap(); // bf16 字节
-let w = stream.alloc_zeros::<u8>(t * NV * KD * 2).unwrap();
+        let w = stream.alloc_zeros::<u8>(t * NV * KD * 2).unwrap();
         let u = stream.alloc_zeros::<u8>(t * NV * VD * 2).unwrap();
         let h = stream.alloc_zeros::<u8>(nt * NV * VD * KD * 2).unwrap();
         let v_new = stream.alloc_zeros::<u8>(t * NV * VD * 2).unwrap();
@@ -296,86 +324,135 @@ let w = stream.alloc_zeros::<u8>(t * NV * KD * 2).unwrap();
         // ── 1. cumsum:raw g(f32)→ gcum;⚠️ fork ABI 无 scale 参(ln2 已烘核内)
         {
             let mut b = stream.launch_builder(&f_cum);
-            b.arg(&g_p).arg(&gcum_p).arg(&cu_p).arg(&idx_p).arg(&ti)
-                .arg(&scratch).arg(&scratch);
+            b.arg(&g_p)
+                .arg(&gcum_p)
+                .arg(&cu_p)
+                .arg(&idx_p)
+                .arg(&ti)
+                .arg(&scratch)
+                .arg(&scratch);
             unsafe {
                 b.launch(LaunchConfig {
                     grid_dim: (nt as u32, NV as u32, 1),
                     block_dim: (32 * LC::CUMSUM_WARPS, 1, 1),
                     shared_mem_bytes: LC::CUMSUM_SHARED,
                 })
-            }.expect("cumsum");
+            }
+            .expect("cumsum");
         }
         // ── 2. kkt:k/beta/gcum → A(f32)【g 语义律:吃 cumsum 产物】
         {
             let mut b = stream.launch_builder(&f_kkt);
-            b.arg(&k_p).arg(&beta_p).arg(&gcum_p).arg(&a_p)
-                .arg(&cu_p).arg(&idx_p).arg(&ti)
-                .arg(&scratch).arg(&scratch);
+            b.arg(&k_p)
+                .arg(&beta_p)
+                .arg(&gcum_p)
+                .arg(&a_p)
+                .arg(&cu_p)
+                .arg(&idx_p)
+                .arg(&ti)
+                .arg(&scratch)
+                .arg(&scratch);
             unsafe {
                 b.launch(LaunchConfig {
                     grid_dim: (nt as u32, NV as u32, 1),
                     block_dim: (32 * LC::KKT_WARPS, 1, 1),
                     shared_mem_bytes: LC::KKT_SHARED,
                 })
-            }.expect("kkt");
+            }
+            .expect("kkt");
         }
         // ── 3. merge:solve_tril(BT=64)A → Ai(bf16 字节;生产链同款)
         {
             let mut b = stream.launch_builder(&f_merge);
-            b.arg(&a_p).arg(&ai_p).arg(&cu_p).arg(&idx_p).arg(&ti)
-                .arg(&scratch).arg(&scratch);
+            b.arg(&a_p)
+                .arg(&ai_p)
+                .arg(&cu_p)
+                .arg(&idx_p)
+                .arg(&ti)
+                .arg(&scratch)
+                .arg(&scratch);
             unsafe {
                 b.launch(LaunchConfig {
                     grid_dim: (nt as u32, NV as u32, 1),
                     block_dim: (32 * LC::MERGE_WARPS, 1, 1),
                     shared_mem_bytes: LC::MERGE_SHARED,
                 })
-            }.expect("merge");
+            }
+            .expect("merge");
         }
         // ── 4. wu:k/v/beta/Ai/gcum → w/u(bf16)
         {
             let mut b = stream.launch_builder(&f_wu);
-            b.arg(&k_p).arg(&v_p).arg(&beta_p).arg(&w_p).arg(&u_p).arg(&ai_p)
-                .arg(&gcum_p).arg(&cu_p).arg(&idx_p).arg(&ti)
-                .arg(&scratch).arg(&scratch);
+            b.arg(&k_p)
+                .arg(&v_p)
+                .arg(&beta_p)
+                .arg(&w_p)
+                .arg(&u_p)
+                .arg(&ai_p)
+                .arg(&gcum_p)
+                .arg(&cu_p)
+                .arg(&idx_p)
+                .arg(&ti)
+                .arg(&scratch)
+                .arg(&scratch);
             unsafe {
                 b.launch(LaunchConfig {
                     grid_dim: (nt as u32, NV as u32, 1),
                     block_dim: (32 * LC::WU_WARPS, 1, 1),
                     shared_mem_bytes: LC::WU_SHARED,
                 })
-            }.expect("wu");
+            }
+            .expect("wu");
         }
         // ── 5. h:k/u/w/gcum/state → h_buf/v_new/ht(SASS 审计序:gk 被剪参;
         //        grid 二维 = (cdiv(VD,BV), HV),非 1D 乘积 —— 补录Ⅴ 校正)
         {
             let mut b = stream.launch_builder(&f_h);
-            b.arg(&k_p).arg(&u_p).arg(&w_p).arg(&vnew_p).arg(&gcum_p)
-                .arg(&h_p).arg(&state_p).arg(&so_p)
-                .arg(&cu_p).arg(&coff_p).arg(&ti)
-                .arg(&scratch).arg(&scratch);
+            b.arg(&k_p)
+                .arg(&u_p)
+                .arg(&w_p)
+                .arg(&vnew_p)
+                .arg(&gcum_p)
+                .arg(&h_p)
+                .arg(&state_p)
+                .arg(&so_p)
+                .arg(&cu_p)
+                .arg(&coff_p)
+                .arg(&ti)
+                .arg(&scratch)
+                .arg(&scratch);
             unsafe {
                 b.launch(LaunchConfig {
                     grid_dim: ((VD as u32).div_ceil(LC::H_BV), NV as u32, 1),
                     block_dim: (32 * LC::H_WARPS, 1, 1),
                     shared_mem_bytes: LC::H_SHARED,
                 })
-            }.expect("h");
+            }
+            .expect("h");
         }
         // ── 6. o:q/k/v_new/h/gcum → o(bf16)
         {
             let mut b = stream.launch_builder(&f_o);
-            b.arg(&q_p).arg(&k_p).arg(&vnew_p).arg(&h_p).arg(&gcum_p)
-                .arg(&o_p).arg(&cu_p).arg(&idx_p).arg(&SCALE).arg(&ti)
-                .arg(&scratch).arg(&scratch);
+            b.arg(&q_p)
+                .arg(&k_p)
+                .arg(&vnew_p)
+                .arg(&h_p)
+                .arg(&gcum_p)
+                .arg(&o_p)
+                .arg(&cu_p)
+                .arg(&idx_p)
+                .arg(&SCALE)
+                .arg(&ti)
+                .arg(&scratch)
+                .arg(&scratch);
             unsafe {
                 b.launch(LaunchConfig {
                     grid_dim: ((VD as u32).div_ceil(LC::O_BV), nt as u32, NV as u32),
                     block_dim: (32 * LC::O_WARPS, 1, 1),
                     shared_mem_bytes: LC::O_SHARED,
                 })
-            }.expect("o");
+            }
+            .expect("o");
         }
         stream.synchronize().expect("sync");
 
@@ -385,29 +462,56 @@ let w = stream.alloc_zeros::<u8>(t * NV * KD * 2).unwrap();
         };
         // 容差分级:tight = fork 同源金标(理论逐位,留 JIT/AOT 变体余量);
         // 宽 = pip-fla f32 金标 × bf16 链(输入量化 × 64 步递推放大)
-        let (tol_a, tol_r) = if *tight { (1e-4f32, 1e-3f32) } else { (6e-2f32, 6e-2f32) };
-        eprintln!("[{tag}] {}金标 对拍:", if *tight { "紧(深谷) " } else { "宽(f32) " });
+        let (tol_a, tol_r) = if *tight {
+            (1e-4f32, 1e-3f32)
+        } else {
+            (6e-2f32, 6e-2f32)
+        };
+        eprintln!(
+            "[{tag}] {}金标 对拍:",
+            if *tight { "紧(深谷) " } else { "宽(f32) " }
+        );
         let g_cum_want: Vec<f32> = if *tight {
             case.g_cum.clone() // c5 = fork 权威,nats 域直比
         } else {
             case.g_cum.iter().map(|v| v / RCP_LN2).collect() // log2 → nats
         };
-        assert_close("g_cum(nats)", tag, &stream.clone_dtoh(&gcum).unwrap(), &g_cum_want,
-            if *tight { 1e-3 } else { 2.5e-2 }, tol_r);
+        assert_close(
+            "g_cum(nats)",
+            tag,
+            &stream.clone_dtoh(&gcum).unwrap(),
+            &g_cum_want,
+            if *tight { 1e-3 } else { 2.5e-2 },
+            tol_r,
+        );
         assert_close("A(solve后)", tag, &dt(&ai), &case.a, tol_a, tol_r);
         assert_close("w", tag, &dt(&w), &case.w, tol_a, tol_r);
         assert_close("u", tag, &dt(&u), &case.u, tol_a, tol_r);
         let h_host = dt(&h);
-        let h_cmp = if needs_transpose(*tight) { transpose_kv_nt(&h_host, nt, NV, KD, VD) } else { h_host };
+        let h_cmp = if needs_transpose(*tight) {
+            transpose_kv_nt(&h_host, nt, NV, KD, VD)
+        } else {
+            h_host
+        };
         assert_close("h", tag, &h_cmp, &case.h, tol_a, tol_r);
         assert_close("v_new", tag, &dt(&v_new), &case.v_new, tol_a, tol_r);
-        assert_close("o", tag, &dt(&o), &case.o, if *tight { 1e-4 } else { 5e-2 }, tol_r);
+        assert_close(
+            "o",
+            tag,
+            &dt(&o),
+            &case.o,
+            if *tight { 1e-4 } else { 5e-2 },
+            tol_r,
+        );
         let ht_host = stream.clone_dtoh(&state_out).unwrap();
-        let ht_cmp = if needs_transpose(*tight) { transpose_kv(&ht_host, NV, VD, KD) } else { ht_host };
+        let ht_cmp = if needs_transpose(*tight) {
+            transpose_kv(&ht_host, NV, VD, KD)
+        } else {
+            ht_host
+        };
         assert_close("ht", tag, &ht_cmp, &case.ht, tol_a, tol_r);
-            }
+    }
 }
-
 
 /// i64 表按字节上传的便桥(meta 表)
 fn bytemuck_meta(v: &[i64]) -> &[u8] {

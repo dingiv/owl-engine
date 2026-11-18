@@ -50,7 +50,9 @@ pub(crate) enum QuantForm<'a> {
         se: &'a RawEntry,
         ze: &'a RawEntry,
     },
-    F16 { we: &'a RawEntry },
+    F16 {
+        we: &'a RawEntry,
+    },
 }
 
 /// 索引表种类(形状索引缓存键的第三轴;原 `bool` 只容 gather/fused 两态)
@@ -105,7 +107,9 @@ impl AwqSource {
     pub fn open_dir(dir: &Path) -> Result<Self, ModelError> {
         let t0 = std::time::Instant::now();
         let (maps, index) = open_raw_index(dir)?;
-        owl_shared::log_info!("awq", "mmap 索引 {} 项 @ {:?}(懒物化,无缓存)",
+        owl_shared::log_info!(
+            "awq",
+            "mmap 索引 {} 项 @ {:?}(懒物化,无缓存)",
             index.len(),
             t0.elapsed()
         );
@@ -135,10 +139,7 @@ impl AwqSource {
     /// - `Ct`:weight_packed + weight_scale + weight_zero_point(量化层);
     /// - `F16`:裸 weight(checkpoint ignore 层,如 layer0 out_proj ——
     ///   尺寸 eligible 但上游未量化)→ 现场量化兜底(见 `build_linear`)。
-    pub(crate) fn linear_form(
-        &self,
-        base: &str,
-    ) -> Option<(usize, usize, QuantForm<'_>)> {
+    pub(crate) fn linear_form(&self, base: &str) -> Option<(usize, usize, QuantForm<'_>)> {
         if let Some(pe) = self.index.get(&format!("{base}.weight_packed")) {
             let se = self.index.get(&format!("{base}.weight_scale"))?;
             let ze = self.index.get(&format!("{base}.weight_zero_point"))?;
@@ -153,7 +154,6 @@ impl AwqSource {
         }
     }
 
-
     /// **冷盘预取**(2026-10-24):把本档将读的源区间按文件偏移合并后,
     /// 后台 `pread` 填页缓存。实现只读索引/`linear_form`,**绝不 resolve**
     /// (否则会把派生键提前物化,反而拖慢装载)。
@@ -167,7 +167,9 @@ impl AwqSource {
             }
         };
         let add_base = |ranges: &mut Vec<(usize, usize, usize)>, base: &str| {
-            let Some((_, _, form)) = self.linear_form(base) else { return };
+            let Some((_, _, form)) = self.linear_form(base) else {
+                return;
+            };
             match form {
                 QuantForm::Ct { pe, se, ze } => {
                     push_entry(ranges, pe);
@@ -185,8 +187,17 @@ impl AwqSource {
                 push_entry(&mut ranges, e);
             }
             let base = [
-                ".qweight", ".scales", ".zeros", ".packed_raw", ".packed_raw_ct",
-                ".i8q", ".i8s", ".weight", ".qweight_a8", ".scales_a8", ".zeros_a8",
+                ".qweight",
+                ".scales",
+                ".zeros",
+                ".packed_raw",
+                ".packed_raw_ct",
+                ".i8q",
+                ".i8s",
+                ".weight",
+                ".qweight_a8",
+                ".scales_a8",
+                ".zeros_a8",
                 ".a8_factor",
             ]
             .iter()
@@ -234,13 +245,18 @@ impl AwqSource {
                         owl_shared::log_warn!(
                             "load",
                             "预取读失败(map {} @{} {}B): {e}(回退按需缺页)",
-                            map, start, end - start
+                            map,
+                            start,
+                            end - start
                         );
                     }
                 }
             }));
         }
-        *self.prefetch_thread.lock().unwrap_or_else(|p| p.into_inner()) = Some(handles);
+        *self
+            .prefetch_thread
+            .lock()
+            .unwrap_or_else(|p| p.into_inner()) = Some(handles);
         owl_shared::log_info!(
             "load",
             "预取源区间:{} 段 / {:.2}GB · {} 读流 · 后台启动 {:.1}ms(冷盘 I/O 与物化重叠)",
@@ -276,24 +292,34 @@ impl AwqSource {
             return Ok(Some(Resolved::Zeroed));
         }
         if let Some(base) = key.strip_suffix(".qweight") {
-            let Some(__b) = self.linear_bytes_for(base, key)? else { return Ok(None) };
+            let Some(__b) = self.linear_bytes_for(base, key)? else {
+                return Ok(None);
+            };
             return Ok(Some(Resolved::Bytes(__b, Dtype::U32)));
         }
         if let Some(base) = key.strip_suffix(".scales") {
-            let Some(__b) = self.linear_bytes_for(base, key)? else { return Ok(None) };
+            let Some(__b) = self.linear_bytes_for(base, key)? else {
+                return Ok(None);
+            };
             return Ok(Some(Resolved::Bytes(__b, Dtype::F16)));
         }
         if let Some(base) = key.strip_suffix(".zeros") {
-            let Some(__b) = self.linear_bytes_for(base, key)? else { return Ok(None) };
+            let Some(__b) = self.linear_bytes_for(base, key)? else {
+                return Ok(None);
+            };
             return Ok(Some(Resolved::Bytes(__b, Dtype::U32)));
         }
         // ---- P1.5-a:int8 per-row 头(packed-⌚ lm_head;源 = bf16 权重)----
         if let Some(base) = key.strip_suffix(".i8q") {
-            let Some(__b) = self.linear_bytes_for(base, key)? else { return Ok(None) };
+            let Some(__b) = self.linear_bytes_for(base, key)? else {
+                return Ok(None);
+            };
             return Ok(Some(Resolved::Bytes(__b, Dtype::I8)));
         }
         if let Some(base) = key.strip_suffix(".i8s") {
-            let Some(__b) = self.linear_bytes_for(base, key)? else { return Ok(None) };
+            let Some(__b) = self.linear_bytes_for(base, key)? else {
+                return Ok(None);
+            };
             return Ok(Some(Resolved::Bytes(__b, Dtype::F32)));
         }
         // ---- W4A8 键族(S2;a8 布局三件套 + 全局因子)----
@@ -310,7 +336,9 @@ impl AwqSource {
             let Some(base) = key.rsplit_once('.').map(|(b, _)| b) else {
                 return Ok(None);
             };
-            let Some(__b) = self.linear_bytes_for(base, key)? else { return Ok(None) };
+            let Some(__b) = self.linear_bytes_for(base, key)? else {
+                return Ok(None);
+            };
             return Ok(Some(Resolved::Bytes(__b, dt)));
         }
         // E5-M2b fc 列半拆:mtp.fc_{e,h}.weight = mtp.fc.weight 的 in 维
@@ -347,7 +375,8 @@ impl AwqSource {
                 return Ok(Some(Resolved::View(pe.clone())));
             }
             if self.index.contains_key(&format!("{base}.weight")) {
-                let Some(__b) = self.linear_bytes_for(base, &format!("{base}.packed_raw_ct"))? else {
+                let Some(__b) = self.linear_bytes_for(base, &format!("{base}.packed_raw_ct"))?
+                else {
                     return Ok(None);
                 };
                 return Ok(Some(Resolved::Bytes(__b, Dtype::U32)));
@@ -356,8 +385,10 @@ impl AwqSource {
         // 非门控线性反量化臂(Linear 与本源同谓词,该键只对 non-eligible 出现)
         if let Some(base) = key.strip_suffix(".weight") {
             if self.index.contains_key(&format!("{base}.weight_packed")) {
-                let Some(__b) = self.linear_bytes_for(base, key)? else { return Ok(None) };
-            return Ok(Some(Resolved::Bytes(__b, Dtype::F16)));
+                let Some(__b) = self.linear_bytes_for(base, key)? else {
+                    return Ok(None);
+                };
+                return Ok(Some(Resolved::Bytes(__b, Dtype::F16)));
             }
         }
         Ok(None)
@@ -407,9 +438,7 @@ impl AwqSource {
                 let mut out = vec![0u8; e.nbytes];
                 match e.dtype {
                     safetensors::Dtype::F16 => out.copy_from_slice(src),
-                    safetensors::Dtype::BF16 => {
-                        crate::f16c::bf16_bytes_to_f16_bytes(src, &mut out)
-                    }
+                    safetensors::Dtype::BF16 => crate::f16c::bf16_bytes_to_f16_bytes(src, &mut out),
                     safetensors::Dtype::F32 => out = f32_bytes_to_f16(src),
                     _ => return Ok(None), // weight_shape 等元数据键不可取
                 }
@@ -512,9 +541,7 @@ impl WeightSource for AwqSource {
             return Ok(None);
         };
         let esz = e.esz();
-        let (Some(soff), Some(want)) =
-            (offset_elems.checked_mul(esz), len.checked_mul(esz))
-        else {
+        let (Some(soff), Some(want)) = (offset_elems.checked_mul(esz), len.checked_mul(esz)) else {
             return Ok(None);
         };
         let Some(s) = e.start.checked_add(soff) else {
@@ -537,28 +564,36 @@ impl WeightSource for AwqSource {
             return Ok(None);
         }
         if let Some(base) = key.strip_suffix(".marlin_ws") {
-            let Some((out, k, _)) = self.linear_form(base) else { return Ok(None) };
+            let Some((out, k, _)) = self.linear_form(base) else {
+                return Ok(None);
+            };
             if !marlin_eligible(out, k) {
                 return Ok(None);
             }
             return Ok(Some(v2_workspace_len(out)));
         }
         if let Some(base) = key.strip_suffix(".marlin_ctmp") {
-            let Some((out, k, _)) = self.linear_form(base) else { return Ok(None) };
+            let Some((out, k, _)) = self.linear_form(base) else {
+                return Ok(None);
+            };
             if !marlin_eligible(out, k) {
                 return Ok(None);
             }
             return Ok(Some(1));
         }
         if let Some(base) = key.strip_suffix(".qweight") {
-            let Some((out, k, _)) = self.linear_form(base) else { return Ok(None) };
+            let Some((out, k, _)) = self.linear_form(base) else {
+                return Ok(None);
+            };
             if !marlin_eligible(out, k) {
                 return Ok(None);
             }
             return Ok(Some(out * k / 8));
         }
         if let Some(base) = key.strip_suffix(".scales") {
-            let Some((out, k, _)) = self.linear_form(base) else { return Ok(None) };
+            let Some((out, k, _)) = self.linear_form(base) else {
+                return Ok(None);
+            };
             if !marlin_eligible(out, k) {
                 return Ok(None);
             }
@@ -566,14 +601,18 @@ impl WeightSource for AwqSource {
         }
         if let Some(base) = key.strip_suffix(".packed_raw") {
             // 设备重排键:原始 packed 元素数(out × k/8;恒供,与 eligible 无关)
-            let Some((out, k, _)) = self.linear_form(base) else { return Ok(None) };
+            let Some((out, k, _)) = self.linear_form(base) else {
+                return Ok(None);
+            };
             if !self.index.contains_key(&format!("{base}.weight_packed")) {
                 return Ok(None); // 仅 ct 形态有原始 packed(F16 兜底层无)
             }
             return Ok(Some(out * (k / 8)));
         }
         if let Some(base) = key.strip_suffix(".zeros") {
-            let Some((out, k, _)) = self.linear_form(base) else { return Ok(None) };
+            let Some((out, k, _)) = self.linear_form(base) else {
+                return Ok(None);
+            };
             if !marlin_eligible(out, k) {
                 return Ok(None);
             }
@@ -581,7 +620,9 @@ impl WeightSource for AwqSource {
         }
         if let Some(base) = key.strip_suffix(".weight") {
             if !self.index.contains_key(key) {
-                let Some((out, k, _)) = self.linear_form(base) else { return Ok(None) };
+                let Some((out, k, _)) = self.linear_form(base) else {
+                    return Ok(None);
+                };
                 if marlin_eligible(out, k) {
                     return Ok(None);
                 }
@@ -756,9 +797,11 @@ mod tests {
     use super::*;
     // 搬去 awq_build 的打包器 + util 助手(测试面专用;放这里 ⇒ 生产构建零 unused)
     use crate::formats::awq_build::pack_scales_bf16_into;
-    use owl_kernels::family::marlin::repack::{marlin_scales_index, pack_marlin_s_idx, unpack_zp_ct};
     use crate::formats::util::{bf16_par, i32s_le_bytes, u16s_le_bytes};
     use crate::testkit::tmp_path;
+    use owl_kernels::family::marlin::repack::{
+        marlin_scales_index, pack_marlin_s_idx, unpack_zp_ct,
+    };
 
     /// 合成 ct 检查点目录(weight_packed I32 / weight_scale BF16 /
     /// weight_zero_point I32 / weight_shape I64)。
@@ -771,7 +814,16 @@ mod tests {
         out: usize,
         k: usize,
     ) {
-        write_ct_named(dir, "model.safetensors", base, packed, scales_bf16, zp, out, k);
+        write_ct_named(
+            dir,
+            "model.safetensors",
+            base,
+            packed,
+            scales_bf16,
+            zp,
+            out,
+            k,
+        );
     }
 
     /// 同上但可指定文件名(多子基检查点:合并虚拟键的对拍需要两个文件共存)
@@ -790,26 +842,64 @@ mod tests {
         let mut header = String::from("{");
         let mut blobs: Vec<Vec<u8>> = Vec::new();
         let mut offset = 0usize;
-        let entry = |header: &mut String, name: &str, dtype: &str, shape: &[usize], bytes: Vec<u8>, offset: &mut usize| {
+        let entry = |header: &mut String,
+                     name: &str,
+                     dtype: &str,
+                     shape: &[usize],
+                     bytes: Vec<u8>,
+                     offset: &mut usize| {
             let n = bytes.len();
             header.push_str(&format!(
                 "{}\"{}\": {{\"dtype\": \"{}\", \"shape\": [{}], \"data_offsets\": [{}, {}]}}",
                 if *offset == 0 { "" } else { ", " },
-                name, dtype,
-                shape.iter().map(|v| v.to_string()).collect::<Vec<_>>().join(","),
-                *offset, *offset + n
+                name,
+                dtype,
+                shape
+                    .iter()
+                    .map(|v| v.to_string())
+                    .collect::<Vec<_>>()
+                    .join(","),
+                *offset,
+                *offset + n
             ));
             *offset += n;
             bytes
         };
-        blobs.push(entry(&mut header, &format!("{base}.weight_packed"), "I32", &[out, k / 8],
-            packed.iter().flat_map(|v| v.to_le_bytes()).collect(), &mut offset));
-        blobs.push(entry(&mut header, &format!("{base}.weight_scale"), "BF16", &[out, k / 32],
-            scales_bf16.to_vec(), &mut offset));
-        blobs.push(entry(&mut header, &format!("{base}.weight_zero_point"), "I32", &[out / 8, k / 32],
-            zp.iter().flat_map(|v| v.to_le_bytes()).collect(), &mut offset));
-        blobs.push(entry(&mut header, &format!("{base}.weight_shape"), "I64", &[2],
-            [(out as i64), (k as i64)].iter().flat_map(|v| v.to_le_bytes()).collect(), &mut offset));
+        blobs.push(entry(
+            &mut header,
+            &format!("{base}.weight_packed"),
+            "I32",
+            &[out, k / 8],
+            packed.iter().flat_map(|v| v.to_le_bytes()).collect(),
+            &mut offset,
+        ));
+        blobs.push(entry(
+            &mut header,
+            &format!("{base}.weight_scale"),
+            "BF16",
+            &[out, k / 32],
+            scales_bf16.to_vec(),
+            &mut offset,
+        ));
+        blobs.push(entry(
+            &mut header,
+            &format!("{base}.weight_zero_point"),
+            "I32",
+            &[out / 8, k / 32],
+            zp.iter().flat_map(|v| v.to_le_bytes()).collect(),
+            &mut offset,
+        ));
+        blobs.push(entry(
+            &mut header,
+            &format!("{base}.weight_shape"),
+            "I64",
+            &[2],
+            [(out as i64), (k as i64)]
+                .iter()
+                .flat_map(|v| v.to_le_bytes())
+                .collect(),
+            &mut offset,
+        ));
         header.push('}');
         let mut file = Vec::new();
         file.extend_from_slice(&(header.len() as u64).to_le_bytes());
@@ -828,7 +918,11 @@ mod tests {
         let vals: Vec<f32> = (0..out * k)
             .map(|i| {
                 let x = (i as f32 * 0.0173).sin() * 3.7 + (i % 17) as f32 * 0.011;
-                if i % 31 == 0 { 0.0 } else { x }
+                if i % 31 == 0 {
+                    0.0
+                } else {
+                    x
+                }
             })
             .collect();
         let bf = f32_to_bf16_bytes(&vals);
@@ -848,8 +942,12 @@ mod tests {
         let dir = tmp_path("awq_merged_raw");
         let n1 = out1 * (k / 8);
         let n2 = out2 * (k / 8);
-        let p1: Vec<i32> = (0..n1).map(|i| (i as i32).wrapping_mul(0x0BB6_7AE1) ^ 0x5a5a).collect();
-        let p2: Vec<i32> = (0..n2).map(|i| (i as i32).wrapping_mul(0x9E37_79B1_u32 as i32)).collect();
+        let p1: Vec<i32> = (0..n1)
+            .map(|i| (i as i32).wrapping_mul(0x0BB6_7AE1) ^ 0x5a5a)
+            .collect();
+        let p2: Vec<i32> = (0..n2)
+            .map(|i| (i as i32).wrapping_mul(0x9E37_79B1_u32 as i32))
+            .collect();
         let mk_scales = |n: usize| f32_to_bf16_bytes(&vec![0.25f32; n]);
         let mk_zp = |n: usize| vec![0i32; n];
         write_ct_named(
@@ -897,7 +995,9 @@ mod tests {
         for (off, len) in windows {
             let mut got = vec![0u8; len * 4];
             assert!(
-                src.convert_chunk_into_bytes(key, off, len, &mut got, Dtype::U32).expect("源").is_some(),
+                src.convert_chunk_into_bytes(key, off, len, &mut got, Dtype::U32)
+                    .expect("源")
+                    .is_some(),
                 "窗口 [{off},{}) 应可直写",
                 off + len
             );
@@ -915,12 +1015,23 @@ mod tests {
         let mut small = vec![0u8; 4];
         // 越界用例给足 dst —— 否则先撞"dst 尺寸门"(两道门都响亮,顺序上先尺寸)
         let mut dst8 = vec![0u8; 8];
-        assert!(src.convert_chunk_into_bytes(key, n - 1, 2, &mut dst8, Dtype::U32).expect("源").is_none(),
-            "越界 = Ok(None)");
-        assert!(src.convert_chunk_into_bytes(key, 0, n, &mut small, Dtype::U32).is_err(),
-            "dst 太小 = 响亮 Err");
-        assert!(src.convert_chunk_into_bytes(key, 0, 1, &mut small, Dtype::F16).expect("源").is_none(),
-            "目标 dtype 不支持 = Ok(None)");
+        assert!(
+            src.convert_chunk_into_bytes(key, n - 1, 2, &mut dst8, Dtype::U32)
+                .expect("源")
+                .is_none(),
+            "越界 = Ok(None)"
+        );
+        assert!(
+            src.convert_chunk_into_bytes(key, 0, n, &mut small, Dtype::U32)
+                .is_err(),
+            "dst 太小 = 响亮 Err"
+        );
+        assert!(
+            src.convert_chunk_into_bytes(key, 0, 1, &mut small, Dtype::F16)
+                .expect("源")
+                .is_none(),
+            "目标 dtype 不支持 = Ok(None)"
+        );
     }
 
     /// **scales 单遍融合**逐位对拍:融合直出字节 ≡ 原链
@@ -931,12 +1042,22 @@ mod tests {
         let (out, k) = (256usize, 256usize);
         let groups = k / 32;
         let dir = tmp_path("awq_scales_fused");
-        let scales: Vec<f32> = (0..out * groups).map(|i| 0.013 + (i % 521) as f32 * 2e-4).collect();
+        let scales: Vec<f32> = (0..out * groups)
+            .map(|i| 0.013 + (i % 521) as f32 * 2e-4)
+            .collect();
         let sb = f32_to_bf16_bytes(&scales);
-        write_ct_dir(&dir, "l", &vec![0i32; out * (k / 8)], &sb, &vec![0i32; (out / 8) * groups], out, k);
+        write_ct_dir(
+            &dir,
+            "l",
+            &vec![0i32; out * (k / 8)],
+            &sb,
+            &vec![0i32; (out / 8) * groups],
+            out,
+            k,
+        );
         let src = AwqSource::open_dir(&dir).expect("open");
-        let view = &src.maps[src.index["l.weight_scale"].map_ix]
-            [src.index["l.weight_scale"].start..src.index["l.weight_scale"].start + src.index["l.weight_scale"].nbytes];
+        let view = &src.maps[src.index["l.weight_scale"].map_ix][src.index["l.weight_scale"].start
+            ..src.index["l.weight_scale"].start + src.index["l.weight_scale"].nbytes];
         // 单段
         let idx = marlin_scales_index(out, groups);
         let want = u16s_le_bytes(&pack_marlin_s(&bf16_par(view), out, groups));
@@ -965,12 +1086,18 @@ mod tests {
         let groups = k / 32;
         let dir = tmp_path("awq_a8_keys");
         let packed: Vec<i32> = (0..out * (k / 8))
-            .map(|i| (i as i32).wrapping_mul(0x0BB6_7AE1).wrapping_mul(0x9E37_79B1_u32 as i32))
+            .map(|i| {
+                (i as i32)
+                    .wrapping_mul(0x0BB6_7AE1)
+                    .wrapping_mul(0x9E37_79B1_u32 as i32)
+            })
             .collect();
         let zp: Vec<i32> = (0..(out / 8) * groups)
             .map(|i| (i as i32).wrapping_mul(0x85EB_CA6B_u32 as i32) ^ 0x1234_5678)
             .collect();
-        let scales: Vec<f32> = (0..out * groups).map(|i| 0.01 + (i % 23) as f32 * 0.002).collect();
+        let scales: Vec<f32> = (0..out * groups)
+            .map(|i| 0.01 + (i % 23) as f32 * 0.002)
+            .collect();
         let sb = f32_to_bf16_bytes(&scales);
         write_ct_dir(&dir, "l", &packed, &sb, &zp, out, k);
         let src = AwqSource::open_dir(&dir).expect("open");
@@ -979,14 +1106,21 @@ mod tests {
         let scales_bf16 = bf16_par(&sb);
 
         let take = |key: &str| -> (Vec<u8>, Dtype) {
-            let (d, dt) = src.key_bytes(key).expect("源").unwrap_or_else(|| panic!("{key} 取不到"));
+            let (d, dt) = src
+                .key_bytes(key)
+                .expect("源")
+                .unwrap_or_else(|| panic!("{key} 取不到"));
             (d.as_slice().to_vec(), dt)
         };
         // 期望 = 直接过 a8 三件套(a16 臂同源的 unpack 两步)
         let want_b = i32s_le_bytes(&pack_marlin_b_a8(&unpack_nibbles(&packed, out, k), k, out));
         let (s_bits, factor) = pack_marlin_s_a8(&scales_bf16, out, groups);
         let want_s = u16s_le_bytes(&s_bits);
-        let want_z = i32s_le_bytes(&pack_marlin_z_a8(&unpack_zp_ct(&zp, out, groups), out, groups));
+        let want_z = i32s_le_bytes(&pack_marlin_z_a8(
+            &unpack_zp_ct(&zp, out, groups),
+            out,
+            groups,
+        ));
 
         let (b, dt_b) = take("l.qweight_a8");
         let (s_, dt_s) = take("l.scales_a8");
@@ -996,9 +1130,17 @@ mod tests {
         assert_eq!(s_, want_s, "scales_a8 逐位(perm_single + int16 归一)");
         assert_eq!(z, want_z, "zeros_a8 逐位(无 n-interleave)");
         assert_eq!(f, factor.to_le_bytes().to_vec(), "a8_factor = max/4096");
-        assert_eq!((dt_b, dt_s, dt_z, dt_f), (Dtype::U32, Dtype::F16, Dtype::U32, Dtype::F32), "线 dtype");
+        assert_eq!(
+            (dt_b, dt_s, dt_z, dt_f),
+            (Dtype::U32, Dtype::F16, Dtype::U32, Dtype::F32),
+            "线 dtype"
+        );
         // 尺寸自查(位数与 GEMM 槽契约对望)
-        assert_eq!(b.len(), (k / 16) * (out * 16 / 8) * 4, "B 字数 = (k/16, n*2) i32");
+        assert_eq!(
+            b.len(),
+            (k / 16) * (out * 16 / 8) * 4,
+            "B 字数 = (k/16, n*2) i32"
+        );
         assert_eq!(s_.len(), groups * out * 2, "scales 字数 = (k/g, n) 2B");
         assert_eq!(z.len(), groups * (out / 8) * 4, "zp 字数 = (k/g, n/8) i32");
         assert_eq!(f.len(), 4, "因子 = f32[1]");
@@ -1023,11 +1165,21 @@ mod tests {
         }
         for (out, groups) in [(64usize, 2usize), (128, 4), (256, 1), (5120, 544)] {
             let n = out * groups;
-            let scales: Vec<f32> = (0..n).map(|i| ((i * 2654435761) % 65536) as f32 / 8192.0).collect();
+            let scales: Vec<f32> = (0..n)
+                .map(|i| ((i * 2654435761) % 65536) as f32 / 8192.0)
+                .collect();
             let idx = marlin_scales_index(out, groups);
             let got = pack_marlin_s_idx(&scales, out, groups, &idx);
-            assert_eq!(got, pack_marlin_s_ref(&scales, out, groups), "(out={out}, groups={groups}) 逐位");
-            assert_eq!(pack_marlin_s(&scales, out, groups), got, "壳函数与索引路一致");
+            assert_eq!(
+                got,
+                pack_marlin_s_ref(&scales, out, groups),
+                "(out={out}, groups={groups}) 逐位"
+            );
+            assert_eq!(
+                pack_marlin_s(&scales, out, groups),
+                got,
+                "壳函数与索引路一致"
+            );
         }
     }
 
@@ -1044,18 +1196,31 @@ mod tests {
         let groups = k / 32;
         let dir = tmp_path("awq_src_deq");
         let packed: Vec<i32> = (0..out * (k / 8))
-            .map(|i| (i as i32).wrapping_mul(0x0BB6_7AE1).wrapping_mul(0x9E37_79B1_u32 as i32))
+            .map(|i| {
+                (i as i32)
+                    .wrapping_mul(0x0BB6_7AE1)
+                    .wrapping_mul(0x9E37_79B1_u32 as i32)
+            })
             .collect();
         let zp: Vec<i32> = (0..(out / 8) * groups)
             .map(|i| (i as i32).wrapping_mul(0x85EB_CA6B_u32 as i32) ^ 0x1234_5678)
             .collect();
-        let scales: Vec<f32> = (0..out * groups).map(|i| 0.01 + (i % 17) as f32 * 0.003).collect();
+        let scales: Vec<f32> = (0..out * groups)
+            .map(|i| 0.01 + (i % 17) as f32 * 0.003)
+            .collect();
         write_ct_dir(&dir, "l", &packed, &f32_to_bf16_bytes(&scales), &zp, out, k);
 
         let src = AwqSource::open_dir(&dir).expect("open");
         // 非 eligible:qweight 不可取,weight 反量化可取
-        assert!(src.elem_len("l.qweight").expect("源").is_none(), "非 eligible 不得供 qweight");
-        assert_eq!(src.elem_len("l.weight").expect("源"), Some(out * k), "反量化臂尺寸");
+        assert!(
+            src.elem_len("l.qweight").expect("源").is_none(),
+            "非 eligible 不得供 qweight"
+        );
+        assert_eq!(
+            src.elem_len("l.weight").expect("源"),
+            Some(out * k),
+            "反量化臂尺寸"
+        );
         let w = src.take("l.weight").expect("源").expect("take weight");
         // host 参考:nibble t of word c = 行 8c+t(zp 打包维 = out)
         for o in 0..out {
@@ -1083,13 +1248,18 @@ mod tests {
         let dir = tmp_path("awq_src_marlin");
         let packed: Vec<i32> = (0..out * (k / 8)).map(|i| i as i32 * 7 + 3).collect();
         let zp: Vec<i32> = (0..(out / 8) * groups).map(|i| i as i32 * 13 + 1).collect();
-        let scales: Vec<f32> = (0..out * groups).map(|i| 0.02 + (i % 7) as f32 * 0.004).collect();
+        let scales: Vec<f32> = (0..out * groups)
+            .map(|i| 0.02 + (i % 7) as f32 * 0.004)
+            .collect();
         write_ct_dir(&dir, "l", &packed, &f32_to_bf16_bytes(&scales), &zp, out, k);
 
         let src = AwqSource::open_dir(&dir).expect("open");
         assert_eq!(src.elem_len("l.qweight").expect("源"), Some(out * k / 8));
         assert_eq!(src.elem_len("l.scales").expect("源"), Some(out * groups));
-        assert_eq!(src.elem_len("l.zeros").expect("源"), Some(groups * (out / 8)));
+        assert_eq!(
+            src.elem_len("l.zeros").expect("源"),
+            Some(groups * (out / 8))
+        );
         assert_eq!(
             src.elem_len("l.marlin_ws").expect("源"),
             Some(owl_kernels::family::marlin::v2_workspace_len(out))
@@ -1100,7 +1270,10 @@ mod tests {
         assert_eq!(z.len(), groups * (out / 8));
         // take_range 分块一致性(w4a16 同律)
         let whole = src.take("l.scales").expect("源").expect("take scales");
-        let half1 = src.take_range("l.scales", 0, whole.len() / 2).expect("源").expect("r1");
+        let half1 = src
+            .take_range("l.scales", 0, whole.len() / 2)
+            .expect("源")
+            .expect("r1");
         assert_eq!(&whole[..half1.len()], &half1[..], "分块 = 整取前缀");
     }
 
@@ -1109,8 +1282,10 @@ mod tests {
         std::fs::read_to_string("/proc/self/io")
             .ok()
             .and_then(|s| {
-                s.lines()
-                    .find_map(|l| l.strip_prefix("read_bytes: ").and_then(|v| v.trim().parse().ok()))
+                s.lines().find_map(|l| {
+                    l.strip_prefix("read_bytes: ")
+                        .and_then(|v| v.trim().parse().ok())
+                })
             })
             .unwrap_or(0)
     }
@@ -1170,7 +1345,11 @@ mod tests {
         let src_bf16 = f32_to_bf16_bytes(&scales_f32);
         eprintln!("[iobench] scales 链(27B mlp 档):out={out} groups={groups} 元素={n}");
         bench_seg("旧链 bf16_par+spack+bytes", n * 2, 3, |_| {
-            std::hint::black_box(u16s_le_bytes(&pack_marlin_s(&bf16_par(&src_bf16), out, groups)));
+            std::hint::black_box(u16s_le_bytes(&pack_marlin_s(
+                &bf16_par(&src_bf16),
+                out,
+                groups,
+            )));
         });
         let idx = marlin_scales_index(out, groups);
         let mut dst = vec![0u8; n * 2];
@@ -1194,9 +1373,15 @@ mod tests {
             owl_shared::testkit::report::skip("OWL_AWQ_IOBENCH 未开");
             return;
         }
-        let dir = std::path::PathBuf::from(owl_shared::testkit::resource("ckpt:27b-awq").unwrap_or_else(|| {
-            concat!(env!("CARGO_MANIFEST_DIR"), "/../../models/cyankiwi/Qwen3.8-27B-AWQ-INT4").into()
-        }));
+        let dir = std::path::PathBuf::from(
+            owl_shared::testkit::resource("ckpt:27b-awq").unwrap_or_else(|| {
+                concat!(
+                    env!("CARGO_MANIFEST_DIR"),
+                    "/../../models/cyankiwi/Qwen3.8-27B-AWQ-INT4"
+                )
+                .into()
+            }),
+        );
         let src = AwqSource::open_dir(&dir).expect("源");
         let want = owl_shared::env_reader::str("OWL_AWQ_IOBENCH_KEYS").unwrap_or_else(|| {
             "model.language_model.layers.0.linear_attn.in_proj_qkvz.packed_raw,model.language_model.layers.0.mlp.down_proj.packed_raw,model.language_model.embed_tokens.weight".into()
@@ -1211,11 +1396,19 @@ mod tests {
                     continue;
                 }
             };
-            let dtype = if key.ends_with(".packed_raw") { Dtype::U32 } else { Dtype::F16 };
+            let dtype = if key.ends_with(".packed_raw") {
+                Dtype::U32
+            } else {
+                Dtype::F16
+            };
             let elems = nbytes / dtype.size_bytes();
             let arm = match src.resolve(key).expect("源") {
-                Some(Resolved::View(e)) => format!("View({:?},{}MB)", e.dtype, e.nbytes / 1_000_000),
-                Some(Resolved::Bytes(b, d)) => format!("Bytes({d:?},{:.1}MB)", b.len() as f64 / 1e6),
+                Some(Resolved::View(e)) => {
+                    format!("View({:?},{}MB)", e.dtype, e.nbytes / 1_000_000)
+                }
+                Some(Resolved::Bytes(b, d)) => {
+                    format!("Bytes({d:?},{:.1}MB)", b.len() as f64 / 1e6)
+                }
                 Some(Resolved::Merged(ps)) => format!(
                     "Merged({} 段,{:.1}MB)",
                     ps.len(),
@@ -1228,21 +1421,27 @@ mod tests {
             eprintln!("[iobench]   臂={arm} 字节={:.1}MB", nbytes as f64 / 1e6);
             let mut dst = vec![0u8; nbytes];
             dst.fill(0x5a); // dst 预热(不把目标缺页算进拷贝)
-            // ① resolve 单独(合并虚拟键 = 每次调用重建整个缓冲)
+                            // ① resolve 单独(合并虚拟键 = 每次调用重建整个缓冲)
             bench_seg("① resolve() 单独", nbytes, 3, |_| {
                 std::hint::black_box(src.resolve(key).expect("源"));
             });
             // ② 现行 API(装载域唯一入口)
             bench_seg("② convert_chunk_into_bytes", nbytes, 3, |_| {
-                src.convert_chunk_into_bytes(key, 0, elems, &mut dst, dtype).expect("源").expect("convert");
+                src.convert_chunk_into_bytes(key, 0, elems, &mut dst, dtype)
+                    .expect("源")
+                    .expect("convert");
             });
             // ③ 裸拷:mmap 视图(仅 View 臂可比)
             if let Some(Resolved::View(e)) = src.resolve(key).expect("源") {
                 let r0 = io_read_bytes();
                 {
                     let view = &src.maps[e.map_ix][e.start..e.start + e.nbytes];
-                    bench_seg("③ 裸拷 mmap 视图 1T", nbytes, 3, |_| dst.copy_from_slice(view));
-                    bench_seg("③' 裸拷 mmap 视图 4T", nbytes, 3, |_| par_copy(view, &mut dst, 4));
+                    bench_seg("③ 裸拷 mmap 视图 1T", nbytes, 3, |_| {
+                        dst.copy_from_slice(view)
+                    });
+                    bench_seg("③' 裸拷 mmap 视图 4T", nbytes, 3, |_| {
+                        par_copy(view, &mut dst, 4)
+                    });
                 }
                 let _ = io_read_bytes().saturating_sub(r0);
             }

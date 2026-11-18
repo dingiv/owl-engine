@@ -89,7 +89,11 @@ fn e4m3_sorted() -> &'static [(f32, u8)] {
             .filter(|c| c & 0x7F != 0x7F) // NaN 两种位型不参与编码(原式同)
             .map(|c| (e4m3_decode_exact(c), c))
             .collect();
-        v.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal).then(a.1.cmp(&b.1)));
+        v.sort_by(|a, b| {
+            a.0.partial_cmp(&b.0)
+                .unwrap_or(std::cmp::Ordering::Equal)
+                .then(a.1.cmp(&b.1))
+        });
         v
     })
 }
@@ -143,7 +147,9 @@ mod encode_opt_tests {
                 cases.push(v - 1e-3);
             }
         }
-        cases.extend([0.0f32, -0.0, 1e-9, -1e-9, 448.0, -448.0, 1e9, -1e9, 1.0, -1.0]);
+        cases.extend([
+            0.0f32, -0.0, 1e-9, -1e-9, 448.0, -448.0, 1e9, -1e9, 1.0, -1.0,
+        ]);
         for i in 0..20_000u32 {
             let x = i.wrapping_mul(0x9E37_79B9).wrapping_add(0x85EB_CA6B);
             cases.push(((x & 0xFFFF) as f32 / 65535.0 - 0.5) * 2.0);
@@ -235,7 +241,13 @@ fn causal_mask_words(t: usize) -> Vec<u32> {
         for w in 0..wpr {
             let lo = w * 32;
             let hi = (i + 1).min(lo + 32);
-            v[i * wpr + w] = if hi <= lo { 0 } else if hi - lo == 32 { u32::MAX } else { (1u32 << (hi - lo)) - 1 };
+            v[i * wpr + w] = if hi <= lo {
+                0
+            } else if hi - lo == 32 {
+                u32::MAX
+            } else {
+                (1u32 << (hi - lo)) - 1
+            };
         }
     }
     v
@@ -300,8 +312,10 @@ fn run_case(t: usize, ctx: usize, host_check: bool, chunked: bool) {
     // ⚠️ semaphores 数组按 **gridDim.y × batch**(KV-split 归约计数,idxSeq =
     // gridDim.y·idxReq + blockIdx.y;参考实现只按 hkv 给,SPEC_DEC 下不够!
     // t=512 时 grid.y = hkv·ceil(t·6/32) = 384 ⇒ 按 12 给 = 越界写)
-    let xqa_grid_y =
-        xqa_consts.launch_geometry(SM86_SM_COUNT, 1, HKV as u32, (nb * PAGE) as u32, t as u32).0 .1;
+    let xqa_grid_y = xqa_consts
+        .launch_geometry(SM86_SM_COUNT, 1, HKV as u32, (nb * PAGE) as u32, t as u32)
+        .0
+         .1;
     let sem_len = xqa_grid_y as usize + 8;
     let d_sem = {
         let mut d = unsafe { stream.alloc::<u32>(sem_len) }.unwrap();
@@ -373,9 +387,9 @@ fn run_case(t: usize, ctx: usize, host_check: bool, chunked: bool) {
     // ---- 现役 prefill 注意力核(xinfer chunked prefill 主核,kNHD fp8) ----
     let ch_func = if chunked {
         let ptx = cudarc::nvrtc::compile_ptx_with_opts(
-            owl_kernels::cu_sig::cu_text(
-                owl_kernels::ops::source("vllm_chunked_prefill_paged_attn_opt_fp8_knhd_hd256"),
-            )
+            owl_kernels::cu_sig::cu_text(owl_kernels::ops::source(
+                "vllm_chunked_prefill_paged_attn_opt_fp8_knhd_hd256",
+            ))
             .as_str(),
             cudarc::nvrtc::CompileOptions {
                 arch: Some("compute_86"),
@@ -482,13 +496,21 @@ fn run_case(t: usize, ctx: usize, host_check: bool, chunked: bool) {
         o_ch = Some(och.iter().map(|&h| f16_to_f32(h)).collect());
     }
     let host = host_check.then(|| host_ref_knhd(&q_f16, &k_fp8, &v_fp8, t, ctx));
-    let dmax = |a: &[f32], b: &[f32]| a.iter().zip(b).map(|(x, y)| (x - y).abs()).fold(0f32, f32::max);
+    let dmax = |a: &[f32], b: &[f32]| {
+        a.iter()
+            .zip(b)
+            .map(|(x, y)| (x - y).abs())
+            .fold(0f32, f32::max)
+    };
     let nz = fx.iter().filter(|&&x| x == 0.0).count();
     // 逐 token 行诊断:哪一行开始分叉(掩码字/行映射嫌疑定位)
     let row_diag = |a: &[f32], b: &[f32]| -> String {
         let mut bad = Vec::new();
         for s in 0..t {
-            let d = dmax(&a[s * H * HD..(s + 1) * H * HD], &b[s * H * HD..(s + 1) * H * HD]);
+            let d = dmax(
+                &a[s * H * HD..(s + 1) * H * HD],
+                &b[s * H * HD..(s + 1) * H * HD],
+            );
             if d > 1e-2 {
                 bad.push(s);
             }
@@ -497,7 +519,12 @@ fn run_case(t: usize, ctx: usize, host_check: bool, chunked: bool) {
             "all rows ok".to_string()
         } else {
             let head: Vec<String> = bad.iter().take(8).map(|r| r.to_string()).collect();
-            format!("{} 行超门: {:?}{}", bad.len(), head, if bad.len() > 8 { " …" } else { "" })
+            format!(
+                "{} 行超门: {:?}{}",
+                bad.len(),
+                head,
+                if bad.len() > 8 { " …" } else { "" }
+            )
         }
     };
 
@@ -517,7 +544,9 @@ fn run_case(t: usize, ctx: usize, host_check: bool, chunked: bool) {
         xqa_consts.rows_per_block,
         xqa_consts.allow_multi_block,
         xqa_consts.smem,
-        ch_ms.map(|m| format!("{m:7.3} ms/call")).unwrap_or_else(|| "(skip)".into()),
+        ch_ms
+            .map(|m| format!("{m:7.3} ms/call"))
+            .unwrap_or_else(|| "(skip)".into()),
         o_ch.as_ref().map(|c| dmax(&fx, c)),
         host.as_ref().map(|h| dmax(&fx, h)),
     );
@@ -571,7 +600,9 @@ fn xqa_prefill_speed_and_parity() {
             continue;
         }
         let host_check = hc || (host_all && t.saturating_mul(ctx) * H * HD <= 8_000_000_000);
-        let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| run_case(t, ctx, host_check, true)));
+        let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            run_case(t, ctx, host_check, true)
+        }));
         if r.is_err() {
             failed.push(format!("T={t} ctx={ctx}"));
         }
@@ -632,8 +663,10 @@ fn xqa_prefill_diag() {
     let (xqa_kernel, xqa_consts) =
         owl_kernels::family::xqa::load_for_probe(&ctx_c, owl_kernels::family::xqa::ASSET_VERIFY)
             .expect("载资产");
-    let diag_grid_y =
-        xqa_consts.launch_geometry(SM86_SM_COUNT, 1, HKV as u32, (nb * PAGE) as u32, t as u32).0 .1;
+    let diag_grid_y = xqa_consts
+        .launch_geometry(SM86_SM_COUNT, 1, HKV as u32, (nb * PAGE) as u32, t as u32)
+        .0
+         .1;
     let sem_len = diag_grid_y as usize + 8;
     let d_sem = {
         let mut d = unsafe { stream.alloc::<u32>(sem_len) }.unwrap();
@@ -681,12 +714,17 @@ fn xqa_prefill_diag() {
         semaphores: sem_p,
         scratch: sc_p,
     };
-    let (grid, block, smem) = xqa_consts.launch_geometry(
-        SM86_SM_COUNT, 1, HKV as u32, (nb * PAGE) as u32, t as u32,
-    );
+    let (grid, block, smem) =
+        xqa_consts.launch_geometry(SM86_SM_COUNT, 1, HKV as u32, (nb * PAGE) as u32, t as u32);
     println!("T={t} ctx={ctx} grid={grid:?} block={block:?} smem={smem} consts={xqa_consts:?}");
-    owl_kernels::family::xqa::launch_on_stream(&stream, &xqa_kernel, &xqa_consts, &args, SM86_SM_COUNT)
-        .expect("launch");
+    owl_kernels::family::xqa::launch_on_stream(
+        &stream,
+        &xqa_kernel,
+        &xqa_consts,
+        &args,
+        SM86_SM_COUNT,
+    )
+    .expect("launch");
     stream.synchronize().unwrap();
     let mut o = vec![0u16; t * H * HD];
     stream.memcpy_dtoh(&d_out, &mut o).unwrap();
@@ -703,13 +741,26 @@ fn xqa_prefill_diag() {
         if nz > 0 {
             nz_rows += 1;
         }
-        let d = row.iter().zip(&host[s * H * HD..(s + 1) * H * HD]).map(|(a, b)| (a - b).abs()).fold(0f32, f32::max);
+        let d = row
+            .iter()
+            .zip(&host[s * H * HD..(s + 1) * H * HD])
+            .map(|(a, b)| (a - b).abs())
+            .fold(0f32, f32::max);
         if s < 6 || (nz > 0 && nz < H * HD) {
             // 每个 token 内按 head 统计非零个数
             let per_head: Vec<usize> = (0..H)
-                .map(|h| row[h * HD..(h + 1) * HD].iter().filter(|&&x| x != 0.0).count())
+                .map(|h| {
+                    row[h * HD..(h + 1) * HD]
+                        .iter()
+                        .filter(|&&x| x != 0.0)
+                        .count()
+                })
                 .collect();
-            println!("  row {s}: nonzero={nz}/{} maxdiff={d:.4} per-head-nz[0..8]={:?}", H * HD, &per_head[..8]);
+            println!(
+                "  row {s}: nonzero={nz}/{} maxdiff={d:.4} per-head-nz[0..8]={:?}",
+                H * HD,
+                &per_head[..8]
+            );
         }
     }
     println!("非零行 {nz_rows}/{t}");

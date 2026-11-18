@@ -34,6 +34,8 @@ template_vars = ""
 [runtime]
 # 满员姿态：reject | queue | queue:<ms>
 admission_on_full = "reject"
+# 首 token 超期动作：ignore(静默继续) | warn(警告继续) | stop(警告并停)
+ttft_on_expire = "ignore"
 # 上下文上限（token，prompt + 生成）
 max_context_length = 32768
 # 单请求生成上限（未带 max_tokens 时默认用它；给了则 min(客户端, 本值)；
@@ -93,7 +95,7 @@ attention_factor = 1.0
 # 显存治理：驱动 total 的占比；以及池外固定预留 MiB
 vram_budget = 0.99
 vram_activation_reserve = 714
-# 宿主/快照/磁盘腿（MiB；0 = 关层）
+# 宿主/磁盘总池（MiB；KV 与 GDN 快照共享；0 = 关层）
 ram_pool_size = 0
 disk_pool_size = 0
 # 磁盘目录：给了磁盘配额就必须给，且必须独占
@@ -101,8 +103,6 @@ disk_dir = ""
 # 前缀缓存（跨 turn / 跨会话复用）
 prefix_cache = true
 no_reclaim = false
-snap_host_mb = 0
-snap_disk_mb = 0
 
 [store.kv]
 # 主 KV 池 dtype：f16 | fp8 | int8

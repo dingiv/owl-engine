@@ -227,9 +227,18 @@ mod tests {
             KernelTag::FEAT_SPEC,
         ]);
         assert!(f.allows(meta("vllm_paged_attention_v2_fp8_knhd_hd256bs32")));
-        assert!(f.allows(meta("owl_naive_attn_nc_bf16_v2")), "草稿 BF16 池核");
-        assert!(!f.allows(meta("owl_naive_attn_nc_f16")), "草稿 F16 池核应拒");
-        assert!(!f.allows(meta("vllm_reshape_and_cache_bf16_knhd")), "主 BF16 池核应拒");
+        assert!(
+            f.allows(meta("owl_naive_attn_nc_bf16_v2")),
+            "草稿 BF16 池核"
+        );
+        assert!(
+            !f.allows(meta("owl_naive_attn_nc_f16")),
+            "草稿 F16 池核应拒"
+        );
+        assert!(
+            !f.allows(meta("vllm_reshape_and_cache_bf16_knhd")),
+            "主 BF16 池核应拒"
+        );
         assert!(!f.allows(meta("vllm_paged_attention_v2_f16_knhd_hd256bs32")));
     }
 
@@ -274,8 +283,7 @@ mod tests {
             KernelTag::FEAT_TP,
         ]);
         let f = f.with_prod_kv_layouts();
-        let active: Vec<&KernelMeta> =
-            crate::ops::all().filter(|m| f.allows(m)).collect();
+        let active: Vec<&KernelMeta> = crate::ops::all().filter(|m| f.allows(m)).collect();
         let mut missing = Vec::new();
         for reader in &active {
             for rp in reader.pool.iter().filter(|p| p.is_reader()) {
@@ -304,7 +312,10 @@ mod tests {
         > = Default::default();
         for m in &active {
             for p in m.pool.iter().filter(|p| p.is_writer()) {
-                writers.entry((p.pool, p.dtype)).or_default().insert(p.layout);
+                writers
+                    .entry((p.pool, p.dtype))
+                    .or_default()
+                    .insert(p.layout);
             }
         }
         let ambiguous: Vec<_> = writers
@@ -335,10 +346,12 @@ mod tests {
         ] {
             assert!(f.allows(meta(entry)), "草稿 fp8 核应放行: {entry}");
         }
-        assert!(f.allows(meta("owl_reshape_and_cache_fp8kv_bf16")), "草稿 classic bf16 写者应放行");
+        assert!(
+            f.allows(meta("owl_reshape_and_cache_fp8kv_bf16")),
+            "草稿 classic bf16 写者应放行"
+        );
 
-        let active: Vec<&KernelMeta> =
-            crate::ops::all().filter(|m| f.allows(m)).collect();
+        let active: Vec<&KernelMeta> = crate::ops::all().filter(|m| f.allows(m)).collect();
         let mut missing = Vec::new();
         for reader in &active {
             for rp in reader.pool.iter().filter(|p| p.is_reader()) {
@@ -369,9 +382,18 @@ mod tests {
         ])
         .with_prod_kv_layouts();
         assert!(f.allows(meta("owl_reshape_and_cache_fp8kv_knhd")));
-        assert!(!f.allows(meta("owl_qknorm_rope_kv_insert_f16_fp8kv")), "主池 classic 应拒");
-        assert!(f.allows(meta("owl_reshape_and_cache_fp8kv_bf16_knhd")), "主池 KnHD 应放行");
-        assert!(f.allows(meta("owl_reshape_and_cache_fp8kv_bf16")), "草稿 classic 应放行");
+        assert!(
+            !f.allows(meta("owl_qknorm_rope_kv_insert_f16_fp8kv")),
+            "主池 classic 应拒"
+        );
+        assert!(
+            f.allows(meta("owl_reshape_and_cache_fp8kv_bf16_knhd")),
+            "主池 KnHD 应放行"
+        );
+        assert!(
+            f.allows(meta("owl_reshape_and_cache_fp8kv_bf16")),
+            "草稿 classic 应放行"
+        );
     }
 
     #[test]

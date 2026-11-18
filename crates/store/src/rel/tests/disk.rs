@@ -5,9 +5,10 @@ use super::*;
 #[test]
 fn plan_need_spills_host_kv_to_disk_when_host_full() {
     let mut i = inputs();
-    i.disk_bytes = 8 << 20;
+    i.disk_bytes = 4 << 20;
     let mut cfg = kv_cfg(64, 32);
     cfg.host_bytes = 1 << 20; // 宿主体量 = 单块(1MB)⇒ 满
+    i.host_bytes = 1 << 20;
     let mut r = Rel::open(
         i,
         AdmissionPolicy::new(2, QueuePolicy::Reject),
@@ -15,9 +16,7 @@ fn plan_need_spills_host_kv_to_disk_when_host_full() {
         cell_for(&i),
     )
     .expect("装配");
-    let attach = r
-        .attach_disk("/tmp/owl-disk-test-kv", 4 << 20, 0)
-        .expect("接盘");
+    let attach = r.attach_disk("/tmp/owl-disk-test-kv").expect("接盘");
     assert_eq!(attach.kv_slots, 4, "盘配额 4MB / 单块 1MB");
     // 两条链(各 1 块)都放进宿主 ⇒ 宿主满、设备无货
     let ta = toks(32);
@@ -77,9 +76,10 @@ fn plan_need_spills_host_kv_to_disk_when_host_full() {
 #[test]
 fn host_pressure_skips_gpu_to_host_and_emits_disk_only() {
     let mut i = inputs();
-    i.disk_bytes = 8 << 20;
+    i.disk_bytes = 4 << 20;
     let mut cfg = kv_cfg(64, 32);
     cfg.host_bytes = 1 << 20; // 宿主 1 块 ⇒ 满
+    i.host_bytes = 1 << 20;
     let mut r = Rel::open(
         i,
         AdmissionPolicy::new(2, QueuePolicy::Reject),
@@ -87,7 +87,7 @@ fn host_pressure_skips_gpu_to_host_and_emits_disk_only() {
         cell_for(&i),
     )
     .expect("装配");
-    r.attach_disk("/tmp/owl-disk-test-host-pressure", 4 << 20, 0)
+    r.attach_disk("/tmp/owl-disk-test-host-pressure")
         .expect("接盘");
     let ta = toks(32);
     let tb: Vec<u32> = (200..232).collect();
@@ -132,9 +132,10 @@ fn host_pressure_skips_gpu_to_host_and_emits_disk_only() {
 /// （双卡 1M 后第二个长 turn 的硬错，§23.11）。
 #[test]
 fn host_free_slots_is_counted_in_chain_slots_under_tp() {
-    let i = inputs();
+    let mut i = inputs();
     let mut cfg = kv_cfg(64, 32);
     cfg.host_bytes = 4 * 2 * BLOCK_BYTES; // 4 个链块（每块 = 两平面）
+    i.host_bytes = 4 * 2 * BLOCK_BYTES;
     let mut r = Rel::open_world(
         i,
         AdmissionPolicy::new(1, QueuePolicy::Reject),
@@ -165,6 +166,7 @@ fn disk_block_is_the_host_slot_under_tp() {
     i.disk_bytes = 8 << 20;
     let mut cfg = kv_cfg(64, 32);
     cfg.host_bytes = 2 * 2 * BLOCK_BYTES;
+    i.host_bytes = 2 * 2 * BLOCK_BYTES;
     let mut r = Rel::open_world(
         i,
         AdmissionPolicy::new(1, QueuePolicy::Reject),
@@ -173,9 +175,7 @@ fn disk_block_is_the_host_slot_under_tp() {
         2,
     )
     .expect("装配 world=2");
-    let at = r
-        .attach_disk("/tmp/owl-disk-test-tp", 4 * 2 * BLOCK_BYTES, 0)
-        .expect("TP 接盘");
+    let at = r.attach_disk("/tmp/owl-disk-test-tp").expect("TP 接盘");
     assert_eq!(at.kv_slots, 4, "4 个链块");
     let a = ChainHash::new(42);
     let p = r.disk.as_ref().expect("盘").plan_spill(a).expect("计划");
@@ -187,9 +187,10 @@ fn disk_block_is_the_host_slot_under_tp() {
 /// **磁盘回填落宿主的兜底**：宿主满 ⇒ 先逐最冷（否则 onload 整单 `Exhausted`）。
 #[test]
 fn host_fill_relieves_cold_copy_when_full() {
-    let i = inputs();
+    let mut i = inputs();
     let mut cfg = kv_cfg(64, 32);
     cfg.host_bytes = BLOCK_BYTES;
+    i.host_bytes = BLOCK_BYTES;
     let mut r = Rel::open(
         i,
         AdmissionPolicy::new(2, QueuePolicy::Reject),
@@ -227,9 +228,10 @@ fn host_fill_relieves_cold_copy_when_full() {
 /// **轮零：宿主满 ⇒ 先削最冷宿主链，再沉设备链**（不许直接丢新块）。
 #[test]
 fn plan_need_prunes_cold_host_chain_to_make_room_for_device_chain() {
-    let i = inputs();
+    let mut i = inputs();
     let mut cfg = kv_cfg(64, 32);
     cfg.host_bytes = BLOCK_BYTES; // 宿主只装一个链块
+    i.host_bytes = BLOCK_BYTES;
     let mut r = Rel::open(
         i,
         AdmissionPolicy::new(2, QueuePolicy::Reject),
@@ -302,8 +304,7 @@ fn plan_need_spills_host_snapshot_to_disk_but_not_transient() {
         }],
     })
     .expect("状态腿布局");
-    r.attach_disk("/tmp/owl-disk-test-snap", 0, 4 << 20)
-        .expect("接盘");
+    r.attach_disk("/tmp/owl-disk-test-snap").expect("接盘");
 
     let k_dur = SnapKey::at_boundary(ChainHash::new(0xD1));
     let k_tr = SnapKey::at_boundary(ChainHash::new(0x77));
@@ -344,6 +345,7 @@ fn host_pressure_keeps_kv_and_snapshot_goals_independent() {
     i.disk_bytes = 8 << 20;
     let mut cfg = kv_cfg(64, 32);
     cfg.host_bytes = BLOCK_BYTES; // KV 宿主 1 块
+    i.host_bytes = BLOCK_BYTES;
     let mut r = Rel::open(
         i,
         AdmissionPolicy::new(2, QueuePolicy::Reject),
@@ -360,8 +362,7 @@ fn host_pressure_keeps_kv_and_snapshot_goals_independent() {
         }],
     })
     .expect("状态腿布局");
-    r.attach_disk("/tmp/owl-disk-test-host-both", 4 << 20, 4 << 20)
-        .expect("接盘");
+    r.attach_disk("/tmp/owl-disk-test-host-both").expect("接盘");
     let kv_tokens = toks(32);
     let mut table = Vec::new();
     r.ensure_for_len_unreserved(&mut table, 32).expect("块表");

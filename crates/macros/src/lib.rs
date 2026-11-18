@@ -38,7 +38,9 @@ use proc_macro::TokenStream;
 use quote::{format_ident, quote, ToTokens};
 use syn::parse::Parser;
 use syn::punctuated::Punctuated;
-use syn::{parse_macro_input, FnArg, ImplItem, ItemFn, ItemImpl, LitStr, Pat, ReturnType, Token, Type};
+use syn::{
+    parse_macro_input, FnArg, ImplItem, ItemFn, ItemImpl, LitStr, Pat, ReturnType, Token, Type,
+};
 
 /// 属性选项(`#[owl_test(gpu, hf_parity, needs = "ckpt:27b-awq")]`;逗号分隔、顺序无关)。
 #[derive(Clone, Default)]
@@ -292,7 +294,6 @@ fn expand(opts: Opts, f: ItemFn) -> syn::Result<proc_macro2::TokenStream> {
     })
 }
 
-
 // ============================================================================
 // `#[kernel_tags(...)]` —— 算子 tag 注入(2026-10-20)
 // ============================================================================
@@ -323,12 +324,9 @@ pub fn kernel_tags(attr: TokenStream, item: TokenStream) -> TokenStream {
         .and_then(|(_, path, _)| path.segments.last())
         .is_some_and(|s| s.ident == "KernelSpec");
     if !is_kernel_spec {
-        return syn::Error::new_spanned(
-            &imp,
-            "#[kernel_tags] 只能标在 `impl KernelSpec for T` 上",
-        )
-        .to_compile_error()
-        .into();
+        return syn::Error::new_spanned(&imp, "#[kernel_tags] 只能标在 `impl KernelSpec for T` 上")
+            .to_compile_error()
+            .into();
     }
     if tags.is_empty() {
         return syn::Error::new_spanned(
@@ -338,7 +336,11 @@ pub fn kernel_tags(attr: TokenStream, item: TokenStream) -> TokenStream {
         .to_compile_error()
         .into();
     }
-    if imp.items.iter().any(|i| matches!(i, ImplItem::Const(c) if c.ident == "TAGS")) {
+    if imp
+        .items
+        .iter()
+        .any(|i| matches!(i, ImplItem::Const(c) if c.ident == "TAGS"))
+    {
         return syn::Error::new_spanned(
             &imp,
             "impl 已手写 `const TAGS` —— 与 #[kernel_tags] 二选一(禁止双真源)",
@@ -353,7 +355,13 @@ pub fn kernel_tags(attr: TokenStream, item: TokenStream) -> TokenStream {
             // 与 build.rs 的 cname 规则逐字一致:非字母数字 → '_',其余大写
             let cname: String = id
                 .chars()
-                .map(|c| if c.is_ascii_alphanumeric() { c.to_ascii_uppercase() } else { '_' })
+                .map(|c| {
+                    if c.is_ascii_alphanumeric() {
+                        c.to_ascii_uppercase()
+                    } else {
+                        '_'
+                    }
+                })
                 .collect();
             syn::Ident::new(&cname, lit.span())
         })

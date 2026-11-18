@@ -43,7 +43,11 @@ pub enum Item {
     /// 通道增量
     Delta { chan: Chan, text: String },
     /// 一个**完整闭合**的工具调用(xml/json 两格式统一出口)
-    ToolCall { index: usize, name: String, arguments: String },
+    ToolCall {
+        index: usize,
+        name: String,
+        arguments: String,
+    },
     /// 畸形工具块(未闭合/无 `<function=`/参数不可解析)—— 不发射工具调用,
     /// 但**不静默**:调用方必须记日志(§4.6)
     Malformed { kind: &'static str, raw: String },
@@ -130,19 +134,29 @@ const TRACE_CAP: usize = 512;
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum StructEvent {
     /// 状态迁移(think / text / tool 三态;由标记驱动)
-    State { from: &'static str, to: &'static str },
+    State {
+        from: &'static str,
+        to: &'static str,
+    },
     /// 结构空白吞除量(关思考标记之后的 `\n`;模板资产,见 `swallow_lf`)
     SwallowLf(usize),
     /// 游标标记(当前态下不该出现的标记;已吞掉不泄漏)
     Stray(&'static str),
     /// 工具调用闭合(解析成功)
-    Tool { index: usize, name: String, arg_bytes: usize },
+    Tool {
+        index: usize,
+        name: String,
+        arg_bytes: usize,
+    },
     /// 模型近失格式被保守修复(只在校验通过后记;不掩盖真错误)
     Repair { tool: String, kind: &'static str },
     /// 畸形工具块(未闭合/超限/参数不可解析;上层记日志)
     Malformed { kind: &'static str, bytes: usize },
     /// 生成流结束时的状态与尾巴余量
-    Finish { state: &'static str, held_bytes: usize },
+    Finish {
+        state: &'static str,
+        held_bytes: usize,
+    },
 }
 
 impl StructEvent {
@@ -152,7 +166,11 @@ impl StructEvent {
             StructEvent::State { from, to } => format!("state {from}→{to}"),
             StructEvent::SwallowLf(n) => format!("swallow_lf {n}"),
             StructEvent::Stray(m) => format!("stray {m}"),
-            StructEvent::Tool { index, name, arg_bytes } => {
+            StructEvent::Tool {
+                index,
+                name,
+                arg_bytes,
+            } => {
                 format!("tool #{index} {name} args={arg_bytes}B")
             }
             StructEvent::Repair { tool, kind } => format!("repair {tool} {kind}"),
@@ -230,7 +248,9 @@ impl ToolSchemas {
         let mut types = HashMap::new();
         for t in tools {
             let f = t.get("function").unwrap_or(t);
-            let Some(name) = f.get("name").and_then(|v| v.as_str()) else { continue };
+            let Some(name) = f.get("name").and_then(|v| v.as_str()) else {
+                continue;
+            };
             let mut props = HashMap::new();
             if let Some(p) = f
                 .get("parameters")
@@ -303,11 +323,7 @@ fn normalize_integer(n: serde_json::Number) -> Json {
         return Json::Number(u.into());
     }
     if let Some(f) = n.as_f64() {
-        if f.is_finite()
-            && f.fract() == 0.0
-            && f >= i64::MIN as f64
-            && f <= i64::MAX as f64
-        {
+        if f.is_finite() && f.fract() == 0.0 && f >= i64::MIN as f64 && f <= i64::MAX as f64 {
             return Json::Number((f as i64).into());
         }
     }
@@ -320,7 +336,11 @@ pub(crate) fn raw_for_log(s: &str) -> String {
     if s.len() <= N {
         return s.to_string();
     }
-    let cut = s.char_indices().take_while(|(i, _)| *i < N).last().map_or(0, |(i, _)| i);
+    let cut = s
+        .char_indices()
+        .take_while(|(i, _)| *i < N)
+        .last()
+        .map_or(0, |(i, _)| i);
     format!("{}…(+{}B)", &s[..cut], s.len() - cut)
 }
 
@@ -371,7 +391,11 @@ impl ChannelSplitter {
     /// 从思考段中间起步,见模块头)
     pub fn new(start_in_think: bool, schemas: ToolSchemas) -> Self {
         Self {
-            state: if start_in_think { State::Think } else { State::Text },
+            state: if start_in_think {
+                State::Think
+            } else {
+                State::Text
+            },
             buf: String::new(),
             schemas,
             tool_index: 0,
@@ -492,7 +516,10 @@ impl ChannelSplitter {
             }
         };
         if to != from {
-            self.trace_event(StructEvent::State { from: state_name(from), to: state_name(to) });
+            self.trace_event(StructEvent::State {
+                from: state_name(from),
+                to: state_name(to),
+            });
         }
         to
     }
@@ -556,7 +583,10 @@ impl ChannelSplitter {
                     salvaged.retain(|i| !matches!(i, Item::Malformed { .. }));
                     out.extend(salvaged);
                 } else {
-                    self.trace_event(StructEvent::Malformed { kind, bytes: raw.len() });
+                    self.trace_event(StructEvent::Malformed {
+                        kind,
+                        bytes: raw.len(),
+                    });
                     self.malformed += 1;
                     out.push(Item::Malformed { kind, raw });
                 }
@@ -580,7 +610,10 @@ impl ChannelSplitter {
                 }
                 if !self.buf.is_empty() {
                     let text = std::mem::take(&mut self.buf);
-                    out.push(Item::Delta { chan: self.chan(), text });
+                    out.push(Item::Delta {
+                        chan: self.chan(),
+                        text,
+                    });
                 }
             }
         }
@@ -640,7 +673,10 @@ impl ChannelSplitter {
                             bytes: raw.len(),
                         });
                         self.malformed += 1;
-                        out.push(Item::Malformed { kind: "tool_call_anthropic_overflow", raw });
+                        out.push(Item::Malformed {
+                            kind: "tool_call_anthropic_overflow",
+                            raw,
+                        });
                         self.state = State::Text;
                         continue;
                     }
@@ -650,7 +686,11 @@ impl ChannelSplitter {
                     // XML: `</function>` 就是工具体闭合（vLLM TOOL_BETWEEN 同款）；
                     // JSON: 仍以 `</tool_call>` 闭合。
                     let xml = self.buf.trim_start().starts_with(MARK_FUNCTION_OPEN);
-                    let func = if xml { self.buf.find(MARK_FUNCTION_CLOSE) } else { None };
+                    let func = if xml {
+                        self.buf.find(MARK_FUNCTION_CLOSE)
+                    } else {
+                        None
+                    };
                     let tool = self.buf.find(MARK_TOOL_CLOSE);
                     let close = match (func, tool) {
                         (Some(f), Some(t)) if f < t => Some((f, MARK_FUNCTION_CLOSE, true)),
@@ -662,7 +702,11 @@ impl ChannelSplitter {
                         let body = self.buf[..p].to_string();
                         self.buf.drain(..p + marker.len());
                         out.push(self.build_tool_call(&body));
-                        self.state = if between { State::InToolBetween } else { State::Text };
+                        self.state = if between {
+                            State::InToolBetween
+                        } else {
+                            State::Text
+                        };
                         continue;
                     }
                     if self.buf.len() > MAX_TOOL_BYTES {
@@ -672,7 +716,10 @@ impl ChannelSplitter {
                             bytes: raw.len(),
                         });
                         self.malformed += 1;
-                        out.push(Item::Malformed { kind: "tool_call_overflow", raw });
+                        out.push(Item::Malformed {
+                            kind: "tool_call_overflow",
+                            raw,
+                        });
                         self.state = State::Text;
                         continue;
                     }
@@ -696,7 +743,13 @@ impl ChannelSplitter {
                             continue;
                         }
                         // 裸函数块的标记本体必须留在 buf 里(parse_tool_body 靠它定名)
-                        self.buf.drain(..if canon(m) == MARK_FUNCTION_OPEN { p } else { p + m.len() });
+                        self.buf.drain(
+                            ..if canon(m) == MARK_FUNCTION_OPEN {
+                                p
+                            } else {
+                                p + m.len()
+                            },
+                        );
                         self.state = match canon(m) {
                             MARK_TOOL_CLOSE => State::Text,
                             MARK_TOOL_OPEN => State::InTool,
@@ -742,7 +795,10 @@ impl ChannelSplitter {
                             bytes: raw.len(),
                         });
                         self.malformed += 1;
-                        out.push(Item::Malformed { kind: "tool_call_bare_overflow", raw });
+                        out.push(Item::Malformed {
+                            kind: "tool_call_bare_overflow",
+                            raw,
+                        });
                         self.state = State::Text;
                         continue;
                     }
@@ -847,7 +903,11 @@ impl ChannelSplitter {
                             name: name.clone(),
                             arg_bytes: arguments.len(),
                         });
-                        Item::ToolCall { index, name, arguments }
+                        Item::ToolCall {
+                            index,
+                            name,
+                            arguments,
+                        }
                     })
                     .collect()
             }
@@ -863,9 +923,15 @@ impl ChannelSplitter {
                 }]
             }
             Err(kind) => {
-                self.trace_event(StructEvent::Malformed { kind, bytes: body.len() });
+                self.trace_event(StructEvent::Malformed {
+                    kind,
+                    bytes: body.len(),
+                });
                 self.malformed += 1;
-                vec![Item::Malformed { kind, raw: body.to_string() }]
+                vec![Item::Malformed {
+                    kind,
+                    raw: body.to_string(),
+                }]
             }
         }
     }
@@ -877,7 +943,10 @@ impl ChannelSplitter {
         match parse_tool_body(body, &self.schemas) {
             Ok((name, args, repair)) => {
                 if let Some(kind) = repair {
-                    self.trace_event(StructEvent::Repair { tool: name.clone(), kind });
+                    self.trace_event(StructEvent::Repair {
+                        tool: name.clone(),
+                        kind,
+                    });
                     owl_shared::log_warn!(
                         "chat",
                         "工具调用近失格式已修复({kind};tool={name};args={}B)",
@@ -890,12 +959,22 @@ impl ChannelSplitter {
                     name: name.clone(),
                     arg_bytes: args.len(),
                 });
-                Item::ToolCall { index, name, arguments: args }
+                Item::ToolCall {
+                    index,
+                    name,
+                    arguments: args,
+                }
             }
             Err(kind) => {
-                self.trace_event(StructEvent::Malformed { kind, bytes: body.len() });
+                self.trace_event(StructEvent::Malformed {
+                    kind,
+                    bytes: body.len(),
+                });
                 self.malformed += 1;
-                Item::Malformed { kind, raw: body.to_string() }
+                Item::Malformed {
+                    kind,
+                    raw: body.to_string(),
+                }
             }
         }
     }
@@ -982,8 +1061,7 @@ fn parse_anthropic_params(
     if !inner[at..].chars().all(|c| c.is_ascii_whitespace()) {
         return Err("tool_call_anthropic_unexpected_text");
     }
-    serde_json::to_string(&Json::Object(obj))
-        .map_err(|_| "tool_call_anthropic_args_unserializable")
+    serde_json::to_string(&Json::Object(obj)).map_err(|_| "tool_call_anthropic_args_unserializable")
 }
 
 /// 从 `<invoke ...>` / `<parameter ...>` 标签里取一个带引号的属性。
@@ -994,9 +1072,7 @@ fn xml_attr(tag: &str, attr: &str) -> Option<String> {
         let i = at + rel;
         let before_ok = i == 0 || b[i - 1].is_ascii_whitespace();
         let after = i + attr.len();
-        let after_ok = after >= b.len()
-            || b[after].is_ascii_whitespace()
-            || b[after] == b'=';
+        let after_ok = after >= b.len() || b[after].is_ascii_whitespace() || b[after] == b'=';
         if before_ok && after_ok {
             let mut j = skip_ws(tag, after);
             if b.get(j) != Some(&b'=') {
@@ -1045,7 +1121,10 @@ struct Lenient<'a> {
 
 impl<'a> Lenient<'a> {
     fn new(s: &'a str) -> Self {
-        Self { b: s.as_bytes(), i: 0 }
+        Self {
+            b: s.as_bytes(),
+            i: 0,
+        }
     }
 
     fn ws(&mut self) {
@@ -1312,7 +1391,10 @@ fn sniff_name(body: &str) -> Option<String> {
                 let tail = &rest[1..];
                 if let Some(end) = tail.find(q) {
                     let n = &tail[..end];
-                    if !n.is_empty() && n.chars().all(|c| c.is_alphanumeric() || c == '_' || c == '-' || c == '.') {
+                    if !n.is_empty()
+                        && n.chars()
+                            .all(|c| c.is_alphanumeric() || c == '_' || c == '-' || c == '.')
+                    {
                         return Some(n.to_string());
                     }
                 }
@@ -1325,10 +1407,7 @@ fn sniff_name(body: &str) -> Option<String> {
 /// **兜底抢救**:从"名字 + JSON 对象"这种裸体里取出一次调用。
 ///
 /// 只认**请求 tools 里存在的名字**(`schemas.knows`),否则 = 不猜、返回 None。
-fn salvage_named_json(
-    body: &str,
-    schemas: &ToolSchemas,
-) -> Option<(String, String, &'static str)> {
+fn salvage_named_json(body: &str, schemas: &ToolSchemas) -> Option<(String, String, &'static str)> {
     let v = parse_lenient(body)?;
     let obj = v.as_object()?;
     // 形态 A:对象自带 name / arguments
@@ -1424,7 +1503,10 @@ fn parse_tool_body(
     if body.contains("<invoke") && !body.contains("<function=") {
         let calls = parse_anthropic_calls(body, schemas)?;
         if calls.len() == 1 {
-            let (name, args) = calls.into_iter().next().ok_or("tool_call_anthropic_no_invoke")?;
+            let (name, args) = calls
+                .into_iter()
+                .next()
+                .ok_or("tool_call_anthropic_no_invoke")?;
             return Ok((name, args, Some("anthropic_inside_tool")));
         }
         return Err("tool_call_anthropic_multiple_in_tool");
@@ -1455,7 +1537,13 @@ fn parse_tool_body(
         let next = find_param_open(inner, op.value_start).map(|n| n.tag_start);
         let (val_end, next_pos) = match (close, next) {
             (Some((e, x)), None) => (e, x),
-            (Some((e, x)), Some(f)) => if e <= f { (e, x) } else { (f, f) },
+            (Some((e, x)), Some(f)) => {
+                if e <= f {
+                    (e, x)
+                } else {
+                    (f, f)
+                }
+            }
             (None, Some(f)) => (f, f),
             // 既无闭标签也无后继开标签:与 vLLM 一样丢尾巴
             (None, None) => break,
@@ -1565,7 +1653,11 @@ fn parse_json_calls(
         for item in arr {
             out.push(json_one_call(item, schemas)?);
         }
-        return if out.is_empty() { Err("tool_call_anthropic_no_invoke") } else { Ok(out) };
+        return if out.is_empty() {
+            Err("tool_call_anthropic_no_invoke")
+        } else {
+            Ok(out)
+        };
     }
     if body.starts_with('{') {
         // 单对象;解析失败再按 JSONL 逐行
@@ -1581,7 +1673,11 @@ fn parse_json_calls(
             let v: Json = serde_json::from_str(line).map_err(|_| "tool_call_json_invalid")?;
             out.push(json_one_call(&v, schemas)?);
         }
-        return if out.is_empty() { Err("tool_call_anthropic_no_invoke") } else { Ok(out) };
+        return if out.is_empty() {
+            Err("tool_call_anthropic_no_invoke")
+        } else {
+            Ok(out)
+        };
     }
     Err("tool_call_anthropic_unexpected_text")
 }
@@ -1656,7 +1752,9 @@ fn fill_qwen_loose(
     schemas: &ToolSchemas,
     obj: &mut Map<String, Json>,
 ) -> bool {
-    let Some(props) = schemas.types.get(tool) else { return false };
+    let Some(props) = schemas.types.get(tool) else {
+        return false;
+    };
     let mut changed = false;
     for prop in props.keys() {
         if obj.get(prop).is_some_and(|v| !v.is_null()) {
@@ -1715,15 +1813,26 @@ fn find_loose_param(inner: &str, prop: &str) -> Option<String> {
         let i = from + rel;
         let before_ok = i == 0 || !inner.as_bytes()[i - 1].is_ascii_alphanumeric();
         let after = i + prop.len();
-        let after_ok = inner.as_bytes().get(after).is_none_or(|b| !b.is_ascii_alphanumeric());
+        let after_ok = inner
+            .as_bytes()
+            .get(after)
+            .is_none_or(|b| !b.is_ascii_alphanumeric());
         if before_ok && after_ok {
             let mut j = after;
-            while inner.as_bytes().get(j).is_some_and(|b| b.is_ascii_whitespace()) {
+            while inner
+                .as_bytes()
+                .get(j)
+                .is_some_and(|b| b.is_ascii_whitespace())
+            {
                 j += 1;
             }
             if inner.as_bytes().get(j) == Some(&b'=') {
                 j += 1;
-                while inner.as_bytes().get(j).is_some_and(|b| b.is_ascii_whitespace()) {
+                while inner
+                    .as_bytes()
+                    .get(j)
+                    .is_some_and(|b| b.is_ascii_whitespace())
+                {
                     j += 1;
                 }
                 if let Some(q @ (b'"' | b'\'')) = inner.as_bytes().get(j).copied() {
@@ -1835,7 +1944,10 @@ fn holdback_len(buf: &str, markers: &[&str]) -> usize {
             continue;
         }
         let tail = &buf[start..];
-        if markers.iter().any(|m| m.len() > tail.len() && m.starts_with(tail)) {
+        if markers
+            .iter()
+            .any(|m| m.len() > tail.len() && m.starts_with(tail))
+        {
             best = best.max(tail.len());
         }
     }
@@ -1886,7 +1998,11 @@ mod tests {
         );
         // `</think>` 之后的 `\n\n` = **模板结构资产**(§4.3 R1)⇒ 不进 content:
         // 回填渲染时模板自己补回,少两个 token 才是对称的(2026-10-19 定谳)
-        assert_eq!(split(&items), "R:我需要先看目录。\n|T:好的,我来执行。\n|", "通道序列");
+        assert_eq!(
+            split(&items),
+            "R:我需要先看目录。\n|T:好的,我来执行。\n|",
+            "通道序列"
+        );
         assert_eq!(
             items.last(),
             Some(&Item::ToolCall {
@@ -1914,7 +2030,10 @@ mod tests {
         let text: String = items
             .iter()
             .filter_map(|i| match i {
-                Item::Delta { chan: Chan::Text, text } => Some(text.as_str()),
+                Item::Delta {
+                    chan: Chan::Text,
+                    text,
+                } => Some(text.as_str()),
                 _ => None,
             })
             .collect();
@@ -1922,7 +2041,10 @@ mod tests {
         let think: String = items
             .iter()
             .filter_map(|i| match i {
-                Item::Delta { chan: Chan::Think, text } => Some(text.as_str()),
+                Item::Delta {
+                    chan: Chan::Think,
+                    text,
+                } => Some(text.as_str()),
                 _ => None,
             })
             .collect();
@@ -1947,9 +2069,11 @@ mod tests {
         let calls: Vec<(usize, &str, &str)> = items
             .iter()
             .filter_map(|i| match i {
-                Item::ToolCall { index, name, arguments } => {
-                    Some((*index, name.as_str(), arguments.as_str()))
-                }
+                Item::ToolCall {
+                    index,
+                    name,
+                    arguments,
+                } => Some((*index, name.as_str(), arguments.as_str())),
                 _ => None,
             })
             .collect();
@@ -1967,7 +2091,10 @@ mod tests {
         let items = s.push(
             "<tool_call>\n<function=bash>\n<parameter=command>\npwd\n<parameter=timeout>\n30\n</parameter>\n</function>\n</tool_call>",
         );
-        let calls: Vec<&Item> = items.iter().filter(|i| matches!(i, Item::ToolCall { .. })).collect();
+        let calls: Vec<&Item> = items
+            .iter()
+            .filter(|i| matches!(i, Item::ToolCall { .. }))
+            .collect();
         assert_eq!(calls.len(), 1);
         assert!(matches!(
             calls[0],
@@ -1999,10 +2126,19 @@ mod tests {
         let items = s.push(
             "<tool_call>\n<function=bash>\n<parameter=command>\npwd\n</parameter>\n</function>\n<function=bash>\n<parameter=command>\nls\n</parameter>\n</function>\n</tool_call>",
         );
-        let calls: Vec<&Item> = items.iter().filter(|i| matches!(i, Item::ToolCall { .. })).collect();
+        let calls: Vec<&Item> = items
+            .iter()
+            .filter(|i| matches!(i, Item::ToolCall { .. }))
+            .collect();
         assert_eq!(calls.len(), 2);
         assert_eq!(
-            calls.iter().map(|i| match i { Item::ToolCall { arguments, .. } => arguments.as_str(), _ => "" }).collect::<Vec<_>>(),
+            calls
+                .iter()
+                .map(|i| match i {
+                    Item::ToolCall { arguments, .. } => arguments.as_str(),
+                    _ => "",
+                })
+                .collect::<Vec<_>>(),
             vec![r#"{"command":"pwd"}"#, r#"{"command":"ls"}"#]
         );
         assert_eq!(s.malformed(), 0);
@@ -2028,7 +2164,10 @@ mod tests {
         let text: String = items
             .iter()
             .filter_map(|it| match it {
-                Item::Delta { chan: Chan::Text, text } => Some(text.as_str()),
+                Item::Delta {
+                    chan: Chan::Text,
+                    text,
+                } => Some(text.as_str()),
                 _ => None,
             })
             .collect();
@@ -2042,13 +2181,18 @@ mod tests {
     #[test]
     fn prose_after_function_block_still_streams() {
         let mut s = ChannelSplitter::new(false, tools());
-        let mut items = s.push("<tool_call>\n<function=bash>\n<parameter=command>\npwd\n</parameter>\n</function>");
+        let mut items = s.push(
+            "<tool_call>\n<function=bash>\n<parameter=command>\npwd\n</parameter>\n</function>",
+        );
         items.extend(s.push("done"));
         items.extend(s.finish());
         let text: String = items
             .iter()
             .filter_map(|it| match it {
-                Item::Delta { chan: Chan::Text, text } => Some(text.as_str()),
+                Item::Delta {
+                    chan: Chan::Text,
+                    text,
+                } => Some(text.as_str()),
                 _ => None,
             })
             .collect();
@@ -2062,11 +2206,11 @@ mod tests {
     #[test]
     fn tolerant_param_tags_and_multiline_values() {
         let schema = ToolSchemas::from_tools(&[json!({"type":"function","function":{
-            "name":"bash",
-            "parameters":{"type":"object","properties":{
-                "command":{"type":"string"},
-                "count":{"type":"integer"}
-            }}}})]);
+        "name":"bash",
+        "parameters":{"type":"object","properties":{
+            "command":{"type":"string"},
+            "count":{"type":"integer"}
+        }}}})]);
         // 标签内故意加空白:开标签 " parameter = command "、闭标签 " / parameter "
         let body = "<tool_call>\n<function=bash>\n< parameter = command >\n\
                     echo a\nb\n< / parameter >\n<parameter=count>\n7\n</parameter>\n\
@@ -2089,12 +2233,12 @@ mod tests {
     #[test]
     fn anyof_schema_types_are_coerced() {
         let schema = ToolSchemas::from_tools(&[json!({"type":"function","function":{
-            "name":"typed",
-            "parameters":{"type":"object","properties":{
-                "count":{"anyOf":[{"type":"integer"},{"type":"null"}]},
-                "flag":{"anyOf":[{"type":"boolean"},{"type":"null"}]},
-                "ratio":{"anyOf":[{"type":"float"},{"type":"null"}]}
-            }}}})]);
+        "name":"typed",
+        "parameters":{"type":"object","properties":{
+            "count":{"anyOf":[{"type":"integer"},{"type":"null"}]},
+            "flag":{"anyOf":[{"type":"boolean"},{"type":"null"}]},
+            "ratio":{"anyOf":[{"type":"float"},{"type":"null"}]}
+        }}}})]);
         let mut s = ChannelSplitter::new(false, schema);
         let items = s.push(
             "<tool_call>\n<function=typed>\n<parameter=count>\n42\n</parameter>\n<parameter=flag>\ntrue\n</parameter>\n<parameter=ratio>\n3.14\n</parameter>\n</function>\n</tool_call>",
@@ -2149,7 +2293,13 @@ mod tests {
             .push("<tool_call>\n<function=bash>\n<parameter=command>\nls")
             .is_empty());
         let f = s.finish();
-        assert!(matches!(f[0], Item::Malformed { kind: "tool_call_unclosed", .. }));
+        assert!(matches!(
+            f[0],
+            Item::Malformed {
+                kind: "tool_call_unclosed",
+                ..
+            }
+        ));
         assert_eq!(s.tool_calls(), 0);
     }
 
@@ -2158,7 +2308,13 @@ mod tests {
     fn malformed_body_is_not_leaked_as_text() {
         let mut s = ChannelSplitter::new(false, tools());
         let items = s.push("<tool_call>\ngarbage\n</tool_call>hello");
-        assert!(matches!(items[0], Item::Malformed { kind: "tool_call_no_function", .. }));
+        assert!(matches!(
+            items[0],
+            Item::Malformed {
+                kind: "tool_call_no_function",
+                ..
+            }
+        ));
         assert_eq!(split(&items), "T:hello|");
     }
 
@@ -2193,9 +2349,9 @@ mod tests {
     #[test]
     fn reasoning_steps_are_phased_by_channel() {
         let mut s = ChannelSplitter::new(true, tools());
-        s.push("想");        // Think ⇒ 1
+        s.push("想"); // Think ⇒ 1
         s.push("</think>"); // 入口仍 Think(标记本体属思考段)⇒ 2
-        s.push("答");        // 入口 Text ⇒ 不计
+        s.push("答"); // 入口 Text ⇒ 不计
         s.push("案");
         assert_eq!(s.reasoning_steps(), 2);
 
@@ -2215,9 +2371,9 @@ mod tests {
     #[test]
     fn structural_trace_records_structure_not_text() {
         let mut s = ChannelSplitter::new(true, tools());
-        s.push("想");        // 无结构事件(纯内容)
+        s.push("想"); // 无结构事件(纯内容)
         s.push("</think>"); // think→text
-        s.push("\n\n答");    // 吞两个结构换行
+        s.push("\n\n答"); // 吞两个结构换行
         let tr = s.structural_trace();
         assert!(tr.iter().any(|l| l == "state think→text"), "{tr:?}");
         assert!(tr.iter().any(|l| l == "swallow_lf 2"), "{tr:?}");
@@ -2278,7 +2434,11 @@ mod tests {
         );
         assert_eq!(
             items[0],
-            Item::ToolCall { index: 0, name: "f".into(), arguments: r#"{"p":"123"}"#.into() }
+            Item::ToolCall {
+                index: 0,
+                name: "f".into(),
+                arguments: r#"{"p":"123"}"#.into()
+            }
         );
     }
 
@@ -2290,16 +2450,18 @@ mod tests {
         let fx = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/chat_tpl");
         let think_on = std::fs::read_to_string(fx.join("ctx1_tools.txt")).unwrap();
         let think_off = std::fs::read_to_string(fx.join("ctx3_tools_notinking.txt")).unwrap();
-        assert!(think_on.contains(MARK_THINK_OPEN), "tools 档起手应含主开标记");
+        assert!(
+            think_on.contains(MARK_THINK_OPEN),
+            "tools 档起手应含主开标记"
+        );
         assert!(think_on.contains(MARK_TOOL_OPEN), "tools 档应含工具开标记");
         assert!(think_on.contains(MARK_TOOL_CLOSE), "tools 档应含工具闭标记");
         assert!(think_off.contains(MARK_THINK_CLOSE), "关思考档应含主闭标记");
         match owl_shared::testkit::resource("tpl:default") {
             Some(dir) => {
-                let src = std::fs::read_to_string(
-                    std::path::Path::new(&dir).join("chat_template.jinja"),
-                )
-                .unwrap();
+                let src =
+                    std::fs::read_to_string(std::path::Path::new(&dir).join("chat_template.jinja"))
+                        .unwrap();
                 assert!(src.contains(MARK_THINK_OPEN_LONG), "模板源应含长形态别名");
             }
             None => eprintln!("skip(部分): 资源 tpl:default 不在,跳过模板源检查"),
@@ -2351,9 +2513,17 @@ mod tests {
             all
         };
         assert_eq!(f("想</think>\n\n答案"), "R:想|T:答案|");
-        assert_eq!(f("想</think>\n答案"), "R:想|T:答案|", "只有一个换行时吞一个");
+        assert_eq!(
+            f("想</think>\n答案"),
+            "R:想|T:答案|",
+            "只有一个换行时吞一个"
+        );
         assert_eq!(f("想</think>答案"), "R:想|T:答案|", "无换行 ⇒ 不吞");
-        assert_eq!(f("想</think>\n\n\n答案"), "R:想|T:\n答案|", "只吞两个(其余归正文)");
+        assert_eq!(
+            f("想</think>\n\n\n答案"),
+            "R:想|T:\n答案|",
+            "只吞两个(其余归正文)"
+        );
     }
 
     /// **流式切半**:结构空白跨 chunk 到达时必须**挂起**(不许先吐给 content
@@ -2445,9 +2615,11 @@ mod tests {
         let calls: Vec<(usize, &str, &str)> = items
             .iter()
             .filter_map(|i| match i {
-                Item::ToolCall { index, name, arguments } => {
-                    Some((*index, name.as_str(), arguments.as_str()))
-                }
+                Item::ToolCall {
+                    index,
+                    name,
+                    arguments,
+                } => Some((*index, name.as_str(), arguments.as_str())),
                 _ => None,
             })
             .collect();
@@ -2480,7 +2652,10 @@ mod tests {
         let text: String = items
             .iter()
             .filter_map(|i| match i {
-                Item::Delta { chan: Chan::Text, text } => Some(text.as_str()),
+                Item::Delta {
+                    chan: Chan::Text,
+                    text,
+                } => Some(text.as_str()),
                 _ => None,
             })
             .collect();
@@ -2497,15 +2672,19 @@ mod tests {
     #[test]
     fn anthropic_function_calls_unclosed_is_malformed() {
         let mut s = ChannelSplitter::new(false, anthropic_tools());
-        assert!(s.push("<function_calls><invoke name=\"screenshot\">").is_empty());
+        assert!(s
+            .push("<function_calls><invoke name=\"screenshot\">")
+            .is_empty());
         let f = s.finish();
         assert!(matches!(
             f[0],
-            Item::Malformed { kind: "tool_call_anthropic_unclosed", .. }
+            Item::Malformed {
+                kind: "tool_call_anthropic_unclosed",
+                ..
+            }
         ));
         assert_eq!(s.tool_calls(), 0);
     }
-
 }
 
 #[cfg(test)]
@@ -2542,7 +2721,8 @@ mod tool_validation_tests {
         assert_eq!(s.malformed(), 0);
 
         let mut s = ChannelSplitter::new(false, schemas());
-        let items = s.push("<tool_call><function=nope><parameter=x>1</parameter></function></tool_call>");
+        let items =
+            s.push("<tool_call><function=nope><parameter=x>1</parameter></function></tool_call>");
         assert!(
             matches!(&items[0], Item::ToolCall { name, .. } if name == "nope"),
             "未知工具也要照发: {items:?}"
@@ -2594,7 +2774,10 @@ mod tool_validation_tests {
         ));
         assert_eq!(s.malformed(), 0);
         // 混用留痕(下一轮现场数据靠它定位)
-        assert!(s.structural_trace().iter().any(|l| l.contains("json_inside_function_calls")));
+        assert!(s
+            .structural_trace()
+            .iter()
+            .any(|l| l.contains("json_inside_function_calls")));
     }
 
     /// Anthropic 壳 + **JSON 数组**(批量调用)
@@ -2608,9 +2791,11 @@ mod tool_validation_tests {
         let calls: Vec<_> = items
             .iter()
             .filter_map(|i| match i {
-                Item::ToolCall { index, name, arguments } => {
-                    Some((*index, name.as_str(), arguments.as_str()))
-                }
+                Item::ToolCall {
+                    index,
+                    name,
+                    arguments,
+                } => Some((*index, name.as_str(), arguments.as_str())),
                 _ => None,
             })
             .collect();
@@ -2664,7 +2849,10 @@ mod tool_validation_tests {
             ),
             "实得 {items:?}"
         );
-        assert!(s.structural_trace().iter().any(|l| l.contains("args_double_encoded")));
+        assert!(s
+            .structural_trace()
+            .iter()
+            .any(|l| l.contains("args_double_encoded")));
     }
 
     /// **缺壳抢救**:EOS 截断只丢了最外层壳 ⇒ 体完整就救回来(不 502)
@@ -2734,7 +2922,13 @@ mod tool_validation_tests {
         let mut s = ChannelSplitter::new(false, schemas());
         let _ = s.push("<tool_call><function=bash><parameter=command>rm -rf /home/us");
         let f = s.finish();
-        assert!(matches!(f[0], Item::Malformed { kind: "tool_call_unclosed", .. }));
+        assert!(matches!(
+            f[0],
+            Item::Malformed {
+                kind: "tool_call_unclosed",
+                ..
+            }
+        ));
         assert_eq!(s.tool_calls(), 0);
     }
 
@@ -2760,7 +2954,9 @@ mod tool_validation_tests {
         items
             .iter()
             .find_map(|i| match i {
-                Item::ToolCall { name, arguments, .. } => Some((name.as_str(), arguments.as_str())),
+                Item::ToolCall {
+                    name, arguments, ..
+                } => Some((name.as_str(), arguments.as_str())),
                 _ => None,
             })
             .unwrap_or_else(|| panic!("应有 ToolCall,实得 {items:?}"))
@@ -2771,8 +2967,9 @@ mod tool_validation_tests {
     fn broken_json_bodies_still_emit_calls() {
         // ① 尾随文字
         let mut s = ChannelSplitter::new(false, gui_schemas());
-        let items =
-            s.push("<tool_call>{\"name\":\"screenshot\",\"arguments\":{}} trailing prose</tool_call>");
+        let items = s.push(
+            "<tool_call>{\"name\":\"screenshot\",\"arguments\":{}} trailing prose</tool_call>",
+        );
         assert_eq!(one_call(&items), ("screenshot", "{}"));
 
         // ② 缺右闭括号(整体截断在参数中间)
@@ -2791,12 +2988,14 @@ mod tool_validation_tests {
         let items = s.push(
             "<tool_call>{'name':'mouse','arguments':{'action':'click','x':1,'y':2}}</tool_call>",
         );
-        assert_eq!(one_call(&items), ("mouse", r#"{"action":"click","x":1,"y":2}"#));
+        assert_eq!(
+            one_call(&items),
+            ("mouse", r#"{"action":"click","x":1,"y":2}"#)
+        );
 
         // ④ 键没加引号
         let mut s = ChannelSplitter::new(false, gui_schemas());
-        let items =
-            s.push("<tool_call>{name: \"screenshot\", arguments: {}}</tool_call>");
+        let items = s.push("<tool_call>{name: \"screenshot\", arguments: {}}</tool_call>");
         assert_eq!(one_call(&items), ("screenshot", "{}"));
     }
 
@@ -2833,17 +3032,17 @@ mod tool_validation_tests {
 
     fn video_schemas() -> ToolSchemas {
         ToolSchemas::from_tools(&[json!({"type":"function","function":{
-            "name":"video_collect",
-            "parameters":{"type":"object",
-                "properties":{
-                    "action":{"type":"string"},
-                    "url":{"type":"string"},
-                    "max_download_mb":{"type":"integer"},
-                    "tags":{"type":"array"},
-                    "dry_run":{"type":"boolean"}
-                },
-                "required":["action","url"]
-            }}})])
+        "name":"video_collect",
+        "parameters":{"type":"object",
+            "properties":{
+                "action":{"type":"string"},
+                "url":{"type":"string"},
+                "max_download_mb":{"type":"integer"},
+                "tags":{"type":"array"},
+                "dry_run":{"type":"boolean"}
+            },
+            "required":["action","url"]
+        }}})])
     }
 
     /// 自定义工具常见近失：数字/数组/布尔被 JSON 引号包住。
@@ -2861,7 +3060,9 @@ mod tool_validation_tests {
              </function></tool_call>",
         );
         let args = match &items[0] {
-            Item::ToolCall { name, arguments, .. } if name == "video_collect" => {
+            Item::ToolCall {
+                name, arguments, ..
+            } if name == "video_collect" => {
                 serde_json::from_str::<Json>(arguments).expect("参数 JSON")
             }
             other => panic!("应为 ToolCall，得到 {other:?}"),
@@ -2951,7 +3152,10 @@ mod tool_validation_tests {
             Item::ToolCall { name, arguments, .. }
                 if name == "bash" && arguments == r#"{"command":"ls -la"}"#
         ));
-        assert!(s.structural_trace().iter().any(|l| l.contains("repair bash qwen_loose")));
+        assert!(s
+            .structural_trace()
+            .iter()
+            .any(|l| l.contains("repair bash qwen_loose")));
         assert_eq!(s.tool_calls(), 1);
         assert_eq!(s.malformed(), 0);
     }
@@ -3020,9 +3224,7 @@ mod tool_validation_tests {
         // 不认识的裸标签**不得**被当成参数回填(否则等于凭猜执行);调用照发,
         // 缺的参数由前端/模型自纠(`lenient` 记账)。
         let mut s = ChannelSplitter::new(false, schemas());
-        let items = s.push(
-            "<tool_call><function=bash><nope>x</nope></function></tool_call>",
-        );
+        let items = s.push("<tool_call><function=bash><nope>x</nope></function></tool_call>");
         assert!(
             matches!(&items[0], Item::ToolCall { name, arguments, .. }
                 if name == "bash" && arguments == "{}"),

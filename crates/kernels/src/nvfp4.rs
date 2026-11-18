@@ -205,7 +205,11 @@ impl Nvfp4Plan {
     /// 权威值 = [`Self::sfb_bytes`]/[`Self::sfa_bytes`](plan 里 cute 实测)。
     #[must_use]
     pub fn new(m: usize, n: usize, k: usize) -> Option<Self> {
-        let (mi, ni, ki) = (i32::try_from(m).ok()?, i32::try_from(n).ok()?, i32::try_from(k).ok()?);
+        let (mi, ni, ki) = (
+            i32::try_from(m).ok()?,
+            i32::try_from(n).ok()?,
+            i32::try_from(k).ok()?,
+        );
         // SAFETY: 纯主机构造,不逃逸指针。
         let ptr = unsafe { owl_nvfp4_plan_new(mi, ni, ki) };
         if ptr.is_null() {
@@ -368,15 +372,7 @@ impl Nvfp4Plan {
         d_g: *mut f32,
         src_bf16: bool,
     ) -> i32 {
-        owl_nvfp4_pack_b_dev(
-            self.ptr,
-            stream,
-            src,
-            q,
-            sf,
-            d_g,
-            i32::from(src_bf16),
-        )
+        owl_nvfp4_pack_b_dev(self.ptr, stream, src, q, sf, d_g, i32::from(src_bf16))
     }
 
     /// SFB 仿射步长(诊断/自证面;设备侧权重量化器内部已用)

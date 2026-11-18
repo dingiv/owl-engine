@@ -24,13 +24,13 @@
 //! U4B8 语义 W = (q-8) × scale。
 
 use crate::contract::{Dtype, ModelError};
+use crate::f16c::{bf16_bytes_to_f16_bytes, dequant_u4_affine_f16_bytes};
 use crate::formats::mmap::{copy_par, open_raw_index, Mmap, RawEntry};
 use crate::formats::util::{
     checked_len, f16_bytes_to_bf16_bytes, f32_bytes_to_f16, i32s_le_bytes, i32s_par,
     marlin_eligible, marlin_n_pack, scales_par, u16s_le_bytes,
 };
 use crate::module::{Taken, WeightSource};
-use crate::f16c::{bf16_bytes_to_f16_bytes, dequant_u4_affine_f16_bytes};
 use owl_kernels::family::marlin::repack::{
     marlin_gather_indices, pack_marlin_b_gather_into, pack_marlin_s, unpack_nibbles_into,
 };
@@ -222,13 +222,18 @@ impl W4A16Source {
                         owl_shared::log_warn!(
                             "load",
                             "预取读失败(map {} @{} {}B): {e}(回退按需缺页)",
-                            map, start, end - start
+                            map,
+                            start,
+                            end - start
                         );
                     }
                 }
             }));
         }
-        *self.prefetch_thread.lock().unwrap_or_else(|p| p.into_inner()) = Some(handles);
+        *self
+            .prefetch_thread
+            .lock()
+            .unwrap_or_else(|p| p.into_inner()) = Some(handles);
         owl_shared::log_info!(
             "load",
             "预取源区间(w4a16):{} 段 / {:.2}GB · {} 读流 · 后台启动 {:.1}ms",
@@ -280,8 +285,12 @@ impl W4A16Source {
     /// 量化线性三元组定位:(out, k) 与 packed/scale 条目。
     /// shape 事实:`weight_packed` [out, k/8] i32。
     fn linear_dims(&self, base: &str) -> Taken<(usize, usize, &RawEntry, &RawEntry)> {
-        let Some(pe) = self.index.get(&format!("{base}.weight_packed")) else { return Ok(None) };
-        let Some(se) = self.index.get(&format!("{base}.weight_scale")) else { return Ok(None) };
+        let Some(pe) = self.index.get(&format!("{base}.weight_packed")) else {
+            return Ok(None);
+        };
+        let Some(se) = self.index.get(&format!("{base}.weight_scale")) else {
+            return Ok(None);
+        };
         let Some(out) = pe.shape.first().copied() else {
             return Ok(None);
         };
@@ -309,14 +318,14 @@ impl W4A16Source {
             // `linear_bytes_for` 把**整键** `to_vec` 一遍（双 rank 半量数据
             // 反而多一次全键拷贝，draft 单键 ~80ms 的主因）。fc 列块五拆 /
             // 合并虚拟键仍走构建路径。
-            if fc_block_index(base).is_none()
-                && crate::formats::split_merged(base).is_none()
-            {
+            if fc_block_index(base).is_none() && crate::formats::split_merged(base).is_none() {
                 if let Some(pe) = self.index.get(&format!("{base}.weight_packed")) {
                     return Ok(Some(Resolved::View(pe.clone())));
                 }
             }
-            let Some(__b) = self.linear_bytes_for(base, key)? else { return Ok(None) };
+            let Some(__b) = self.linear_bytes_for(base, key)? else {
+                return Ok(None);
+            };
             return Ok(Some(Resolved::Bytes(__b, Dtype::U32)));
         }
         // DFlash2 fc 列块五拆派生(E5-DF3.5):`fc_{i}.qweight/.scales` =
@@ -324,22 +333,30 @@ impl W4A16Source {
         // packed [out, k/8] 列连续 ↔ in 连续,块宽 640/40)
         if let Some(base) = key.strip_suffix(".qweight") {
             if let Some(i) = fc_block_index(base) {
-                let Some(__b) = self.fc_block_bytes(i, false)? else { return Ok(None) };
+                let Some(__b) = self.fc_block_bytes(i, false)? else {
+                    return Ok(None);
+                };
                 return Ok(Some(Resolved::Bytes(__b, Dtype::U32)));
             }
         }
         if let Some(base) = key.strip_suffix(".scales") {
             if let Some(i) = fc_block_index(base) {
-                let Some(__b) = self.fc_block_bytes(i, true)? else { return Ok(None) };
+                let Some(__b) = self.fc_block_bytes(i, true)? else {
+                    return Ok(None);
+                };
                 return Ok(Some(Resolved::Bytes(__b, Dtype::F16)));
             }
         }
         if let Some(base) = key.strip_suffix(".qweight") {
-            let Some(__b) = self.linear_bytes_for(base, key)? else { return Ok(None) };
+            let Some(__b) = self.linear_bytes_for(base, key)? else {
+                return Ok(None);
+            };
             return Ok(Some(Resolved::Bytes(__b, Dtype::U32)));
         }
         if let Some(base) = key.strip_suffix(".scales") {
-            let Some(__b) = self.linear_bytes_for(base, key)? else { return Ok(None) };
+            let Some(__b) = self.linear_bytes_for(base, key)? else {
+                return Ok(None);
+            };
             return Ok(Some(Resolved::Bytes(__b, Dtype::F16)));
         }
         // passthrough 优先(norm/conv/embed 等原生存量键)
@@ -349,7 +366,9 @@ impl W4A16Source {
         // 非门控线性反量化臂(Linear 与本源同谓词,该键只对 non-eligible 出现)
         if let Some(base) = key.strip_suffix(".weight") {
             if self.index.contains_key(&format!("{base}.weight_packed")) {
-                let Some(__b) = self.linear_bytes_for(base, key)? else { return Ok(None) };
+                let Some(__b) = self.linear_bytes_for(base, key)? else {
+                    return Ok(None);
+                };
                 return Ok(Some(Resolved::Bytes(__b, Dtype::F16)));
             }
         }
@@ -370,9 +389,15 @@ impl W4A16Source {
                 return Ok(Some(b.clone()));
             }
         }
-        let Some(pe) = self.index.get("fc.weight_packed") else { return Ok(None) };
-        let Some(out) = pe.shape.first().copied() else { return Ok(None) };
-        let Some(packed_cols) = pe.shape.get(1).copied() else { return Ok(None) };
+        let Some(pe) = self.index.get("fc.weight_packed") else {
+            return Ok(None);
+        };
+        let Some(out) = pe.shape.first().copied() else {
+            return Ok(None);
+        };
+        let Some(packed_cols) = pe.shape.get(1).copied() else {
+            return Ok(None);
+        };
         let n_fc = 5usize;
         let cols = packed_cols / n_fc;
         let packed_bytes = &self.maps[pe.map_ix][pe.start..pe.start + pe.nbytes];
@@ -398,9 +423,15 @@ impl W4A16Source {
                 return Ok(Some(b.clone()));
             }
         }
-        let Some(pe) = self.index.get("fc.weight_packed") else { return Ok(None) };
-        let Some(se) = self.index.get("fc.weight_scale") else { return Ok(None) };
-        let Some(out) = pe.shape.first().copied() else { return Ok(None) };
+        let Some(pe) = self.index.get("fc.weight_packed") else {
+            return Ok(None);
+        };
+        let Some(se) = self.index.get("fc.weight_scale") else {
+            return Ok(None);
+        };
+        let Some(out) = pe.shape.first().copied() else {
+            return Ok(None);
+        };
         let Some(packed_cols) = pe.shape.get(1).copied() else {
             return Ok(None);
         }; // k_all / 8 = 3200
@@ -420,11 +451,15 @@ impl W4A16Source {
         let _ = k;
         let mut packed = Vec::with_capacity(out * cols);
         for r in 0..out {
-            packed.extend_from_slice(&packed_all[r * packed_cols + blk * cols..r * packed_cols + (blk + 1) * cols]);
+            packed.extend_from_slice(
+                &packed_all[r * packed_cols + blk * cols..r * packed_cols + (blk + 1) * cols],
+            );
         }
         let mut scales = Vec::with_capacity(out * scol);
         for r in 0..out {
-            scales.extend_from_slice(&scales_all[r * (scol * n_fc) + blk * scol..r * (scol * n_fc) + (blk + 1) * scol]);
+            scales.extend_from_slice(
+                &scales_all[r * (scol * n_fc) + blk * scol..r * (scol * n_fc) + (blk + 1) * scol],
+            );
         }
         let out_b = out as u32;
         let _ = out_b;
@@ -453,14 +488,18 @@ impl W4A16Source {
 
     /// 原始尺度([out, groups] f32)+ 形状(合并键重排用)。
     fn scales_f32_words(&self, base: &str) -> Taken<(Vec<f32>, usize, usize)> {
-        let Some((out, k, _pe, se)) = self.linear_dims(base)? else { return Ok(None) };
+        let Some((out, k, _pe, se)) = self.linear_dims(base)? else {
+            return Ok(None);
+        };
         let bytes = &self.maps[se.map_ix][se.start..se.start + se.nbytes];
         Ok(Some((scales_par(se.dtype, bytes), out, k)))
     }
 
     /// 原始 packed 字([out, k/8] I32)+ 形状(合并键重排用)。
     fn packed_words(&self, base: &str) -> Taken<(Vec<i32>, usize, usize)> {
-        let Some((out, k, pe, _se)) = self.linear_dims(base)? else { return Ok(None) };
+        let Some((out, k, pe, _se)) = self.linear_dims(base)? else {
+            return Ok(None);
+        };
         let bytes = &self.maps[pe.map_ix][pe.start..pe.start + pe.nbytes];
         Ok(Some((i32s_par(bytes), out, k)))
     }
@@ -480,8 +519,12 @@ impl W4A16Source {
         if let Some((b1, b2)) = crate::formats::split_merged(base) {
             let suffix = &key[base.len()..];
             if suffix == ".scales" {
-                let Some((s1, o1, k1)) = self.scales_f32_words(&b1)? else { return Ok(None) };
-                let Some((s2, o2, k2)) = self.scales_f32_words(&b2)? else { return Ok(None) };
+                let Some((s1, o1, k1)) = self.scales_f32_words(&b1)? else {
+                    return Ok(None);
+                };
+                let Some((s2, o2, k2)) = self.scales_f32_words(&b2)? else {
+                    return Ok(None);
+                };
                 if k1 != k2 {
                     return Err(ModelError::Msg(format!(
                         "合并键 {base}: 两子 k 不一致（{k1} vs {k2}）"
@@ -499,8 +542,12 @@ impl W4A16Source {
                 return Ok(Some(buf));
             }
             if suffix == ".qweight" {
-                let Some((p1, o1, k1)) = self.packed_words(&b1)? else { return Ok(None) };
-                let Some((p2, o2, k2)) = self.packed_words(&b2)? else { return Ok(None) };
+                let Some((p1, o1, k1)) = self.packed_words(&b1)? else {
+                    return Ok(None);
+                };
+                let Some((p2, o2, k2)) = self.packed_words(&b2)? else {
+                    return Ok(None);
+                };
                 if k1 != k2 {
                     return Err(ModelError::Msg(format!(
                         "合并键 {base}: 两子 k 不一致（{k1} vs {k2}）"
@@ -525,8 +572,12 @@ impl W4A16Source {
                 cache.0.insert(key.to_string(), buf.clone());
                 return Ok(Some(buf));
             }
-            let Some(s1) = self.linear_bytes_for(&b1, &format!("{b1}{suffix}"))? else { return Ok(None) };
-            let Some(s2) = self.linear_bytes_for(&b2, &format!("{b2}{suffix}"))? else { return Ok(None) };
+            let Some(s1) = self.linear_bytes_for(&b1, &format!("{b1}{suffix}"))? else {
+                return Ok(None);
+            };
+            let Some(s2) = self.linear_bytes_for(&b2, &format!("{b2}{suffix}"))? else {
+                return Ok(None);
+            };
             let mut buf = Vec::with_capacity(s1.len() + s2.len());
             buf.extend_from_slice(&s1);
             buf.extend_from_slice(&s2);
@@ -547,7 +598,9 @@ impl W4A16Source {
             }
             return Ok(None);
         }
-        let Some((out, k, pe, se)) = self.linear_dims(base)? else { return Ok(None) };
+        let Some((out, k, pe, se)) = self.linear_dims(base)? else {
+            return Ok(None);
+        };
         {
             let cache = self.cache_guard();
             if let Some(b) = cache.0.get(key) {
@@ -700,7 +753,9 @@ impl WeightSource for W4A16Source {
     }
 
     fn take(&self, key: &str) -> Taken<Vec<f32>> {
-        let Some(n) = self.elem_len(key)? else { return Ok(None) };
+        let Some(n) = self.elem_len(key)? else {
+            return Ok(None);
+        };
         self.take_range(key, 0, n)
     }
 
@@ -729,28 +784,36 @@ impl WeightSource for W4A16Source {
         // 派生键:尺寸由基线性形状推导;谓词门控(eligible → qweight/scales/
         // ws/ctmp;non-eligible → weight),错位键报 None 免误消费
         if let Some(base) = key.strip_suffix(".marlin_ws") {
-            let Some((out, k, _, _)) = self.linear_dims(base)? else { return Ok(None) };
+            let Some((out, k, _, _)) = self.linear_dims(base)? else {
+                return Ok(None);
+            };
             if !marlin_eligible(out, k) {
                 return Ok(None);
             }
             return Ok(Some(v2_workspace_len(marlin_n_pack(out))));
         }
         if let Some(base) = key.strip_suffix(".marlin_ctmp") {
-            let Some((out, k, _, _)) = self.linear_dims(base)? else { return Ok(None) };
+            let Some((out, k, _, _)) = self.linear_dims(base)? else {
+                return Ok(None);
+            };
             if !marlin_eligible(out, k) {
                 return Ok(None);
             }
             return Ok(Some(1));
         }
         if let Some(base) = key.strip_suffix(".qweight") {
-            let Some((out, k, _, _)) = self.linear_dims(base)? else { return Ok(None) };
+            let Some((out, k, _, _)) = self.linear_dims(base)? else {
+                return Ok(None);
+            };
             if !marlin_eligible(out, k) {
                 return Ok(None);
             }
             return Ok(Some(out * k / 8));
         }
         if let Some(base) = key.strip_suffix(".scales") {
-            let Some((out, k, _, _)) = self.linear_dims(base)? else { return Ok(None) };
+            let Some((out, k, _, _)) = self.linear_dims(base)? else {
+                return Ok(None);
+            };
             if !marlin_eligible(out, k) {
                 return Ok(None);
             }
@@ -758,7 +821,9 @@ impl WeightSource for W4A16Source {
         }
         if let Some(base) = key.strip_suffix(".weight") {
             if !self.index.contains_key(key) {
-                let Some((out, k, _, _)) = self.linear_dims(base)? else { return Ok(None) };
+                let Some((out, k, _, _)) = self.linear_dims(base)? else {
+                    return Ok(None);
+                };
                 if marlin_eligible(out, k) {
                     return Ok(None);
                 }
@@ -772,13 +837,23 @@ impl WeightSource for W4A16Source {
     }
 
     fn take_range(&self, key: &str, offset_elems: usize, len: usize) -> Taken<Vec<f32>> {
-        let Some((data, dtype)) = self.key_bytes(key)? else { return Ok(None) };
+        let Some((data, dtype)) = self.key_bytes(key)? else {
+            return Ok(None);
+        };
         let bytes = data.as_slice();
         let esz = dtype.size_bytes();
-        let Some(s) = offset_elems.checked_mul(esz) else { return Ok(None) };
-        let Some(lb) = len.checked_mul(esz) else { return Ok(None) };
-        let Some(e) = s.checked_add(lb) else { return Ok(None) };
-        let Some(win) = bytes.get(s..e) else { return Ok(None) };
+        let Some(s) = offset_elems.checked_mul(esz) else {
+            return Ok(None);
+        };
+        let Some(lb) = len.checked_mul(esz) else {
+            return Ok(None);
+        };
+        let Some(e) = s.checked_add(lb) else {
+            return Ok(None);
+        };
+        let Some(win) = bytes.get(s..e) else {
+            return Ok(None);
+        };
         Ok(Some(match dtype {
             Dtype::F16 => win
                 .chunks_exact(2)
@@ -805,7 +880,9 @@ impl WeightSource for W4A16Source {
         dtype: Dtype,
     ) -> Taken<()> {
         let esz = dtype.size_bytes();
-        let Some(need) = len.checked_mul(esz) else { return Ok(None) };
+        let Some(need) = len.checked_mul(esz) else {
+            return Ok(None);
+        };
         // 目标缓冲不足 = **调用方违约** ⇒ 响亮拒(旧版返回 None ⇒ 被上层收成"缺键")
         if need > dst.len() {
             return Err(ModelError::Msg(format!(
@@ -881,7 +958,9 @@ impl WeightSource for W4A16Source {
                 let Some(sz) = checked_len(len, src_esz) else {
                     return Ok(None);
                 };
-                let Some(win) = b.get(s..s + sz) else { return Ok(None) };
+                let Some(win) = b.get(s..s + sz) else {
+                    return Ok(None);
+                };
                 if reg == dtype {
                     // 声明一致 ⇒ 逐字节直拷(零转换)
                     dst[..need].copy_from_slice(win);
@@ -954,11 +1033,21 @@ mod tests {
 
         // ---- 权威面:fused 键(声明与内容一致:packed=I32 字、scale=F16)----
         // 注:这两把键走不了 `key_bytes`(I32 不在元素通道的 dtype 表里)⇒ 直读 owner 面。
-        let pe = src.index.get("fc.weight_packed").expect("fused packed 索引");
+        let pe = src
+            .index
+            .get("fc.weight_packed")
+            .expect("fused packed 索引");
         let pk = i32s_par(&src.maps[pe.map_ix][pe.start..pe.start + pe.nbytes]);
         let se = src.index.get("fc.weight_scale").expect("fused scale 索引");
-        assert_eq!(se.dtype, safetensors::Dtype::F16, "fused 尺度声明 F16(内容亦 F16)");
-        let fused_s = scales_par(se.dtype, &src.maps[se.map_ix][se.start..se.start + se.nbytes]);
+        assert_eq!(
+            se.dtype,
+            safetensors::Dtype::F16,
+            "fused 尺度声明 F16(内容亦 F16)"
+        );
+        let fused_s = scales_par(
+            se.dtype,
+            &src.maps[se.map_ix][se.start..se.start + se.nbytes],
+        );
 
         const OUT: usize = 5120;
         const N_FC: usize = 5;
@@ -972,7 +1061,11 @@ mod tests {
             // ---- ① 尺度:派生(按**内容口径 BF16** 解)== fused 列块(按 F16 解)----
             let skey = format!("fc_{blk}.scales");
             let (sb, sdt) = src.key_bytes(&skey).expect("源").expect("派生尺度");
-            assert_eq!(sdt, Dtype::F16, "{skey}: 线格式声明必须保持 F16(算子表口径)");
+            assert_eq!(
+                sdt,
+                Dtype::F16,
+                "{skey}: 线格式声明必须保持 F16(算子表口径)"
+            );
             // 派生尺度 = **f16 位型的 marlin S**(声明 F16 ⇒ 事实 F16;bf16 臂的转换在装载侧)
             let got = f16_par(sb.as_slice());
             assert_eq!(got.len(), OUT * scol, "{skey}: 元素数");
@@ -1014,7 +1107,8 @@ mod tests {
             assert_eq!(derived.len(), want_b.len(), "{qkey}: 字数");
             let bad = derived.iter().zip(&want_b).filter(|(a, b)| a != b).count();
             assert_eq!(
-                bad, 0,
+                bad,
+                0,
                 "{qkey}: 派生 B 与 fused 现算不一致({bad}/{} 字)—— 派生链路(重排/切块/打包)有罪",
                 want_b.len()
             );
@@ -1027,7 +1121,9 @@ mod tests {
             assert_eq!(rdt, Dtype::U32, "{rkey}: 原始 ct 字以 U32 承载");
             let raw = i32s_par(rb.as_slice());
             let want_raw: Vec<i32> = (0..OUT)
-                .flat_map(|r| pk[r * COLS_ALL + blk * cols..r * COLS_ALL + (blk + 1) * cols].to_vec())
+                .flat_map(|r| {
+                    pk[r * COLS_ALL + blk * cols..r * COLS_ALL + (blk + 1) * cols].to_vec()
+                })
                 .collect();
             assert_eq!(raw.len(), want_raw.len(), "{rkey}: 字数");
 
@@ -1069,12 +1165,16 @@ mod merge_regression {
     }
 
     fn bf16_bytes(v: &[f32]) -> Vec<u8> {
-        v.iter().flat_map(|x| half::bf16::from_f32(*x).to_le_bytes()).collect()
+        v.iter()
+            .flat_map(|x| half::bf16::from_f32(*x).to_le_bytes())
+            .collect()
     }
 
     /// 源 scales 落盘是 BF16 ⇒ 权威面也必须先过 BF16 网格。
     fn bf16_round(v: &[f32]) -> Vec<f32> {
-        v.iter().map(|x| half::bf16::from_f32(*x).to_f32()).collect()
+        v.iter()
+            .map(|x| half::bf16::from_f32(*x).to_f32())
+            .collect()
     }
 
     #[test]
@@ -1123,7 +1223,11 @@ mod merge_regression {
         let idx = marlin_gather_indices(K, OUT * 2);
         let mut want_b = Vec::new();
         pack_marlin_b_gather_into(&merged_q, &idx, OUT * 2 * K / 8, &mut want_b);
-        assert_eq!(i32s_par(qb.as_slice()), want_b, "merged qweight 必须整体重排");
+        assert_eq!(
+            i32s_par(qb.as_slice()),
+            want_b,
+            "merged qweight 必须整体重排"
+        );
 
         let (sb, sdt) = src.key_bytes(&format!("{base}.scales")).unwrap().unwrap();
         assert_eq!(sdt, Dtype::F16);

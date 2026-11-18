@@ -15,6 +15,19 @@
 
 ---
 
+> **2026-11-18 配置变更**：`snap_host_mb` / `snap_disk_mb` 已删除；
+> `[store].ram_pool_size` / `disk_pool_size` 是**整层共享总池**（KV 与快照共享）。
+> 下文历史段落里的 `snap_host_mb=…` 读数仅作当时现场记录，不再对应现行键。
+>
+> **TTFT 快照保护（2026-11-18）**：prefill 首 token 预算 ≤
+> `PREFILL_SNAP_OFFLOAD_GUARD_MS`（8s）且快照槽满时，直接丢设备最冷快照，
+> 不在关键路径做宿主大块下沉；指标 `store.snap.prefill_drop`。decode / 宽松
+> prefill 仍走正常 host/disk 票。
+>
+> **TTFT 超期动作（2026-11-18）**：`[runtime] ttft_on_expire =
+> "ignore" | "warn" | "stop"`；缺省 `ignore`（静默继续），3080 双卡档设
+> `warn`（告警一次、不停止），`stop` 保留旧强停行为。
+
 ## §0 摘要(给三个月后的自己)
 
 1. **pi 侧零成本**:`~/.pi/agent/models.json` 加一个 provider 条目(≈20 行)即可接入;

@@ -95,7 +95,9 @@ pub fn tracked() -> bool {
 
 /// 当前作用域 id(调试/断言用;析构期视为无作用域)
 pub fn current_scope() -> Option<ScopeId> {
-    STACK.try_with(|s| s.borrow().last().map(|f| f.id)).unwrap_or(None)
+    STACK
+        .try_with(|s| s.borrow().last().map(|f| f.id))
+        .unwrap_or(None)
 }
 
 #[cfg(test)]

@@ -45,7 +45,11 @@ pub fn set_hint(n_bytes: usize) {
 /// 消费 hint(graph_begin;None = 缺席)。
 pub fn take_hint() -> Option<usize> {
     let v = HINT.swap(0, Ordering::Relaxed);
-    if v == 0 { None } else { Some(v) }
+    if v == 0 {
+        None
+    } else {
+        Some(v)
+    }
 }
 
 /// 丢弃 hint(捕获失败/未请求捕获的收尾;防陈旧 hint 污染下一图)。
@@ -405,8 +409,8 @@ pub mod live_diag {
         pub fn double_new(&self, id: u64, node_id: u64, overrides: usize, memo_len: usize) {
             let n = self.bump(&self.double_new);
             if n < 12 {
-                let name = crate::slab_hint::probe_name_of(id)
-                    .unwrap_or_else(|| "(未命名)".to_string());
+                let name =
+                    crate::slab_hint::probe_name_of(id).unwrap_or_else(|| "(未命名)".to_string());
                 crate::log_warn!(
                     "live-dup",
                     "块重复登记 block={id} node={node_id} overrides={overrides} memo={memo_len} name={name}"
@@ -425,8 +429,8 @@ pub mod live_diag {
 
         /// 决定点落账(`reason = None` = 真回收;`left_u` = 该刻残余 users)
         pub fn outcome(&self, block_id: u64, bytes: usize, reason: Option<Refuse>, left_u: usize) {
-            let name = crate::slab_hint::probe_name_of(block_id)
-                .unwrap_or_else(|| "(未命名)".to_string());
+            let name =
+                crate::slab_hint::probe_name_of(block_id).unwrap_or_else(|| "(未命名)".to_string());
             let key = (reason.map_or(0, Refuse::code), name);
             if let Ok(mut m) = self.by_name.lock() {
                 let e = m.entry(key).or_insert((0, 0, 0));
@@ -484,8 +488,11 @@ pub mod live_diag {
             // 顺序:真回收 → users → pending → alias → 非竞技场 → keep → 未登记
             let order: [u8; 7] = [0, 2, 1, 3, 4, 5, 6];
             for c in order {
-                let rows: Vec<(&String, &(u64, u64, u64))> =
-                    m.iter().filter(|((k, _), _)| *k == c).map(|((_, n), v)| (n, v)).collect();
+                let rows: Vec<(&String, &(u64, u64, u64))> = m
+                    .iter()
+                    .filter(|((k, _), _)| *k == c)
+                    .map(|((_, n), v)| (n, v))
+                    .collect();
                 if rows.is_empty() {
                     continue;
                 }
@@ -500,8 +507,11 @@ pub mod live_diag {
                     .collect::<Vec<_>>()
                     .join(" / ");
                 let maxu = rows.iter().map(|(_, v)| v.2).max().unwrap_or(0);
-                let label =
-                    if c == 0 { "真回收" } else { Refuse::by_code(c).map_or("?", Refuse::label) };
+                let label = if c == 0 {
+                    "真回收"
+                } else {
+                    Refuse::by_code(c).map_or("?", Refuse::label)
+                };
                 parts.push(format!(
                     "{label} {:.0}MB×{cnt}(残余users≤{maxu}): {tops}",
                     tot as f64 / 1048576.0
@@ -647,7 +657,10 @@ pub mod live_diag {
             l.outcome(2, 1_048_576, Some(Refuse::Users), 5);
             l.outcome(3, 0, None, 0);
             let rep = l.by_name_report();
-            assert!(rep.contains("users") && rep.contains("残余users≤5"), "{rep}");
+            assert!(
+                rep.contains("users") && rep.contains("残余users≤5"),
+                "{rep}"
+            );
             assert!(rep.contains("2MB"), "两次 1MiB 合并 ⇒ 2MB: {rep}");
             assert!(rep.contains("真回收"), "{rep}");
         }
@@ -811,7 +824,10 @@ pub fn probe_end() -> usize {
 
 /// 取走最后一次归因报告(取走即清)
 pub fn take_probe_report() -> String {
-    PROBE_REPORT.lock().map(|mut r| std::mem::take(&mut *r)).unwrap_or_default()
+    PROBE_REPORT
+        .lock()
+        .map(|mut r| std::mem::take(&mut *r))
+        .unwrap_or_default()
 }
 
 /// 报告渲染:双口径 —— ①**容量峰值**(slab 定尺靠它)②**活跃峰值**(谁占大头)
@@ -824,7 +840,11 @@ fn render_report(st: &ProbeState) -> String {
     let compose = |ids: &[u64]| -> (String, usize) {
         let mut comp: Vec<(String, usize)> = Vec::new();
         for id in ids {
-            let name = st.names.get(id).cloned().unwrap_or_else(|| "(未命名)".to_string());
+            let name = st
+                .names
+                .get(id)
+                .cloned()
+                .unwrap_or_else(|| "(未命名)".to_string());
             let n = *st.bytes.get(id).unwrap_or(&0);
             match comp.iter_mut().find(|(k, _)| *k == name) {
                 Some((_, v)) => *v += n,
@@ -840,7 +860,11 @@ fn render_report(st: &ProbeState) -> String {
                 format!(
                     "{k} {:.1}MB({:.0}%)",
                     *n as f64 / 1048576.0,
-                    if total == 0 { 0.0 } else { *n as f64 * 100.0 / total as f64 }
+                    if total == 0 {
+                        0.0
+                    } else {
+                        *n as f64 * 100.0 / total as f64
+                    }
                 )
             })
             .collect::<Vec<_>>()
@@ -886,7 +910,11 @@ fn render_report(st: &ProbeState) -> String {
             )
         }
     };
-    let mut sums: Vec<(String, usize)> = st.per_name_sum.iter().map(|(k, v)| (k.clone(), *v)).collect();
+    let mut sums: Vec<(String, usize)> = st
+        .per_name_sum
+        .iter()
+        .map(|(k, v)| (k.clone(), *v))
+        .collect();
     sums.sort_unstable_by_key(|(_, n)| std::cmp::Reverse(*n));
     let sum_total: usize = sums.iter().map(|(_, n)| *n).sum();
     let sum_part = sums
@@ -896,7 +924,11 @@ fn render_report(st: &ProbeState) -> String {
             format!(
                 "{k} {:.0}MB({:.0}%)",
                 *n as f64 / 1048576.0,
-                if sum_total == 0 { 0.0 } else { *n as f64 * 100.0 / sum_total as f64 }
+                if sum_total == 0 {
+                    0.0
+                } else {
+                    *n as f64 * 100.0 / sum_total as f64
+                }
             )
         })
         .collect::<Vec<_>>()
@@ -945,13 +977,17 @@ fn render_refs(st: &ProbeState) -> String {
         return String::new();
     }
     let name_of = |id: u64| -> String {
-        let n = st.names.get(&id).cloned().unwrap_or_else(|| "(未命名)".to_string());
+        let n = st
+            .names
+            .get(&id)
+            .cloned()
+            .unwrap_or_else(|| "(未命名)".to_string());
         let bytes = *st.bytes.get(&id).unwrap_or(&0);
         format!("{n}({:.0}MB)", bytes as f64 / 1048576.0)
     };
     // ① 用户峰值前 3
     let mut top: Vec<(u64, (u32, u32))> = live.clone();
-    top.sort_by(|a, b| b.1.0.cmp(&a.1.0));
+    top.sort_by(|a, b| b.1 .0.cmp(&a.1 .0));
     let tops = top
         .iter()
         .take(3)
@@ -1085,7 +1121,12 @@ mod arena_tests {
             a.release(big.0, big.1);
         }
         let one = align_up(34 << 20) + align_up(17 << 20) + align_up(64 << 10);
-        assert_eq!(a.high(), one, "64 轮同形状序列必须只占单轮峰值(实测 {})", a.high());
+        assert_eq!(
+            a.high(),
+            one,
+            "64 轮同形状序列必须只占单轮峰值(实测 {})",
+            a.high()
+        );
     }
 
     /// 容量上限:超限返回 None(调用方结构化拒,不静默截断);
@@ -1141,7 +1182,10 @@ mod arena_tests {
         assert!(rep.contains("u=1 1块/1MB"), "u=1 桶:{rep}");
         assert!(rep.contains("u=2-3 1块/1MB"), "u=2-3 桶:{rep}");
         assert!(rep.contains("u≥4 1块/2MB"), "u≥4 桶:{rep}");
-        assert!(rep.contains("users 前3:kv.c(2MB):u5/p0"), "users 降序前 3:{rep}");
+        assert!(
+            rep.contains("users 前3:kv.c(2MB):u5/p0"),
+            "users 降序前 3:{rep}"
+        );
         assert!(!rep.contains("幽灵块"), "无幽灵时不得出现警报:{rep}");
     }
 
@@ -1203,11 +1247,23 @@ mod arena_tests {
         let peak = probe_end();
         let rep = take_probe_report();
         assert_eq!(peak, 6144, "峰值 = 前两块(复合后不高过)");
-        assert!(rep.contains("容量峰值") && rep.contains("活跃峰值"), "报告:{rep}");
-        assert!(rep.contains("marlin.w4a16"), "容量峰值构成须含 marlin(报告:{rep})");
-        assert!(rep.contains("owl_norm_rope_f16"), "活跃峰值构成须含 norm(报告:{rep})");
+        assert!(
+            rep.contains("容量峰值") && rep.contains("活跃峰值"),
+            "报告:{rep}"
+        );
+        assert!(
+            rep.contains("marlin.w4a16"),
+            "容量峰值构成须含 marlin(报告:{rep})"
+        );
+        assert!(
+            rep.contains("owl_norm_rope_f16"),
+            "活跃峰值构成须含 norm(报告:{rep})"
+        );
         assert!(rep.contains("分配总量"), "报告:{rep}");
-        assert!(rep.contains("gdn_chunked"), "总量须含晚到的名字(报告:{rep})");
+        assert!(
+            rep.contains("gdn_chunked"),
+            "总量须含晚到的名字(报告:{rep})"
+        );
         assert_eq!(take_probe_report(), "", "取走即清");
         // 未开探针:名字/报告皆空(零开销路径)
         probe_name(9, "x");

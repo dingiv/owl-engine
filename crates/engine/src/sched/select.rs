@@ -126,7 +126,11 @@ impl BAxisProfile {
     /// 人类可读一行(各相位 + 占比)。
     pub fn line(&self) -> String {
         let pct = |v: f64| {
-            if self.total_ms > 0.0 { v / self.total_ms * 100.0 } else { 0.0 }
+            if self.total_ms > 0.0 {
+                v / self.total_ms * 100.0
+            } else {
+                0.0
+            }
         };
         format!(
             "B 轴相位 ×{} 边界:合计 {:.1}ms | 索引 {:.1}({:.0}%) 查询面 {:.1}({:.0}%) \
@@ -312,9 +316,7 @@ impl SelectRuntime {
     ///
     /// 为什么成对:拆成两次 `&mut self` 调用会在借用检查上打架
     /// (调用方要同时用两件);一次借出 = 两件互不重叠的不变量写在类型上。
-    pub(crate) fn analysis_pair(
-        &mut self,
-    ) -> (&mut BAxisProfile, &mut Option<CoveragePending>) {
+    pub(crate) fn analysis_pair(&mut self) -> (&mut BAxisProfile, &mut Option<CoveragePending>) {
         (&mut self.prof, &mut self.cov_pending)
     }
 
@@ -330,13 +332,7 @@ impl SelectRuntime {
 
     // ── stage-in 账 ─────────────────────────────────────────────────
 
-    pub(crate) fn note_stage_in(
-        &mut self,
-        blocks: usize,
-        bytes: usize,
-        nanos: u64,
-        src: StageSrc,
-    ) {
+    pub(crate) fn note_stage_in(&mut self, blocks: usize, bytes: usize, nanos: u64, src: StageSrc) {
         self.stage.blocks += blocks;
         self.stage.bytes += bytes;
         self.stage.nanos += nanos;
@@ -461,7 +457,6 @@ impl SelectRuntime {
     pub(crate) fn prof(&self) -> &BAxisProfile {
         &self.prof
     }
-
 }
 
 /// 相位计时出口(唯一;`select.rs` 内 note_* 共用)。
@@ -473,6 +468,11 @@ fn record_phase(tag: &'static str, ms: f64) {
         return; // 计时脏值不污染分布(不静默:调用点仍是累加器)
     }
     owl_shared::metrics::with_metrics_store(|s| {
-        s.timer_record_tag(tag, std::time::Duration::from_secs_f64(ms / 1000.0), file!(), line!());
+        s.timer_record_tag(
+            tag,
+            std::time::Duration::from_secs_f64(ms / 1000.0),
+            file!(),
+            line!(),
+        );
     });
 }

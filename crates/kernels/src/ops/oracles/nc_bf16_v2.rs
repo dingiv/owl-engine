@@ -12,8 +12,8 @@
 //! 正在这里;只多 8 行时差值落在 bf16 噪声内,判据区分不出来),同时把
 //! HQ/HKV 缩小到 4/1 让 host 参考成本落在几十毫秒级。
 
-use crate::contract::{LaunchVal, OpError};
 use crate::bootcheck::{BootCheck, CheckBuf, CheckReport, CheckRunner};
+use crate::contract::{LaunchVal, OpError};
 const DFLASH2_F16: &str = "cu/attn/naive_attn_nc.cu";
 
 use super::{bf16_to_f32, lcg_bf16};
@@ -54,7 +54,11 @@ pub fn host_ref(
     window: bool,
 ) -> Vec<f32> {
     let prefix = kv_len - T;
-    let srow_begin = if window { prefix.saturating_sub(2048) } else { 0 };
+    let srow_begin = if window {
+        prefix.saturating_sub(2048)
+    } else {
+        0
+    };
     let scale = 1.0 / (HD as f32).sqrt();
     let mut out = vec![0f32; T * HQ * HD];
     for t in 0..T {
@@ -173,7 +177,13 @@ pub fn run_case(r: &mut dyn CheckRunner, c: &Case) -> Result<Vec<f32>, OpError> 
     r.sync()?;
     let n = T * HQ * HD;
     let mut raw = vec![0u8; n * 2];
-    r.download(CheckBuf { ptr: d_out.ptr, bytes: n * 2 }, &mut raw)?;
+    r.download(
+        CheckBuf {
+            ptr: d_out.ptr,
+            bytes: n * 2,
+        },
+        &mut raw,
+    )?;
     Ok(raw
         .chunks_exact(2)
         .map(|x| bf16_to_f32(u16::from_le_bytes([x[0], x[1]])))

@@ -367,12 +367,17 @@ fn vendor_stamp(src: &std::path::Path) -> String {
 /// vendor/flashinfer/xqa 的 vendor 面)各有自己的增量闸,不在此列。
 fn native_headers(cu_root: &std::path::Path) -> Vec<PathBuf> {
     fn walk(dir: &std::path::Path, out: &mut Vec<PathBuf>) {
-        let Ok(rd) = std::fs::read_dir(dir) else { return };
+        let Ok(rd) = std::fs::read_dir(dir) else {
+            return;
+        };
         for e in rd.flatten() {
             let p = e.path();
             let name = p.file_name().and_then(|n| n.to_str()).unwrap_or("");
             if p.is_dir() {
-                if matches!(name, "cutlass" | "vllm_marlin" | "vendor" | "flashinfer" | "triton") {
+                if matches!(
+                    name,
+                    "cutlass" | "vllm_marlin" | "vendor" | "flashinfer" | "triton"
+                ) {
                     continue;
                 }
                 walk(&p, out);
@@ -618,7 +623,11 @@ fn build_native_cubins(
             mix(&b);
         }
     }
-    for (_, bin) in xqa_rows.iter().map(|(n, p)| (*n, p)).chain(gdn_rows.iter().map(|(n, p)| (n.as_str(), p))) {
+    for (_, bin) in xqa_rows
+        .iter()
+        .map(|(n, p)| (*n, p))
+        .chain(gdn_rows.iter().map(|(n, p)| (n.as_str(), p)))
+    {
         if let Ok(b) = std::fs::read(bin) {
             mix(&b);
         }
@@ -765,7 +774,10 @@ fn build_gdn_assets(out_dir: &std::path::Path) -> Vec<(String, PathBuf)> {
         .map(|a| {
             a.iter()
                 .map(|e| {
-                    e.get("tag").and_then(|t| t.as_str()).expect("extra_shapes[].tag 必填").to_string()
+                    e.get("tag")
+                        .and_then(|t| t.as_str())
+                        .expect("extra_shapes[].tag 必填")
+                        .to_string()
                 })
                 .collect()
         })
@@ -838,7 +850,10 @@ fn build_gdn_assets(out_dir: &std::path::Path) -> Vec<(String, PathBuf)> {
             assert!(p.exists(), "gdn-aot: 自编未产出 {n}.cubin");
             for tag in &extra_tags {
                 let tp = dir.join(format!("{n}_{tag}.cubin"));
-                assert!(tp.exists(), "gdn-aot: 自编未产出 {n}_{tag}.cubin(extra_shapes)");
+                assert!(
+                    tp.exists(),
+                    "gdn-aot: 自编未产出 {n}_{tag}.cubin(extra_shapes)"
+                );
             }
         }
         stamp_write(&probe, &deps, &flags);

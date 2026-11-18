@@ -6,8 +6,8 @@
 //! 容器 + LoaderOps 装载形态(子层描述 chain 聚合)。
 
 use super::linear::Linear;
-use crate::module::{Loadable, LoaderCtx, LoaderOps, PlanSource, QuantPlan};
 use crate::module::{ForwardCtx, Module};
+use crate::module::{Loadable, LoaderCtx, LoaderOps, PlanSource, QuantPlan};
 use crate::TensorOps;
 
 pub struct Mlp {
@@ -43,14 +43,13 @@ impl Mlp {
         Self::new_with(hidden, intermediate, p, merge)
     }
 
-    fn new_with<'a>(
-        hidden: usize,
-        intermediate: usize,
-        p: PlanSource<'a>,
-        merge: bool,
-    ) -> Mlp {
-        let down_proj =
-            Linear::new("down_proj", hidden, intermediate, p.of("down_proj", hidden, intermediate));
+    fn new_with<'a>(hidden: usize, intermediate: usize, p: PlanSource<'a>, merge: bool) -> Mlp {
+        let down_proj = Linear::new(
+            "down_proj",
+            hidden,
+            intermediate,
+            p.of("down_proj", hidden, intermediate),
+        );
         if merge {
             Mlp {
                 gate_proj: None,
@@ -128,7 +127,9 @@ impl Module for Mlp {
         // silu(gate) * up(门控)—— C1 融合:silu_and_mul 单发(float 中间,
         // 双发中间量化消除);f32 语义组合保留(CPU 锚)。BF16 臂(E5-DF3
         // 同日十四;DFlash2 草稿 MLP)同吃融合核(owl_silu_and_mul_bf16)
-        let h = if gate.dtype == crate::tensor::Dtype::F16 || gate.dtype == crate::tensor::Dtype::BF16 {
+        let h = if gate.dtype == crate::tensor::Dtype::F16
+            || gate.dtype == crate::tensor::Dtype::BF16
+        {
             let n: usize = gate.shape().iter().product();
             TensorOps::call(crate::ops::SemanticKernel::SiluAndMul)
                 .aux(&[n])
@@ -158,24 +159,31 @@ impl Loadable for Mlp {
             _ => unreachable!("Mlp: layout 臂不唯一（gate_up 与 gate/up 混存）"),
         }
     }
-
 }
-
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::module::QuantPlan;
-    use crate::testkit::{assert_close, f32b, harvest, hf_python, parity_enabled, skip_note, st_read, st_write, tmp_path, Src};
-    use std::collections::HashMap;
     use crate::tensor::Dtype;
+    use crate::testkit::{
+        assert_close, f32b, harvest, hf_python, parity_enabled, skip_note, st_read, st_write,
+        tmp_path, Src,
+    };
+    use std::collections::HashMap;
 
     #[tokio::test]
     async fn chain_matches_host_reference() {
         let (hidden, intermediate) = (4usize, 6usize);
-        let gate_w: Vec<f32> = (0..intermediate * hidden).map(|i| (i as f32 * 0.01) - 0.1).collect();
-        let up_w: Vec<f32> = (0..intermediate * hidden).map(|i| 0.2 - (i as f32 * 0.005)).collect();
-        let down_w: Vec<f32> = (0..hidden * intermediate).map(|i| (i as f32 * 0.008) + 0.05).collect();
+        let gate_w: Vec<f32> = (0..intermediate * hidden)
+            .map(|i| (i as f32 * 0.01) - 0.1)
+            .collect();
+        let up_w: Vec<f32> = (0..intermediate * hidden)
+            .map(|i| 0.2 - (i as f32 * 0.005))
+            .collect();
+        let down_w: Vec<f32> = (0..hidden * intermediate)
+            .map(|i| (i as f32 * 0.008) + 0.05)
+            .collect();
         let x = vec![0.5, -0.25, 1.0, 0.0];
 
         let mut face = owl_cpu::CpuFace::new();
@@ -220,25 +228,40 @@ mod tests {
             return;
         }
         let (tokens, hidden, inter) = (2usize, 4usize, 6usize);
-        let x: Vec<f32> = (0..tokens * hidden).map(|i| ((i as f32 * 0.41) - 0.9).sin()).collect();
-        let gate_w: Vec<f32> = (0..inter * hidden).map(|i| (i as f32 * 0.013) - 0.3).collect();
-        let up_w: Vec<f32> = (0..inter * hidden).map(|i| (i as f32 * 0.027) - 0.2).collect();
-        let down_w: Vec<f32> = (0..hidden * inter).map(|i| (i as f32 * 0.031) - 0.1).collect();
+        let x: Vec<f32> = (0..tokens * hidden)
+            .map(|i| ((i as f32 * 0.41) - 0.9).sin())
+            .collect();
+        let gate_w: Vec<f32> = (0..inter * hidden)
+            .map(|i| (i as f32 * 0.013) - 0.3)
+            .collect();
+        let up_w: Vec<f32> = (0..inter * hidden)
+            .map(|i| (i as f32 * 0.027) - 0.2)
+            .collect();
+        let down_w: Vec<f32> = (0..hidden * inter)
+            .map(|i| (i as f32 * 0.031) - 0.1)
+            .collect();
         let xs = TensorOps::from_host(Dtype::F32, vec![tokens, hidden], &f32b(&x));
         let ctx = ForwardCtx::minimal(tokens);
 
         let inp = tmp_path("mlp_in");
         let outp = tmp_path("mlp_out");
-        st_write(&inp, &[
-            ("x", &x, vec![tokens, hidden]),
-            ("gate_w", &gate_w, vec![inter, hidden]),
-            ("up_w", &up_w, vec![inter, hidden]),
-            ("down_w", &down_w, vec![hidden, inter]),
-        ]);
-        let manifest = hf_python("mlp.py", &[
-            inp.to_str().unwrap(), outp.to_str().unwrap(),
-            &format!(r#"{{"hidden": {hidden}, "inter": {inter}}}"#),
-        ]);
+        st_write(
+            &inp,
+            &[
+                ("x", &x, vec![tokens, hidden]),
+                ("gate_w", &gate_w, vec![inter, hidden]),
+                ("up_w", &up_w, vec![inter, hidden]),
+                ("down_w", &down_w, vec![hidden, inter]),
+            ],
+        );
+        let manifest = hf_python(
+            "mlp.py",
+            &[
+                inp.to_str().unwrap(),
+                outp.to_str().unwrap(),
+                &format!(r#"{{"hidden": {hidden}, "inter": {inter}}}"#),
+            ],
+        );
         eprintln!("[hf manifest] mlp: {manifest}");
         let want = st_read(&outp, "y");
 
@@ -255,7 +278,8 @@ mod tests {
                     ("down_proj".to_string(), down_w.clone()),
                 ]);
                 crate::interpreters::eval_load(&layer, &mut face, &src, &Default::default())
-                    .await.expect("eval_load");
+                    .await
+                    .expect("eval_load");
                 ("cpu", harvest(&mut face, &layer.forward(&xs, &ctx)).await)
             } else {
                 let mut gpu = crate::testkit::gpu_client().await;
@@ -266,7 +290,8 @@ mod tests {
                     ("down_proj".to_string(), down_w.clone()),
                 ]);
                 crate::interpreters::eval_load(&layer, &mut gpu, &src, &Default::default())
-                    .await.expect("eval_load");
+                    .await
+                    .expect("eval_load");
                 let o = harvest(&mut gpu, &layer.forward(&xs, &ctx)).await;
                 gpu.close().await.expect("server 关机");
                 ("gpu", o)

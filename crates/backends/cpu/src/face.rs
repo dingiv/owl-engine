@@ -16,15 +16,13 @@
 
 use crate::ops;
 use crate::value::Value;
+use owl_iface::contract::Shape;
 use owl_iface::contract::{
     Arg, BlockLedgerRow, Bytes, DeviceClient, Dtype, GraphId, KernelSource, LaunchMsg, ModelError,
     UpChunk,
 };
-use owl_iface::contract::Shape;
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
-
-
 
 /// **mock 档调用/耗时统计**(诊断面;§18)。
 ///
@@ -34,12 +32,14 @@ use std::sync::atomic::{AtomicU64, Ordering};
 static MOCK_CALLS: [AtomicU64; 6] = [const { AtomicU64::new(0) }; 6];
 static MOCK_NS: [AtomicU64; 6] = [const { AtomicU64::new(0) }; 6];
 
-
 /// 统计快照(诊断面;`[...]` = 各索引的 (调用次数, 累计纳秒))。
 pub fn mock_stats() -> [(u64, u64); 6] {
     let mut out = [(0u64, 0u64); 6];
     for i in 0..6 {
-        out[i] = (MOCK_CALLS[i].load(Ordering::Relaxed), MOCK_NS[i].load(Ordering::Relaxed));
+        out[i] = (
+            MOCK_CALLS[i].load(Ordering::Relaxed),
+            MOCK_NS[i].load(Ordering::Relaxed),
+        );
     }
     out
 }
@@ -100,7 +100,10 @@ impl Recorded {
     /// 重建发射消息(`source` 不参与 CPU 路由:只按名字选朴素算子)。
     fn to_msg(&self) -> LaunchMsg {
         LaunchMsg {
-            kernel: KernelSource { name: self.kernel.clone(), source: String::new() },
+            kernel: KernelSource {
+                name: self.kernel.clone(),
+                source: String::new(),
+            },
             args: self.args.clone(),
             grid: (0, 0, 0),
             block: (0, 0, 0),
@@ -231,7 +234,10 @@ impl CpuFace {
     /// 返回句柄上的 `Bytes.dtype` 只是它的投影 —— 2026-10-17 审查定谳:
     /// 此前 `alloc` 把句柄钉成 F32、内部表记真 dtype,两个副本各说一套。
     fn decl_dtype(&self, id: u64) -> Dtype {
-        self.declared.get(&id).map(|(d, _)| *d).unwrap_or(Dtype::F32)
+        self.declared
+            .get(&id)
+            .map(|(d, _)| *d)
+            .unwrap_or(Dtype::F32)
     }
 
     /// **设备字节 ↔ 值平面槽位**的唯一折算口(声明 dtype 是权威)。
@@ -324,7 +330,12 @@ fn launch_out_facts(msg: &LaunchMsg) -> Result<(u64, (Dtype, u8)), ModelError> {
             _ => None,
         })
         .ok_or_else(|| ModelError::Msg("launch: args 中无输出块".to_string()))?;
-    let facts = msg.args.iter().rev().find_map(|a| a.facts()).unwrap_or((Dtype::F32, 0));
+    let facts = msg
+        .args
+        .iter()
+        .rev()
+        .find_map(|a| a.facts())
+        .unwrap_or((Dtype::F32, 0));
     Ok((id, facts))
 }
 
@@ -434,7 +445,12 @@ impl DeviceClient for CpuFace {
             )));
         }
         match cmd {
-            C::Alloc { dtype, elems, zero, name } => {
+            C::Alloc {
+                dtype,
+                elems,
+                zero,
+                name,
+            } => {
                 let b = if zero {
                     self.alloc(dtype, elems, &name).await?
                 } else {
@@ -446,13 +462,23 @@ impl DeviceClient for CpuFace {
                 self.free(&ids).await?;
                 Ok(Outcome::Done)
             }
-            C::Htod { dtype, shape, src, stream, name } => {
+            C::Htod {
+                dtype,
+                shape,
+                src,
+                stream,
+                name,
+            } => {
                 // CPU 面无流:承载点即"落地",流选择无语义(不是静默丢弃 ——
                 // 上游两条路径最终都落到同一同步拷贝)
                 let _ = stream;
                 Ok(Outcome::Buf(self.htod(dtype, &shape, &src, &name).await?))
             }
-            C::Dtoh { id, off_bytes, want_bytes } => {
+            C::Dtoh {
+                id,
+                off_bytes,
+                want_bytes,
+            } => {
                 let b = Bytes::new(id, 0, Dtype::U8, 0);
                 let mut out = vec![0u8; want_bytes];
                 if off_bytes == 0 {
@@ -491,10 +517,7 @@ impl DeviceClient for CpuFace {
     }
 
     /// **追加到待提交批**(不入队任何设备动作;CPU 面纯 Host 缓存)。
-    fn queue(
-        &mut self,
-        cmd: owl_iface::command::Command,
-    ) -> Result<usize, ModelError> {
+    fn queue(&mut self, cmd: owl_iface::command::Command) -> Result<usize, ModelError> {
         let i = self.pending.len();
         self.pending.push(cmd);
         Ok(i)
@@ -531,7 +554,9 @@ impl DeviceClient for CpuFace {
             outcomes.push(self.exec(cmd).await);
         }
         let segments = outcomes.len();
-        Ok(owl_iface::command::BatchOutcome::collect(outcomes, segments))
+        Ok(owl_iface::command::BatchOutcome::collect(
+            outcomes, segments,
+        ))
     }
 
     /// 进入捕获窗(不可嵌套;窗内只录不发)。
@@ -632,7 +657,12 @@ impl DeviceClient for CpuFace {
     /// `_name`(全量记名):CPU 面无显存账房(值块是 host Vec)⇒ 无 OOM
     /// 现场可归因,名字无处落 —— 有意不存(不是遗忘;GPU 面由
     /// `GpuClient`→`Command::Alloc`→块账房 `BlockEntry.name` 承担)。
-    async fn alloc(&mut self, dtype: Dtype, elems: usize, _name: &str) -> Result<Bytes, ModelError> {
+    async fn alloc(
+        &mut self,
+        dtype: Dtype,
+        elems: usize,
+        _name: &str,
+    ) -> Result<Bytes, ModelError> {
         match dtype {
             Dtype::F32 | Dtype::F16 | Dtype::BF16 => {}
             other => {
@@ -673,7 +703,12 @@ impl DeviceClient for CpuFace {
         self.note_alloc(id, dtype, src.len());
         // 句柄事实:len = **元素数**(契约 `Bytes.len` 元素口径;原先恒 0 ⇒
         // "len × dsz" 推字节的调用点全得 0)
-        Ok(Bytes::new(id, owl_iface::contract::numel(shape), dtype, shape.len() as u8))
+        Ok(Bytes::new(
+            id,
+            owl_iface::contract::numel(shape),
+            dtype,
+            shape.len() as u8,
+        ))
     }
 
     /// 归还(记账面覆写;见 [`CpuFace::freed_ids`])—— **不焚数据**:
@@ -768,15 +803,18 @@ impl DeviceClient for CpuFace {
         let mut f32s: Vec<f32> = Vec::new();
         for a in &msg.args {
             match a {
-                Arg::Block { id, .. } => {
-                    vals.push(
-                        self.blocks
-                            .get(id)
-                            .cloned()
-                            .ok_or(ModelError::DeadBlock { id: *id })?,
-                    )
-                }
-                Arg::BlockSlice { id, byte_offset, elems, .. } => {
+                Arg::Block { id, .. } => vals.push(
+                    self.blocks
+                        .get(id)
+                        .cloned()
+                        .ok_or(ModelError::DeadBlock { id: *id })?,
+                ),
+                Arg::BlockSlice {
+                    id,
+                    byte_offset,
+                    elems,
+                    ..
+                } => {
                     // 刀1:连续切片视图 —— host 真值直接切片(CPU 面零指针)。
                     // 折算口径 = **声明 dtype**(与 `slots_at` 同一折算;F32 块 = /4,
                     // 与既有行为一致)。2026-10-17 审查:原硬除 4 + 越界**静默保留整块**
@@ -943,7 +981,8 @@ impl DeviceClient for CpuFace {
         self.capture_guard("upload_and_launch")?;
         let __t = std::time::Instant::now();
         for c in chunks {
-            self.upload_pinned(c.lease, dst, c.offset_bytes, c.len_bytes).await?;
+            self.upload_pinned(c.lease, dst, c.offset_bytes, c.len_bytes)
+                .await?;
         }
         let r = self.launch(msg).await;
         MOCK_CALLS[3].fetch_add(1, Ordering::Relaxed);
@@ -1026,12 +1065,17 @@ impl DeviceClient for CpuFace {
         len_bytes: usize,
     ) -> Result<(), ModelError> {
         self.capture_guard("copy_block_at")?;
-        let (src_dtype, src_range) =
-            (self.decl_dtype(src.id), self.slots_at(src.id, src_off_bytes, len_bytes, "copy_block_at(src)")?);
+        let (src_dtype, src_range) = (
+            self.decl_dtype(src.id),
+            self.slots_at(src.id, src_off_bytes, len_bytes, "copy_block_at(src)")?,
+        );
         let dst_range = self.slots_at(dst.id, dst_off_bytes, len_bytes, "copy_block_at(dst)")?;
         // 源 -> 设备字节
         let bytes = {
-            let v = self.blocks.get(&src.id).ok_or(ModelError::DeadBlock { id: src.id })?;
+            let v = self
+                .blocks
+                .get(&src.id)
+                .ok_or(ModelError::DeadBlock { id: src.id })?;
             let mut buf = vec![0u8; len_bytes];
             encode_from(src_dtype, &v.f32[src_range], &mut buf)?;
             buf
@@ -1094,11 +1138,26 @@ mod tests {
     /// `owl_add_f32` 的线格式迷你样例(输出块 = **最后一个** Block 槽 —— 契约)。
     fn msg_add(a: u64, b: u64, out: u64, n: usize) -> LaunchMsg {
         LaunchMsg {
-            kernel: KernelSource { name: "owl_add_f32".into(), source: String::new() },
+            kernel: KernelSource {
+                name: "owl_add_f32".into(),
+                source: String::new(),
+            },
             args: vec![
-                Arg::Block { id: a, dtype: Dtype::F32, rank: 1 },
-                Arg::Block { id: b, dtype: Dtype::F32, rank: 1 },
-                Arg::Block { id: out, dtype: Dtype::F32, rank: 1 },
+                Arg::Block {
+                    id: a,
+                    dtype: Dtype::F32,
+                    rank: 1,
+                },
+                Arg::Block {
+                    id: b,
+                    dtype: Dtype::F32,
+                    rank: 1,
+                },
+                Arg::Block {
+                    id: out,
+                    dtype: Dtype::F32,
+                    rank: 1,
+                },
             ],
             grid: (1, 1, 1),
             block: (1, 1, 1),
@@ -1110,7 +1169,9 @@ mod tests {
     async fn read_f32(f: &mut CpuFace, b: &Bytes, n: usize) -> Vec<f32> {
         let mut buf = vec![0u8; 4 * n];
         f.dtoh(b, &mut buf).await.expect("dtoh");
-        buf.chunks_exact(4).map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]])).collect()
+        buf.chunks_exact(4)
+            .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+            .collect()
     }
 
     /// **图捕获/重放(§18)**:窗内只录不发 → 重放 = 重算;空窗/嵌套/窗内搬运
@@ -1118,12 +1179,19 @@ mod tests {
     #[tokio::test]
     async fn graph_capture_records_and_replay_recomputes() {
         // 图能力 = mock 档显式开(默认档无图,与改造前一致)
-        let mut f = CpuFace::mock(MockLimits { graph_capture: true, ..Default::default() });
+        let mut f = CpuFace::mock(MockLimits {
+            graph_capture: true,
+            ..Default::default()
+        });
         let a = f.alloc(Dtype::F32, 4, "t").await.expect("a");
         let b = f.alloc(Dtype::F32, 4, "t").await.expect("b");
         let out = f.alloc(Dtype::F32, 4, "t").await.expect("out");
-        f.write_block_f32(&a, 0, &[1.0, 2.0, 3.0, 4.0]).await.expect("写 a");
-        f.write_block_f32(&b, 0, &[10.0, 20.0, 30.0, 40.0]).await.expect("写 b");
+        f.write_block_f32(&a, 0, &[1.0, 2.0, 3.0, 4.0])
+            .await
+            .expect("写 a");
+        f.write_block_f32(&b, 0, &[10.0, 20.0, 30.0, 40.0])
+            .await
+            .expect("写 b");
 
         // 默认档拒图(回归哨兵:引擎的"无图能力"降级路径靠它守着)
         {
@@ -1132,7 +1200,9 @@ mod tests {
         }
 
         f.graph_begin().await.expect("进窗");
-        f.launch(msg_add(a.id, b.id, out.id, 4)).await.expect("录一条");
+        f.launch(msg_add(a.id, b.id, out.id, 4))
+            .await
+            .expect("录一条");
         let g = f.graph_end().await.expect("实例化");
 
         assert_eq!(read_f32(&mut f, &out, 4).await[0], 0.0, "捕获窗内只录不发");
@@ -1165,7 +1235,10 @@ mod tests {
     #[tokio::test]
     async fn mock_vram_wall_and_fault_injection_are_loud() {
         // 墙:1024 字节 ⇒ 一个 256-elem f32 块正好占满
-        let mut f = CpuFace::mock(MockLimits { vram_bytes: 1024, ..Default::default() });
+        let mut f = CpuFace::mock(MockLimits {
+            vram_bytes: 1024,
+            ..Default::default()
+        });
         let a = f.alloc(Dtype::F32, 256, "t").await.expect("恰满");
         assert_eq!(f.vram_used(), 1024);
         let err = f.alloc(Dtype::F32, 1, "t").await.expect_err("越界必拒");
@@ -1177,12 +1250,18 @@ mod tests {
         let _b = f.alloc(Dtype::F32, 256, "t").await.expect("归还后可再分配");
 
         // 声明口径:alloc(F16, n) 只记 2n 字节(不按 mock 的 f32 存储翻倍)
-        let mut w = CpuFace::mock(MockLimits { vram_bytes: 4096, ..Default::default() });
+        let mut w = CpuFace::mock(MockLimits {
+            vram_bytes: 4096,
+            ..Default::default()
+        });
         let _h = w.alloc(Dtype::F16, 1024, "t").await.expect("f16 块");
         assert_eq!(w.vram_used(), 2048, "按声明 dtype 记账(真卡口径)");
 
         // 注入:第 2 次分配失败(一次性)
-        let mut g = CpuFace::mock(MockLimits { fail_alloc_nth: 2, ..Default::default() });
+        let mut g = CpuFace::mock(MockLimits {
+            fail_alloc_nth: 2,
+            ..Default::default()
+        });
         let _x = g.alloc(Dtype::F32, 1, "t").await.expect("第 1 次");
         let err = g.alloc(Dtype::F32, 1, "t").await.expect_err("第 2 次注入");
         assert!(format!("{err}").contains("故障注入"), "{err}");
@@ -1205,7 +1284,11 @@ mod tests {
         let lease: Box<dyn PinnedRegion + Send> = Box::new(HeapRegion(src.clone()));
         f.upload_and_launch(
             &a,
-            vec![UpChunk { offset_bytes: 0, len_bytes: src.len(), lease }],
+            vec![UpChunk {
+                offset_bytes: 0,
+                len_bytes: src.len(),
+                lease,
+            }],
             msg_add(a.id, b.id, out.id, 2),
         )
         .await
@@ -1218,15 +1301,25 @@ mod tests {
     /// 不再报错 —— 输出清零返回(账跑得通、数值不算)。
     #[tokio::test]
     async fn null_kernels_turn_unregistered_ops_into_noops() {
-        let mut f = CpuFace::mock(MockLimits { null_kernels: true, ..Default::default() });
+        let mut f = CpuFace::mock(MockLimits {
+            null_kernels: true,
+            ..Default::default()
+        });
         let a = f.alloc(Dtype::F32, 4, "t").await.expect("a");
         let out = f.alloc(Dtype::F32, 4, "t").await.expect("out");
         f.write_block_f32(&a, 0, &[7.0; 4]).await.expect("写");
         f.write_block_f32(&out, 0, &[9.0; 4]).await.expect("写 out");
         // 未注册核:空转档不报错
         let unsupported = LaunchMsg {
-            kernel: KernelSource { name: "owl_attention_paged_f16".into(), source: String::new() },
-            args: vec![Arg::Block { id: out.id, dtype: Dtype::F32, rank: 1 }],
+            kernel: KernelSource {
+                name: "owl_attention_paged_f16".into(),
+                source: String::new(),
+            },
+            args: vec![Arg::Block {
+                id: out.id,
+                dtype: Dtype::F32,
+                rank: 1,
+            }],
             grid: (1, 1, 1),
             block: (1, 1, 1),
             shared_mem: 0,
@@ -1239,8 +1332,15 @@ mod tests {
         let o2 = g.alloc(Dtype::F32, 4, "t").await.expect("out2");
         let err = g
             .launch(LaunchMsg {
-                kernel: KernelSource { name: "owl_attention_paged_f16".into(), source: String::new() },
-                args: vec![Arg::Block { id: o2.id, dtype: Dtype::F32, rank: 1 }],
+                kernel: KernelSource {
+                    name: "owl_attention_paged_f16".into(),
+                    source: String::new(),
+                },
+                args: vec![Arg::Block {
+                    id: o2.id,
+                    dtype: Dtype::F32,
+                    rank: 1,
+                }],
                 grid: (1, 1, 1),
                 block: (1, 1, 1),
                 shared_mem: 0,
@@ -1283,7 +1383,10 @@ mod bench {
             *d = f32::from_bits((u16::from_le_bytes([c[0], c[1]]) as u32) << 16);
         }
         let el = t.elapsed().as_secs_f64();
-        eprintln!("[bench] {n} 元素 {el:.3}s ⇒ {:.0} MB/s", (n * 2) as f64 / el / 1e6);
+        eprintln!(
+            "[bench] {n} 元素 {el:.3}s ⇒ {:.0} MB/s",
+            (n * 2) as f64 / el / 1e6
+        );
     }
 }
 
@@ -1350,11 +1453,27 @@ mod bench2 {
         let d = t.elapsed().as_secs_f64();
         black_box(&out);
 
-        eprintln!("[cmp] n={n}({:.0}MB→{:.0}MB)", (n * 2) as f64 / 1e6, (n * 4) as f64 / 1e6);
-        eprintln!("[cmp] A chunks_exact+zip+lut : {a:.3}s ({:.1}ns/元素)", a / n as f64 * 1e9);
-        eprintln!("[cmp] B 索引+lut             : {b:.3}s ({:.1}ns/元素)", b / n as f64 * 1e9);
-        eprintln!("[cmp] C 只读 chunks_exact    : {c:.3}s ({:.1}ns/元素)", c / n as f64 * 1e9);
-        eprintln!("[cmp] D 纯写(black_box)      : {d:.3}s ({:.1}ns/元素)", d / n as f64 * 1e9);
+        eprintln!(
+            "[cmp] n={n}({:.0}MB→{:.0}MB)",
+            (n * 2) as f64 / 1e6,
+            (n * 4) as f64 / 1e6
+        );
+        eprintln!(
+            "[cmp] A chunks_exact+zip+lut : {a:.3}s ({:.1}ns/元素)",
+            a / n as f64 * 1e9
+        );
+        eprintln!(
+            "[cmp] B 索引+lut             : {b:.3}s ({:.1}ns/元素)",
+            b / n as f64 * 1e9
+        );
+        eprintln!(
+            "[cmp] C 只读 chunks_exact    : {c:.3}s ({:.1}ns/元素)",
+            c / n as f64 * 1e9
+        );
+        eprintln!(
+            "[cmp] D 纯写(black_box)      : {d:.3}s ({:.1}ns/元素)",
+            d / n as f64 * 1e9
+        );
     }
 }
 
@@ -1396,10 +1515,24 @@ mod bench3 {
         let d = t.elapsed().as_secs_f64();
         black_box(&out);
 
-        eprintln!("[big] n={:.0}M({:.0}MB→{:.0}MB)", n as f64 / 1e6, (n * 2) as f64 / 1e6, (n * 4) as f64 / 1e6);
-        eprintln!("[big] A chunks_exact+zip : {a:.3}s ({:.1}ns/元素)", a / n as f64 * 1e9);
-        eprintln!("[big] B 索引+lut          : {b:.3}s ({:.1}ns/元素)", b / n as f64 * 1e9);
-        eprintln!("[big] D 纯写(black_box)   : {d:.3}s ({:.1}ns/元素)", d / n as f64 * 1e9);
+        eprintln!(
+            "[big] n={:.0}M({:.0}MB→{:.0}MB)",
+            n as f64 / 1e6,
+            (n * 2) as f64 / 1e6,
+            (n * 4) as f64 / 1e6
+        );
+        eprintln!(
+            "[big] A chunks_exact+zip : {a:.3}s ({:.1}ns/元素)",
+            a / n as f64 * 1e9
+        );
+        eprintln!(
+            "[big] B 索引+lut          : {b:.3}s ({:.1}ns/元素)",
+            b / n as f64 * 1e9
+        );
+        eprintln!(
+            "[big] D 纯写(black_box)   : {d:.3}s ({:.1}ns/元素)",
+            d / n as f64 * 1e9
+        );
     }
 }
 

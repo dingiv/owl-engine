@@ -32,7 +32,12 @@ fn dev(name: &str) -> Option<usize> {
 fn dir_of() -> PathBuf {
     std::env::var("OWL_27B_DIR")
         .map(PathBuf::from)
-        .unwrap_or_else(|_| PathBuf::from(concat!(env!("CARGO_MANIFEST_DIR"), "/../../models/cyankiwi/Qwen3.8-27B-AWQ-INT4")))
+        .unwrap_or_else(|_| {
+            PathBuf::from(concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/../../models/cyankiwi/Qwen3.8-27B-AWQ-INT4"
+            ))
+        })
 }
 
 // 结构性豁免(2026-11-02 clippy 清理):用例逐项赋"非缺省"字段:保持与配置面逐行对照的可读性
@@ -45,7 +50,12 @@ fn knobs() -> EngineKnobs {
 }
 
 fn cfg_of(ordinal: usize, chunk: usize) -> EngineConfig {
-    EngineConfig { device_ordinal: ordinal, max_context_length_tokens: 1024, prefill_chunk: chunk, knobs: knobs() }
+    EngineConfig {
+        device_ordinal: ordinal,
+        max_context_length_tokens: 1024,
+        prefill_chunk: chunk,
+        knobs: knobs(),
+    }
 }
 
 /// 跑一个 turn(只取首步 logits;`max_new = 1`)
@@ -61,7 +71,9 @@ async fn first_logits(
     let mut text = String::new();
     loop {
         let ev = running.pump().await?;
-        if matches!(&ev, owl_engine::TurnEvent::Token { turn: t, .. } if *t == turn) && logits.is_none() {
+        if matches!(&ev, owl_engine::TurnEvent::Token { turn: t, .. } if *t == turn)
+            && logits.is_none()
+        {
             logits = running.read_output_f32("logits").await?;
         }
         match ev {
@@ -126,13 +138,23 @@ fn tp_logits_27b() {
 }
 
 async fn body(oa: usize, ob: usize, oc: usize, dir: PathBuf) {
-    let chunk: usize = std::env::var("OWL_TP_CHUNK").ok().and_then(|s| s.parse().ok()).unwrap_or(128);
+    let chunk: usize = std::env::var("OWL_TP_CHUNK")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(128);
     eprintln!("[27b-logits] chunk={chunk};TP1=ordinal {oa};TP2={ob}/{oc}");
 
     // ── ① TP1 参考 ──
     let l1 = {
         let mut e = Engine::new(cfg_of(oa, chunk)).expect("engine(TP1)");
-        let loaded = e.loader().load_qwen38_27b_awq(&dir, &dir, owl_models::module::QuantPlan::F16, owl_models::module::QuantPlan::W4A16Awq)
+        let loaded = e
+            .loader()
+            .load_qwen38_27b_awq(
+                &dir,
+                &dir,
+                owl_models::module::QuantPlan::F16,
+                owl_models::module::QuantPlan::W4A16Awq,
+            )
             .await
             .expect("TP1 装载");
         let mut r = e.run(loaded).await.expect("TP1 装配");
@@ -142,19 +164,41 @@ async fn body(oa: usize, ob: usize, oc: usize, dir: PathBuf) {
         v
     };
     let (mn1, mx1, mean1) = stats(&l1);
-    eprintln!("[27b-logits] TP1:{} 项 logits;min={mn1:.3} max={mx1:.3} mean={mean1:.4}", l1.len());
+    eprintln!(
+        "[27b-logits] TP1:{} 项 logits;min={mn1:.3} max={mx1:.3} mean={mean1:.4}",
+        l1.len()
+    );
     eprintln!("[27b-logits] TP1 top8 = {:?}", topn(&l1, 8));
 
     // ── ② TP2 ──
     let mut e0 = Engine::new(cfg_of(ob, chunk)).expect("engine(r0)");
-    let m0 = e0.loader().slice(0, 2)
-        .load_qwen38_27b_awq(&dir, &dir, owl_models::module::QuantPlan::F16, owl_models::module::QuantPlan::W4A16Awq)
-        .await.expect("rank0 分片装载");
-    let mut e1 = Engine::new_with_ledger(cfg_of(oc, chunk), e0.ledger_cell(), 1).expect("engine(r1)");
-    let m1 = e1.loader().slice(1, 2)
-        .load_qwen38_27b_awq(&dir, &dir, owl_models::module::QuantPlan::F16, owl_models::module::QuantPlan::W4A16Awq)
-        .await.expect("rank1 分片装载");
-    let tp = TpEngine::assemble(vec![e0, e1], vec![m0, m1]).await.expect("TP2 装配");
+    let m0 = e0
+        .loader()
+        .slice(0, 2)
+        .load_qwen38_27b_awq(
+            &dir,
+            &dir,
+            owl_models::module::QuantPlan::F16,
+            owl_models::module::QuantPlan::W4A16Awq,
+        )
+        .await
+        .expect("rank0 分片装载");
+    let mut e1 =
+        Engine::new_with_ledger(cfg_of(oc, chunk), e0.ledger_cell(), 1).expect("engine(r1)");
+    let m1 = e1
+        .loader()
+        .slice(1, 2)
+        .load_qwen38_27b_awq(
+            &dir,
+            &dir,
+            owl_models::module::QuantPlan::F16,
+            owl_models::module::QuantPlan::W4A16Awq,
+        )
+        .await
+        .expect("rank1 分片装载");
+    let tp = TpEngine::assemble(vec![e0, e1], vec![m0, m1])
+        .await
+        .expect("TP2 装配");
     let mut r = tp.run().expect("TP2 进执行态");
     let l2 = first_logits(&mut r, PROMPT).await.expect("TP2 首步");
     let l2r1 = r.read_peer_output_f32("logits").await.ok().flatten();
@@ -176,13 +220,24 @@ async fn body(oa: usize, ob: usize, oc: usize, dir: PathBuf) {
     let _ = r.shutdown_tp().await;
 
     let (mn2, mx2, mean2) = stats(&l2);
-    eprintln!("[27b-logits] TP2:{} 项 logits;min={mn2:.3} max={mx2:.3} mean={mean2:.4}", l2.len());
+    eprintln!(
+        "[27b-logits] TP2:{} 项 logits;min={mn2:.3} max={mx2:.3} mean={mean2:.4}",
+        l2.len()
+    );
     eprintln!("[27b-logits] TP2 top8 = {:?}", topn(&l2, 8));
     if let Some(p) = &l2r1 {
-        let nbit = p.iter().zip(&l2).filter(|(a, b)| a.to_bits() != b.to_bits()).count();
+        let nbit = p
+            .iter()
+            .zip(&l2)
+            .filter(|(a, b)| a.to_bits() != b.to_bits())
+            .count();
         eprintln!("[27b-logits] 两 rank logits:{nbit} 项不同(应 0)");
     }
-    let mx = l1.iter().zip(&l2).map(|(a, b)| (a - b).abs()).fold(0f32, f32::max);
+    let mx = l1
+        .iter()
+        .zip(&l2)
+        .map(|(a, b)| (a - b).abs())
+        .fold(0f32, f32::max);
     eprintln!("[27b-logits] 逐步 max|Δ|(TP1 vs TP2)= {mx:.4}");
     eprintln!(
         "[27b-logits] **量级比** max(TP2)/max(TP1) = {:.3}(≈1 同档;≫1 = 逐层放大)",

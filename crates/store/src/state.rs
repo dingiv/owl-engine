@@ -731,7 +731,7 @@ mod tests {
             SnapRole::History,
         );
         key
-        }
+    }
 
     fn policy(cap: usize) -> SnapAdmitPolicy {
         SnapAdmitPolicy { session_cap: cap }

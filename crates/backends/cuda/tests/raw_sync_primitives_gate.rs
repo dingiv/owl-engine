@@ -22,7 +22,10 @@ use std::path::{Path, PathBuf};
 
 /// 白名单:(相对仓根路径, 理由)。命中白名单外 = 红。
 const ALLOW: &[(&str, &str)] = &[
-    ("crates/backends/cuda/src/ffi.rs", "受控再导出(必须 pub(crate))"),
+    (
+        "crates/backends/cuda/src/ffi.rs",
+        "受控再导出(必须 pub(crate))",
+    ),
     (
         "crates/backends/cuda/src/server/mod.rs",
         "GpuRes 三处:upload(legacy 位)/ upload_block(legacy 位)/ download(已内建排空)",
@@ -50,7 +53,9 @@ fn workspace_root() -> PathBuf {
 }
 
 fn walk(dir: &Path, out: &mut Vec<PathBuf>) {
-    let Ok(rd) = std::fs::read_dir(dir) else { return };
+    let Ok(rd) = std::fs::read_dir(dir) else {
+        return;
+    };
     for e in rd.flatten() {
         let p = e.path();
         let name = e.file_name().to_string_lossy().to_string();
@@ -88,8 +93,14 @@ fn null_stream_sync_primitives_are_fenced() {
     // 1) 逐行扫代码面(token 命中)
     let mut hits: Vec<(String, String, usize)> = Vec::new();
     for f in &files {
-        let rel = f.strip_prefix(&root).unwrap_or(f).to_string_lossy().to_string();
-        let Ok(txt) = std::fs::read_to_string(f) else { continue };
+        let rel = f
+            .strip_prefix(&root)
+            .unwrap_or(f)
+            .to_string_lossy()
+            .to_string();
+        let Ok(txt) = std::fs::read_to_string(f) else {
+            continue;
+        };
         for (ln, raw) in txt.lines().enumerate() {
             let code = code_of(raw);
             if let Some(t) = TOKENS.iter().find(|t| code.contains(**t)) {

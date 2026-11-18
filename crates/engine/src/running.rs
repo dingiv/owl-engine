@@ -637,7 +637,11 @@ impl<D: DeviceClient> RunningEngine<D> {
     /// **会话 token 账**(诊断/门面:prompt + 已生成,逐 token;S4 ⑤-K3 的 G8
     /// 判据面 —— 与 `gpu_spec_identity_gate` 同一条 token 级硬判)。`None` = 无此会话。
     pub fn session_token_ids(&self, sid: u64) -> Option<Vec<u32>> {
-        self.bank.parts().sessions.get(sid).map(|s| s.tokens.clone())
+        self.bank
+            .parts()
+            .sessions
+            .get(sid)
+            .map(|s| s.tokens.clone())
     }
 
     /// **tokenize 出口**(G5③:服务面 `POST /tokenize`):纯 CPU,不落 turn、
@@ -955,11 +959,7 @@ impl<D: DeviceClient> RunningEngine<D> {
                                 &new_tags,
                             )
                         } else {
-                            crate::img_evict::detect_text_delete(
-                                &old_text,
-                                &input,
-                                &s.img_spans,
-                            )
+                            crate::img_evict::detect_text_delete(&old_text, &input, &s.img_spans)
                         };
                         // 单段没命中且旧图全部被换掉时，再试“多段全删”：
                         // 旧图可能分散在多个 tool result，新图追加在尾部。
@@ -1142,9 +1142,8 @@ impl<D: DeviceClient> RunningEngine<D> {
                                 );
                             } else {
                                 input = rebuilt;
-                                deletion = Some(crate::img_evict::DeletionPlan {
-                                    ranges: vec![hit],
-                                });
+                                deletion =
+                                    Some(crate::img_evict::DeletionPlan { ranges: vec![hit] });
                             }
                         } else if let Some(plan) = multi {
                             let marked = s.img_spans.iter().filter(|x| x.evict).count();
@@ -1202,9 +1201,7 @@ impl<D: DeviceClient> RunningEngine<D> {
                                     .count();
                                 if common > 0 {
                                     let cut = crate::img_evict::padded_prefix_for_raw(
-                                        &survivors,
-                                        &surv_pads,
-                                        common,
+                                        &survivors, &surv_pads, common,
                                     )
                                     .map_err(ModelError::Msg)?;
                                     let mut merged = survivors[..cut].to_vec();
@@ -1306,20 +1303,12 @@ impl<D: DeviceClient> RunningEngine<D> {
             // 位置签名必须同源：非紧凑链（leave-gap）的 K 只在同一 position
             // 基下有效，必须折进块身份，否则跨会话会按 token 撞链。
             let total = act.prompt_ids.len() + act.out.len();
-            return crate::img_evict::block_tags_pos(
-                total,
-                page,
-                &act.img_spans,
-                &act.positions,
-            );
+            return crate::img_evict::block_tags_pos(total, page, &act.img_spans, &act.positions);
         }
         match self.bank.parts().sessions.get(sid) {
-            Some(s) => crate::img_evict::block_tags_pos(
-                s.tokens.len(),
-                page,
-                &s.img_spans,
-                &s.positions,
-            ),
+            Some(s) => {
+                crate::img_evict::block_tags_pos(s.tokens.len(), page, &s.img_spans, &s.positions)
+            }
             None => Vec::new(),
         }
     }
@@ -1343,9 +1332,8 @@ impl<D: DeviceClient> RunningEngine<D> {
         let mut positions = act.positions.clone();
         if positions.len() < total {
             let base = act.next_rope_pos;
-            positions.extend((0..total - positions.len()).map(|i| {
-                [base.saturating_add(i as i32); 3]
-            }));
+            positions
+                .extend((0..total - positions.len()).map(|i| [base.saturating_add(i as i32); 3]));
         }
         crate::img_evict::block_tags_pos(total, page, &act.img_spans, &positions)
     }
@@ -1454,7 +1442,9 @@ impl<D: DeviceClient> RunningEngine<D> {
         let (prompt_ids, img_spans, img_pads, deletion) =
             self.image_pad_law(session, raw_ids, &opts.images)?;
         if prompt_ids.is_empty() {
-            return Err(SubmitError::Engine(ModelError::Msg("submit: 空 prompt".into())));
+            return Err(SubmitError::Engine(ModelError::Msg(
+                "submit: 空 prompt".into(),
+            )));
         }
         let (positions, positions_gap) =
             self.prompt_positions(session, &prompt_ids, &img_spans, deletion.as_ref())?;
@@ -1513,7 +1503,10 @@ impl<D: DeviceClient> RunningEngine<D> {
         // 历史守卫只做**诊断/旧键降级**：历史长度唯一真源 = tokens.len()；
         // 真正可复用面由 store 内容树回答，不能把历史长度当设备驻留长度。
         if let Some((id, false)) = session.and_then(|id| {
-            self.bank.parts().sessions.get(id)
+            self.bank
+                .parts()
+                .sessions
+                .get(id)
                 .map(|s| (id, s.guard(&prompt_ids)))
         }) {
             // **守卫失配取证**(`[probes] debug`;§4.3):报首个分叉的**位置 +
@@ -1574,16 +1567,18 @@ impl<D: DeviceClient> RunningEngine<D> {
             && !positions_gap
             && session_prefix > 0
         {
-            let tags = crate::img_evict::block_tags_pos(
-                prompt_ids.len(),
-                page,
-                &img_spans,
-                &positions,
-            );
+            let tags =
+                crate::img_evict::block_tags_pos(prompt_ids.len(), page, &img_spans, &positions);
             let (hit, recall) = self
-                .bank.parts_mut().rel.match_prefix_tagged(&prompt_ids, &tags)?;
+                .bank
+                .parts_mut()
+                .rel
+                .match_prefix_tagged(&prompt_ids, &tags)?;
             let (m, _dev) = self
-                .bank.parts().rel.reuse_face(&hit, &recall, prompt_ids.len(), page);
+                .bank
+                .parts()
+                .rel
+                .reuse_face(&hit, &recall, prompt_ids.len(), page);
             m.saturating_mul(page)
                 .min(session_prefix)
                 .min(prompt_ids.len())
@@ -1611,7 +1606,11 @@ impl<D: DeviceClient> RunningEngine<D> {
                 } else {
                     let prefix_tags = session
                         .and_then(|id| self.bank.parts().sessions.get(id))
-                        .filter(|s| a <= s.tokens.len() && a <= prompt_ids.len() && s.tokens[..a] == prompt_ids[..a])
+                        .filter(|s| {
+                            a <= s.tokens.len()
+                                && a <= prompt_ids.len()
+                                && s.tokens[..a] == prompt_ids[..a]
+                        })
                         .map(|s| {
                             (
                                 s.tokens[..a].to_vec(),
@@ -1625,8 +1624,11 @@ impl<D: DeviceClient> RunningEngine<D> {
                         });
                     match prefix_tags {
                         Some((prefix, tags)) => {
-                            let (hit, _) =
-                                self.bank.parts_mut().rel.match_prefix_tagged(&prefix, &tags)?;
+                            let (hit, _) = self
+                                .bank
+                                .parts_mut()
+                                .rel
+                                .match_prefix_tagged(&prefix, &tags)?;
                             let resident = hit
                                 .slots
                                 .iter()
@@ -1723,11 +1725,7 @@ impl<D: DeviceClient> RunningEngine<D> {
             && self.dev.pool.geom.paged
             && self.dev.pool.snap_capacity() > 0;
         let mut candidates = if snap_on {
-            crate::msg_boundary::message_snap_points(
-                &prompt_ids,
-                &self.boot.msg_open_ids,
-                page,
-            )
+            crate::msg_boundary::message_snap_points(&prompt_ids, &self.boot.msg_open_ids, page)
         } else {
             Vec::new()
         };
@@ -1814,7 +1812,9 @@ impl<D: DeviceClient> RunningEngine<D> {
         let mut reclassified = 0usize;
         let mut reclass_miss = 0usize;
         for i in 0..msg_snap_keys.len() {
-            let Some(key) = msg_snap_keys[i] else { continue };
+            let Some(key) = msg_snap_keys[i] else {
+                continue;
+            };
             let role = msg_snap_roles[i];
             if self.bank.parts_mut().rel.reclassify_snap(key, role) {
                 reclassified += 1;
@@ -2067,6 +2067,11 @@ impl<D: DeviceClient> RunningEngine<D> {
         self.turns.ttft_expired(now_ms)
     }
 
+    /// **标记 TTFT WARN 已发出**（`warn` 档去重；纯账）。
+    pub(crate) fn mark_ttft_warned(&mut self, turn: u64) -> bool {
+        self.turns.mark_ttft_warned(turn)
+    }
+
     /// 提交时**前缀命中量**(usage `cached_tokens` 真源;AGT-12):
     /// 会话守卫命中 ⇒ = 会话已缓存 token 数;未命中/无会话 ⇒ 0。
     /// **真值**:`prompt_tokens - cached_tokens` = 本 turn 实际 prefill 量。
@@ -2245,6 +2250,40 @@ impl<D: DeviceClient> RunningEngine<D> {
                     // 用状态腿的同一张票（snap_bytes = 一条快照），
                     // host 满时会出 Disk 票，盘层因此可达。
                     let snap_bytes = self.bank.parts().rel.snap_file_bytes();
+                    // **TTFT 硬门保护（2026-11-18 现场）**：prefill 且首 token
+                    // 预算很紧时，宿主快照下沉可能在新分配/首次触碰宿主大块上
+                    // 偶发数秒停顿（实测 `prefill.bnd` 5.8s / `srv.swap.out.put`
+                    // 5.8s ⇒ turn 76 首 token 超时）。此时直接丢**设备上的**最冷
+                    // 快照：它还没进宿主，宿主里的旧复用面不受影响；当前新快照
+                    // 照常拿槽。decode/宽松 prefill 仍走正常 host/disk 票。
+                    let tight_prefill = self
+                        .turns
+                        .active()
+                        .map(|a| {
+                            a.first_token_ms.is_none()
+                                && a.ttft_budget_ms
+                                    <= crate::ttft_gate::PREFILL_SNAP_OFFLOAD_GUARD_MS
+                        })
+                        .unwrap_or(false);
+                    if tight_prefill && !self.bank.parts().rel.snap_disk_enabled() {
+                        owl_shared::metrics::with_metrics_store(|m| {
+                            m.counter_add("store.snap.prefill_drop", 1, file!(), line!());
+                        });
+                        owl_shared::log_warn!(
+                            "store",
+                            "TTFT 保护:prefill 首 token 预算 ≤{}ms,快照槽满 ⇒ 直接丢设备最冷 {victim:?}(不落宿主;当前 capture 继续)",
+                            crate::ttft_gate::PREFILL_SNAP_OFFLOAD_GUARD_MS
+                        );
+                        self.bank.parts_mut().rel.drop_snap_host(victim)?;
+                        if let Err(e) = self.bank.parts_mut().rel.drop_snap_account(victim) {
+                            owl_shared::log_debug!("store", "快照 {victim:?} 出账: {e}");
+                        }
+                        self.dev.pool.snap_clear_slot(slot);
+                        if let Some(pr) = self.peer.as_mut() {
+                            pr.pool.snap_clear_slot(slot);
+                        }
+                        return Ok(slot);
+                    }
                     if snap_bytes > 0 {
                         let applied = self
                             .pool_housekeeping(
@@ -2333,11 +2372,24 @@ impl<D: DeviceClient> RunningEngine<D> {
         // - Load = 回灌块占用的设备槽；consume 标记已兑现；
         // - Temp = 本次回灌的周转额度；turn 收尾统一归还。
         // 两者都不进 ActiveFloor 的 KV 准入面（`Rel::reserved_slots` 按 kind 过滤）。
-        let load_grant = self.bank.parts_mut().rel.reserve_load(req.turn, need_slots)?;
-        self.bank.parts_mut().rel.consume_capacity(load_grant.id, need_slots, load_bytes)?;
+        let load_grant = self
+            .bank
+            .parts_mut()
+            .rel
+            .reserve_load(req.turn, need_slots)?;
+        self.bank
+            .parts_mut()
+            .rel
+            .consume_capacity(load_grant.id, need_slots, load_bytes)?;
         let temp_grant = self
-            .bank.parts_mut().rel.reserve_temp(req.turn, need_slots, load_bytes)?;
-        self.bank.parts_mut().rel.consume_capacity(temp_grant.id, need_slots, load_bytes)?;
+            .bank
+            .parts_mut()
+            .rel
+            .reserve_temp(req.turn, need_slots, load_bytes)?;
+        self.bank
+            .parts_mut()
+            .rel
+            .consume_capacity(temp_grant.id, need_slots, load_bytes)?;
         let mut applied = owl_store::Applied::default();
         // 设备槽先腾够：`Need.slots` 是需求，`plan_capacity` 会按当前 free 折算缺口。
         if self.bank.parts().rel.slots_free() < need_slots {
@@ -2365,7 +2417,11 @@ impl<D: DeviceClient> RunningEngine<D> {
                 return Err(e);
             }
         };
-        let slots = self.bank.parts_mut().rel.commit_onload(&cs, &new_slots, table)?;
+        let slots = self
+            .bank
+            .parts_mut()
+            .rel
+            .commit_onload(&cs, &new_slots, table)?;
         let d_swap = t_swap.elapsed();
         let loaded_blocks = cs.len();
         let moved_bytes = loaded_blocks * self.dev.pool.block_bytes();
@@ -2391,7 +2447,10 @@ impl<D: DeviceClient> RunningEngine<D> {
             );
         }
         let s = self
-            .bank.parts_mut().sessions.get_mut(req.session)
+            .bank
+            .parts_mut()
+            .sessions
+            .get_mut(req.session)
             .ok_or_else(|| ModelError::Msg(format!("回灌:会话 {} 不在账", req.session)))?;
         for ((idx, _), slot) in req.blocks.iter().zip(&slots) {
             if *idx >= s.block_table.len() {
@@ -2425,12 +2484,7 @@ impl<D: DeviceClient> RunningEngine<D> {
     ///
     /// 位置账与 token 账必须等长；不齐 = 结构错，拒绝发布（宁可下轮重算，
     /// 不许把无位置签名/错位置的链写进共享树）。
-    fn publish_turn_chain(
-        &mut self,
-        session: u64,
-        turn: u64,
-        kind: ReleaseKind,
-    ) -> Result<()> {
+    fn publish_turn_chain(&mut self, session: u64, turn: u64, kind: ReleaseKind) -> Result<()> {
         let bank = self.bank.parts_mut();
         let Some(s) = bank.sessions.get(session) else {
             return Ok(());
@@ -2452,12 +2506,9 @@ impl<D: DeviceClient> RunningEngine<D> {
             &s.img_spans,
             &s.positions,
         );
-        let up = bank.rel.register_chain_owned_tagged(
-            &s.tokens,
-            &s.block_table,
-            session,
-            &tags,
-        )?;
+        let up = bank
+            .rel
+            .register_chain_owned_tagged(&s.tokens, &s.block_table, session, &tags)?;
         if self.boot.cfg.knobs.probes.debug {
             owl_shared::log_debug!(
                 "dbg prefix",
@@ -2498,12 +2549,18 @@ impl<D: DeviceClient> RunningEngine<D> {
             // 会话账此刻仍在（turn 终局不再抹账）。
             if self.dev.pool.geom.paged && self.bank.parts().rel.disk_enabled() {
                 let toks = self
-                    .bank.parts().sessions.get(release.session)
+                    .bank
+                    .parts()
+                    .sessions
+                    .get(release.session)
                     .map(|s| s.tokens.clone())
                     .unwrap_or_default();
                 if !toks.is_empty() {
                     let tags = self
-                        .bank.parts().sessions.get(release.session)
+                        .bank
+                        .parts()
+                        .sessions
+                        .get(release.session)
                         .map(|s| {
                             crate::img_evict::block_tags_pos(
                                 s.tokens.len(),
@@ -2523,7 +2580,10 @@ impl<D: DeviceClient> RunningEngine<D> {
                 // 挂在收口上直接变成 agent 的尾延迟;而空转拍没有人在等回包。
                 // 会话 tokens 在空转拍仍可取(会话未出表),不影响链取址。
                 let tags = self
-                    .bank.parts().sessions.get(release.session)
+                    .bank
+                    .parts()
+                    .sessions
+                    .get(release.session)
                     .map(|s| {
                         crate::img_evict::block_tags_pos(
                             s.tokens.len(),
@@ -2562,7 +2622,12 @@ impl<D: DeviceClient> RunningEngine<D> {
         }
 
         // ── GDN 行归还（行 = turn 域资源；失败只 WARN） --------------------
-        if let Err(e) = self.bank.parts_mut().rel.return_state_row(release.gdn_slot, None) {
+        if let Err(e) = self
+            .bank
+            .parts_mut()
+            .rel
+            .return_state_row(release.gdn_slot, None)
+        {
             owl_shared::log_warn!("session", "turn {} 还 GDN 行失败: {e}", release.turn);
         }
 
@@ -2640,9 +2705,10 @@ impl<D: DeviceClient> RunningEngine<D> {
                 host_snap_slots: 0,
                 why: owl_store::NeedWhy::Pressure,
             },
-            Maintain::HostPressure { kv_slots, snap_slots } => {
-                owl_store::Need::host(kv_slots, snap_slots)
-            }
+            Maintain::HostPressure {
+                kv_slots,
+                snap_slots,
+            } => owl_store::Need::host(kv_slots, snap_slots),
         };
         let applied = self.pool_housekeeping(need, &[]).await?;
         Ok(StoreOutcome {
@@ -2790,7 +2856,10 @@ impl<D: DeviceClient> RunningEngine<D> {
             }
             evicted += 1;
         }
-        (evicted, self.bank.parts().rel.slots_free().saturating_sub(free0))
+        (
+            evicted,
+            self.bank.parts().rel.slots_free().saturating_sub(free0),
+        )
     }
 
     /// 会话当前链尾的内容身份（压力淘汰用；`None` = 不足一整块/不在树上）。
@@ -2801,13 +2870,12 @@ impl<D: DeviceClient> RunningEngine<D> {
         if full == 0 {
             return None;
         }
-        let tags = crate::img_evict::block_tags_pos(
-            s.tokens.len(),
-            page,
-            &s.img_spans,
-            &s.positions,
-        );
-        self.bank.parts().rel.tail_hash_tagged(&s.tokens, full, &tags)
+        let tags =
+            crate::img_evict::block_tags_pos(s.tokens.len(), page, &s.img_spans, &s.positions);
+        self.bank
+            .parts()
+            .rel
+            .tail_hash_tagged(&s.tokens, full, &tags)
     }
 
     /// **压力信号快照**（P1-3；纯 host 账，零 I/O）。
@@ -2820,7 +2888,8 @@ impl<D: DeviceClient> RunningEngine<D> {
         PressureSignals {
             pool_free_pages: rel.slots_free(),
             pool_total_pages: rel.slots_total(),
-            host_free_slots: rel.host_free_slots() + self.bank.parts().rel.snap_host_free_slots(),
+            // 共享池：两腿看同一本余量，不能把 KV 槽与快照条相加（会双算）。
+            host_free_slots: rel.host_free_slots(),
             host_kv_enabled: rel.host_enabled(),
             host_snap_enabled: self.bank.parts().rel.snap_host_budget() > 0,
             host_kv_total_slots: rel.host_total_slots(),
@@ -2928,9 +2997,7 @@ impl<D: DeviceClient> RunningEngine<D> {
 
     /// **逐 rank 设备显存实况**(只读;`/debug/vram` 的驱动残差/闭合账):
     /// `(free, total)`。TP2 必须逐卡取 —— 只读 rank0 会把另一张卡算漏。
-    pub async fn mem_info_all(
-        &mut self,
-    ) -> Vec<(u8, std::result::Result<(u64, u64), String>)> {
+    pub async fn mem_info_all(&mut self) -> Vec<(u8, std::result::Result<(u64, u64), String>)> {
         let mut out: Vec<(u8, std::result::Result<(u64, u64), String>)> = Vec::new();
         let r = self
             .dev
@@ -3098,11 +3165,22 @@ impl<D: DeviceClient> RunningEngine<D> {
                         &t.img_spans,
                         &t.positions,
                     );
-                    let (hit, recall) = self.bank.parts_mut().rel.match_prefix_tagged(&t.prompt_ids, &tags)?;
-                    self.bank.parts().rel.reuse_face(&hit, &recall, plen, page).1
+                    let (hit, recall) = self
+                        .bank
+                        .parts_mut()
+                        .rel
+                        .match_prefix_tagged(&t.prompt_ids, &tags)?;
+                    self.bank
+                        .parts()
+                        .rel
+                        .reuse_face(&hit, &recall, plen, page)
+                        .1
                 };
                 let have = self
-                    .bank.parts().sessions.get(sid)
+                    .bank
+                    .parts()
+                    .sessions
+                    .get(sid)
                     .map(|s| s.block_table.len())
                     .unwrap_or(0);
                 // `dev`（复用面里在设备的块）与 `have`（会话当前表）可能指向
@@ -3125,10 +3203,7 @@ impl<D: DeviceClient> RunningEngine<D> {
                 act.prompt_ids.len(),
                 self.boot.cfg.prefill_chunk,
                 crate::engine::PREFILL_TAIL_MERGE,
-                Self::prefill_align_page(
-                    self.boot.cfg.knobs.prefix_cache,
-                    self.dev.pool.geom.page,
-                ),
+                Self::prefill_align_page(self.boot.cfg.knobs.prefix_cache, self.dev.pool.geom.page),
                 &act.msg_snaps,
                 &act.evict_snaps,
                 crate::engine::SNAP_MSG_MIN_SPAN,
@@ -3137,7 +3212,10 @@ impl<D: DeviceClient> RunningEngine<D> {
                 None => self.generation_target(act.fed), // 生成相位(act.fed = pos)
             };
             let have = self
-                .bank.parts().sessions.get(act.session_id)
+                .bank
+                .parts()
+                .sessions
+                .get(act.session_id)
                 .map(|s| s.block_table.len())
                 .unwrap_or(0);
             need += slots_for(target).saturating_sub(have);
@@ -3392,11 +3470,7 @@ impl<D: DeviceClient> RunningEngine<D> {
         // 会话账/块表/准入账同屋（2026-11-15 下沉）：engine 只给活跃 turn
         // 的 `(turn, session)` 事实，slots/持有面/可动面全由 store 从自己的
         // 会话账与块腿报告推导。
-        let active: Vec<(u64, u64)> = self
-            .turns
-            .actives()
-            .map(|a| (a.id, a.session_id))
-            .collect();
+        let active: Vec<(u64, u64)> = self.turns.actives().map(|a| (a.id, a.session_id)).collect();
         self.bank.sync_pool_account(&active)?;
         Ok(())
     }
@@ -3488,12 +3562,7 @@ impl<D: DeviceClient> RunningEngine<D> {
                 "per-turn 地板 {req_pages} 页 > 本档工作集 {ws_pages} 页(视图只能保这么多常驻)\
                  —— 调大 [kvmem].workspace_per_req 或调小请求地板"
             );
-            self.reject_queued_turn(
-                turn_id,
-                "no_memory",
-                format!("准入拒绝：{reason}"),
-                None,
-            )?;
+            self.reject_queued_turn(turn_id, "no_memory", format!("准入拒绝：{reason}"), None)?;
             return Ok(());
         }
         match self.bank.parts().rel.check(floor, new_ctx_tokens) {
@@ -3556,12 +3625,7 @@ impl<D: DeviceClient> RunningEngine<D> {
                 }
             }
             AdmissionVerdict::Reject { reason } => {
-                self.reject_queued_turn(
-                    turn_id,
-                    "no_memory",
-                    format!("准入拒绝：{reason}"),
-                    None,
-                )?;
+                self.reject_queued_turn(turn_id, "no_memory", format!("准入拒绝：{reason}"), None)?;
             }
         }
         Ok(())
@@ -3722,7 +3786,7 @@ impl<D: DeviceClient> RunningEngine<D> {
         // 旧实现只落**链尾那一张** ⇒ `reuse_face` 从命中面尾部往回找快照时,
         // 只有尾边界可用/或者干脆没有(实测 `m_raw=1398/3072`,尾快照层=None);
         // 复用面被削到 1/3。这里按"已写进盘的块前缀"逐个边界落盘,
-        // 盘不够就停(配额由 snap_disk 管,谁先到顶谁截断)。
+        // 盘不够就停(配额由共享磁盘总池管,谁先到顶谁截断)。
         // 部分写失败时只能保证 `already + 实际写成功` 的前缀；完整成功才
         // 用 store 计划的全链（含之前已在盘上的前缀）。
         let planned = plan.dev.len() + plan.host.len();
@@ -3769,8 +3833,18 @@ impl<D: DeviceClient> RunningEngine<D> {
                 t0.elapsed()
             );
             owl_shared::metrics::with_metrics_store(|m| {
-                m.counter_add("store.disk.checkpoint.blocks", st.blocks() as u64, file!(), line!());
-                m.counter_add("store.disk.checkpoint.bytes", st.bytes as u64, file!(), line!());
+                m.counter_add(
+                    "store.disk.checkpoint.blocks",
+                    st.blocks() as u64,
+                    file!(),
+                    line!(),
+                );
+                m.counter_add(
+                    "store.disk.checkpoint.bytes",
+                    st.bytes as u64,
+                    file!(),
+                    line!(),
+                );
                 if st.snap_disk {
                     m.counter_add("store.disk.checkpoint.snap", 1, file!(), line!());
                 }
@@ -3956,11 +4030,20 @@ impl<D: DeviceClient> RunningEngine<D> {
             return Ok(());
         }
         let st = self.bank.parts().rel.leg_stats();
-        let bytes = st.slots_total.saturating_mul(st.block_bytes).min(4usize << 30);
+        let bytes = st
+            .slots_total
+            .saturating_mul(st.block_bytes)
+            .min(4usize << 30);
         if bytes == 0 {
             return Ok(());
         }
-        let (made, have) = self.dev.graphs.session.face_mut().prewarm_pinned(bytes).await?;
+        let (made, have) = self
+            .dev
+            .graphs
+            .session
+            .face_mut()
+            .prewarm_pinned(bytes)
+            .await?;
         owl_shared::log_warn!(
             "store",
             "pinned staging 预热:目标 {} MiB → 新建 {made} 桶 / 已有 {have} 桶",
@@ -3978,7 +4061,9 @@ impl<D: DeviceClient> RunningEngine<D> {
     /// 失败 = 整条失败(与同步路径同语义):`abort_offload` 回滚块票 + 会话表
     /// 恢复成原槽 —— **不许留下"表说在宿主、实际在设备"的半态**。
     pub(crate) async fn drain_pending_out(&mut self) -> Result<()> {
-        let Some(p) = self.pending_out.take() else { return Ok(()) };
+        let Some(p) = self.pending_out.take() else {
+            return Ok(());
+        };
         // 在飞时长(诊断面):它应该 ≈ 一个 chunk 的计算时间(完全被盖住),
         // 而不是被白白串行掉。
         let inflight_ms = p.since.elapsed().as_secs_f64() * 1000.0;
@@ -4067,7 +4152,10 @@ impl<D: DeviceClient> RunningEngine<D> {
                         // 这不是错，但说明计划面没预见到(盘写失败/账漂);
                         // 如实上账，别让"计划曾经乐观"隐身。
                         let relief = self
-                            .bank.parts().rel.host_relief_blocks()
+                            .bank
+                            .parts()
+                            .rel
+                            .host_relief_blocks()
                             .saturating_sub(relief0);
                         if relief > 0 {
                             owl_shared::metrics::with_metrics_store(|m| {
@@ -4088,12 +4176,16 @@ impl<D: DeviceClient> RunningEngine<D> {
                                 return Err(e);
                             }
                         };
-                        a.offloaded +=
-                            self.bank.parts_mut().rel.commit_offload(&blocks, table)?;
+                        a.offloaded += self.bank.parts_mut().rel.commit_offload(&blocks, table)?;
                     }
                     // **整枝塌缩**:一张票可带 `span` 块(叶→根,到分叉点为止);
                     // 逐块校验引用(活跃面停),丢掉的块数如实记账。
-                    Sink::Drop => match self.bank.parts_mut().rel.prune_branch(*chain, (*span).max(1)) {
+                    Sink::Drop => match self
+                        .bank
+                        .parts_mut()
+                        .rel
+                        .prune_branch(*chain, (*span).max(1))
+                    {
                         Ok(n) => a.dropped += n,
                         Err(owl_store::StoreError::Busy(_)) => a.skipped_busy += 1,
                         Err(e) => return Err(e.into()),
@@ -4168,7 +4260,12 @@ impl<D: DeviceClient> RunningEngine<D> {
         let mut moved_bytes = 0usize;
         for chain in &verdict.in_ {
             let (cs, slots, pieces, table) = {
-                match self.bank.parts_mut().rel.plan_onload(std::slice::from_ref(chain)) {
+                match self
+                    .bank
+                    .parts_mut()
+                    .rel
+                    .plan_onload(std::slice::from_ref(chain))
+                {
                     Ok(p) => (p.chains, p.slots, p.pieces, p.table),
                     Err(e) => return Err(e.into()),
                 }
@@ -4183,7 +4280,11 @@ impl<D: DeviceClient> RunningEngine<D> {
                     return Err(e);
                 }
             };
-            let _ = self.bank.parts_mut().rel.commit_onload(&cs, &slots, table)?;
+            let _ = self
+                .bank
+                .parts_mut()
+                .rel
+                .commit_onload(&cs, &slots, table)?;
             moved_blocks += cs.len();
             moved_bytes += cs.len() * self.dev.pool.block_bytes();
             a.onloaded += 1;
@@ -4430,7 +4531,10 @@ impl<D: DeviceClient> RunningEngine<D> {
                 // 不许把空转打断(下一拍还有机会,内部 `CheckpointPolicy.min_gap` 另管节拍)。
                 if let Some((sid, toks, tags)) = self.hk.take_kv_checkpoint() {
                     if let Err(e) = self.maybe_checkpoint_kv(sid, &toks, &tags).await {
-                        owl_shared::log_warn!("store", "空转 checkpoint 失败(session={sid:#x}): {e}");
+                        owl_shared::log_warn!(
+                            "store",
+                            "空转 checkpoint 失败(session={sid:#x}): {e}"
+                        );
                     }
                 }
                 // 准入拒(S3b §23.4)等 host 侧即时终态:先回吐再报 Idle ——
@@ -4647,8 +4751,14 @@ mod budget_tests {
     fn consolidates_only_when_positions_would_overflow() {
         use super::needs_consolidation;
         // 262144 ctx + 0.5 预留 = 393216；leading gap 用到 393200 时：
-        assert!(needs_consolidation(393_200, 16, 393_216), "末位 393216 越界");
-        assert!(!needs_consolidation(393_200, 15, 393_216), "末位 393215 安全");
+        assert!(
+            needs_consolidation(393_200, 16, 393_216),
+            "末位 393216 越界"
+        );
+        assert!(
+            !needs_consolidation(393_200, 15, 393_216),
+            "末位 393215 安全"
+        );
         // 边界：末位 = pos_cap-1 安全；= pos_cap 触发
         assert!(!needs_consolidation(98, 1, 100), "末位 99 安全");
         assert!(needs_consolidation(99, 1, 100), "末位 100 越界");
@@ -4732,9 +4842,7 @@ mod generation_target_tests {
     #[test]
     fn alloc_face_covers_spec_round_overflow() {
         let (prompt, max_new, d, page) = (111_340usize, 16usize, 7usize, 32usize);
-        let naive = prompt
-            .saturating_add(max_new)
-            .div_ceil(page);
+        let naive = prompt.saturating_add(max_new).div_ceil(page);
         let alloc = chain_alloc_tokens(prompt, max_new, d, GenerationKind::DFlash2).div_ceil(page);
         assert_eq!(naive, 3480, "旧式（少一页）");
         assert_eq!(alloc, 3481, "上界必须含 verify+propose 滑越");
@@ -4749,4 +4857,3 @@ mod generation_target_tests {
         }
     }
 }
-

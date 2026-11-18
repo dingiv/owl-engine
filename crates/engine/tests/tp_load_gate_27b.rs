@@ -52,13 +52,18 @@ use owl_models::plan::tp::TpPlan;
 fn dir_of() -> PathBuf {
     std::env::var("OWL_27B_DIR")
         .map(PathBuf::from)
-        .unwrap_or_else(|_| PathBuf::from(concat!(env!("CARGO_MANIFEST_DIR"), "/../../models/cyankiwi/Qwen3.8-27B-AWQ-INT4")))
+        .unwrap_or_else(|_| {
+            PathBuf::from(concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/../../models/cyankiwi/Qwen3.8-27B-AWQ-INT4"
+            ))
+        })
 }
 
 /// 四层 spec(真检查点 + 真维度,只截层表;前 4 层 = 3×GDN + 1×full)
 fn two_layer_spec(dir: &Path) -> (ModelSpec, String) {
-    let (spec, rep) = ModelSpec::from_ckpt(dir, SpecSource::family(&qwen3_8_27b()))
-        .expect("27B spec 解析");
+    let (spec, rep) =
+        ModelSpec::from_ckpt(dir, SpecSource::family(&qwen3_8_27b())).expect("27B spec 解析");
     let base = rep.keys_base.trim_end_matches('.').to_string();
     let mut spec = spec;
     // 前 4 层(3×GDN + 1×full)⇒ 两类层都被覆盖;键名仍是真索引
@@ -82,12 +87,8 @@ async fn load_once(
     } else {
         spec
     };
-    let model = Model::new(
-        &spec,
-        Qwen35Convention::new(&base),
-        quant,
-        QuantPlan::F16,
-    ).expect("Model::new");
+    let model =
+        Model::new(&spec, Qwen35Convention::new(&base), quant, QuantPlan::F16).expect("Model::new");
     let opts = LoadOpts {
         dtype: spec.dtype,
         shard: n,
@@ -182,22 +183,42 @@ async fn body(dir: &Path) {
     )
     .expect("GpuClient(设备被占?)");
     eprintln!("[tp-load-27b] 设备 ordinal {ordinal}");
-    let repack = std::env::var("OWL_TP_LOAD_REPACK").map(|v| v != "0").unwrap_or(true);
+    let repack = std::env::var("OWL_TP_LOAD_REPACK")
+        .map(|v| v != "0")
+        .unwrap_or(true);
     eprintln!("[tp-load-27b] device_repack = {repack}");
     let t0 = std::time::Instant::now();
-    let full = load_once(dir, &mut face, (0, 1), quant, repack).await.expect("全量装载");
-    eprintln!("[tp-load-27b] 全量 {} 键 / {:.1}s", full.0.len(), t0.elapsed().as_secs_f64());
+    let full = load_once(dir, &mut face, (0, 1), quant, repack)
+        .await
+        .expect("全量装载");
+    eprintln!(
+        "[tp-load-27b] 全量 {} 键 / {:.1}s",
+        full.0.len(),
+        t0.elapsed().as_secs_f64()
+    );
     if std::env::var("OWL_TP_DUMP").is_ok() {
         for e in full.entries() {
-            eprintln!("  DUMP {:<70} {:?} {:?} rule={:?}", e.key, e.shape, e.dtype, rule_of(&e.key));
+            eprintln!(
+                "  DUMP {:<70} {:?} {:?} rule={:?}",
+                e.key,
+                e.shape,
+                e.dtype,
+                rule_of(&e.key)
+            );
         }
     }
 
     let mut shards: Vec<LoadManifest> = Vec::new();
     for id in 0..2usize {
         let t = std::time::Instant::now();
-        let m = load_once(dir, &mut face, (id, 2), quant, repack).await.expect("分片装载");
-        eprintln!("[tp-load-27b] slice{id} {} 键 / {:.1}s", m.0.len(), t.elapsed().as_secs_f64());
+        let m = load_once(dir, &mut face, (id, 2), quant, repack)
+            .await
+            .expect("分片装载");
+        eprintln!(
+            "[tp-load-27b] slice{id} {} 键 / {:.1}s",
+            m.0.len(),
+            t.elapsed().as_secs_f64()
+        );
         shards.push(m);
     }
 
@@ -220,13 +241,14 @@ async fn body(dir: &Path) {
         let full_vals = dtoh_bytes(&mut face, e).await;
 
         let segs: Vec<usize> = match rule {
-            WeightRule::SegmentedCol(kind) => {
-                kind.segments(&full_spec).expect("段长展开")
-            }
+            WeightRule::SegmentedCol(kind) => kind.segments(&full_spec).expect("段长展开"),
             _ => Vec::new(),
         };
 
-        for (id, (plan, m)) in [(plan0, &shards[0]), (plan1, &shards[1])].into_iter().enumerate() {
+        for (id, (plan, m)) in [(plan0, &shards[0]), (plan1, &shards[1])]
+            .into_iter()
+            .enumerate()
+        {
             let Some(se) = entry_by_key(m, key) else {
                 fails.push(format!("{key}: slice{id} 缺键"));
                 continue;
@@ -274,8 +296,16 @@ async fn body(dir: &Path) {
             if se.shape != want_shape {
                 fails.push(format!(
                     "{key}: slice{id} 形状 {} ≠ 参考 {}",
-                    se.shape.iter().map(|v| v.to_string()).collect::<Vec<_>>().join("x"),
-                    want_shape.iter().map(|v| v.to_string()).collect::<Vec<_>>().join("x"),
+                    se.shape
+                        .iter()
+                        .map(|v| v.to_string())
+                        .collect::<Vec<_>>()
+                        .join("x"),
+                    want_shape
+                        .iter()
+                        .map(|v| v.to_string())
+                        .collect::<Vec<_>>()
+                        .join("x"),
                 ));
                 continue;
             }
@@ -286,7 +316,8 @@ async fn body(dir: &Path) {
                 fails.push(format!(
                     "{key}: slice{id} 内容不等(首差元素 idx={fi} / {} 元素;{:?})",
                     got.len() / esz,
-                    got.get(first.unwrap_or(0)).zip(want.get(first.unwrap_or(0)))
+                    got.get(first.unwrap_or(0))
+                        .zip(want.get(first.unwrap_or(0)))
                         .map(|(g, w)| format!("got=0x{g:02x} want=0x{w:02x}")),
                 ));
             }
@@ -299,7 +330,11 @@ async fn body(dir: &Path) {
     for f in fails.iter().take(30) {
         eprintln!("  ✗ {f}");
     }
-    assert!(fails.is_empty(), "27B 分片装载对拍失败 {} 条(见上)", fails.len());
+    assert!(
+        fails.is_empty(),
+        "27B 分片装载对拍失败 {} 条(见上)",
+        fails.len()
+    );
     let _ = base;
 }
 
@@ -321,7 +356,8 @@ fn read_all<S: owl_models::module::WeightSource + ?Sized>(
 ) -> Option<Vec<u8>> {
     let n = src.elem_len(key).ok()??;
     let mut buf = vec![0u8; n * dtype.size_bytes()];
-    src.convert_chunk_into_bytes(key, 0, n, &mut buf, dtype).ok()??;
+    src.convert_chunk_into_bytes(key, 0, n, &mut buf, dtype)
+        .ok()??;
     Some(buf)
 }
 
@@ -358,9 +394,16 @@ async fn source_body(dir: &Path) {
         Qwen35Convention::new(&base),
         QuantPlan::W4A16Awq,
         QuantPlan::F16,
-    ).expect("Model::new");
+    )
+    .expect("Model::new");
     // 全量口径(声明 = 层侧全量形状)
-    let ctx_full = LoaderCtx { dtype: spec.dtype, shard: 1, slice_id: 0, device_repack: true, ..Default::default() };
+    let ctx_full = LoaderCtx {
+        dtype: spec.dtype,
+        shard: 1,
+        slice_id: 0,
+        device_repack: true,
+        ..Default::default()
+    };
     let ops_full = model.layout(&ctx_full);
 
     let mut checked = 0usize;
@@ -383,7 +426,8 @@ async fn source_body(dir: &Path) {
             Qwen35Convention::new(&base),
             QuantPlan::W4A16Awq,
             QuantPlan::F16,
-        ).expect("Model::new");
+        )
+        .expect("Model::new");
         let mut ops_s = model_s.layout(&ctx_s);
         let spans = owl_models::formats::shard::build_shard_pass(&mut ops_s, &ctx_s)
             .expect("build_shard_pass");
@@ -449,7 +493,10 @@ async fn source_body(dir: &Path) {
             }
         }
     }
-    eprintln!("[tp-src-27b] 源级对拍 {checked} 次通过 / 跳过 {skipped} / 失败 {}", fails.len());
+    eprintln!(
+        "[tp-src-27b] 源级对拍 {checked} 次通过 / 跳过 {skipped} / 失败 {}",
+        fails.len()
+    );
     for f in fails.iter().take(20) {
         eprintln!("  ✗ {f}");
     }
@@ -513,8 +560,18 @@ async fn repack_body(dir: &Path, ordinal: usize) {
     for (shard, plan_i) in [(1usize, 0usize), (2, 0), (2, 1)] {
         let plan = TpPlan::new(plan_i, shard).expect("plan");
         let (spec, base) = two_layer_spec(dir);
-        let spec_s = if shard > 1 { spec.sharded(plan).expect("sharded spec") } else { spec.clone() };
-        let model = Model::new(&spec_s, Qwen35Convention::new(&base), QuantPlan::W4A16Awq, QuantPlan::F16).expect("Model::new");
+        let spec_s = if shard > 1 {
+            spec.sharded(plan).expect("sharded spec")
+        } else {
+            spec.clone()
+        };
+        let model = Model::new(
+            &spec_s,
+            Qwen35Convention::new(&base),
+            QuantPlan::W4A16Awq,
+            QuantPlan::F16,
+        )
+        .expect("Model::new");
         let ctx = LoaderCtx {
             dtype: spec.dtype,
             shard,
@@ -531,11 +588,13 @@ async fn repack_body(dir: &Path, ordinal: usize) {
             device_repack: Some(true),
             verify: false,
             debug_tap: false,
-        staging_mb: 128,
-        dump: false,
-        gguf_dequant: false,
+            staging_mb: 128,
+            dump: false,
+            gguf_dequant: false,
         };
-        let manifest = load_from_dir(dir, &mut face, &model, opts).await.expect("装载");
+        let manifest = load_from_dir(dir, &mut face, &model, opts)
+            .await
+            .expect("装载");
         // ② 参考:同一 want 的源矩形 → CPU marlin B
         let mut ops = model.layout(&ctx);
         let spans = owl_models::formats::shard::build_shard_pass(&mut ops, &ctx).expect("pass");
@@ -550,7 +609,11 @@ async fn repack_body(dir: &Path, ordinal: usize) {
             face.dtoh(&e.block, &mut got).await.expect("dtoh 设备块");
             // 源矩形(与装载同一条 ShardedSource)
             let mut raw = vec![0u8; n * 4]; // U32 字
-            let ok = sharded.convert_chunk_into_bytes(key, 0, n, &mut raw, e.dtype).ok().flatten().is_some();
+            let ok = sharded
+                .convert_chunk_into_bytes(key, 0, n, &mut raw, e.dtype)
+                .ok()
+                .flatten()
+                .is_some();
             if !ok {
                 fails.push(format!("{key}: 源矩形读失败(参考面)"));
                 continue;
@@ -558,24 +621,41 @@ async fn repack_body(dir: &Path, ordinal: usize) {
             // CPU marlin B:rows=out(shape[0]), cols=k/8(shape[1])
             let (rows, cols) = (e.shape[0], e.shape[1]);
             let k = cols * 8;
-            let packed: Vec<i32> = raw.chunks_exact(4).map(|c| i32::from_le_bytes(c.try_into().unwrap())).collect();
+            let packed: Vec<i32> = raw
+                .chunks_exact(4)
+                .map(|c| i32::from_le_bytes(c.try_into().unwrap()))
+                .collect();
             let fused = owl_kernels::family::marlin::repack::marlin_fused_indices(k, rows);
             let mut b_ref: Vec<i32> = Vec::new();
-            owl_kernels::family::marlin::repack::pack_marlin_b_fused(&packed, &fused, rows * k / 8, &mut b_ref);
+            owl_kernels::family::marlin::repack::pack_marlin_b_fused(
+                &packed,
+                &fused,
+                rows * k / 8,
+                &mut b_ref,
+            );
             let ref_bytes: Vec<u8> = b_ref.iter().flat_map(|v| v.to_le_bytes()).collect();
             if ref_bytes.len() != got.len() {
-                fails.push(format!("{key}: 参考字数 {} ≠ 设备块 {}B", ref_bytes.len() / 4, got.len()));
+                fails.push(format!(
+                    "{key}: 参考字数 {} ≠ 设备块 {}B",
+                    ref_bytes.len() / 4,
+                    got.len()
+                ));
                 continue;
             }
             if got != ref_bytes {
                 let first = got.iter().zip(&ref_bytes).position(|(a, b)| a != b);
-                fails.push(format!("{key}: shard{shard}/slice{plan_i} 设备字节 ≠ CPU 参考(首差 @ {first:?})"));
+                fails.push(format!(
+                    "{key}: shard{shard}/slice{plan_i} 设备字节 ≠ CPU 参考(首差 @ {first:?})"
+                ));
             } else {
                 checked += 1;
             }
         }
     }
-    eprintln!("[tp-repack-27b] 重排面门:{checked} 键通过 / 失败 {}", fails.len());
+    eprintln!(
+        "[tp-repack-27b] 重排面门:{checked} 键通过 / 失败 {}",
+        fails.len()
+    );
     for f in fails.iter().take(10) {
         eprintln!("  ✗ {f}");
     }
@@ -590,13 +670,18 @@ async fn repack_body(dir: &Path, ordinal: usize) {
 fn draft_dir_of() -> PathBuf {
     std::env::var("OWL_DFLASH_DIR")
         .map(PathBuf::from)
-        .unwrap_or_else(|_| PathBuf::from(concat!(env!("CARGO_MANIFEST_DIR"), "/../../models/syvai/Qwen3.8-27B-DFlash2-W4A16")))
+        .unwrap_or_else(|_| {
+            PathBuf::from(concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/../../models/syvai/Qwen3.8-27B-DFlash2-W4A16"
+            ))
+        })
 }
 
 /// 草稿 spec(真检查点维度;层表截成前 2 层 ⇒ 秒级)
 fn draft_spec(dir: &Path) -> (ModelSpec, String) {
-    let (spec, rep) = ModelSpec::from_ckpt(dir, SpecSource::family(&qwen3_8_27b()))
-        .expect("草稿 spec 解析");
+    let (spec, rep) =
+        ModelSpec::from_ckpt(dir, SpecSource::family(&qwen3_8_27b())).expect("草稿 spec 解析");
     let base = rep.keys_base.trim_end_matches('.').to_string();
     let mut spec = spec;
     let n = spec.layer_types.len().min(2);
@@ -613,8 +698,11 @@ async fn load_draft_once(
     let (id, n) = slice;
     let (spec, _base) = draft_spec(dir);
     let spec = if n > 1 {
-        owl_models::formats::qwen35::shard_draft_spec(spec, TpPlan::new(id, n).map_err(ModelError::Msg)?)
-            .map_err(|e| ModelError::Msg(e.to_string()))?
+        owl_models::formats::qwen35::shard_draft_spec(
+            spec,
+            TpPlan::new(id, n).map_err(ModelError::Msg)?,
+        )
+        .map_err(|e| ModelError::Msg(e.to_string()))?
     } else {
         spec
     };
@@ -646,7 +734,9 @@ async fn load_draft_once(
 fn tp_load_gate_27b_draft() {
     let dir = draft_dir_of();
     if !dir.join("config.json").exists() {
-        owl_shared::testkit::report::skip(format_args!("DFlash2 草稿检查点不在 {dir:?}(设 OWL_DFLASH_DIR)"));
+        owl_shared::testkit::report::skip(format_args!(
+            "DFlash2 草稿检查点不在 {dir:?}(设 OWL_DFLASH_DIR)"
+        ));
         return;
     }
     std::thread::Builder::new()
@@ -684,22 +774,35 @@ async fn body_draft(dir: &Path) {
     )
     .expect("GpuClient(设备被占?)");
     eprintln!("[tp-load-draft] 设备 ordinal {ordinal};dir={dir:?}");
-    let full = load_draft_once(dir, &mut face, (0, 1)).await.expect("草稿全量装载");
+    let full = load_draft_once(dir, &mut face, (0, 1))
+        .await
+        .expect("草稿全量装载");
     eprintln!("[tp-load-draft] 全量 {} 键", full.entries().len());
     if std::env::var("OWL_TP_DUMP").is_ok() {
         for e in full.entries() {
-            eprintln!("  DUMP {:<70} {:?} {:?} rule={:?}", e.key, e.shape, e.dtype, rule_of(&e.key));
+            eprintln!(
+                "  DUMP {:<70} {:?} {:?} rule={:?}",
+                e.key,
+                e.shape,
+                e.dtype,
+                rule_of(&e.key)
+            );
         }
     }
     let mut shards: Vec<LoadManifest> = Vec::new();
     for id in 0..2usize {
-        let m = load_draft_once(dir, &mut face, (id, 2)).await.expect("草稿分片装载");
+        let m = load_draft_once(dir, &mut face, (id, 2))
+            .await
+            .expect("草稿分片装载");
         eprintln!("[tp-load-draft] slice{id} {} 键", m.0.len());
         shards.push(m);
     }
     let plan0 = TpPlan::new(0, 2).expect("plan0");
     let plan1 = TpPlan::new(1, 2).expect("plan1");
-    let full_spec = { let (s, _) = draft_spec(dir); s };
+    let full_spec = {
+        let (s, _) = draft_spec(dir);
+        s
+    };
 
     let mut n_rep = 0usize;
     let mut n_split = 0usize;
@@ -715,13 +818,19 @@ async fn body_draft(dir: &Path) {
             _ => Vec::new(),
         };
         let segs_ok = !segs_try.is_empty() && segs_try.iter().sum::<usize>() == e.shape[0];
-        let rule = owl_models::plan::rules::rule_of_want(key, if segs_ok { Some(&segs_try) } else { None });
+        let rule = owl_models::plan::rules::rule_of_want(
+            key,
+            if segs_ok { Some(&segs_try) } else { None },
+        );
         let full_vals = dtoh_bytes(&mut face, e).await;
         let segs: Vec<usize> = match rule {
             WeightRule::SegmentedCol(_) => segs_try,
             _ => Vec::new(),
         };
-        for (id, (plan, m)) in [(plan0, &shards[0]), (plan1, &shards[1])].into_iter().enumerate() {
+        for (id, (plan, m)) in [(plan0, &shards[0]), (plan1, &shards[1])]
+            .into_iter()
+            .enumerate()
+        {
             let Some(se) = entry_by_key(m, key) else {
                 fails.push(format!("{key}: slice{id} 缺键"));
                 continue;
@@ -738,22 +847,39 @@ async fn body_draft(dir: &Path) {
             if rule == WeightRule::Replicate {
                 n_rep += 1;
                 if got != full_vals {
-                    fails.push(format!("{key}: Replicate 键在 slice{id} 变了(len {} vs {})", got.len(), full_vals.len()));
+                    fails.push(format!(
+                        "{key}: Replicate 键在 slice{id} 变了(len {} vs {})",
+                        got.len(),
+                        full_vals.len()
+                    ));
                 }
                 continue;
             }
             n_split += 1;
             let (want, want_shape) = expected_slice(
-                rule, &e.shape, plan, &segs, want_axis(key), &full_vals, e.dtype.size_bytes(),
+                rule,
+                &e.shape,
+                plan,
+                &segs,
+                want_axis(key),
+                &full_vals,
+                e.dtype.size_bytes(),
             );
             if se.shape != want_shape {
-                fails.push(format!("{key}: slice{id} 形状 {:?} ≠ 参考 {:?}", se.shape, want_shape));
+                fails.push(format!(
+                    "{key}: slice{id} 形状 {:?} ≠ 参考 {:?}",
+                    se.shape, want_shape
+                ));
                 continue;
             }
             if got != want {
                 let esz = e.dtype.size_bytes().max(1);
                 let first = got.iter().zip(&want).position(|(a, b)| a != b).unwrap_or(0);
-                fails.push(format!("{key}: slice{id} 内容不等(首差元素 idx={} / {})", first / esz, got.len() / esz));
+                fails.push(format!(
+                    "{key}: slice{id} 内容不等(首差元素 idx={} / {})",
+                    first / esz,
+                    got.len() / esz
+                ));
             }
         }
     }
@@ -764,5 +890,9 @@ async fn body_draft(dir: &Path) {
     for f in fails.iter().take(30) {
         eprintln!("  ✗ {f}");
     }
-    assert!(fails.is_empty(), "草稿分片装载对拍失败 {} 条(见上)", fails.len());
+    assert!(
+        fails.is_empty(),
+        "草稿分片装载对拍失败 {} 条(见上)",
+        fails.len()
+    );
 }

@@ -29,15 +29,13 @@ use owl_models::formats::gguf::shard::ShardSel;
 use owl_models::formats::gguf::transform::vhead_deperm;
 use owl_models::formats::gguf::{spec_from_gguf, GgufConvention, GgufPlan, GgufSource};
 use owl_models::model::Model;
-use owl_models::module::{
-    Loadable, LoaderCtx, PlanSource, PlanTable, SourceFacts, WeightSource,
-};
+use owl_models::module::{Loadable, LoaderCtx, PlanSource, PlanTable, SourceFacts, WeightSource};
 use owl_models::plan::tp::TpPlan;
 use owl_shared::testkit::{resource, resource_ok};
 
 /// 读全量字节(量化件,B=U8)
 fn read_full(src: &GgufSource, key: &str) -> Vec<u8> {
-    let n = src.elem_len(key).expect("elem_len").expect("键在" );
+    let n = src.elem_len(key).expect("elem_len").expect("键在");
     let mut v = vec![0u8; n];
     src.convert_chunk_into_bytes(key, 0, n, &mut v, Dtype::U8)
         .expect("全量读")
@@ -96,7 +94,7 @@ fn grouped_full(src: &GgufSource, key: &str) -> (usize, usize, Vec<f32>) {
 /// `expected_col = (order[c/hv] - h0)·hv + c%hv`。`atom | hv` 时 order 是
 /// grouped 连续窗口 ⇒ 退化为 `c`,即旧的“连续块”判据。
 fn shard_reads_equal_grouped_windows(res_key: &str) {
-    use owl_models::formats::gguf::shard::{geom_of, role_of, Role, ShardSel, Shape, TensorFacts};
+    use owl_models::formats::gguf::shard::{geom_of, role_of, Role, Shape, ShardSel, TensorFacts};
     use owl_models::formats::gguf::transform::rank_head_order;
     let Some(path) = resource(res_key).map(std::path::PathBuf::from) else {
         owl_shared::testkit::report::skip(&format!("资源清单缺 \"{res_key}\""));
@@ -118,7 +116,11 @@ fn shard_reads_equal_grouped_windows(res_key: &str) {
     let mut n_skip = 0usize;
     for key in &keys {
         let t = full.gguf().get_tensor(key).expect("张量在");
-        let f = TensorFacts { ty: t.ty, rows: t.rows() as usize, inner: t.inner() as usize };
+        let f = TensorFacts {
+            ty: t.ty,
+            rows: t.rows() as usize,
+            inner: t.inner() as usize,
+        };
         let native = t.ty.native_dtype().is_some();
         // grouped 全量(行置换源侧已做;列 tiled → grouped 在这里补)
         let (_rows_f, inner_f, grouped) = if native {
@@ -132,7 +134,11 @@ fn shard_reads_equal_grouped_windows(res_key: &str) {
         let inhead = matches!(role_of(key, &d, false), Ok(Role::InHead));
         let atom = t.ty.block().0;
         for rank in 0..2usize {
-            let sel = ShardSel { id: rank, world: 2, head_split: false };
+            let sel = ShardSel {
+                id: rank,
+                world: 2,
+                head_split: false,
+            };
             let Some(g) = geom_of(key, &d, &f, Some(sel)).expect("geom") else {
                 n_skip += 1;
                 continue;
@@ -145,10 +151,9 @@ fn shard_reads_equal_grouped_windows(res_key: &str) {
                 dequant_all(t.ty, &bytes, g.rows(), g.row_elems()).expect("dequant(shard)")
             };
             // 列序表(仅 ssm_out;其余键 = col_first + c,即旧判据)
-            let head_order = inhead
-                .then(|| {
-                    rank_head_order(d.nk, d.nv, d.hv, atom, 2, rank).expect("rank_head_order")
-                });
+            let head_order = inhead.then(|| {
+                rank_head_order(d.nk, d.nv, d.hv, atom, 2, rank).expect("rank_head_order")
+            });
             let (h0, hn) = (rank * (d.nv / 2), d.nv / 2);
             let expect_col = |c: usize| -> usize {
                 match &head_order {
@@ -235,8 +240,14 @@ fn sharded_plan_shapes_match_source(res_key: &str) {
     let full = GgufSource::open(&path).expect("全量源");
     let (spec0, _rep) = spec_from_gguf(full.gguf()).expect("spec");
     for rank in 0..2 {
-        let sel = ShardSel { id: rank, world: 2, head_split: false };
-        let spec = spec0.sharded(TpPlan::new(rank, 2).expect("plan")).expect("shard spec");
+        let sel = ShardSel {
+            id: rank,
+            world: 2,
+            head_split: false,
+        };
+        let spec = spec0
+            .sharded(TpPlan::new(rank, 2).expect("plan"))
+            .expect("shard spec");
         let src = GgufSource::open_shard(&path, Some(sel)).expect("分片源");
         let plan = GgufPlan::for_shard(src.gguf(), *src.dims(), sel);
         let keys = GgufConvention::new();
@@ -253,9 +264,10 @@ fn sharded_plan_shapes_match_source(res_key: &str) {
         let mut n_quant = 0usize;
         for w in ops.wants() {
             let n: usize = w.shape.iter().product();
-            let got = src.elem_len(&w.key).expect("elem_len").unwrap_or_else(|| {
-                panic!("[rank{rank}] 键 {} 在源里不存在", w.key)
-            });
+            let got = src
+                .elem_len(&w.key)
+                .expect("elem_len")
+                .unwrap_or_else(|| panic!("[rank{rank}] 键 {} 在源里不存在", w.key));
             assert_eq!(
                 got, n,
                 "[rank{rank}] 键 {} 的源交付量 {got} ≠ 声明形状 {:?} = {n}",
@@ -267,7 +279,10 @@ fn sharded_plan_shapes_match_source(res_key: &str) {
             }
         }
         let unresolved = plan.take_unresolved();
-        assert!(unresolved.is_empty(), "[rank{rank}] 计划表未解析:{unresolved:?}");
+        assert!(
+            unresolved.is_empty(),
+            "[rank{rank}] 计划表未解析:{unresolved:?}"
+        );
         eprintln!(
             "[gguf-tp] {res_key} rank{rank}:声明 {} 件(量化 {n_quant} 件)· 量化字节 {:.2} GiB",
             ops.wants().len(),
@@ -313,7 +328,11 @@ fn gguf_head_split_plan_and_source_match() {
     spec0.head_split = true;
     let mut halves: Vec<(usize, Vec<u8>)> = Vec::new();
     for rank in 0..2 {
-        let sel = ShardSel { id: rank, world: 2, head_split: true };
+        let sel = ShardSel {
+            id: rank,
+            world: 2,
+            head_split: true,
+        };
         let spec = spec0
             .sharded(TpPlan::new(rank, 2).expect("plan"))
             .expect("shard spec");
@@ -332,9 +351,10 @@ fn gguf_head_split_plan_and_source_match() {
         let ops = model.layout(&ctx);
         for w in ops.wants() {
             let n: usize = w.shape.iter().product();
-            let got = src.elem_len(&w.key).expect("elem_len").unwrap_or_else(|| {
-                panic!("[rank{rank}] 键 {} 在源里不存在", w.key)
-            });
+            let got = src
+                .elem_len(&w.key)
+                .expect("elem_len")
+                .unwrap_or_else(|| panic!("[rank{rank}] 键 {} 在源里不存在", w.key));
             assert_eq!(
                 got, n,
                 "[rank{rank}] 键 {} 的源交付量 {got} ≠ 声明形状 {:?} = {n}",
@@ -358,10 +378,16 @@ fn gguf_head_split_plan_and_source_match() {
             let _ = head_elems;
         }
         let unresolved = plan.take_unresolved();
-        assert!(unresolved.is_empty(), "[rank{rank}] 计划表未解析:{unresolved:?}");
+        assert!(
+            unresolved.is_empty(),
+            "[rank{rank}] 计划表未解析:{unresolved:?}"
+        );
     }
     assert_eq!(halves.len(), 2, "两 rank 都应读到 output.weight");
-    assert_ne!(halves[0].1, halves[1].1, "两 rank 的 output.weight 首块相同 —— head_split 行窗没生效!");
+    assert_ne!(
+        halves[0].1, halves[1].1,
+        "两 rank 的 output.weight 首块相同 —— head_split 行窗没生效!"
+    );
 }
 
 /// **开箱几何门(逐键,零 dequant)**:27B 的三个 GGUF 档(Q4_K_M / UD-IQ4_XS /
@@ -378,7 +404,11 @@ fn open_shard_geometry_accepts_all_27b_quants() {
             continue;
         };
         for rank in 0..2usize {
-            let sel = ShardSel { id: rank, world: 2, head_split: false };
+            let sel = ShardSel {
+                id: rank,
+                world: 2,
+                head_split: false,
+            };
             let src = GgufSource::open_shard(&path, Some(sel))
                 .unwrap_or_else(|e| panic!("[{res}] rank{rank} 几何拒启:{e}"));
             let bytes: usize = src
@@ -387,7 +417,11 @@ fn open_shard_geometry_accepts_all_27b_quants() {
                 .iter()
                 .map(|t| src.elem_len(&t.name).expect("elem_len").unwrap_or(0))
                 .sum();
-            eprintln!("[gguf-tp] {res} rank{rank}:{} 张量几何通过 · 交付 {:.2} GiB", src.gguf().tensors.len(), bytes as f64 / (1u64 << 30) as f64);
+            eprintln!(
+                "[gguf-tp] {res} rank{rank}:{} 张量几何通过 · 交付 {:.2} GiB",
+                src.gguf().tensors.len(),
+                bytes as f64 / (1u64 << 30) as f64
+            );
         }
     }
 }

@@ -2,7 +2,10 @@
 //!
 //! 只被 actor 线程触碰(单线程所有权;零锁)。
 
-use crate::ffi::{device_get_count, free_host, malloc_host, CudaContext, CudaFunction, CudaSlice, CudaStream, CAPTURE_MODE_THREAD_LOCAL};
+use crate::ffi::{
+    device_get_count, free_host, malloc_host, CudaContext, CudaFunction, CudaSlice, CudaStream,
+    CAPTURE_MODE_THREAD_LOCAL,
+};
 use owl_iface::contract::GraphId;
 use owl_iface::contract::ModelError;
 use owl_iface::contract::{numel, Shape};
@@ -102,7 +105,11 @@ impl DiagOpts {
         let c = &cfg.cuda;
         // 同步点分解:launch_sync 仍是「全同步」的合称(向后兼容/回退),
         // sync_mask 逐点归因(生产缺省 0 = 全关)。
-        let mask = if c.launch_sync { sync_bit::ALL } else { c.sync_mask };
+        let mask = if c.launch_sync {
+            sync_bit::ALL
+        } else {
+            c.sync_mask
+        };
         Self {
             srv_timing: c.srv_timing,
             cap_prof: c.cap_prof,
@@ -137,7 +144,9 @@ impl DiagOpts {
 ///
 /// 语义 = 互斥 facet 单选 + 通用算子放行；见 `owl_kernels::tag_filter`。
 /// 这里只读配置事实，不探测硬件/不读 env。
-fn tag_filter_from_config(cfg: &owl_shared::config::OwlConfig) -> owl_kernels::tag_filter::TagFilter {
+fn tag_filter_from_config(
+    cfg: &owl_shared::config::OwlConfig,
+) -> owl_kernels::tag_filter::TagFilter {
     use owl_kernels::spec::KernelTag as T;
     use owl_shared::config::{HeadQuant, ModelFormat, QuantScheme, SpecDraft};
     if cfg.kernel.tag_wildcard {
@@ -274,7 +283,9 @@ impl DeviceSelector {
             Self::Uuid(uuid) => {
                 let count = device_get_count().map_err(|e| format!("device_get_count: {e:?}"))?;
                 for o in 0..count as usize {
-                    if crate::ffi::device_uuid(o).map_err(|e| format!("device_uuid({o}): {e:?}"))? == *uuid {
+                    if crate::ffi::device_uuid(o).map_err(|e| format!("device_uuid({o}): {e:?}"))?
+                        == *uuid
+                    {
                         return Ok(o);
                     }
                 }
@@ -299,7 +310,12 @@ impl DeviceSelector {
 /// - Peer:peer 面 VMM 显式授予(TP2 S1;见 [`PeerBlock`])—— 生命周期 不走设备池:唯一释放口 = `Command::PeerRelease`(D2 裁决)
 pub(super) enum Block {
     Owned(CudaSlice<u8>),
-    Carved { slab: Arc<CudaSlice<u8>>, off: usize, n: usize, cap_n: usize },
+    Carved {
+        slab: Arc<CudaSlice<u8>>,
+        off: usize,
+        n: usize,
+        cap_n: usize,
+    },
     Peer(PeerBlock),
     /// **pinned host-mapped 块**(2026-11-04;TP host relay 兜底通道)。
     /// 不是设备显存:账长记 host 字节,`block_ptr` 给设备侧 alias。
@@ -393,7 +409,11 @@ fn local_of(id: u64) -> u64 {
 fn assert_ledger(id: u64, ledger: u32) -> Result<(), ModelError> {
     let owner = ledger_of(id);
     if owner != ledger {
-        return Err(ModelError::CrossLedger { id, owner, reader: ledger });
+        return Err(ModelError::CrossLedger {
+            id,
+            owner,
+            reader: ledger,
+        });
     }
     Ok(())
 }
@@ -431,7 +451,11 @@ where
     for (name, (bytes, n)) in rows.iter().take(top) {
         s.push_str(&format!(
             " {}={}×{n}",
-            if name.is_empty() { "(未命名!)" } else { name },
+            if name.is_empty() {
+                "(未命名!)"
+            } else {
+                name
+            },
             fmt_bytes(*bytes)
         ));
     }
@@ -477,7 +501,7 @@ where
         g.1 += 1;
     }
     let mut rows: Vec<(&str, (u64, usize))> = agg.into_iter().collect();
-    rows.sort_by(|a, b| b.1.0.cmp(&a.1.0).then_with(|| a.0.cmp(b.0)));
+    rows.sort_by(|a, b| b.1 .0.cmp(&a.1 .0).then_with(|| a.0.cmp(b.0)));
     let total_bytes: u64 = rows.iter().map(|(_, v)| v.0).sum();
     let total_blocks: usize = rows.iter().map(|(_, v)| v.1).sum();
     // **显式拼**(不吃 format 的 `{{`/`}}` 转义):嵌套名字槽 + 花括号叠加时
@@ -498,7 +522,9 @@ where
         out.push('}');
     }
     out.push(']');
-    out.push_str(&format!(",\"total_bytes\":{total_bytes},\"total_blocks\":{total_blocks}"));
+    out.push_str(&format!(
+        ",\"total_bytes\":{total_bytes},\"total_blocks\":{total_blocks}"
+    ));
     out.push('}');
     out
 }
@@ -507,22 +533,22 @@ where
 ///
 /// 返回 `Some(新水位)` = 该写;`None` = 不写(未到门/未破步进/写满)。
 /// 与 `GpuServer::maybe_dump_peak` 同源(那边只负责取 env + I/O)。
- pub(crate) fn peak_should_dump(
- live: u64,
- threshold_bytes: u64,
- watermark: u64,
- written: u32,
- max: u32,
- ) -> Option<u64> {
- if threshold_bytes == 0 || live < threshold_bytes || written >= max {
-     return None;
- }
- // 步进 5%:首次(watermark==0)或显著更高才写
- if watermark > 0 && live < watermark.saturating_mul(105) / 100 {
-     return None;
- }
- Some(live)
- }
+pub(crate) fn peak_should_dump(
+    live: u64,
+    threshold_bytes: u64,
+    watermark: u64,
+    written: u32,
+    max: u32,
+) -> Option<u64> {
+    if threshold_bytes == 0 || live < threshold_bytes || written >= max {
+        return None;
+    }
+    // 步进 5%:首次(watermark==0)或显著更高才写
+    if watermark > 0 && live < watermark.saturating_mul(105) / 100 {
+        return None;
+    }
+    Some(live)
+}
 
 /// **OOM 现场落盘路径解析**(纯函数;离线可测,2026-10-16)。
 ///
@@ -565,8 +591,12 @@ pub(crate) fn prune_vram_dumps(dir: &std::path::Path, keep: usize) -> usize {
     let mut stamps: Vec<(u128, std::path::PathBuf)> = Vec::new();
     for e in rd.flatten() {
         let name_os = e.file_name();
-        let Some(name) = name_os.to_str() else { continue };
-        let Some(ms) = vram_dump_stamp(name) else { continue };
+        let Some(name) = name_os.to_str() else {
+            continue;
+        };
+        let Some(ms) = vram_dump_stamp(name) else {
+            continue;
+        };
         stamps.push((ms, e.path()));
     }
     if stamps.len() <= keep {
@@ -766,7 +796,9 @@ impl VramGuard {
                 self.sample = Some((std::time::Instant::now(), free, live));
             }
         }
-        if let Some((free_est, _)) = Self::estimate_free(self.sample, live, std::time::Instant::now()) {
+        if let Some((free_est, _)) =
+            Self::estimate_free(self.sample, live, std::time::Instant::now())
+        {
             let avail = free_est.saturating_sub(reserve_bytes);
             if n_bytes as u64 > avail {
                 // **取证**(2026-10-19,main):把当时的数打全(此前只报“要多少/还剩多少”,
@@ -797,9 +829,7 @@ impl VramGuard {
 
 pub(super) fn cap_strict() -> bool {
     static STRICT: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *STRICT.get_or_init(|| {
-        owl_shared::env_reader::parse_or::<u8>("OWL_CAP_STRICT", 0) != 0
-    })
+    *STRICT.get_or_init(|| owl_shared::env_reader::parse_or::<u8>("OWL_CAP_STRICT", 0) != 0)
 }
 
 /// 入境判定(**纯函数**,零 CUDA ⇒ 可单测):
@@ -1013,7 +1043,11 @@ impl CaptureNodes {
 
     /// Top-N 摘要(次数降序,同数按名序;日志/诊断用)
     pub(super) fn top(&self, n: usize) -> Vec<(String, usize)> {
-        let mut v: Vec<(String, usize)> = self.by_kernel.iter().map(|(k, c)| (k.clone(), *c)).collect();
+        let mut v: Vec<(String, usize)> = self
+            .by_kernel
+            .iter()
+            .map(|(k, c)| (k.clone(), *c))
+            .collect();
         v.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
         v.truncate(n);
         v
@@ -1120,11 +1154,8 @@ pub(super) fn pool_ledger_snapshot() -> Option<(u64, u64, u64, u64)> {
         let pool = pool.assume_init();
         let get = |attr: cs::CUmemPool_attribute| -> Option<u64> {
             let mut v: u64 = 0;
-            let rc = cs::cuMemPoolGetAttribute(
-                pool,
-                attr,
-                &mut v as *mut u64 as *mut core::ffi::c_void,
-            );
+            let rc =
+                cs::cuMemPoolGetAttribute(pool, attr, &mut v as *mut u64 as *mut core::ffi::c_void);
             (rc == cs::CUresult::CUDA_SUCCESS).then_some(v)
         };
         Some((
@@ -1155,7 +1186,11 @@ impl GpuCtx {
                 vram.total_set(bytes as u64);
                 owl_shared::vram::total_set(bytes as u64);
             }
-            Err(e) => sink.logf(owl_shared::log::LVL_INFO, "boot", format_args!("vram total 查询失败(治理禁用): {e:?}")),
+            Err(e) => sink.logf(
+                owl_shared::log::LVL_INFO,
+                "boot",
+                format_args!("vram total 查询失败(治理禁用): {e:?}"),
+            ),
         }
         if let Ok((free, _)) = cudarc::driver::result::mem_get_info() {
             vram.free_set(free as u64);
@@ -1285,15 +1320,18 @@ impl GpuCtx {
             (STREAM_D2H, "d2h"),
             (STREAM_COMPUTE_AUX, "compute-aux"),
         ] {
-            let s = ctx.new_stream().map_err(|e| format!("建流({_role}): {e:?}"))?;
+            let s = ctx
+                .new_stream()
+                .map_err(|e| format!("建流({_role}): {e:?}"))?;
             streams.insert(id, s);
         }
         // E1:三流事件池(**CU_EVENT_DISABLE_TIMING** —— 计时的 event 会拖慢
         // 且扰动时序;要计时另开探针)
         let mut event_pool = Vec::with_capacity(EVENT_POOL_N);
         for i in 0..EVENT_POOL_N {
-            let ev = crate::ffi::event_create(crate::ffi::sys::CUevent_flags::CU_EVENT_DISABLE_TIMING)
-                .map_err(|e| format!("建事件({i}): {e:?}"))?;
+            let ev =
+                crate::ffi::event_create(crate::ffi::sys::CUevent_flags::CU_EVENT_DISABLE_TIMING)
+                    .map_err(|e| format!("建事件({i}): {e:?}"))?;
             event_pool.push(TailEvent(ev));
         }
         Ok(Self {
@@ -1417,7 +1455,9 @@ impl GpuCtx {
         // SAFETY:dev 来自 device::get;MaybeUninit 按 CUDA 契约写满
         let rc = unsafe { cs::cuDeviceGetDefaultMemPool(pool.as_mut_ptr(), dev) };
         if rc != cs::CUresult::CUDA_SUCCESS {
-            return Err(ModelError::Msg(format!("mem_pool_trim: cuDeviceGetDefaultMemPool: {rc:?}")));
+            return Err(ModelError::Msg(format!(
+                "mem_pool_trim: cuDeviceGetDefaultMemPool: {rc:?}"
+            )));
         }
         let pool = unsafe { pool.assume_init() };
         let reserved = |pool: cs::CUmemoryPool| -> Result<u64, ModelError> {
@@ -1431,7 +1471,9 @@ impl GpuCtx {
                 )
             };
             if rc != cs::CUresult::CUDA_SUCCESS {
-                return Err(ModelError::Msg(format!("mem_pool_trim: get RESERVED: {rc:?}")));
+                return Err(ModelError::Msg(format!(
+                    "mem_pool_trim: get RESERVED: {rc:?}"
+                )));
             }
             Ok(v)
         };
@@ -1439,7 +1481,9 @@ impl GpuCtx {
         // minBytesToKeep = 0 ⇒ 未使用的缓存块全还
         let rc = unsafe { cs::cuMemPoolTrimTo(pool, 0) };
         if rc != cs::CUresult::CUDA_SUCCESS {
-            return Err(ModelError::Msg(format!("mem_pool_trim: cuMemPoolTrimTo: {rc:?}")));
+            return Err(ModelError::Msg(format!(
+                "mem_pool_trim: cuMemPoolTrimTo: {rc:?}"
+            )));
         }
         let after = reserved(pool)?;
         Ok(before.saturating_sub(after))
@@ -1448,13 +1492,14 @@ impl GpuCtx {
     /// **登记"本块已清零"事件**(在 `alloc{zero:true}` 的 memset 之后由 server 调)
     pub(super) fn note_zeroing(&mut self, id: u64, stream: StreamId) -> Result<(), ModelError> {
         let st = self.stream(stream)?.clone();
-        let ev =
-            crate::ffi::event_create(crate::ffi::sys::CUevent_flags::CU_EVENT_DISABLE_TIMING)
-                .map_err(|e| ModelError::Msg(format!("note_zeroing({id}): 建事件 {e:?}")))?;
+        let ev = crate::ffi::event_create(crate::ffi::sys::CUevent_flags::CU_EVENT_DISABLE_TIMING)
+            .map_err(|e| ModelError::Msg(format!("note_zeroing({id}): 建事件 {e:?}")))?;
         unsafe { crate::ffi::event_record(ev, st.cu_stream()) }
             .map_err(|e| ModelError::Msg(format!("note_zeroing({id}): 记入 {e:?}")))?;
         if let Some(old) = self.zero_ev.insert(id, TailEvent(ev)) {
-            unsafe { let _ = crate::ffi::event_destroy(old.0); }
+            unsafe {
+                let _ = crate::ffi::event_destroy(old.0);
+            }
         }
         Ok(())
     }
@@ -1476,7 +1521,9 @@ impl GpuCtx {
             )
         }
         .map_err(|e| ModelError::Msg(format!("wait_zeroing({id}): {e:?}")));
-        unsafe { let _ = crate::ffi::event_destroy(ev.0); }
+        unsafe {
+            let _ = crate::ffi::event_destroy(ev.0);
+        }
         r
     }
 
@@ -1484,12 +1531,18 @@ impl GpuCtx {
     pub(super) fn clear_zeroing(&mut self, ids: &[u64]) {
         for id in ids {
             if let Some(ev) = self.zero_ev.remove(id) {
-                unsafe { let _ = crate::ffi::event_destroy(ev.0); }
+                unsafe {
+                    let _ = crate::ffi::event_destroy(ev.0);
+                }
             }
         }
     }
 
-    pub(super) fn wait_stream_on_tail(&self, stream: StreamId, dep: StreamId) -> Result<(), ModelError> {
+    pub(super) fn wait_stream_on_tail(
+        &self,
+        stream: StreamId,
+        dep: StreamId,
+    ) -> Result<(), ModelError> {
         if self.capture_stream() {
             return Err(ModelError::Msg(
                 "跨流等待不可捕获:捕获期禁止 wait_stream_on_tail".into(),
@@ -1540,7 +1593,7 @@ impl GpuCtx {
     // ======================================================================
 
     /// 当前是否捕获中
-        /// 设备 ordinal(foreign-kernel 需要:marlin SM 数查询的 dev 参数)
+    /// 设备 ordinal(foreign-kernel 需要:marlin SM 数查询的 dev 参数)
     pub(super) fn device_ordinal(&self) -> usize {
         self.ordinal
     }
@@ -1638,9 +1691,10 @@ impl GpuCtx {
         //
         // 旧实现还把"在 origin 上调用"当静默 no-op —— 静默失败,已按纪律改掉。
         let (origin, target) = {
-            let c = self.capture.as_ref().ok_or_else(|| {
-                ModelError::Msg("capture_join: 不在捕获期".into())
-            })?;
+            let c = self
+                .capture
+                .as_ref()
+                .ok_or_else(|| ModelError::Msg("capture_join: 不在捕获期".into()))?;
             let t = c
                 .involved
                 .iter()
@@ -1709,8 +1763,12 @@ impl GpuCtx {
             // §65.3-2 定谳)—— 此处**不再二次放大**(双保险会 4× 吃显存)。
             None => owl_shared::slab_hint::take_hint().unwrap_or(64 << 20),
         };
-        let slab = unsafe { stream.alloc::<u8>(slab_cap) }
-            .map_err(|e| ModelError::Msg(format!("graph_begin: 捕获 slab 分配失败({}MiB) {e:?}", slab_cap >> 20)))?;
+        let slab = unsafe { stream.alloc::<u8>(slab_cap) }.map_err(|e| {
+            ModelError::Msg(format!(
+                "graph_begin: 捕获 slab 分配失败({}MiB) {e:?}",
+                slab_cap >> 20
+            ))
+        })?;
         owl_shared::vram::live_add(slab_cap as i64); // B6.5(直配不走 handle_alloc)
         self.vram.live_add(slab_cap as i64);
         // **取证**(2026-10-19;`OWL_VRAM_DBG=1`):图捕获 slab 是"每图一份、
@@ -1748,21 +1806,20 @@ impl GpuCtx {
         Ok(())
     }
 
-
-/// **`graph_end` 的错误翻译**(2026-10-18;§38.4)。
-///
-/// 驱动的 `CUDA_ERROR_STREAM_CAPTURE_UNJOINED` 原文只有一句
-/// "capturing stream has unjoined work" —— **读不出该改什么**。本函数把它翻成
-/// 可操作诊断(语义 + 两条判据 + 口径门位置)。
-///
-/// ⚠️ **生产现状(零风险,但要知道为什么)**:引擎侧**没有任何调用点**用
-/// `capture_route_to`(只有 `owl-cuda` 的测试在用)⇒ 捕获窗恒不 fork ⇒
-/// `launch_stream()` 恒 = `stream(STREAM_COMPUTE)` ⇒ `copy_block` 的捕获路由
-/// 改动对生产是**零行为变化**。这条翻译是给"将来真有人 fork"时的现场准备的。
-fn end_capture_err(e: crate::ffi::DriverError) -> ModelError {
-    let raw = format!("{e:?}");
-    if raw.contains("UNJOINED") {
-        return ModelError::Msg(format!(
+    /// **`graph_end` 的错误翻译**(2026-10-18;§38.4)。
+    ///
+    /// 驱动的 `CUDA_ERROR_STREAM_CAPTURE_UNJOINED` 原文只有一句
+    /// "capturing stream has unjoined work" —— **读不出该改什么**。本函数把它翻成
+    /// 可操作诊断(语义 + 两条判据 + 口径门位置)。
+    ///
+    /// ⚠️ **生产现状(零风险,但要知道为什么)**:引擎侧**没有任何调用点**用
+    /// `capture_route_to`(只有 `owl-cuda` 的测试在用)⇒ 捕获窗恒不 fork ⇒
+    /// `launch_stream()` 恒 = `stream(STREAM_COMPUTE)` ⇒ `copy_block` 的捕获路由
+    /// 改动对生产是**零行为变化**。这条翻译是给"将来真有人 fork"时的现场准备的。
+    fn end_capture_err(e: crate::ffi::DriverError) -> ModelError {
+        let raw = format!("{e:?}");
+        if raw.contains("UNJOINED") {
+            return ModelError::Msg(format!(
             "graph_end: **捕获窗里有 fork 出去的支流没 join 回来**(驱动原文:{raw})。\n\
              语义:`capture_route_to` 卷入的支流必须沿依赖边回到 origin,否则**整窗作废**\n\
              (不是「图有个洞」,是这次捕获被驱动拒掉 —— 发生在**捕获期**,不是回放期)。\n\
@@ -1773,9 +1830,9 @@ fn end_capture_err(e: crate::ffi::DriverError) -> ModelError {
              · 最省事的形态:把 CE 搬运留在 origin 流(别 fork)。\n\
              口径门:`crates/backends/cuda/tests/graph_multistream_gate.rs::m6_capture_join_semantics`(四形状)"
         ));
+        }
+        ModelError::Msg(format!("graph_end: {raw}"))
     }
-    ModelError::Msg(format!("graph_end: {raw}"))
-}
 
     /// 图捕获结束(实例化 + 登记)。空捕获窗拒绝(哨兵③:发射数须 > 0)。
     pub(super) fn graph_end(&mut self) -> Result<GraphId, ModelError> {
@@ -1801,7 +1858,9 @@ fn end_capture_err(e: crate::ffi::DriverError) -> ModelError {
                 self.sink.logf(
                     owl_shared::log::LVL_WARN,
                     "graph-abort",
-                    format_args!("空捕获窗作废:回收 {orphan} 块 slab 引用(slab 随最后一个引用释放)"),
+                    format_args!(
+                        "空捕获窗作废:回收 {orphan} 块 slab 引用(slab 随最后一个引用释放)"
+                    ),
                 );
             }
             return Err(ModelError::Msg(
@@ -1873,14 +1932,11 @@ fn end_capture_err(e: crate::ffi::DriverError) -> ModelError {
                     // 刀D:内核名清单(图材料单;派发税定位)
                     let mut params: crate::ffi::sys::CUDA_KERNEL_NODE_PARAMS =
                         unsafe { std::mem::zeroed() };
-                    let r = unsafe {
-                        crate::ffi::sys::cuGraphKernelNodeGetParams_v2(*nd, &mut params)
-                    };
+                    let r =
+                        unsafe { crate::ffi::sys::cuGraphKernelNodeGetParams_v2(*nd, &mut params) };
                     if r == crate::ffi::sys::CUresult::CUDA_SUCCESS {
                         let mut name: *const std::ffi::c_char = std::ptr::null();
-                        let rn = unsafe {
-                            crate::ffi::sys::cuFuncGetName(&mut name, params.func)
-                        };
+                        let rn = unsafe { crate::ffi::sys::cuFuncGetName(&mut name, params.func) };
                         if rn == crate::ffi::sys::CUresult::CUDA_SUCCESS {
                             let cname = unsafe { std::ffi::CStr::from_ptr(name) };
                             let sname = cname.to_string_lossy().to_string();
@@ -1891,9 +1947,8 @@ fn end_capture_err(e: crate::ffi::DriverError) -> ModelError {
                 if t as u32 == 10 {
                     let mut params: crate::ffi::sys::CUDA_MEM_ALLOC_NODE_PARAMS =
                         unsafe { std::mem::zeroed() };
-                    let r = unsafe {
-                        crate::ffi::sys::cuGraphMemAllocNodeGetParams(*nd, &mut params)
-                    };
+                    let r =
+                        unsafe { crate::ffi::sys::cuGraphMemAllocNodeGetParams(*nd, &mut params) };
                     if r == crate::ffi::sys::CUresult::CUDA_SUCCESS {
                         *alloc_sizes.entry(params.bytesize).or_default() += 1;
                     }
@@ -1925,21 +1980,33 @@ fn end_capture_err(e: crate::ffi::DriverError) -> ModelError {
                 let mut rows: Vec<_> = alloc_sizes.into_iter().collect();
                 rows.sort_by_key(|b| std::cmp::Reverse(b.0));
                 for (sz, n) in rows.iter().take(12) {
-                    self.sink.logf(owl_shared::log::LVL_DEBUG, "gl-prof", format_args!("  MEM_ALLOC {sz}B × {n}"));
+                    self.sink.logf(
+                        owl_shared::log::LVL_DEBUG,
+                        "gl-prof",
+                        format_args!("  MEM_ALLOC {sz}B × {n}"),
+                    );
                 }
             }
             if !kern_names.is_empty() {
                 let mut rows: Vec<_> = kern_names.into_iter().collect();
                 rows.sort_by_key(|b| std::cmp::Reverse(b.1));
                 for (name, n) in rows.iter().take(40) {
-                    self.sink.logf(owl_shared::log::LVL_DEBUG, "gl-prof", format_args!("  K {name} × {n}"));
+                    self.sink.logf(
+                        owl_shared::log::LVL_DEBUG,
+                        "gl-prof",
+                        format_args!("  K {name} × {n}"),
+                    );
                 }
             }
             if !cpy_sizes.is_empty() {
                 let mut rows: Vec<_> = cpy_sizes.into_iter().collect();
                 rows.sort_by(|a, b| b.0.cmp(&a.0));
                 for (sz, n) in rows.iter().take(12) {
-                    self.sink.logf(owl_shared::log::LVL_DEBUG, "gl-prof", format_args!("  MEMCPY {:?} × {n}", sz));
+                    self.sink.logf(
+                        owl_shared::log::LVL_DEBUG,
+                        "gl-prof",
+                        format_args!("  MEMCPY {:?} × {n}", sz),
+                    );
                 }
             }
         }
@@ -2069,7 +2136,11 @@ fn end_capture_err(e: crate::ffi::DriverError) -> ModelError {
         unsafe { crate::ffi::graph_launch(exec, cu_stream) }
             .map_err(|e| ModelError::Msg(format!("graph_launch({gid}): {e:?}")))?;
         if prof {
-            self.sink.logf(owl_shared::log::LVL_DEBUG, "gl-prof", format_args!("gid={gid} launch={:?}", t0.unwrap().elapsed()));
+            self.sink.logf(
+                owl_shared::log::LVL_DEBUG,
+                "gl-prof",
+                format_args!("gid={gid} launch={:?}", t0.unwrap().elapsed()),
+            );
         }
         // 诊断开关(diag.sync_at(G RAPH)):回放后同步归因(烘焙指针消费者)
         if self.diag.sync_at(owl_shared::config::sync_bit::GRAPH) {
@@ -2077,7 +2148,11 @@ fn end_capture_err(e: crate::ffi::DriverError) -> ModelError {
             stream
                 .synchronize()
                 .map_err(|e| ModelError::Msg(format!("graph-sync({gid}): {e:?}")))?;
-            self.sink.logf(owl_shared::log::LVL_DEBUG, "gl-prof", format_args!("gid={gid} gpu-sync={:?}", t1.elapsed()));
+            self.sink.logf(
+                owl_shared::log::LVL_DEBUG,
+                "gl-prof",
+                format_args!("gid={gid} gpu-sync={:?}", t1.elapsed()),
+            );
         }
         Ok(())
     }
@@ -2130,11 +2205,16 @@ fn end_capture_err(e: crate::ffi::DriverError) -> ModelError {
             !name.is_empty(),
             "carve_block: 空名 = 分配点未记名(全量记名纪律;见 BlockEntry::name)"
         );
-        let cap = self.capture.as_mut().ok_or_else(|| {
-            ModelError::Msg("carve_block: 仅限捕获期(内部护栏违例)".to_string())
-        })?;
+        let cap = self
+            .capture
+            .as_mut()
+            .ok_or_else(|| ModelError::Msg("carve_block: 仅限捕获期(内部护栏违例)".to_string()))?;
         if self.cap_prof {
-            self.sink.logf(owl_shared::log::LVL_DEBUG, "cap-prof", format_args!("carve {}B", n));
+            self.sink.logf(
+                owl_shared::log::LVL_DEBUG,
+                "cap-prof",
+                format_args!("carve {}B", n),
+            );
         }
         let cap_total = cap.cap;
         let (off, cap_n) = cap.arena.carve(n, cap_total).ok_or_else(|| {
@@ -2150,7 +2230,12 @@ fn end_capture_err(e: crate::ffi::DriverError) -> ModelError {
         self.blocks.insert(
             id,
             BlockEntry {
-                block: Block::Carved { slab, off, n, cap_n },
+                block: Block::Carved {
+                    slab,
+                    off,
+                    n,
+                    cap_n,
+                },
                 bytes: n,
                 ledger: self.ledger,
                 dtype: BlockDtype::Bytes,
@@ -2179,7 +2264,10 @@ fn end_capture_err(e: crate::ffi::DriverError) -> ModelError {
         // 窗内 free = 回 arena 复用 —— 正是 M1 峰值口径的来源,不能被租约
         // 拦下)。Peer 块由 `peer_release` 的前置校验读租约(拒收被钉块)。
         if self.capture.is_some()
-            && matches!(e.block, Block::Owned(_) | Block::Peer(_) | Block::HostMapped(_))
+            && matches!(
+                e.block,
+                Block::Owned(_) | Block::Peer(_) | Block::HostMapped(_)
+            )
         {
             self.graph_refs.borrow_mut().record(id);
         }
@@ -2199,7 +2287,9 @@ fn end_capture_err(e: crate::ffi::DriverError) -> ModelError {
             if numel(&e.shape) != e.bytes {
                 return Err(ModelError::Msg(format!(
                     "块账破损:id={id} shape {:?} 元素数 {} ≠ 账长 {} 字节",
-                    e.shape, numel(&e.shape), e.bytes
+                    e.shape,
+                    numel(&e.shape),
+                    e.bytes
                 )));
             }
             if e.dtype.size_bytes() < 1 {
@@ -2253,7 +2343,11 @@ fn end_capture_err(e: crate::ffi::DriverError) -> ModelError {
     /// `block_ptr`/`assert_ledger`)
     pub(super) fn block_len(&self, id: u64) -> Result<usize, ModelError> {
         assert_ledger(id, self.ledger)?;
-        Ok(self.blocks.get(&id).ok_or(ModelError::DeadBlock { id })?.bytes)
+        Ok(self
+            .blocks
+            .get(&id)
+            .ok_or(ModelError::DeadBlock { id })?
+            .bytes)
     }
 
     /// **块账按名清单**(OOM dump 的"谁占着"面;2026-10-16)。
@@ -2266,7 +2360,10 @@ fn end_capture_err(e: crate::ffi::DriverError) -> ModelError {
     /// 名字为分配点所报(空名 = 调用点违约,单独计数上屏 —— 见
     /// [`Self::unnamed_blocks`],这是"全量记名"的漏网信号)。
     pub(super) fn block_report_by_name(&self, top: usize) -> String {
-        render_block_report(self.blocks.values().map(|e| (e.name.as_str(), e.bytes)), top)
+        render_block_report(
+            self.blocks.values().map(|e| (e.name.as_str(), e.bytes)),
+            top,
+        )
     }
 
     /// 块账结构化清单(JSON;查询/OOM 落盘共用)。
@@ -2336,7 +2433,11 @@ fn end_capture_err(e: crate::ffi::DriverError) -> ModelError {
         for id in ids {
             let owner = ledger_of(*id);
             if owner != self.ledger {
-                return Err(ModelError::CrossLedger { id: *id, owner, reader: self.ledger });
+                return Err(ModelError::CrossLedger {
+                    id: *id,
+                    owner,
+                    reader: self.ledger,
+                });
             }
             if !self.blocks.contains_key(id) {
                 return Err(ModelError::Msg(format!(
@@ -2361,18 +2462,20 @@ fn end_capture_err(e: crate::ffi::DriverError) -> ModelError {
             let (pinned, rest): (Vec<u64>, Vec<u64>) = ids
                 .iter()
                 .partition(|id| self.graph_refs.borrow().is_pinned(**id));
-            self.sink.count("srv.count.free_pinned_reject", pinned.len() as u64);
+            self.sink
+                .count("srv.count.free_pinned_reject", pinned.len() as u64);
             // **取证**(2026-10-19):拒收 = 块**永远回不了池**。累计字节(此前只报块数
             // ⇒ "每 chunk 漏 ~128 MiB"这种量级看不出来)。
             {
-                static REJ_BYTES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-                static REJ_BLOCKS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+                static REJ_BYTES: std::sync::atomic::AtomicU64 =
+                    std::sync::atomic::AtomicU64::new(0);
+                static REJ_BLOCKS: std::sync::atomic::AtomicU64 =
+                    std::sync::atomic::AtomicU64::new(0);
                 let bytes: u64 = pinned
                     .iter()
                     .map(|id| self.blocks.get(id).map(|b| b.bytes as u64).unwrap_or(0))
                     .sum();
-                let tb =
-                    REJ_BYTES.fetch_add(bytes, std::sync::atomic::Ordering::Relaxed) + bytes;
+                let tb = REJ_BYTES.fetch_add(bytes, std::sync::atomic::Ordering::Relaxed) + bytes;
                 let tn = REJ_BLOCKS
                     .fetch_add(pinned.len() as u64, std::sync::atomic::Ordering::Relaxed)
                     + pinned.len() as u64;
@@ -2410,7 +2513,8 @@ fn end_capture_err(e: crate::ffi::DriverError) -> ModelError {
             if !fence.is_empty() {
                 // 可观测面(父会话收口验收用):实发栅栏数 / 等待流数 / 被定向化省掉数
                 self.sink.count("srv.count.free_fence", 1);
-                self.sink.count("srv.count.free_fence_streams", fence.len() as u64);
+                self.sink
+                    .count("srv.count.free_fence_streams", fence.len() as u64);
                 let sink = self.sink;
                 if let Ok(comp) = self.stream(STREAM_COMPUTE) {
                     if let Ok(ev) = comp.record_event(None) {
@@ -2421,11 +2525,14 @@ fn end_capture_err(e: crate::ffi::DriverError) -> ModelError {
                                 sink.logf(
                                     owl_shared::log::LVL_WARN,
                                     "free-fence",
-                                    format_args!("跳流栅栏 wait 失败(已降级;若见跨流脏读请查此): {e:?}"),
+                                    format_args!(
+                                        "跳流栅栏 wait 失败(已降级;若见跨流脏读请查此): {e:?}"
+                                    ),
                                 );
                             }
                         }
-                    } // 事件创建失败 = 回旧语义(不让回收路径崩),但记一笔
+                    }
+                    // 事件创建失败 = 回旧语义(不让回收路径崩),但记一笔
                     else {
                         sink.logf(
                             owl_shared::log::LVL_WARN,
@@ -2434,10 +2541,11 @@ fn end_capture_err(e: crate::ffi::DriverError) -> ModelError {
                         );
                     }
                 }
-            } else if ids
-                .iter()
-                .any(|id| self.blocks.get(id).is_some_and(|e| matches!(e.block, Block::Owned(_))))
-            {
+            } else if ids.iter().any(|id| {
+                self.blocks
+                    .get(id)
+                    .is_some_and(|e| matches!(e.block, Block::Owned(_)))
+            }) {
                 // 旧实现(“任一 Owned 块 ⇒ 恒等 H2D+D2H 都等”)会在此发一道栅栏
                 // —— 本计数 = 被定向化省掉的栅栏数(谓词与旧实现逐字同为 Owned;
                 // 每 chunk 千级;应远大于上面)
@@ -2517,8 +2625,12 @@ fn end_capture_err(e: crate::ffi::DriverError) -> ModelError {
         let mut out: Vec<Arc<CudaStream>> = Vec::new();
         let compute = self.streams.get(&STREAM_COMPUTE);
         for id in ids {
-            let Some(e) = self.blocks.get(id) else { continue };
-            let Block::Owned(slice) = &e.block else { continue };
+            let Some(e) = self.blocks.get(id) else {
+                continue;
+            };
+            let Block::Owned(slice) = &e.block else {
+                continue;
+            };
             if self.diag.sync_at(owl_shared::config::sync_bit::FENCE) {
                 for sid in [STREAM_H2D, STREAM_D2H] {
                     if let Some(s) = self.streams.get(&sid) {
@@ -2573,8 +2685,8 @@ fn end_capture_err(e: crate::ffi::DriverError) -> ModelError {
         if bytes == 0 {
             return Err(ModelError::Msg("host_alloc: bytes = 0(拒绝)".into()));
         }
-        let flags = crate::ffi::sys::CU_MEMHOSTALLOC_DEVICEMAP
-            | crate::ffi::sys::CU_MEMHOSTALLOC_PORTABLE;
+        let flags =
+            crate::ffi::sys::CU_MEMHOSTALLOC_DEVICEMAP | crate::ffi::sys::CU_MEMHOSTALLOC_PORTABLE;
         let host = unsafe { malloc_host(bytes, flags) }
             .map_err(|e| ModelError::Msg(format!("host_alloc malloc_host({bytes}B): {e:?}")))?;
         if host.is_null() {
@@ -2592,7 +2704,12 @@ fn end_capture_err(e: crate::ffi::DriverError) -> ModelError {
         }
         let host_u64 = host as u64;
         let id = self.new_host_block(
-            HostMapped { host: host_u64, dev: dev as u64, bytes, owner: true },
+            HostMapped {
+                host: host_u64,
+                dev: dev as u64,
+                bytes,
+                owner: true,
+            },
             bytes,
             name,
         );
@@ -2630,7 +2747,12 @@ fn end_capture_err(e: crate::ffi::DriverError) -> ModelError {
             )));
         }
         Ok(self.new_host_block(
-            HostMapped { host, dev: dev as u64, bytes, owner: false },
+            HostMapped {
+                host,
+                dev: dev as u64,
+                bytes,
+                owner: false,
+            },
             bytes,
             name,
         ))
@@ -2659,8 +2781,12 @@ fn end_capture_err(e: crate::ffi::DriverError) -> ModelError {
         let mut errs: Vec<String> = Vec::new();
         let mut n = 0usize;
         for id in ids {
-            let Some(e) = self.blocks.remove(id) else { continue };
-            let Block::HostMapped(h) = e.block else { continue };
+            let Some(e) = self.blocks.remove(id) else {
+                continue;
+            };
+            let Block::HostMapped(h) = e.block else {
+                continue;
+            };
             self.host_mapped_bytes = self.host_mapped_bytes.saturating_sub(h.bytes as u64);
             self.host_mappings = self.host_mappings.saturating_sub(1);
             if h.owner {
@@ -2699,7 +2825,9 @@ fn end_capture_err(e: crate::ffi::DriverError) -> ModelError {
             self.host_mappings
         );
         for (id, e) in &self.blocks {
-            let Block::HostMapped(h) = &e.block else { continue };
+            let Block::HostMapped(h) = &e.block else {
+                continue;
+            };
             s.push_str(&format!(
                 " id{id}={}MiB@{:#x}({})",
                 h.bytes >> 20,
@@ -2791,7 +2919,11 @@ fn end_capture_err(e: crate::ffi::DriverError) -> ModelError {
         // ③ 记账 + 入册(账长 = 请求值;映射值在 PeerShared.map 里)
         let mapped = map.bytes as u64;
         let id = self.new_peer_block(
-            PeerBlock::Shared(PeerShared { map, fds: vec![fd], gran }),
+            PeerBlock::Shared(PeerShared {
+                map,
+                fds: vec![fd],
+                gran,
+            }),
             bytes,
             name,
         );
@@ -2835,7 +2967,11 @@ fn end_capture_err(e: crate::ffi::DriverError) -> ModelError {
             return Err(crate::vmm::fail_with_rollback(map, e));
         }
         let id = self.new_peer_block(
-            PeerBlock::Alias(PeerAlias { map, peer_uuid: peer_uuid.to_string(), gran }),
+            PeerBlock::Alias(PeerAlias {
+                map,
+                peer_uuid: peer_uuid.to_string(),
+                gran,
+            }),
             want_bytes,
             name,
         );
@@ -2871,7 +3007,9 @@ fn end_capture_err(e: crate::ffi::DriverError) -> ModelError {
         let mut errs: Vec<String> = Vec::new();
         let mut n = 0usize;
         for id in ids {
-            let Some(e) = self.blocks.remove(id) else { continue };
+            let Some(e) = self.blocks.remove(id) else {
+                continue;
+            };
             let Block::Peer(p) = e.block else { continue };
             match p {
                 PeerBlock::Shared(s) => {
@@ -2879,7 +3017,8 @@ fn end_capture_err(e: crate::ffi::DriverError) -> ModelError {
                     for fd in &s.fds {
                         crate::vmm::close_fd(*fd);
                     }
-                    self.peer_shared_bytes = self.peer_shared_bytes.saturating_sub(s.map.bytes as u64);
+                    self.peer_shared_bytes =
+                        self.peer_shared_bytes.saturating_sub(s.map.bytes as u64);
                     owl_shared::vram::live_add(-(s.map.bytes as i64));
                     self.vram.live_add(-(s.map.bytes as i64));
                     if let Err(er) = crate::vmm::release(s.map) {
@@ -2887,7 +3026,8 @@ fn end_capture_err(e: crate::ffi::DriverError) -> ModelError {
                     }
                 }
                 PeerBlock::Alias(a) => {
-                    self.peer_alias_bytes = self.peer_alias_bytes.saturating_sub(a.map.bytes as u64);
+                    self.peer_alias_bytes =
+                        self.peer_alias_bytes.saturating_sub(a.map.bytes as u64);
                     if let Err(er) = crate::vmm::release(a.map) {
                         errs.push(format!("id={id}(alias): {er}"));
                     }
@@ -3009,7 +3149,11 @@ impl Drop for GpuCtx {
             );
         }
         for e in &errs {
-            sink.logf(owl_shared::log::LVL_WARN, "peer-drop", format_args!("兜底释放失败: {e}"));
+            sink.logf(
+                owl_shared::log::LVL_WARN,
+                "peer-drop",
+                format_args!("兜底释放失败: {e}"),
+            );
         }
     }
 }
@@ -3113,7 +3257,11 @@ impl KernelCache {
         }
         let asset = owl_kernels::family::cubins::asset(source).ok_or_else(|| {
             // 机器判据面:整轮 e2e 日志里 `grep -c aot-miss` 应恒 0
-            sink.logf(owl_shared::log::LVL_WARN, "aot-miss", format_args!("{name} —— 无构建期 cubin 资产(源 {} B)", source.len()));
+            sink.logf(
+                owl_shared::log::LVL_WARN,
+                "aot-miss",
+                format_args!("{name} —— 无构建期 cubin 资产(源 {} B)", source.len()),
+            );
             if !self.misses.iter().any(|m| m == name) {
                 self.misses.push(name.to_string());
             }
@@ -3193,7 +3341,8 @@ impl Staging {
     pub(super) fn alloc(n: usize, label: &str) -> Result<Self, ModelError> {
         // 字节口径(f16 基线,2026-09-26):n = 字节数,DMA 按 byte 计数
         let ptr = unsafe { malloc_host(n, 0) }
-            .map_err(|e| ModelError::Msg(format!("malloc_host(n={n}B): {e:?}")))? as *mut u8;
+            .map_err(|e| ModelError::Msg(format!("malloc_host(n={n}B): {e:?}")))?
+            as *mut u8;
         // cudarc 的 `malloc_host` 对**失败/零尺寸**可能回 Ok(null)(2026-10-13 记录):
         // 这是**可失败路径**,归 Result 面 —— 原为裸 assert(上下文足却把进程打死,
         // 上层拿不到 OOM 归因面;C2 2026-10-17)。两种病因分开报。
@@ -3237,14 +3386,19 @@ mod tests {
     fn vram_guard_estimate_follows_live_growth() {
         let t0 = std::time::Instant::now();
         let sample = Some((t0, 1u64 << 30, 100u64 << 20)); // free=1GiB @ live=100MiB
-        // live +200MiB ⇒ est 少 200MiB
-        let (est, stale) = VramGuard::estimate_free(sample, 300 << 20, t0 + std::time::Duration::from_millis(100))
-            .expect("采样在场");
+                                                           // live +200MiB ⇒ est 少 200MiB
+        let (est, stale) = VramGuard::estimate_free(
+            sample,
+            300 << 20,
+            t0 + std::time::Duration::from_millis(100),
+        )
+        .expect("采样在场");
         assert_eq!(est, (1u64 << 30) - (200u64 << 20));
         assert!(!stale, "TTL 内不陈旧");
         // live 回退 ⇒ grown 饱和为 0(估计不高于采样值:保守方向)
-        let (est2, _) = VramGuard::estimate_free(sample, 10 << 20, t0 + std::time::Duration::from_millis(100))
-            .expect("采样在场");
+        let (est2, _) =
+            VramGuard::estimate_free(sample, 10 << 20, t0 + std::time::Duration::from_millis(100))
+                .expect("采样在场");
         assert_eq!(est2, 1u64 << 30);
     }
 
@@ -3254,8 +3408,12 @@ mod tests {
         let t0 = std::time::Instant::now();
         assert!(VramGuard::estimate_free(None, 0, t0).is_none(), "无采样");
         let sample = Some((t0, 1u64 << 30, 0));
-        let (_, stale) = VramGuard::estimate_free(sample, 0, t0 + VramGuard::SAMPLE_TTL + std::time::Duration::from_millis(1))
-            .expect("采样在场");
+        let (_, stale) = VramGuard::estimate_free(
+            sample,
+            0,
+            t0 + VramGuard::SAMPLE_TTL + std::time::Duration::from_millis(1),
+        )
+        .expect("采样在场");
         assert!(stale, "超 TTL 必须重采");
     }
 
@@ -3296,7 +3454,10 @@ mod tests {
             ("fi.indices", 512 << 10),
         ];
         let rep = render_block_report(es.iter().copied(), 2);
-        assert!(rep.starts_with("在册 4 块 / 合计 5.5MiB(按名 top2):"), "头:{rep}");
+        assert!(
+            rep.starts_with("在册 4 块 / 合计 5.5MiB(按名 top2):"),
+            "头:{rep}"
+        );
         // 降序:dfk(3MiB) 在 kv(2MiB) 之前;同名字合并 ×2
         let dfk = rep.find("dfk.k.0=3.0MiB×1").expect("dfk 行");
         let kv = rep.find("kv.k.0=2.0MiB×2").expect("kv 合并行");
@@ -3314,7 +3475,10 @@ mod tests {
         let rep = render_block_report(es.iter().copied(), 8);
         assert!(rep.contains("(未命名!)=2.0MiB×1"), "空名必须显式子项:{rep}");
         // 单位律:小于 1MiB 的块必须用 KiB 显形(不许渲染成 0.0MiB 而消失量级)
-        assert!(rep.contains("tiny.meta=1.5KiB×1"), "小块必须 KiB 口径:{rep}");
+        assert!(
+            rep.contains("tiny.meta=1.5KiB×1"),
+            "小块必须 KiB 口径:{rep}"
+        );
         assert_eq!(count_unnamed(es.iter().copied()), 1);
         // 全有名 ⇒ 计数 0(正向对照:门不误报)
         let ok: [(&str, usize); 1] = [("kv.k.0", 1 << 20)];
@@ -3326,8 +3490,14 @@ mod tests {
     fn block_json_shape_and_escapes() {
         let es: [(&str, usize); 3] = [("kv.k.0", 1 << 20), ("kv.k.0", 1 << 20), ("a\"b\\c", 1536)];
         let js = block_report_json(es.iter().copied());
-        assert!(js.starts_with("{\"blocks\":[{\"name\":\"kv.k.0\",\"bytes\":2097152,\"blocks\":2}"), "头:{js}");
-        assert!(js.contains("{\"name\":\"a\\\"b\\\\c\",\"bytes\":1536,\"blocks\":1}"), "转义:{js}");
+        assert!(
+            js.starts_with("{\"blocks\":[{\"name\":\"kv.k.0\",\"bytes\":2097152,\"blocks\":2}"),
+            "头:{js}"
+        );
+        assert!(
+            js.contains("{\"name\":\"a\\\"b\\\\c\",\"bytes\":1536,\"blocks\":1}"),
+            "转义:{js}"
+        );
         // 尾判据用"片段在 + 总数字面"而不是 ends_with(尾字符判据脆弱,已踩)
         assert!(js.contains("\"total_bytes\":2098688"), "total_bytes:{js}");
         assert!(js.contains("\"total_blocks\":3"), "total_blocks:{js}");
@@ -3342,13 +3512,25 @@ mod tests {
         // 未到门 ⇒ 不写
         assert_eq!(peak_should_dump(100 * mb, 1000 * mb, 0, 0, 8), None);
         // 到门首次 ⇒ 写,水位 = live
-        assert_eq!(peak_should_dump(1000 * mb, 1000 * mb, 0, 0, 8), Some(1000 * mb));
+        assert_eq!(
+            peak_should_dump(1000 * mb, 1000 * mb, 0, 0, 8),
+            Some(1000 * mb)
+        );
         // 到门但只比上次高 4% ⇒ 不写(步进 5%)
-        assert_eq!(peak_should_dump(1040 * mb, 1000 * mb, 1000 * mb, 1, 8), None);
+        assert_eq!(
+            peak_should_dump(1040 * mb, 1000 * mb, 1000 * mb, 1, 8),
+            None
+        );
         // 高 6% ⇒ 写
-        assert_eq!(peak_should_dump(1060 * mb, 1000 * mb, 1000 * mb, 1, 8), Some(1060 * mb));
+        assert_eq!(
+            peak_should_dump(1060 * mb, 1000 * mb, 1000 * mb, 1, 8),
+            Some(1060 * mb)
+        );
         // 写满 ⇒ 不写(即使破步进)
-        assert_eq!(peak_should_dump(9999 * mb, 1000 * mb, 1000 * mb, 8, 8), None);
+        assert_eq!(
+            peak_should_dump(9999 * mb, 1000 * mb, 1000 * mb, 8, 8),
+            None
+        );
         // 门值 0 = 关
         assert_eq!(peak_should_dump(9999 * mb, 0, 0, 0, 8), None);
     }
@@ -3364,8 +3546,14 @@ mod tests {
     /// 现场名字 → 毫秒戳:两种自家形态认得出,陌生形态一律 `None`(不误删)。
     #[test]
     fn vram_dump_stamp_forms() {
-        assert_eq!(vram_dump_stamp("owl-vram-1792124456019.json"), Some(1792124456019));
-        assert_eq!(vram_dump_stamp("owl-vram-peak-1792124456019-64MiB.json"), Some(1792124456019));
+        assert_eq!(
+            vram_dump_stamp("owl-vram-1792124456019.json"),
+            Some(1792124456019)
+        );
+        assert_eq!(
+            vram_dump_stamp("owl-vram-peak-1792124456019-64MiB.json"),
+            Some(1792124456019)
+        );
         // 陌生/残缺形态 ⇒ None(显式路径恰好长这样也照样不放行)
         assert_eq!(vram_dump_stamp("x.json"), None);
         assert_eq!(vram_dump_stamp("owl-vram-abc.json"), None);
@@ -3387,9 +3575,16 @@ mod tests {
         // 5 份自家现场(4 OOM + 1 峰值),keep = 2 ⇒ 删 3 份最旧(戳 5 / 10 / 20)
         assert_eq!(prune_vram_dumps(&dir, 2), 3);
         for ms in [30u128, 40] {
-            assert!(dir.join(format!("owl-vram-{ms}.json")).is_file(), "戳 {ms} 应留下");
+            assert!(
+                dir.join(format!("owl-vram-{ms}.json")).is_file(),
+                "戳 {ms} 应留下"
+            );
         }
-        for gone in ["owl-vram-10.json", "owl-vram-20.json", "owl-vram-peak-5-1MiB.json"] {
+        for gone in [
+            "owl-vram-10.json",
+            "owl-vram-20.json",
+            "owl-vram-peak-5-1MiB.json",
+        ] {
             assert!(!dir.join(gone).is_file(), "{gone} 应被裁掉");
         }
         assert!(dir.join("别人的文件.json").is_file(), "陌生文件不得删");
@@ -3405,7 +3600,10 @@ mod tests {
     fn empty_ledger_report_is_well_formed() {
         let es: [(&str, usize); 0] = [];
         assert_eq!(render_block_report(es.iter().copied(), 4), "(块账空)");
-        assert_eq!(block_report_json(es.iter().copied()), "{\"blocks\":[],\"total_bytes\":0,\"total_blocks\":0}");
+        assert_eq!(
+            block_report_json(es.iter().copied()),
+            "{\"blocks\":[],\"total_bytes\":0,\"total_blocks\":0}"
+        );
         assert_eq!(count_unnamed(es.iter().copied()), 0);
     }
 
@@ -3419,7 +3617,10 @@ mod tests {
         r.record(7);
         r.record(9);
         assert_eq!(r.window_len(), 2);
-        assert!(!r.is_pinned(7), "收窗前不得入租约(否则捕获失败的块会被永久钉住)");
+        assert!(
+            !r.is_pinned(7),
+            "收窗前不得入租约(否则捕获失败的块会被永久钉住)"
+        );
         assert_eq!(r.pinned_len(), 0);
         // 收窗:本图引用集 = 2 块,入租约
         let refs = r.adopt();
@@ -3485,9 +3686,16 @@ mod tests {
         assert!(fam_window_verdict(FamAct::Upload { invariant: false }, false).is_ok());
         // 严格档:结构化拒,且拒语必须点出病因(免得后人以为只是"不支持")
         let e = fam_window_verdict(FamAct::ScratchAlloc, true).expect_err("严格档须拒");
-        assert!(e.contains("alloc") && e.contains("MEM_ALLOC"), "拒语应可行动:{e}");
-        let e = fam_window_verdict(FamAct::Upload { invariant: false }, true).expect_err("严格档须拒");
-        assert!(e.contains("upload") && e.contains("不变盒"), "拒语应可行动:{e}");
+        assert!(
+            e.contains("alloc") && e.contains("MEM_ALLOC"),
+            "拒语应可行动:{e}"
+        );
+        let e =
+            fam_window_verdict(FamAct::Upload { invariant: false }, true).expect_err("严格档须拒");
+        assert!(
+            e.contains("upload") && e.contains("不变盒"),
+            "拒语应可行动:{e}"
+        );
     }
 }
 
@@ -3595,7 +3803,10 @@ mod tag_filter_tests {
         cfg.model.head_quant = HeadQuant::Off;
         cfg.spec.depth = 0;
         assert!(allows(&cfg, "marlin_gemm_w4a8_awq"));
-        assert!(!allows(&cfg, "marlin_gemm_w4a16_awq"), "无头/无草稿时不得放行 W4A16");
+        assert!(
+            !allows(&cfg, "marlin_gemm_w4a16_awq"),
+            "无头/无草稿时不得放行 W4A16"
+        );
     }
 
     #[test]
@@ -3606,8 +3817,14 @@ mod tag_filter_tests {
         cfg.spec.draft = owl_shared::config::SpecDraft::Mtp;
         cfg.spec.depth = 3;
         assert!(allows(&cfg, "owl_naive_attn_nc_f16"), "MTP 链 = F16");
-        assert!(allows(&cfg, "vllm_reshape_and_cache_f16_knhd"), "MTP 写核走主池 KnHD f16");
-        assert!(!allows(&cfg, "owl_naive_attn_nc_bf16"), "MTP 不应派生 BF16 草稿池");
+        assert!(
+            allows(&cfg, "vllm_reshape_and_cache_f16_knhd"),
+            "MTP 写核走主池 KnHD f16"
+        );
+        assert!(
+            !allows(&cfg, "owl_naive_attn_nc_bf16"),
+            "MTP 不应派生 BF16 草稿池"
+        );
     }
 
     #[test]
@@ -3621,9 +3838,18 @@ mod tag_filter_tests {
         cfg.spec.draft = SpecDraft::Mtp;
         cfg.spec.depth = 7;
         cfg.store.kv.draft_kv_dtype = owl_shared::config::DraftKvDtype::Fp8;
-        assert!(allows(&cfg, "owl_reshape_and_cache_fp8kv_knhd"), "MTP fp8 写核应放行");
-        assert!(allows(&cfg, "vllm_reshape_and_cache_f16_knhd") == false, "MTP fp8 档不应再派生 F16");
-        assert!(allows(&cfg, "owl_naive_attn_nc_bf16") == false, "MTP 不是 BF16");
+        assert!(
+            allows(&cfg, "owl_reshape_and_cache_fp8kv_knhd"),
+            "MTP fp8 写核应放行"
+        );
+        assert!(
+            allows(&cfg, "vllm_reshape_and_cache_f16_knhd") == false,
+            "MTP fp8 档不应再派生 F16"
+        );
+        assert!(
+            allows(&cfg, "owl_naive_attn_nc_bf16") == false,
+            "MTP 不是 BF16"
+        );
     }
 
     #[test]

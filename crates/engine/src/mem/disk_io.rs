@@ -52,7 +52,10 @@ pub(crate) async fn write_block(
     .await;
     match joined {
         Ok(Ok(())) => Ok(n),
-        Ok(Err((b, e))) => Err(WriteFail { bytes: b, err: format!("磁盘写失败({label}):{e}") }),
+        Ok(Err((b, e))) => Err(WriteFail {
+            bytes: b,
+            err: format!("磁盘写失败({label}):{e}"),
+        }),
         Err(e) => Err(WriteFail {
             bytes: Vec::new(),
             err: format!("磁盘写任务 join 失败({label}):{e}(内容已丢)"),
@@ -173,11 +176,7 @@ pub(crate) async fn remove_files(paths: Vec<PathBuf>) -> usize {
                 Ok(()) => n += 1,
                 Err(e) if e.kind() == std::io::ErrorKind::NotFound => n += 1,
                 Err(e) => {
-                    owl_shared::log_warn!(
-                        "disk",
-                        "删除失败({}):{e}(账已出,文件残留)",
-                        p.display()
-                    );
+                    owl_shared::log_warn!("disk", "删除失败({}):{e}(账已出,文件残留)", p.display());
                 }
             }
         }
@@ -199,7 +198,9 @@ pub(crate) fn scan_dir_sync<K: DiskKey>(dir: &Path) -> Vec<(K, PathBuf, usize)> 
     };
     for ent in rd.flatten() {
         let path = ent.path();
-        let Some(name) = path.file_name().and_then(|s| s.to_str()) else { continue };
+        let Some(name) = path.file_name().and_then(|s| s.to_str()) else {
+            continue;
+        };
         let Some(key) = DiskTier::<K>::key_of_file(name) else {
             if name.ends_with(".tmp") {
                 // 崩在 rename 前的残件:删掉(它不是账的一部分)
@@ -216,10 +217,14 @@ pub(crate) fn scan_dir_sync<K: DiskKey>(dir: &Path) -> Vec<(K, PathBuf, usize)> 
 /// 扫一个目录里的 **`.idx` 索引文件**(S6.1;`(键, 路径)`)。名字形状 === `.bin` 的键规则。
 pub(crate) fn scan_index_sync<K: DiskKey>(dir: &Path) -> Vec<(K, PathBuf)> {
     let mut out = Vec::new();
-    let Ok(rd) = std::fs::read_dir(dir) else { return out };
+    let Ok(rd) = std::fs::read_dir(dir) else {
+        return out;
+    };
     for ent in rd.flatten() {
         let path = ent.path();
-        let Some(name) = path.file_name().and_then(|s| s.to_str()) else { continue };
+        let Some(name) = path.file_name().and_then(|s| s.to_str()) else {
+            continue;
+        };
         let Some(stem) = name.strip_suffix(".idx") else {
             continue;
         };

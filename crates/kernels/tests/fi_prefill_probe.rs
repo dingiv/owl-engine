@@ -306,10 +306,7 @@ fn run_case_dtype(t: usize, ctx: usize, host_check: bool, iters: usize, f16_kv: 
             "vllm_reshape_and_cache_f16_knhd",
         ]
     } else {
-        &[
-            fp8_name,
-            "owl_reshape_and_cache_fp8kv_knhd",
-        ]
+        &[fp8_name, "owl_reshape_and_cache_fp8kv_knhd"]
     };
     let mut reg = owl_kernels::registry::OpRegistry::init_all_with(
         owl_kernels::server::family_factories(),

@@ -40,7 +40,10 @@ impl LockInfo {
             pid: std::process::id(),
             port,
             cfg,
-            started_at: SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0),
+            started_at: SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .map(|d| d.as_secs())
+                .unwrap_or(0),
         }
     }
 
@@ -77,7 +80,10 @@ pub fn default_lock_dir() -> PathBuf {
             return c.clone();
         }
     }
-    cands.last().cloned().unwrap_or_else(|| PathBuf::from("/tmp/owl-gpu-locks"))
+    cands
+        .last()
+        .cloned()
+        .unwrap_or_else(|| PathBuf::from("/tmp/owl-gpu-locks"))
 }
 
 /// 锁目录候选(纯函数,按优先级;**锁是运行期状态 ⇒ 优先 `/run`**,重启即清):
@@ -118,7 +124,9 @@ fn lock_path(dir: &Path, uuid: &str) -> PathBuf {
 /// 读某目录下的锁:**陈旧者就地删除**(进程已死;删失败则响亮 warn),返回活锁
 pub fn live_locks_in(dir: &Path) -> Vec<LockInfo> {
     let mut out = Vec::new();
-    let Ok(rd) = std::fs::read_dir(dir) else { return out };
+    let Ok(rd) = std::fs::read_dir(dir) else {
+        return out;
+    };
     for e in rd.flatten() {
         let p = e.path();
         if p.extension().and_then(|s| s.to_str()) != Some("lock") {
@@ -136,7 +144,12 @@ pub fn live_locks_in(dir: &Path) -> Vec<LockInfo> {
             Ok(info) => {
                 // 陈旧锁:持有者进程已死 ⇒ 清掉(不静默)
                 match std::fs::remove_file(&p) {
-                    Ok(()) => crate::log_info!("gpu-lock", "清理陈旧锁(pid {} 已死):{}", info.pid, p.display()),
+                    Ok(()) => crate::log_info!(
+                        "gpu-lock",
+                        "清理陈旧锁(pid {} 已死):{}",
+                        info.pid,
+                        p.display()
+                    ),
                     Err(e) => crate::log_warn!("gpu-lock", "陈旧锁删除失败:{}: {e}", p.display()),
                 }
             }
@@ -172,11 +185,18 @@ impl LockGuard {
                 info.uuid, h.pid, h.port, h.cfg, h.started_at
             ));
         }
-        std::fs::create_dir_all(dir).map_err(|e| format!("锁目录 {} 建失败: {e}", dir.display()))?;
+        std::fs::create_dir_all(dir)
+            .map_err(|e| format!("锁目录 {} 建失败: {e}", dir.display()))?;
         let path = lock_path(dir, &info.uuid);
         let body = toml::to_string(info).map_err(|e| format!("锁序列化失败: {e}"))?;
         std::fs::write(&path, body).map_err(|e| format!("锁写入失败 {}: {e}", path.display()))?;
-        crate::log_info!("gpu-lock", "持锁 {:?}(pid {} port {})", info.uuid, info.pid, info.port);
+        crate::log_info!(
+            "gpu-lock",
+            "持锁 {:?}(pid {} port {})",
+            info.uuid,
+            info.pid,
+            info.port
+        );
         Ok(Self { path })
     }
 
@@ -225,10 +245,16 @@ mod tests {
     #[test]
     fn acquire_refuse_then_release() {
         let d = tmp("acq");
-        let g = LockGuard::acquire_in(&d, &LockInfo::new("GPU-test-1", 8137, Some("agent-27b.toml".into())))
-            .expect("首取");
+        let g = LockGuard::acquire_in(
+            &d,
+            &LockInfo::new("GPU-test-1", 8137, Some("agent-27b.toml".into())),
+        )
+        .expect("首取");
         let err = LockGuard::acquire_in(&d, &LockInfo::new("GPU-test-1", 8138, None)).unwrap_err();
-        assert!(err.contains("已被占用") && err.contains("8137"), "拒绝信息应带持有者: {err}");
+        assert!(
+            err.contains("已被占用") && err.contains("8137"),
+            "拒绝信息应带持有者: {err}"
+        );
         drop(g);
         LockGuard::acquire_in(&d, &LockInfo::new("GPU-test-1", 8138, None)).expect("释放后可再取");
         let _ = std::fs::remove_dir_all(&d);
@@ -273,9 +299,17 @@ mod tests {
             Some(1000),
         );
         assert_eq!(c[0], PathBuf::from("/tmp/x"), "显式覆盖最优先");
-        assert_eq!(c[1], PathBuf::from("/run/user/1000/owl/gpu-locks"), "XDG 运行期目录次之");
+        assert_eq!(
+            c[1],
+            PathBuf::from("/run/user/1000/owl/gpu-locks"),
+            "XDG 运行期目录次之"
+        );
         assert_eq!(c[2], PathBuf::from("/run/user/1000/owl/gpu-locks"));
-        assert_eq!(c[3], PathBuf::from("/home/user/.owl/gpu-locks"), "HOME 兜底");
+        assert_eq!(
+            c[3],
+            PathBuf::from("/home/user/.owl/gpu-locks"),
+            "HOME 兜底"
+        );
         // env 与 XDG 都缺 ⇒ 仍要有 /run 与 HOME 两级
         let c2 = lock_dir_candidates(None, None, Some(PathBuf::from("/home/user")), Some(7));
         assert_eq!(c2[0], PathBuf::from("/run/user/7/owl/gpu-locks"));

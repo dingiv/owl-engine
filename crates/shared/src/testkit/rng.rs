@@ -62,7 +62,10 @@ mod tests {
         let mut a = Rng::new(42);
         let mut b = Rng::new(42);
         for _ in 0..100 {
-            assert_eq!(a.f32_uniform(-1.0, 1.0).to_bits(), b.f32_uniform(-1.0, 1.0).to_bits());
+            assert_eq!(
+                a.f32_uniform(-1.0, 1.0).to_bits(),
+                b.f32_uniform(-1.0, 1.0).to_bits()
+            );
         }
     }
 

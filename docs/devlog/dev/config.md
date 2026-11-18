@@ -64,6 +64,28 @@ $EDITOR ~/my-27b.toml          # 改 model.path / server.bind / [parallel] 卡�
   - 列表按**去重消费**：`["3090","3090"]` = 两张不同的 3090；
   - **禁 CUDA 序号**（0/1/… 这种数字会被拒；4 位型号名如 3090 是名字）。
 
+### 1.1.1 宿主 / 磁盘 = 一层一个共享总池（2026-11-18 裁决）
+
+- `[store].ram_pool_size` / `[store].disk_pool_size` 是**整层总预算**；
+  KV 块与 GDN 快照**共享**同一本账。
+- `snap_host_mb` / `snap_disk_mb` 已删除（旧键被 `deny_unknown_fields` 拒启）。
+- 两腿仍各有驻留表/键空间；`plan_capacity` / `Rel` 按实际需求分配余量，
+  一侧需要空间时可逐另一侧最冷条目（跨腿让位）。
+- 配置只给总池；不要再按“KV 一份 + 快照一份”心算。
+
+### 1.1.2 TTFT 超期动作（2026-11-18 裁决）
+
+`[runtime] ttft_on_expire` 控制首 token 门到点后的处置：
+
+| 值 | 行为 |
+|---|---|
+| `ignore`（缺省） | **静默**：不打印、不停止，继续等首 token |
+| `warn` | 每个 turn 打印一次 WARN，**不停止** |
+| `stop` | 打印 WARN 并强停该 turn（旧行为） |
+
+3080 双卡生产档显式设 `warn`（长会话偶发慢边界不打断 agent）。
+预算算式不变，仍由 `crates/engine/src/ttft_gate.rs` 定值。
+
 ## 2. 层序(后面的覆盖前面的)
 
 ```text

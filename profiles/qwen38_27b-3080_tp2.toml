@@ -40,6 +40,8 @@ quant = "w4a8"
 
 [runtime]
 admission_on_full = "reject"
+# TTFT 超期只告警、不强停（2026-11-18 用户裁决；长会话偶发慢边界不打断 agent）
+ttft_on_expire = "warn"
 # 模型 native 上限；再高需要 YaRN
 max_context_length = 262144
 max_concurrency = 2
@@ -68,8 +70,7 @@ draft_path = "../models/syvai/Qwen3.8-27B-DFlash2-W4A16"
 # 前缀缓存是默认行为（正常服务恒开；仅 ablation/reuse=off 才关）
 # 显式钉死显存预算：全部给 KV 池
 vram_budget = 1.0
-ram_pool_size = 10240
-snap_host_mb = 3072
+ram_pool_size = 13312
 # 满池：池 = cap−prefill瞬态；本垫是长 prefill 的实测下限（见文件头）
 vram_activation_reserve = 1024
 

@@ -4,9 +4,9 @@
 //! `client::cublas::parse_gemm` 的解析断言。现在**唯一真源 = 本表**
 //! (槽序由 `PARAMS` 派生),server 侧 `check` 同时校验发射端。
 
-use owl_macros::kernel_tags;
 use crate::contract::{Dtype, Law};
 use crate::spec::{meta_of, CaptureEvidence, Determinism, KernelMeta, KernelSpec, Param};
+use owl_macros::kernel_tags;
 
 /// `cublas_gemm_f16` —— f16 GEMM(lm_head / 非量化线性层)
 pub struct CublasGemmF16;
@@ -86,7 +86,6 @@ impl KernelSpec for CublasGemmF16Dst {
 pub static GEMM_F16: KernelMeta = meta_of::<CublasGemmF16>();
 pub static GEMM_F16_DST: KernelMeta = meta_of::<CublasGemmF16Dst>();
 pub static GEMM_BF16: KernelMeta = meta_of::<CublasGemmBf16>();
-
 
 #[cfg(test)]
 mod tests {

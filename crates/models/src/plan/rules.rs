@@ -283,27 +283,69 @@ mod tests {
     #[test]
     fn rules_cover_27b_keys() {
         let cases: &[(&str, WeightRule)] = &[
-            ("model.layers.0.mlp.gate_proj.weight", WeightRule::UniformCol),
+            (
+                "model.layers.0.mlp.gate_proj.weight",
+                WeightRule::UniformCol,
+            ),
             ("mlp.up_proj.weight", WeightRule::UniformCol),
-            ("model.layers.3.mlp.down_proj.weight", WeightRule::UniformRow),
-            ("model.layers.3.self_attn.q_proj.weight", WeightRule::UniformCol),
+            (
+                "model.layers.3.mlp.down_proj.weight",
+                WeightRule::UniformRow,
+            ),
+            (
+                "model.layers.3.self_attn.q_proj.weight",
+                WeightRule::UniformCol,
+            ),
             ("self_attn.k_proj.weight", WeightRule::UniformCol),
-            ("model.layers.3.self_attn.v_proj.weight", WeightRule::UniformCol),
-            ("model.layers.3.self_attn.o_proj.weight", WeightRule::UniformRow),
+            (
+                "model.layers.3.self_attn.v_proj.weight",
+                WeightRule::UniformCol,
+            ),
+            (
+                "model.layers.3.self_attn.o_proj.weight",
+                WeightRule::UniformRow,
+            ),
             // want 键(层内短键)→ 四段融合
-            ("in_proj_qkvz.weight", WeightRule::SegmentedCol(SegKind::QKVZ)),
-            ("model.layers.0.linear_attn.in_proj_qkvz.weight", WeightRule::SegmentedCol(SegKind::QKVZ)),
+            (
+                "in_proj_qkvz.weight",
+                WeightRule::SegmentedCol(SegKind::QKVZ),
+            ),
+            (
+                "model.layers.0.linear_attn.in_proj_qkvz.weight",
+                WeightRule::SegmentedCol(SegKind::QKVZ),
+            ),
             ("linear_attn.in_proj_a.weight", WeightRule::PerHead),
-            ("model.layers.0.linear_attn.in_proj_b.weight", WeightRule::PerHead),
-            ("model.layers.0.linear_attn.out_proj.weight", WeightRule::UniformRow),
-            ("model.layers.0.linear_attn.conv1d.weight", WeightRule::SegmentedCol(SegKind::ConvQKV)),
+            (
+                "model.layers.0.linear_attn.in_proj_b.weight",
+                WeightRule::PerHead,
+            ),
+            (
+                "model.layers.0.linear_attn.out_proj.weight",
+                WeightRule::UniformRow,
+            ),
+            (
+                "model.layers.0.linear_attn.conv1d.weight",
+                WeightRule::SegmentedCol(SegKind::ConvQKV),
+            ),
             ("model.layers.0.linear_attn.A_log", WeightRule::PerHead),
             ("model.layers.0.linear_attn.dt_bias", WeightRule::PerHead),
             // 其余一律 Replicate
-            ("model.layers.0.input_layernorm.weight", WeightRule::Replicate),
-            ("model.layers.0.post_attention_layernorm.weight", WeightRule::Replicate),
-            ("model.layers.0.linear_attn.norm.weight", WeightRule::Replicate),
-            ("model.layers.3.self_attn.q_norm.weight", WeightRule::Replicate),
+            (
+                "model.layers.0.input_layernorm.weight",
+                WeightRule::Replicate,
+            ),
+            (
+                "model.layers.0.post_attention_layernorm.weight",
+                WeightRule::Replicate,
+            ),
+            (
+                "model.layers.0.linear_attn.norm.weight",
+                WeightRule::Replicate,
+            ),
+            (
+                "model.layers.3.self_attn.q_norm.weight",
+                WeightRule::Replicate,
+            ),
             ("model.norm.weight", WeightRule::Replicate),
             ("model.embed_tokens.weight", WeightRule::Replicate),
             ("lm_head.weight", WeightRule::Replicate),
@@ -347,7 +389,11 @@ mod tests {
         );
         let p = TpPlan::new(1, 2).unwrap();
         let out_dim = 2 * spec.full_heads.0 * spec.full_heads.2;
-        assert_eq!(p.shard_range(out_dim).unwrap(), 6144..12288, "rank1 = heads 12..23");
+        assert_eq!(
+            p.shard_range(out_dim).unwrap(),
+            6144..12288,
+            "rank1 = heads 12..23"
+        );
         let local = spec.sharded(p).unwrap();
         assert_eq!(local.full_heads.0, 12, "每 rank 12 个完整 q/gate 头对");
     }
@@ -358,13 +404,21 @@ mod tests {
         let spec = spec27b();
         // QGate 段长保留给显式 q ⊕ gate 两段源；当前 AWQ/GGUF 的
         // gated q_proj 都是 per-head 交错，规则表/角色表都走整行等分。
-        assert_eq!(SegKind::QGate.segments(&spec).unwrap(), vec![6144, 6144], "q ⊕ gate");
+        assert_eq!(
+            SegKind::QGate.segments(&spec).unwrap(),
+            vec![6144, 6144],
+            "q ⊕ gate"
+        );
         assert_eq!(
             SegKind::QKVZ.segments(&spec).unwrap(),
             vec![2048, 2048, 6144, 6144],
             "q ⊕ k ⊕ v ⊕ z(27B:2K=4096 + 2V=12288 = 16384)"
         );
-        assert_eq!(SegKind::ConvQKV.segments(&spec).unwrap(), vec![2048, 2048, 6144], "conv q ⊕ k ⊕ v");
+        assert_eq!(
+            SegKind::ConvQKV.segments(&spec).unwrap(),
+            vec![2048, 2048, 6144],
+            "conv q ⊕ k ⊕ v"
+        );
         // world=2 下,每段取一半(分段切的实际区间)
         let p = TpPlan::new(1, 2).unwrap();
         let qkv = SegKind::ConvQKV.segments(&spec).unwrap();

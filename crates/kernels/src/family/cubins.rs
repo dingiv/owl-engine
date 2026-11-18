@@ -102,7 +102,10 @@ mod tests {
     /// (测试面允许 IO)。判据不变:算法漂移一处即红。
     #[test]
     fn generated_hashes_match_rust_hash_fn() {
-        assert!(!CUBIN_ASSETS.is_empty(), "资产表为空 —— build.rs 未产 cubin?");
+        assert!(
+            !CUBIN_ASSETS.is_empty(),
+            "资产表为空 —— build.rs 未产 cubin?"
+        );
         for a in CUBIN_ASSETS {
             let text = crate::cu_sig::cu_text(a.id);
             assert_eq!(
@@ -111,7 +114,11 @@ mod tests {
                 "资产 {} 的源哈希与 build.rs 不一致(算法漂移)",
                 a.id
             );
-            assert!(asset(a.id).is_some_and(|x| x.module == a.module), "资产 {} 反查失败", a.id);
+            assert!(
+                asset(a.id).is_some_and(|x| x.module == a.module),
+                "资产 {} 反查失败",
+                a.id
+            );
         }
     }
 

@@ -41,7 +41,11 @@ fn e4m3_decode(code: u8) -> f32 {
     if e == 15 && m == 7 {
         return f32::NAN;
     }
-    let v = if e == 0 { (m as f32) * 2f32.powi(-9) } else { (1.0 + m as f32 / 8.0) * 2f32.powi(e - 7) };
+    let v = if e == 0 {
+        (m as f32) * 2f32.powi(-9)
+    } else {
+        (1.0 + m as f32 / 8.0) * 2f32.powi(e - 7)
+    };
     s * v
 }
 fn e4m3_encode(v: f32) -> u8 {
@@ -118,9 +122,10 @@ fn host_ref_knhd(q: &[u16], kc: &[u8], vc: &[u8], lens: &[usize]) -> Vec<f32> {
     out
 }
 
-
 /// 一次全量测量:XQA 单发 + v2(主核+reduce)两发,同 ctx、同池。
-fn run_case(ctx: usize, check: bool) { run_case_mm(ctx, check, false) }
+fn run_case(ctx: usize, check: bool) {
+    run_case_mm(ctx, check, false)
+}
 
 /// 掩码变体 A/B:v=0 因果(bit k 允许 k≤row) / 1 位序反 / 2 极性反 / 3 行序反
 fn mask_variant(v: u32) -> Vec<u32> {
@@ -151,7 +156,9 @@ fn mask_variant(v: u32) -> Vec<u32> {
 
 /// `mask_all=true` → 掩码全开(块内 8 行互相全可见)+ host 同口径(lens 全 = ctx)
 /// 用途:区分"掩码语义/位打包复刻错"(全开后误差应塌)与"数值精度"(不塌)。
-fn run_case_mm(ctx: usize, check: bool, mask_all: bool) { run_case_var(ctx, check, mask_all, 0) }
+fn run_case_mm(ctx: usize, check: bool, mask_all: bool) {
+    run_case_var(ctx, check, mask_all, 0)
+}
 
 fn run_case_var(ctx: usize, check: bool, mask_all: bool, mask_var: u32) {
     let nb = ctx.div_ceil(PAGE);
@@ -208,7 +215,11 @@ fn run_case_var(ctx: usize, check: bool, mask_all: bool, mask_var: u32) {
         d
     };
     // 下三角位掩码:行 i 的 bit j = 可看块内第 j 个 key ⇒ 0x1,0x3,…,0xFF
-    let mask: Vec<u32> = if mask_all { vec![u32::MAX; S] } else { mask_variant(mask_var) };
+    let mask: Vec<u32> = if mask_all {
+        vec![u32::MAX; S]
+    } else {
+        mask_variant(mask_var)
+    };
     let d_mask = {
         let mut d = unsafe { stream.alloc::<u32>(mask.len()) }.unwrap();
         stream.memcpy_htod(&mask, &mut d).unwrap();
@@ -231,17 +242,23 @@ fn run_case_var(ctx: usize, check: bool, mask_all: bool, mask_var: u32) {
     };
     let d_lens_f32 = {
         let mut d = unsafe { stream.alloc::<f32>(lens.len()) }.unwrap();
-        stream.memcpy_htod(&lens.iter().map(|&l| l as f32).collect::<Vec<_>>(), &mut d).unwrap();
+        stream
+            .memcpy_htod(&lens.iter().map(|&l| l as f32).collect::<Vec<_>>(), &mut d)
+            .unwrap();
         d
     };
     let d_es = {
         let mut d = unsafe { stream.alloc::<f32>(S * H * nparts) }.unwrap();
-        stream.memcpy_htod(&vec![0f32; S * H * nparts], &mut d).unwrap();
+        stream
+            .memcpy_htod(&vec![0f32; S * H * nparts], &mut d)
+            .unwrap();
         d
     };
     let d_ml = {
         let mut d = unsafe { stream.alloc::<f32>(S * H * nparts) }.unwrap();
-        stream.memcpy_htod(&vec![0f32; S * H * nparts], &mut d).unwrap();
+        stream
+            .memcpy_htod(&vec![0f32; S * H * nparts], &mut d)
+            .unwrap();
         d
     };
     let d_partial = dev_u16(&vec![0u16; S * H * nparts * HD]);
@@ -306,7 +323,10 @@ fn run_case_var(ctx: usize, check: bool, mask_all: bool, mask_var: u32) {
 
     // ---- v2 基线(主核 + reduce;与生产同两发) ----
     let ptx = cudarc::nvrtc::compile_ptx_with_opts(
-        owl_kernels::cu_sig::cu_text(owl_kernels::ops::source("vllm_paged_attention_v2_fp8_knhd_hd256bs32")).as_str(),
+        owl_kernels::cu_sig::cu_text(owl_kernels::ops::source(
+            "vllm_paged_attention_v2_fp8_knhd_hd256bs32",
+        ))
+        .as_str(),
         cudarc::nvrtc::CompileOptions {
             arch: Some("compute_86"),
             include_paths: vec!["/usr/local/cuda/include".into()],
@@ -367,7 +387,12 @@ fn run_case_var(ctx: usize, check: bool, mask_all: bool, mask_var: u32) {
         unsafe { b.launch(cfg) }.expect("v2 main");
         let mut b2 = stream.launch_builder(&f_red);
         let np_i = nparts as i32;
-        b2.arg(&es_p).arg(&ml_p).arg(&pa_p).arg(&ln_p).arg(&np_i).arg(&o2_p);
+        b2.arg(&es_p)
+            .arg(&ml_p)
+            .arg(&pa_p)
+            .arg(&ln_p)
+            .arg(&np_i)
+            .arg(&o2_p);
         let cfg2 = LaunchConfig {
             grid_dim: (H as u32, S as u32, 1),
             block_dim: (128, 1, 1),
@@ -391,8 +416,18 @@ fn run_case_var(ctx: usize, check: bool, mask_all: bool, mask_var: u32) {
         stream.synchronize().unwrap();
         t.elapsed().as_secs_f64() * 1e3 / n as f64
     };
-    let xqa_ms = bench(20, Box::new(|| { xqa_call(o_p); }));
-    let v2_ms = bench(20, Box::new(|| { v2_call(); }));
+    let xqa_ms = bench(
+        20,
+        Box::new(|| {
+            xqa_call(o_p);
+        }),
+    );
+    let v2_ms = bench(
+        20,
+        Box::new(|| {
+            v2_call();
+        }),
+    );
 
     // ---- 数值 ----
     let mut o_xqa = vec![0u16; S * H * HD];
@@ -411,12 +446,22 @@ fn run_case_var(ctx: usize, check: bool, mask_all: bool, mask_var: u32) {
             n_xv += 1;
         }
     }
-    let host = if check { Some(host_ref_knhd(&q_f16, &k_fp8, &v_fp8, &lens)) } else { None };
+    let host = if check {
+        Some(host_ref_knhd(&q_f16, &k_fp8, &v_fp8, &lens))
+    } else {
+        None
+    };
     let d_xh = host.as_ref().map(|h| {
-        fx.iter().zip(h.iter()).map(|(a, b)| (a - b).abs()).fold(0f32, f32::max)
+        fx.iter()
+            .zip(h.iter())
+            .map(|(a, b)| (a - b).abs())
+            .fold(0f32, f32::max)
     });
     let d_vh = host.as_ref().map(|h| {
-        fv.iter().zip(h.iter()).map(|(a, b)| (a - b).abs()).fold(0f32, f32::max)
+        fv.iter()
+            .zip(h.iter())
+            .map(|(a, b)| (a - b).abs())
+            .fold(0f32, f32::max)
     });
 
     println!(

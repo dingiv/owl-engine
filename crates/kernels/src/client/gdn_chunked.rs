@@ -27,8 +27,21 @@ pub const SIG: &str = "T,T,T,T,T,T,T,O,sz,sz,sz,sz,sz,sz,sz";
 /// `parse` 取用的槽名(声明序) —— F3 成对律;
 /// `client::tests::parse_slots_are_exactly_declared` 逐字锁死。
 pub const PARSE_SLOTS: &[&str] = &[
-    "q", "k", "v", "beta", "gate", "state", "tables", "out", "t", "slot", "nv", "nk", "kd",
-    "scale_bits", "nt",
+    "q",
+    "k",
+    "v",
+    "beta",
+    "gate",
+    "state",
+    "tables",
+    "out",
+    "t",
+    "slot",
+    "nv",
+    "nk",
+    "kd",
+    "scale_bits",
+    "nt",
 ];
 
 /// raw 门控(f16;层侧 g 原块)—— 客户端面唯一产出的 g 形态
@@ -109,8 +122,16 @@ impl GdnChunkedCall {
             Arg::block(self.v.id, self.v.dtype, self.v.rank),
             Arg::block(self.beta.id, self.beta.dtype, self.beta.rank),
             Arg::block(self.gate.0.id, self.gate.0.dtype, self.gate.0.rank),
-            Arg::block(self.state.pool.id, self.state.pool.dtype, self.state.pool.rank),
-            Arg::block(self.tables.tables.id, self.tables.tables.dtype, self.tables.tables.rank),
+            Arg::block(
+                self.state.pool.id,
+                self.state.pool.dtype,
+                self.state.pool.rank,
+            ),
+            Arg::block(
+                self.tables.tables.id,
+                self.tables.tables.dtype,
+                self.tables.tables.rank,
+            ),
         ]
     }
 
@@ -164,8 +185,14 @@ impl GdnChunkedCall {
             v: s.flat_block("v")?,
             beta: s.flat_block("beta")?,
             gate: GateRaw(s.flat_block("gate")?),
-            state: StateSlot { pool: s.flat_block("state")?, slot: s.u64("slot")? as u32 },
-            tables: TablesSlot { tables: s.flat_block("tables")?, nt: s.u64("nt")? as usize },
+            state: StateSlot {
+                pool: s.flat_block("state")?,
+                slot: s.u64("slot")? as u32,
+            },
+            tables: TablesSlot {
+                tables: s.flat_block("tables")?,
+                nt: s.u64("nt")? as usize,
+            },
             shape,
         };
         Ok((call, out))
@@ -179,7 +206,10 @@ impl GdnChunkedCall {
         args.push(Arg::block(out.id, out.dtype, out.rank));
         args.extend(self.scalar_args());
         LaunchMsg {
-            kernel: KernelSource { name: GDN_CHUNKED.to_string(), source: String::new() },
+            kernel: KernelSource {
+                name: GDN_CHUNKED.to_string(),
+                source: String::new(),
+            },
             args,
             grid: (0, 0, 0), // foreign 面:grid/block 由 runtime 单源(核内常量)
             block: (0, 0, 0),
@@ -190,14 +220,30 @@ impl GdnChunkedCall {
     }
 
     // ── 访问器(runtime 只读消费;字段私有防漂移)──
-    pub fn q(&self) -> &Bytes { &self.q }
-    pub fn k(&self) -> &Bytes { &self.k }
-    pub fn v(&self) -> &Bytes { &self.v }
-    pub fn beta(&self) -> &Bytes { &self.beta }
-    pub fn gate(&self) -> &GateRaw { &self.gate }
-    pub fn state(&self) -> &StateSlot { &self.state }
-    pub fn shape(&self) -> GdnShape { self.shape }
-    pub fn tables(&self) -> &TablesSlot { &self.tables }
+    pub fn q(&self) -> &Bytes {
+        &self.q
+    }
+    pub fn k(&self) -> &Bytes {
+        &self.k
+    }
+    pub fn v(&self) -> &Bytes {
+        &self.v
+    }
+    pub fn beta(&self) -> &Bytes {
+        &self.beta
+    }
+    pub fn gate(&self) -> &GateRaw {
+        &self.gate
+    }
+    pub fn state(&self) -> &StateSlot {
+        &self.state
+    }
+    pub fn shape(&self) -> GdnShape {
+        self.shape
+    }
+    pub fn tables(&self) -> &TablesSlot {
+        &self.tables
+    }
 }
 
 /// builder(字段名即契约;类型不对编译不过,长度不对构造期结构化报错)
@@ -231,20 +277,32 @@ impl GdnChunkedCallBuilder {
     }
 
     pub fn q(mut self, b: &Bytes) -> Result<Self, OpError> {
-        self.check(b, self.shape.t as usize * self.shape.nk as usize * self.shape.kd as usize, "q")?;
+        self.check(
+            b,
+            self.shape.t as usize * self.shape.nk as usize * self.shape.kd as usize,
+            "q",
+        )?;
         self.q = Some(b.clone());
         Ok(self)
     }
 
     pub fn k(mut self, b: &Bytes) -> Result<Self, OpError> {
-        self.check(b, self.shape.t as usize * self.shape.nk as usize * self.shape.kd as usize, "k")?;
+        self.check(
+            b,
+            self.shape.t as usize * self.shape.nk as usize * self.shape.kd as usize,
+            "k",
+        )?;
         self.k = Some(b.clone());
         Ok(self)
     }
 
     pub fn v(mut self, b: &Bytes) -> Result<Self, OpError> {
         // vd = kd(GDN 家族律;零字面量,变架构随 GdnShape 单源)
-        self.check(b, self.shape.t as usize * self.shape.nv as usize * self.shape.kd as usize, "v")?;
+        self.check(
+            b,
+            self.shape.t as usize * self.shape.nv as usize * self.shape.kd as usize,
+            "v",
+        )?;
         self.v = Some(b.clone());
         Ok(self)
     }
@@ -285,7 +343,10 @@ impl GdnChunkedCallBuilder {
                 });
             }
         }
-        self.state = Some(StateSlot { pool: pool.clone(), slot });
+        self.state = Some(StateSlot {
+            pool: pool.clone(),
+            slot,
+        });
         Ok(self)
     }
 
@@ -302,7 +363,10 @@ impl GdnChunkedCallBuilder {
                 got: format!("块 id={} len={}", b.id, b.len),
             });
         }
-        self.tables = Some(TablesSlot { tables: b.clone(), nt });
+        self.tables = Some(TablesSlot {
+            tables: b.clone(),
+            nt,
+        });
         Ok(self)
     }
 
@@ -348,7 +412,12 @@ mod tests {
     use crate::contract::Dtype;
 
     fn shape(t: u32) -> GdnShape {
-        GdnShape { t, nv: 48, nk: 16, kd: 128 }
+        GdnShape {
+            t,
+            nv: 48,
+            nk: 16,
+            kd: 128,
+        }
     }
 
     /// 测试块:事实按本面配方填(q/k/v/beta/gate = F16;state = F32 [slots,HV,KD,VD];out = F16 [t,nv,kd])
@@ -366,15 +435,30 @@ mod tests {
         // 序列表(P-6b):nt 由真长度推(与生产同式),块长按 table_bytes(nt)
         let nt = (t as usize).div_ceil(crate::family::gdn_chunked::BT).max(1);
         GdnChunkedCall::builder(s)
-            .q(&dummy(1, (s.t as usize) * 16 * 128)).unwrap()
-            .k(&dummy(2, (s.t as usize) * 16 * 128)).unwrap()
-            .v(&dummy(3, (s.t as usize) * 48 * 128)).unwrap()
-            .beta(&dummy_f(4, (s.t as usize) * 48, Dtype::F16, 2)).unwrap()
-            .gate_raw(&dummy_f(5, (s.t as usize) * 48, Dtype::F16, 2)).unwrap()
-            .state(&dummy_f(6, 48 * 128 * 128, Dtype::F32, 4), 0).unwrap()
-            .tables(&dummy_f(7, crate::family::gdn_chunked::table_bytes(nt), Dtype::U32, 1), nt)
+            .q(&dummy(1, (s.t as usize) * 16 * 128))
             .unwrap()
-            .build().unwrap()
+            .k(&dummy(2, (s.t as usize) * 16 * 128))
+            .unwrap()
+            .v(&dummy(3, (s.t as usize) * 48 * 128))
+            .unwrap()
+            .beta(&dummy_f(4, (s.t as usize) * 48, Dtype::F16, 2))
+            .unwrap()
+            .gate_raw(&dummy_f(5, (s.t as usize) * 48, Dtype::F16, 2))
+            .unwrap()
+            .state(&dummy_f(6, 48 * 128 * 128, Dtype::F32, 4), 0)
+            .unwrap()
+            .tables(
+                &dummy_f(
+                    7,
+                    crate::family::gdn_chunked::table_bytes(nt),
+                    Dtype::U32,
+                    1,
+                ),
+                nt,
+            )
+            .unwrap()
+            .build()
+            .unwrap()
     }
 
     /// roundtrip property:parse(to_launch(x)) == x(契约单源的结构锁)
@@ -427,8 +511,7 @@ mod tests {
     #[test]
     fn builder_rejects_wrong_len() {
         let s = shape(64);
-        let r = GdnChunkedCall::builder(s)
-            .q(&dummy(1, 999)); // 长度错:构造期即拒,链条在此断
+        let r = GdnChunkedCall::builder(s).q(&dummy(1, 999)); // 长度错:构造期即拒,链条在此断
         match r {
             Err(OpError::Contract { field: "q", .. }) => {}
             Err(e) => panic!("期望 q 长度 Contract 错,实得 {e}"),
@@ -440,7 +523,12 @@ mod tests {
     /// 错误带槽名 + 块 id(不是 panic、不是静默)。
     #[test]
     fn builder_rejects_zero_len_shape() {
-        let s = GdnShape { t: 0, nv: 48, nk: 16, kd: 128 };
+        let s = GdnShape {
+            t: 0,
+            nv: 48,
+            nk: 16,
+            kd: 128,
+        };
         let r = GdnChunkedCall::builder(s).q(&dummy(7, 0));
         let msg = match r {
             Err(e) => format!("{e}"),

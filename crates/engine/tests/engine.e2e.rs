@@ -108,11 +108,16 @@ async fn e2e_body() {
     }
     let dev = dev.unwrap_or(0);
     if cpu_only {
-        eprintln!("[e2e] 无卡档(OWL_CPU_MOCK):只跑 CPU mock 场景 —— store 演示台三门口 + S2 状态腿");
+        eprintln!(
+            "[e2e] 无卡档(OWL_CPU_MOCK):只跑 CPU mock 场景 —— store 演示台三门口 + S2 状态腿"
+        );
         run!(cpu_mock_offload_probe);
         run!(cpu_mock_state_leg_probe);
         run!(cpu_mock_index_probe);
-        eprintln!("[e2e] 无卡档完成,用时 {:.1}s", std::time::Instant::now().elapsed().as_secs_f32());
+        eprintln!(
+            "[e2e] 无卡档完成,用时 {:.1}s",
+            std::time::Instant::now().elapsed().as_secs_f32()
+        );
         return;
     }
     let has_27b = owl_shared::testkit::resource("ckpt:27b-awq").is_some();
@@ -197,11 +202,11 @@ async fn e2e_body() {
     // ── 0.8B 其余档:boot 期配置各不相同,各自装载 ──
     run!(gpu_schedule_decision_surface); // max_context_length=64/chunk=4(切块敏感)
     run!(gpu_batch_decode_matches_serial); // B5.1 合批 decode(T=2,0.8B)
-    // §18 CPU mock 档:同一套 store 三门口跑在 CpuFace 上(无卡;OWL_CPU_MOCK 门控)
+                                           // §18 CPU mock 档:同一套 store 三门口跑在 CpuFace 上(无卡;OWL_CPU_MOCK 门控)
     run!(cpu_mock_offload_probe);
     run!(cpu_mock_state_leg_probe);
-    run!(gpu_gdn_slot_cross_probe);   // gdn_slots=2 + prefix_cache=false
-    run!(gpu_08b_fuse_text_parity);   // greedy + fused_decode 臂
+    run!(gpu_gdn_slot_cross_probe); // gdn_slots=2 + prefix_cache=false
+    run!(gpu_08b_fuse_text_parity); // greedy + fused_decode 臂
     run!(gpu_longctx_fi_direct_gate); // fp8 池 × {FI 直读, 自研读核}(自装载两回)
 
     // ── 0.8B W4A16 装载臂(另一装载器) ──
@@ -224,12 +229,12 @@ async fn e2e_body() {
     run!(gpu_27b_select_probe);
 
     // ── 27B 其余档:boot 期配置各不相同(草稿类型/池/fp8/slab),各自装载 ──
-    run!(gpu_27b_raw_completion_diag);   // greedy + Dumb 草稿 + slab
-    run!(gpu_decode_marginal_bench);     // greedy + slots1
-    run!(gpu_batch_decode_bench_27b);    // B5.1 合批 decode 吞吐(27B,spec off)
-    run!(gpu_head_int8_gate);            // int8 头 ≡ bf16 头(token 级)
-    run!(gpu_spec_identity_gate_27b);    // MTP 草稿
-    run!(gpu_mtp_kv_parity);             // T3：MTP KV 行 t=1 vs 多行对拍
+    run!(gpu_27b_raw_completion_diag); // greedy + Dumb 草稿 + slab
+    run!(gpu_decode_marginal_bench); // greedy + slots1
+    run!(gpu_batch_decode_bench_27b); // B5.1 合批 decode 吞吐(27B,spec off)
+    run!(gpu_head_int8_gate); // int8 头 ≡ bf16 头(token 级)
+    run!(gpu_spec_identity_gate_27b); // MTP 草稿
+    run!(gpu_mtp_kv_parity); // T3：MTP KV 行 t=1 vs 多行对拍
     run!(gpu_dflash2_identity_gate_27b); // DFlash2 草稿 + fp8 池
 
     eprintln!("[e2e] 全场景通过,用时 {:.1}s", t0.elapsed().as_secs_f32());

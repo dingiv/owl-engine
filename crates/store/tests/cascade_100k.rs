@@ -82,8 +82,9 @@ fn cascade_gpu_host_disk_drop_at_100k_tokens() {
     );
 
     // ③ 宿主 → 盘（模拟 engine 执行；盘层只做账，不写文件）。
-    let mut disk = DiskTier::<ChainHash>::new("/tmp/owl-cascade-100k", BLOCK_BYTES, PAGES * BLOCK_BYTES)
-        .expect("盘层");
+    let mut disk =
+        DiskTier::<ChainHash>::new("/tmp/owl-cascade-100k", BLOCK_BYTES, PAGES * BLOCK_BYTES)
+            .expect("盘层");
     for &tail in &a {
         let buf = l.host_take(tail).expect("取宿主内容");
         let plan = disk.plan_spill(tail).expect("盘计划");

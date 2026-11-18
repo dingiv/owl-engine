@@ -207,8 +207,7 @@ pub fn dequant_row(ty: GgmlTy, row: &[u8], out: &mut [f32]) -> Result<(), ModelE
                 let y = &mut out[blk * 32..blk * 32 + 32];
                 for j in 0..16 {
                     y[j] = d * super::iq_tables::KVALUES_IQ4NL[(qs[j] & 0xF) as usize] as f32;
-                    y[j + 16] =
-                        d * super::iq_tables::KVALUES_IQ4NL[(qs[j] >> 4) as usize] as f32;
+                    y[j + 16] = d * super::iq_tables::KVALUES_IQ4NL[(qs[j] >> 4) as usize] as f32;
                 }
             }
         }
@@ -241,23 +240,20 @@ pub fn dequant_row(ty: GgmlTy, row: &[u8], out: &mut [f32]) -> Result<(), ModelE
                 let qs = &chunk[2..98];
                 let y = &mut out[blk * 256..blk * 256 + 256];
                 for ib32 in 0..8usize {
-                    let aux = u32::from_le_bytes(
-                        qs[64 + 4 * ib32..68 + 4 * ib32].try_into().unwrap(),
-                    );
+                    let aux =
+                        u32::from_le_bytes(qs[64 + 4 * ib32..68 + 4 * ib32].try_into().unwrap());
                     let db = d * (0.5 + (aux >> 28) as f32) * 0.5;
                     for l in 0..4usize {
                         let signs =
                             super::iq_tables::KSIGNS_IQ2XS[((aux >> (7 * l)) & 127) as usize];
                         let g1 = super::iq_tables::IQ3XXS_GRID[qs[8 * ib32 + 2 * l] as usize]
                             .to_le_bytes();
-                        let g2 = super::iq_tables::IQ3XXS_GRID
-                            [qs[8 * ib32 + 2 * l + 1] as usize]
+                        let g2 = super::iq_tables::IQ3XXS_GRID[qs[8 * ib32 + 2 * l + 1] as usize]
                             .to_le_bytes();
                         let o = ib32 * 32 + l * 8;
                         for j in 0..4usize {
                             y[o + j] = db * g1[j] as f32 * iq_sign(signs & (1 << j));
-                            y[o + 4 + j] =
-                                db * g2[j] as f32 * iq_sign(signs & (1 << (j + 4)));
+                            y[o + 4 + j] = db * g2[j] as f32 * iq_sign(signs & (1 << (j + 4)));
                         }
                     }
                 }
@@ -342,9 +338,7 @@ pub fn dequant_row(ty: GgmlTy, row: &[u8], out: &mut [f32]) -> Result<(), ModelE
                 // 12 字节 → 16 个 6bit 尺度(逐字译自 ggml-quants.c 的 kmask 拼法)
                 let mut aux = [0u32; 4];
                 for w in 0..3 {
-                    aux[w] = u32::from_le_bytes(
-                        sc12[w * 4..w * 4 + 4].try_into().unwrap(),
-                    );
+                    aux[w] = u32::from_le_bytes(sc12[w * 4..w * 4 + 4].try_into().unwrap());
                 }
                 let tmp = aux[2];
                 aux[2] = ((aux[0] >> 4) & 0x0F0F_0F0F) | (((tmp >> 4) & 0x0303_0303) << 4);
@@ -394,15 +388,12 @@ pub fn dequant_row(ty: GgmlTy, row: &[u8], out: &mut [f32]) -> Result<(), ModelE
                     // 按 u16 步进 ⇒ 字节偏移 = **8*ib32**(踩过:按 4 字节步进
                     // 会让后 7 个 ib32 全部错位,首块却恰好正确)
                     let byte = 8 * ib32;
-                    let aux0 = u32::from_le_bytes(
-                        qs[byte..byte + 4].try_into().unwrap(),
-                    );
-                    let aux1 = u32::from_le_bytes(
-                        qs[byte + 4..byte + 8].try_into().unwrap(),
-                    );
+                    let aux0 = u32::from_le_bytes(qs[byte..byte + 4].try_into().unwrap());
+                    let aux1 = u32::from_le_bytes(qs[byte + 4..byte + 8].try_into().unwrap());
                     let db = d * (0.5 + (aux1 >> 28) as f32) * 0.25;
                     for l in 0..4usize {
-                        let grid = super::iq_tables::IQ2XXS_GRID[((aux0 >> (8 * l)) & 0xFF) as usize]
+                        let grid = super::iq_tables::IQ2XXS_GRID
+                            [((aux0 >> (8 * l)) & 0xFF) as usize]
                             .to_le_bytes();
                         let signs =
                             super::iq_tables::KSIGNS_IQ2XS[((aux1 >> (7 * l)) & 127) as usize];
@@ -457,8 +448,8 @@ pub fn dequant_row(ty: GgmlTy, row: &[u8], out: &mut [f32]) -> Result<(), ModelE
                         d * (0.5 + (scales[ib32] >> 4) as f32) * 0.25,
                     ];
                     for l in 0..4usize {
-                        let idx = qs[4 * ib32 + l] as u32
-                            | (((qh[ib32] as u32) << (8 - 2 * l)) & 0x300);
+                        let idx =
+                            qs[4 * ib32 + l] as u32 | (((qh[ib32] as u32) << (8 - 2 * l)) & 0x300);
                         let grid = super::iq_tables::IQ2S_GRID[idx as usize].to_le_bytes();
                         let sg = signs[4 * ib32 + l];
                         let o = ib32 * 32 + l * 8;
@@ -523,7 +514,11 @@ pub fn dequant_all(
     }
     let mut out = vec![0f32; rows * inner];
     for r in 0..rows {
-        dequant_row(ty, &bytes[r * row_bytes..(r + 1) * row_bytes], &mut out[r * inner..(r + 1) * inner])?;
+        dequant_row(
+            ty,
+            &bytes[r * row_bytes..(r + 1) * row_bytes],
+            &mut out[r * inner..(r + 1) * inner],
+        )?;
     }
     Ok(out)
 }
@@ -540,11 +535,18 @@ mod tests {
         resource_ok(key).then(|| PathBuf::from(resource(key).expect("列了就有")))
     }
 
-
     /// gguf-py 源码树(对拍锚的另一端);不在 = 调用方 skip。
     fn py_root() -> Option<String> {
         owl_shared::env_reader::str("OWL_GGUF_PY")
-            .or_else(|| Some(concat!(env!("CARGO_MANIFEST_DIR"), "/../../../../repos/llama.cpp/gguf-py").to_string()))
+            .or_else(|| {
+                Some(
+                    concat!(
+                        env!("CARGO_MANIFEST_DIR"),
+                        "/../../../../repos/llama.cpp/gguf-py"
+                    )
+                    .to_string(),
+                )
+            })
             .filter(|p| std::path::Path::new(p).is_dir())
     }
 
@@ -560,7 +562,9 @@ mod tests {
         };
         let script = crate::testkit::manifest_dir().join("src/formats/gguf_dequant.py");
         let g = Gguf::open(&path).expect("open");
-        let ti = g.get_tensor(tname).unwrap_or_else(|| panic!("[{key}] 缺张量 {tname}"));
+        let ti = g
+            .get_tensor(tname)
+            .unwrap_or_else(|| panic!("[{key}] 缺张量 {tname}"));
         let ix = g.index_of(tname).unwrap();
         let bytes = g.bytes(ix);
         let rows = ti.rows() as usize;
@@ -632,16 +636,16 @@ mod tests {
         };
         // 每型挑一张代表张量(4B:五型俱全;27B:补 Q5_K 无 ⇒ 只跑交集)
         let cases: &[(&str, &str)] = &[
-            ("gguf:4b", "blk.0.attn_qkv.weight"),    // Q6_K
-            ("gguf:4b", "blk.0.attn_gate.weight"),   // Q4_K
-            ("gguf:4b", "blk.0.ffn_up.weight"),      // Q4_K(大张量)
-            ("gguf:4b", "blk.0.ssm_out.weight"),     // Q8_0
-            ("gguf:4b", "blk.0.ssm_a"),              // F32
-            ("gguf:4b", "blk.3.attn_q.weight"),      // Q6_K(full 层)
-            ("gguf:27b", "blk.1.ffn_down.weight"),   // Q4_K
-            ("gguf:27b", "blk.1.attn_qkv.weight"),   // Q8_0
-            ("gguf:4b", "blk.3.attn_k.weight"),      // Q5_K(full 层)
-            ("gguf:27b", "blk.3.attn_v.weight"),     // Q8_0(full 层)
+            ("gguf:4b", "blk.0.attn_qkv.weight"),     // Q6_K
+            ("gguf:4b", "blk.0.attn_gate.weight"),    // Q4_K
+            ("gguf:4b", "blk.0.ffn_up.weight"),       // Q4_K(大张量)
+            ("gguf:4b", "blk.0.ssm_out.weight"),      // Q8_0
+            ("gguf:4b", "blk.0.ssm_a"),               // F32
+            ("gguf:4b", "blk.3.attn_q.weight"),       // Q6_K(full 层)
+            ("gguf:27b", "blk.1.ffn_down.weight"),    // Q4_K
+            ("gguf:27b", "blk.1.attn_qkv.weight"),    // Q8_0
+            ("gguf:4b", "blk.3.attn_k.weight"),       // Q5_K(full 层)
+            ("gguf:27b", "blk.3.attn_v.weight"),      // Q8_0(full 层)
             ("gguf:27b", "blk.3.attn_q_norm.weight"), // F32(小张量)
         ];
         for (k, t) in cases {
@@ -663,12 +667,12 @@ mod tests {
             ("gguf:27b-iq3s", "blk.4.attn_gate.weight"),   // IQ3_S
             ("gguf:27b-iq3s", "blk.11.attn_k.weight"),     // IQ4_NL
             // ---- 27B 的 k-quant / IQ2 / IQ1(2026-10-20;UD 混型档)----
-            ("gguf:27b-iq4xs", "blk.15.attn_q.weight"),    // Q2_K
-            ("gguf:27b-iq4xs", "blk.12.ssm_out.weight"),   // Q3_K
-            ("gguf:27b-iq4xs", "blk.0.ffn_gate.weight"),   // IQ2_XS
-            ("gguf:27b-iq4xs", "blk.0.ffn_up.weight"),     // IQ2_S
-            ("gguf:27b-iq3s", "blk.19.attn_q.weight"),     // IQ2_XXS
-            ("gguf:27b-iq3s", "blk.0.ffn_up.weight"),      // IQ1_S
+            ("gguf:27b-iq4xs", "blk.15.attn_q.weight"), // Q2_K
+            ("gguf:27b-iq4xs", "blk.12.ssm_out.weight"), // Q3_K
+            ("gguf:27b-iq4xs", "blk.0.ffn_gate.weight"), // IQ2_XS
+            ("gguf:27b-iq4xs", "blk.0.ffn_up.weight"),  // IQ2_S
+            ("gguf:27b-iq3s", "blk.19.attn_q.weight"),  // IQ2_XXS
+            ("gguf:27b-iq3s", "blk.0.ffn_up.weight"),   // IQ1_S
         ];
         for (k, t) in cases {
             parity_case(&py, k, t);
@@ -680,14 +684,26 @@ mod tests {
     fn rejects_bad_geometry() {
         let mut out = vec![0f32; 256];
         assert!(dequant_row(GgmlTy::Q4K, &[0u8; 144], &mut out).is_ok());
-        assert!(dequant_row(GgmlTy::Q4K, &[0u8; 143], &mut out).is_err(), "短一字节必须拒");
-        assert!(dequant_row(GgmlTy::Q4K, &[0u8; 145], &mut out).is_err(), "多一字节必须拒");
+        assert!(
+            dequant_row(GgmlTy::Q4K, &[0u8; 143], &mut out).is_err(),
+            "短一字节必须拒"
+        );
+        assert!(
+            dequant_row(GgmlTy::Q4K, &[0u8; 145], &mut out).is_err(),
+            "多一字节必须拒"
+        );
         let mut bad = vec![0f32; 250];
-        assert!(dequant_row(GgmlTy::Q4K, &[0u8; 144], &mut bad).is_err(), "元素数非块倍数必须拒");
+        assert!(
+            dequant_row(GgmlTy::Q4K, &[0u8; 144], &mut bad).is_err(),
+            "元素数非块倍数必须拒"
+        );
         // IQ1_S…IQ4_XS 全族已接(REQ-GGUF-04);**未接臂**(IQ1_M)必须照旧响亮拒。
         // ⚠️ 2026-10-20 修正:原用例拿 IQ2_XXS 当"未接臂",IQ 族落地后该断言失效
         // (静默变成"已实现却断言拒"—— 用例陈旧,不是实现错)
-        assert!(dequant_row(GgmlTy::Iq1M, &[0u8; 50], &mut out).is_err(), "未接臂必须拒");
+        assert!(
+            dequant_row(GgmlTy::Iq1M, &[0u8; 50], &mut out).is_err(),
+            "未接臂必须拒"
+        );
     }
 
     /// 零块 = 全零(Q4_K 的 d=0 时:`d*q - dmin*m`,若 dmin 也 0 ⇒ 全 0)

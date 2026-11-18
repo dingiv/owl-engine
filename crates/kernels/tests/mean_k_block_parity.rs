@@ -85,8 +85,11 @@ fn compile(ctx: &Arc<CudaContext>, name: &str) -> cudarc::driver::CudaFunction {
         },
     )
     .unwrap_or_else(|e| panic!("nvrtc({name}): {e:?}"));
-    let m = ctx.load_module(ptx).unwrap_or_else(|e| panic!("module({name}): {e:?}"));
-    m.load_function(name).unwrap_or_else(|e| panic!("fn({name}): {e:?}"))
+    let m = ctx
+        .load_module(ptx)
+        .unwrap_or_else(|e| panic!("module({name}): {e:?}"));
+    m.load_function(name)
+        .unwrap_or_else(|e| panic!("fn({name}): {e:?}"))
 }
 
 fn run_f16(
@@ -118,8 +121,13 @@ fn run_f16(
         let mut d_kc = unsafe { stream.alloc::<u16>(bits.len()) }.unwrap();
         stream.memcpy_htod(bits, &mut d_kc).unwrap();
         let kcp = d_kc.device_ptr(stream).0;
-        let (page, hkv, hd, half, layers) =
-            (PAGE as i32, HKV as i32, HD as i32, HALF as i32, LAYERS as i32);
+        let (page, hkv, hd, half, layers) = (
+            PAGE as i32,
+            HKV as i32,
+            HD as i32,
+            HALF as i32,
+            LAYERS as i32,
+        );
         let layer_i = layer as i32;
         let mut b = stream.launch_builder(&f);
         b.arg(&kcp)
@@ -177,8 +185,13 @@ fn run_fp8(
         let mut d_kc = unsafe { stream.alloc::<u8>(codes.len()) }.unwrap();
         stream.memcpy_htod(codes, &mut d_kc).unwrap();
         let kcp = d_kc.device_ptr(stream).0;
-        let (page, hkv, hd, half, layers) =
-            (PAGE as i32, HKV as i32, HD as i32, HALF as i32, LAYERS as i32);
+        let (page, hkv, hd, half, layers) = (
+            PAGE as i32,
+            HKV as i32,
+            HD as i32,
+            HALF as i32,
+            LAYERS as i32,
+        );
         let layer_i = layer as i32;
         let mut b = stream.launch_builder(&f);
         b.arg(&kcp)
@@ -253,7 +266,10 @@ fn mean_k_block_parity() {
         let want = host_ref(&pools_ref, &phys, &cos, &sin);
         let got = run_f16(&ctx, &stream, &pools_bits, &phys, &cos, &sin);
         for (i, (g, w)) in got.iter().zip(want.iter()).enumerate() {
-            assert_eq!(g, w, "f16 Mean-K 第 {i} 项不一致: got={g:#06x} want={w:#06x}");
+            assert_eq!(
+                g, w,
+                "f16 Mean-K 第 {i} 项不一致: got={g:#06x} want={w:#06x}"
+            );
         }
     }
 
@@ -282,7 +298,10 @@ fn mean_k_block_parity() {
         let want = host_ref(&pools_ref, &phys, &cos, &sin);
         let got = run_fp8(&ctx, &stream, &pools_codes, &phys, &cos, &sin);
         for (i, (g, w)) in got.iter().zip(want.iter()).enumerate() {
-            assert_eq!(g, w, "fp8 Mean-K 第 {i} 项不一致: got={g:#06x} want={w:#06x}");
+            assert_eq!(
+                g, w,
+                "fp8 Mean-K 第 {i} 项不一致: got={g:#06x} want={w:#06x}"
+            );
         }
     }
 }

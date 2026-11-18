@@ -242,7 +242,6 @@ struct Fa2Key {
 /// 视觉 cu_seqlens 设备 scratch: 1024 段(`n_seq <= 1023`)
 const VIS_CU_BYTES: usize = 4096;
 
-
 /// plan 条目表容量软上限(超过就驱逐**非图归属**的最旧条目)
 const PLAN_ENTRIES_SOFT_MAX: usize = 32;
 /// 驱逐后水位(避免每次插入都驱逐)
@@ -337,7 +336,8 @@ impl FiRuntime {
             capturing,
         );
         Ok(())
-    }}
+    }
+}
 
 impl Default for FiRuntime {
     fn default() -> Self {
@@ -363,7 +363,6 @@ impl Default for FiRuntime {
     }
 }
 
-
 impl KernelFamily for FiRuntime {
     fn id(&self) -> OpId {
         Self::ID
@@ -371,7 +370,6 @@ impl KernelFamily for FiRuntime {
 
     // 本族**已建表**算子(fp8 臂;f16 臂未建表 —— 它由族主名承担,
     // 见 `KernelFamily::names()` 的 id ∪ ops 律)。
-
 
     /// 构造函数:workspace 预钉(float 64MB + int 32MB + ragged int 8MB;
     /// 构造期,捕获内首次初始化事故类结构性消灭)
@@ -390,10 +388,7 @@ impl KernelFamily for FiRuntime {
             stamp: 0,
             plan_ragged: None,
             ragged_cu: Some(res.alloc(VIS_CU_BYTES, "fi.ragged_cu")?),
-            fa2_lse: Some(res.alloc(
-                crate::family::flashinfer::FA2_LSE_BYTES,
-                "fa2.lse",
-            )?),
+            fa2_lse: Some(res.alloc(crate::family::flashinfer::FA2_LSE_BYTES, "fa2.lse")?),
             fa2_cu: Some(res.alloc(VIS_CU_BYTES, "fa2.cu")?),
             fa2_key: None,
             shadow: None,
@@ -426,11 +421,23 @@ impl KernelFamily for FiRuntime {
                 got: format!("t={t} ctx={ctx_total} hq={hq} hkv={hkv} hd={hd} page={page}"),
             });
         }
-        let geom = FiPlanGeom { total_rows: t, t, hq, hkv, hd, page };
+        let geom = FiPlanGeom {
+            total_rows: t,
+            t,
+            hq,
+            hkv,
+            hd,
+            page,
+        };
         self.plan_sync(&geom, ctx_total, res)
     }
 
-    fn run(&mut self, msg: &LaunchMsg, res: &mut dyn crate::device::DeviceRes, _exec: &mut crate::device::Exec) -> Result<Bytes, OpError> {
+    fn run(
+        &mut self,
+        msg: &LaunchMsg,
+        res: &mut dyn crate::device::DeviceRes,
+        _exec: &mut crate::device::Exec,
+    ) -> Result<Bytes, OpError> {
         // **plan 表同步虚拟算子**(2026-11-01):族内 host 调用 + int_ws 搬运,
         // 无核 —— 走同一张转发面(声明/准入/路由/记账),不再单独一条命令。
         if msg.kernel.name == crate::family::flashinfer::PLAN_SYNC_FI {
@@ -444,9 +451,8 @@ impl KernelFamily for FiRuntime {
             return self.run_fa2_varlen(msg, res);
         }
         let call = parse_prefill(msg)?;
-        let r = |b: &crate::client::flashinfer::BlockRef| {
-            res.resolve(b.id).map(|p| p + b.byte_offset)
-        };
+        let r =
+            |b: &crate::client::flashinfer::BlockRef| res.resolve(b.id).map(|p| p + b.byte_offset);
         let q = r(&call.q)?;
         let kc = r(&call.kc_fi)?;
         let vc = r(&call.vc)?;
@@ -454,7 +460,10 @@ impl KernelFamily for FiRuntime {
         let indices = r(&call.indices)?;
         let indptr = r(&call.indptr)?;
         let last_len = r(&call.last_len)?;
-        let out_ref = crate::client::flashinfer::BlockRef { id: call.out.id, byte_offset: 0 };
+        let out_ref = crate::client::flashinfer::BlockRef {
+            id: call.out.id,
+            byte_offset: 0,
+        };
         let out_ptr = r(&out_ref)?;
         // 就地解包( locals 贯穿 plan/run;None = init 未跑,Asset 拒)
         // 注:只取 (ptr, bytes) 两个标量 —— 后面要 `self.activate(&mut self)`,
@@ -478,10 +487,8 @@ impl KernelFamily for FiRuntime {
         // 反量化净亏);t>=64 覆盖主 prefill chunk,尾块仍走 fp8。
         // **仅 fp8 主池**:配置面 `validate` 已拒 `prefill_shadow && kv_dtype != "fp8"`;
         // 这里再以 `call.fp8kv` 双保险 —— f16 池的 `PREFILL_FI` 绝不应触发。
-        let shadow = prefill_shadow_on()
-            && call.fp8kv
-            && call.t >= 64
-            && !res.capturing().unwrap_or(false);
+        let shadow =
+            prefill_shadow_on() && call.fp8kv && call.t >= 64 && !res.capturing().unwrap_or(false);
 
         // plan(host,每形状一次;键 = 形状七元组 + **桶化 ctx**)
         let kv_bytes = if shadow || !call.fp8kv { 2 } else { 1 };
@@ -628,7 +635,12 @@ impl KernelFamily for FiRuntime {
         };
         // 家族面入账(A13 补漏):FlashInfer = **直连 FFI 发射**(plan/run 均不经
         // `Exec::launch`),账上本无痕;ptrs = q/kc/vc/out 四块地址。
-        res.note_device("fam_ffi_launch", &msg.kernel.name, 0, &[q_run, kc_run, vc_run, out_ptr]);
+        res.note_device(
+            "fam_ffi_launch",
+            &msg.kernel.name,
+            0,
+            &[q_run, kc_run, vc_run, out_ptr],
+        );
         let rc = unsafe {
             run(
                 q_run as *const std::ffi::c_void,
@@ -679,14 +691,16 @@ impl FiRuntime {
         res: &mut dyn crate::device::DeviceRes,
     ) -> Result<Bytes, OpError> {
         let call = crate::client::flashinfer::parse_attn_ragged(msg)?;
-        let r = |b: &crate::client::flashinfer::BlockRef| {
-            res.resolve(b.id).map(|p| p + b.byte_offset)
-        };
+        let r =
+            |b: &crate::client::flashinfer::BlockRef| res.resolve(b.id).map(|p| p + b.byte_offset);
         let q = r(&call.q)?;
         let k = r(&call.k)?;
         let v = r(&call.v)?;
         let cu_f32_addr = r(&call.cu)?; // f32 varlen 段界(视觉契约);plan 期转 int32
-        let out = r(&crate::client::flashinfer::BlockRef { id: call.out.id, byte_offset: 0 })?;
+        let out = r(&crate::client::flashinfer::BlockRef {
+            id: call.out.id,
+            byte_offset: 0,
+        })?;
         let float_ws = self.float_ws.as_ref().ok_or_else(|| OpError::Asset {
             op: crate::family::flashinfer::ATTN_RAGGED_F16.into(),
             detail: "workspace 未装配".into(),
@@ -720,7 +734,12 @@ impl FiRuntime {
             })?
             .ptr as *const std::ffi::c_void;
         // 与 paged 臂同律:**plan 必须在捕获窗外算**(内含 H2D)
-        if self.plan_ragged.as_ref().map(|(k, _)| *k != key).unwrap_or(true) {
+        if self
+            .plan_ragged
+            .as_ref()
+            .map(|(k, _)| *k != key)
+            .unwrap_or(true)
+        {
             if res.capturing().unwrap_or(false) {
                 return Err(OpError::Launch {
                     op: msg.kernel.name.clone(),
@@ -744,11 +763,12 @@ impl FiRuntime {
                 });
             }
             let mut cu_raw = vec![0u8; cu_need];
-            res.download(cu_f32_addr, &mut cu_raw).map_err(|e| OpError::Launch {
-                op: msg.kernel.name.clone(),
-                stage: crate::contract::Stage::Load,
-                detail: format!("ragged cu download: {e}"),
-            })?;
+            res.download(cu_f32_addr, &mut cu_raw)
+                .map_err(|e| OpError::Launch {
+                    op: msg.kernel.name.clone(),
+                    stage: crate::contract::Stage::Load,
+                    detail: format!("ragged cu download: {e}"),
+                })?;
             let mut cu_host = Vec::with_capacity(call.n_seq + 1);
             for c in cu_raw.chunks_exact(4) {
                 let v = f32::from_le_bytes([c[0], c[1], c[2], c[3]]);
@@ -796,7 +816,10 @@ impl FiRuntime {
                 return Err(OpError::Launch {
                     op: msg.kernel.name.clone(),
                     stage: crate::contract::Stage::Load,
-                    detail: format!("ragged plan err {rc}(rows={} n_seq={} heads={} hd={})", call.rows, call.n_seq, call.heads, call.head_dim),
+                    detail: format!(
+                        "ragged plan err {rc}(rows={} n_seq={} heads={} hd={})",
+                        call.rows, call.n_seq, call.heads, call.head_dim
+                    ),
                 });
             }
             // plan 内部的 H2D 源是共享的 `host_staging`;这里等它真正读完再允许
@@ -809,7 +832,11 @@ impl FiRuntime {
             })?;
             self.plan_ragged = Some((key, plan15));
         }
-        let plan15 = self.plan_ragged.as_ref().map(|(_, p)| *p).expect("plan 缓存");
+        let plan15 = self
+            .plan_ragged
+            .as_ref()
+            .map(|(_, p)| *p)
+            .expect("plan 缓存");
         res.note_device("fam_ffi_launch", &msg.kernel.name, 0, &[q, k, v, out]);
         let rc = unsafe {
             crate::family::flashinfer::owl_fi_attn_ragged_run_f16(
@@ -850,8 +877,14 @@ mod plan_key_tests {
     /// (实测 32k 单请求 186 次重算);桶化后只跨桶才新键。图档位单列。
     #[test]
     fn ctx_always_enters_key_before_bucketing() {
-        let k = |rows: usize, ctx: usize, graph: bool| plan_key(rows, ctx, rows, 24, 4, 256, 32, graph, 1);
-        assert_ne!(k(512, 512, true), k(512, 2048, true), "ctx 必须分键(桶化由引擎侧做)");
+        let k = |rows: usize, ctx: usize, graph: bool| {
+            plan_key(rows, ctx, rows, 24, 4, 256, 32, graph, 1)
+        };
+        assert_ne!(
+            k(512, 512, true),
+            k(512, 2048, true),
+            "ctx 必须分键(桶化由引擎侧做)"
+        );
         // 图档位:同形状不同档 ⇒ 不同键(数组与 padded_batch_size 都不同)
         assert_ne!(k(512, 0, false), k(512, 0, true));
         // 形状位:行数/页 仍分键
@@ -924,7 +957,8 @@ impl FiRuntime {
                 op: op_name.to_string(),
                 stage: crate::contract::Stage::Load,
                 detail: "FI plan 未缓存而处于捕获窗:plan 内含 H2D(可被捕获),\
-                         必须在窗口外算 —— 拒捕回 eager".to_string(),
+                         必须在窗口外算 —— 拒捕回 eager"
+                    .to_string(),
             });
         }
         let qo_indptr = [0i32, geom.t as i32];
@@ -1099,7 +1133,17 @@ impl FiRuntime {
         let staged = InvariantBox::freeze(self.host_staging[..int_bytes].to_vec());
         let born = self.stamp;
         self.stamp += 1;
-        self.plans.insert(key, PlanEntry { plan15, staged, mask, tiles, born, graph_owned: false });
+        self.plans.insert(
+            key,
+            PlanEntry {
+                plan15,
+                staged,
+                mask,
+                tiles,
+                born,
+                graph_owned: false,
+            },
+        );
         // ⚠️ **不再信任 C++ 侧那次写**(2026-10-17):`owl_fi_prefill_plan` 的
         // `int_ws ← page_locked staging` memcpy 在**C++ 适配器内部**发起
         // (自有/NULL 流),与本 server 的 COMPUTE 流**无跨流序**;而 FI 核
@@ -1138,7 +1182,11 @@ impl FiRuntime {
         // **固定 cap**:cap_tokens=0 时退回按当前 ctx 增长(探针/未配置);
         // 生产 boot 期下发 max_context_length ⇒ 首层就按最大 ctx 预留,池后期变满也不再扩容。
         let cap_tokens = prefill_shadow_cap();
-        let cap_pages = if cap_tokens == 0 { 0 } else { cap_tokens.div_ceil(page.max(1)) };
+        let cap_pages = if cap_tokens == 0 {
+            0
+        } else {
+            cap_tokens.div_ceil(page.max(1))
+        };
         if cap_pages != 0 && pages > cap_pages {
             return Err(OpError::Contract {
                 op: PREFILL_FI.into(),
@@ -1148,12 +1196,14 @@ impl FiRuntime {
             });
         }
         let want_pages = pages.max(cap_pages);
-        let k_bytes = want_pages.checked_mul(per_page).ok_or_else(|| OpError::Contract {
-            op: PREFILL_FI.into(),
-            field: "shadow.bytes",
-            expect: "pages*per_page 不溢出".into(),
-            got: format!("pages={want_pages} per_page={per_page}"),
-        })?;
+        let k_bytes = want_pages
+            .checked_mul(per_page)
+            .ok_or_else(|| OpError::Contract {
+                op: PREFILL_FI.into(),
+                field: "shadow.bytes",
+                expect: "pages*per_page 不溢出".into(),
+                got: format!("pages={want_pages} per_page={per_page}"),
+            })?;
         let total = k_bytes.checked_mul(2).ok_or_else(|| OpError::Contract {
             op: PREFILL_FI.into(),
             field: "shadow.bytes",
@@ -1168,7 +1218,12 @@ impl FiRuntime {
                 got: format!("pages={pages} k_bytes={k_bytes}"),
             });
         }
-        if self.shadow.as_ref().map(|b| b.bytes < total).unwrap_or(true) {
+        if self
+            .shadow
+            .as_ref()
+            .map(|b| b.bytes < total)
+            .unwrap_or(true)
+        {
             let sb = res.alloc(total, "fi.prefill_shadow")?;
             owl_shared::log_info!(
                 "kernels",
@@ -1183,7 +1238,12 @@ impl FiRuntime {
             self.shadow = Some(sb);
         }
         let need_idx = want_pages * 4;
-        if self.shadow_indices.as_ref().map(|b| b.bytes < need_idx).unwrap_or(true) {
+        if self
+            .shadow_indices
+            .as_ref()
+            .map(|b| b.bytes < need_idx)
+            .unwrap_or(true)
+        {
             let sb = res.alloc(need_idx, "fi.prefill_shadow_idx")?;
             let mut bytes = Vec::with_capacity(need_idx);
             for i in 0..want_pages {
@@ -1192,14 +1252,22 @@ impl FiRuntime {
             res.upload(sb.ptr, &bytes)?;
             self.shadow_indices = Some(sb);
         }
-        let base = self.shadow.as_ref().ok_or_else(|| OpError::Asset {
-            op: PREFILL_FI.into(),
-            detail: "shadow 未装配".into(),
-        })?.ptr;
-        let idx = self.shadow_indices.as_ref().ok_or_else(|| OpError::Asset {
-            op: PREFILL_FI.into(),
-            detail: "shadow identity 表未装配".into(),
-        })?.ptr;
+        let base = self
+            .shadow
+            .as_ref()
+            .ok_or_else(|| OpError::Asset {
+                op: PREFILL_FI.into(),
+                detail: "shadow 未装配".into(),
+            })?
+            .ptr;
+        let idx = self
+            .shadow_indices
+            .as_ref()
+            .ok_or_else(|| OpError::Asset {
+                op: PREFILL_FI.into(),
+                detail: "shadow identity 表未装配".into(),
+            })?
+            .ptr;
         Ok((base, base + k_bytes as u64, idx))
     }
 
@@ -1337,9 +1405,8 @@ impl FiRuntime {
                 got: "0".into(),
             });
         }
-        let r = |b: &crate::client::flashinfer::BlockRef| {
-            res.resolve(b.id).map(|p| p + b.byte_offset)
-        };
+        let r =
+            |b: &crate::client::flashinfer::BlockRef| res.resolve(b.id).map(|p| p + b.byte_offset);
         let q = r(&call.q)?;
         let k = r(&call.k)?;
         let v = r(&call.v)?;
@@ -1389,11 +1456,12 @@ impl FiRuntime {
                     });
                 }
                 let mut raw = vec![0u8; need];
-                res.download(cu_f32_addr, &mut raw).map_err(|e| OpError::Launch {
-                    op: msg.kernel.name.clone(),
-                    stage: crate::contract::Stage::Load,
-                    detail: format!("fa2 cu download: {e}"),
-                })?;
+                res.download(cu_f32_addr, &mut raw)
+                    .map_err(|e| OpError::Launch {
+                        op: msg.kernel.name.clone(),
+                        stage: crate::contract::Stage::Load,
+                        detail: format!("fa2 cu download: {e}"),
+                    })?;
                 let mut cu_host = Vec::with_capacity(call.n_seq + 1);
                 for c in raw.chunks_exact(4) {
                     let v = f32::from_le_bytes([c[0], c[1], c[2], c[3]]);
@@ -1423,15 +1491,13 @@ impl FiRuntime {
                     .map(|w| (w[1] - w[0]) as usize)
                     .max()
                     .unwrap_or(0);
-                let cu_bytes: Vec<u8> = cu_host
-                    .iter()
-                    .flat_map(|v| v.to_le_bytes())
-                    .collect();
-                res.upload(cu_scratch.ptr, &cu_bytes).map_err(|e| OpError::Launch {
-                    op: msg.kernel.name.clone(),
-                    stage: crate::contract::Stage::Load,
-                    detail: format!("fa2 cu upload: {e}"),
-                })?;
+                let cu_bytes: Vec<u8> = cu_host.iter().flat_map(|v| v.to_le_bytes()).collect();
+                res.upload(cu_scratch.ptr, &cu_bytes)
+                    .map_err(|e| OpError::Launch {
+                        op: msg.kernel.name.clone(),
+                        stage: crate::contract::Stage::Load,
+                        detail: format!("fa2 cu upload: {e}"),
+                    })?;
                 // upload 是流序异步拷贝;源是本函数栈上 `cu_bytes`。等它
                 // 真正读完再返回,避免 27 层逐层复用时源已释放。
                 stream.synchronize().map_err(|e| OpError::Launch {

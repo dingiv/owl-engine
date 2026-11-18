@@ -133,12 +133,18 @@ pub enum Role {
 pub fn role_of(key: &str, d: &GgufDims, head_split: bool) -> Result<Role, ModelError> {
     let (k, v) = (d.nk * d.hk, d.nv * d.hv);
     Ok(match classify(key) {
-        KeyClass::Gdn(GdnPart::Qkv) => Role::Segs { lens: vec![k, k, v], tail_perm: true },
+        KeyClass::Gdn(GdnPart::Qkv) => Role::Segs {
+            lens: vec![k, k, v],
+            tail_perm: true,
+        },
         KeyClass::Gdn(GdnPart::Z) => Role::OutHead,
         KeyClass::Gdn(GdnPart::Ab) | KeyClass::Gdn(GdnPart::Dt) | KeyClass::Gdn(GdnPart::A) => {
             Role::OutHead
         }
-        KeyClass::Gdn(GdnPart::Conv) => Role::Segs { lens: vec![k, k, v], tail_perm: true },
+        KeyClass::Gdn(GdnPart::Conv) => Role::Segs {
+            lens: vec![k, k, v],
+            tail_perm: true,
+        },
         KeyClass::Gdn(GdnPart::Out) => Role::InHead,
         KeyClass::Gdn(GdnPart::Norm) => Role::Replicate,
         // 词表切档:GGUF 的 `output.weight` 是普通 2-D 行表(untied head),
@@ -283,7 +289,10 @@ pub fn geom_of(
             }
             let (g0, gn) = sel.window(f.rows, "外维(行)", key)?;
             KeyGeom {
-                shape: Shape::Mat { wins: vec![(g0, gn)], rows: gn },
+                shape: Shape::Mat {
+                    wins: vec![(g0, gn)],
+                    rows: gn,
+                },
                 cols: Cols::Full,
                 col_first: 0,
                 row_atoms: f.inner / elem_per_atom,
@@ -333,8 +342,14 @@ pub fn geom_of(
                 )));
             }
             KeyGeom {
-                shape: Shape::Mat { wins: vec![(0, f.rows)], rows: f.rows },
-                cols: Cols::Window { src0: c0 / elem_per_atom, n: cn / elem_per_atom },
+                shape: Shape::Mat {
+                    wins: vec![(0, f.rows)],
+                    rows: f.rows,
+                },
+                cols: Cols::Window {
+                    src0: c0 / elem_per_atom,
+                    n: cn / elem_per_atom,
+                },
                 col_first: c0,
                 row_atoms: cn / elem_per_atom,
                 atom_bytes,
@@ -414,7 +429,10 @@ pub fn geom_of(
                 (segs, hn * hv / elem_per_atom)
             };
             KeyGeom {
-                shape: Shape::Mat { wins: vec![(0, f.rows)], rows: f.rows },
+                shape: Shape::Mat {
+                    wins: vec![(0, f.rows)],
+                    rows: f.rows,
+                },
                 cols: Cols::Segs(segs),
                 col_first: h0 * hv,
                 row_atoms,
@@ -448,11 +466,22 @@ mod tests {
         let (spec, _r) = crate::formats::gguf::spec_from_gguf(g).expect("spec");
         let (nk, hk, nv, hv) = spec.gdn_heads;
         let (nq, nkv, _hd) = spec.full_heads;
-        GgufDims { nk, nv, hk, hv, nq, nkv }
+        GgufDims {
+            nk,
+            nv,
+            hk,
+            hv,
+            nq,
+            nkv,
+        }
     }
 
     fn tf(t: &crate::formats::gguf::TensorInfo) -> TensorFacts {
-        TensorFacts { ty: t.ty, rows: t.rows() as usize, inner: t.inner() as usize }
+        TensorFacts {
+            ty: t.ty,
+            rows: t.rows() as usize,
+            inner: t.inner() as usize,
+        }
     }
 
     /// **27B 全键角色/几何表**(手算钉值;零设备)
@@ -463,12 +492,26 @@ mod tests {
             return;
         };
         let d = facts(&g);
-        assert_eq!((d.nk, d.hk, d.nv, d.hv), (16, 128, 48, 128), "27B v-head 事实");
-        let sel = ShardSel { id: 0, world: 2, head_split: false };
-        let sel1 = ShardSel { id: 1, world: 2, head_split: false };
+        assert_eq!(
+            (d.nk, d.hk, d.nv, d.hv),
+            (16, 128, 48, 128),
+            "27B v-head 事实"
+        );
+        let sel = ShardSel {
+            id: 0,
+            world: 2,
+            head_split: false,
+        };
+        let sel1 = ShardSel {
+            id: 1,
+            world: 2,
+            head_split: false,
+        };
         let case = |k: &str, want: KeyGeom| {
             let t = g.get_tensor(k).unwrap_or_else(|| panic!("缺键 {k}"));
-            let got = geom_of(k, &d, &tf(t), Some(sel)).unwrap().unwrap_or_else(|| panic!("{k} 未切"));
+            let got = geom_of(k, &d, &tf(t), Some(sel))
+                .unwrap()
+                .unwrap_or_else(|| panic!("{k} 未切"));
             assert_eq!(got, want, "[{k}] rank0 几何");
         };
         // ── ssm_out(Q8_0,列 = v-head;每头 4 块 = 136 B)──────────────
@@ -476,7 +519,10 @@ mod tests {
         case(
             "blk.0.ssm_out.weight",
             KeyGeom {
-                shape: Shape::Mat { wins: vec![(0, 5120)], rows: 5120 },
+                shape: Shape::Mat {
+                    wins: vec![(0, 5120)],
+                    rows: 5120,
+                },
                 cols: Cols::Segs(
                     (0..24)
                         .map(|h| {
@@ -486,15 +532,17 @@ mod tests {
                         .collect(),
                 ),
                 col_first: 0,
-                row_atoms: 96,    // 24 头 × 4 块
-                atom_bytes: 34,   // Q8_0 块字节
+                row_atoms: 96,  // 24 头 × 4 块
+                atom_bytes: 34, // Q8_0 块字节
                 elem_per_atom: 32,
                 quantized: true,
             },
         );
         // rank1 的头 = grouped 24..47 ⇒ 文件头从 g=8 起
         let t = g.get_tensor("blk.0.ssm_out.weight").unwrap();
-        let g1 = geom_of("blk.0.ssm_out.weight", &d, &tf(t), Some(sel1)).unwrap().unwrap();
+        let g1 = geom_of("blk.0.ssm_out.weight", &d, &tf(t), Some(sel1))
+            .unwrap()
+            .unwrap();
         match &g1.cols {
             Cols::Segs(s) => {
                 assert_eq!(s.len(), 24);
@@ -507,7 +555,10 @@ mod tests {
         case(
             "blk.0.ffn_down.weight",
             KeyGeom {
-                shape: Shape::Mat { wins: vec![(0, 5120)], rows: 5120 },
+                shape: Shape::Mat {
+                    wins: vec![(0, 5120)],
+                    rows: 5120,
+                },
                 cols: Cols::Window { src0: 0, n: 34 },
                 col_first: 0,
                 row_atoms: 34,
@@ -520,7 +571,10 @@ mod tests {
         case(
             "blk.3.attn_output.weight",
             KeyGeom {
-                shape: Shape::Mat { wins: vec![(0, 5120)], rows: 5120 },
+                shape: Shape::Mat {
+                    wins: vec![(0, 5120)],
+                    rows: 5120,
+                },
                 cols: Cols::Window { src0: 0, n: 12 },
                 col_first: 0,
                 row_atoms: 12,
@@ -533,7 +587,10 @@ mod tests {
         case(
             "blk.0.attn_qkv.weight",
             KeyGeom {
-                shape: Shape::Mat { wins: vec![(0, 1024), (2048, 1024), (4096, 3072)], rows: 5120 },
+                shape: Shape::Mat {
+                    wins: vec![(0, 1024), (2048, 1024), (4096, 3072)],
+                    rows: 5120,
+                },
                 cols: Cols::Full,
                 col_first: 0,
                 row_atoms: 160, // 5120/32
@@ -546,7 +603,10 @@ mod tests {
         case(
             "blk.3.attn_q.weight",
             KeyGeom {
-                shape: Shape::Mat { wins: vec![(0, 6144)], rows: 6144 },
+                shape: Shape::Mat {
+                    wins: vec![(0, 6144)],
+                    rows: 6144,
+                },
                 cols: Cols::Full,
                 col_first: 0,
                 row_atoms: 160,
@@ -557,17 +617,25 @@ mod tests {
         );
         // rank1 必须从 head 12 开始（文件 row 6144），而不是 q/gate 两段各半
         let t = g.get_tensor("blk.3.attn_q.weight").unwrap();
-        let q1 = geom_of("blk.3.attn_q.weight", &d, &tf(t), Some(sel1)).unwrap().unwrap();
+        let q1 = geom_of("blk.3.attn_q.weight", &d, &tf(t), Some(sel1))
+            .unwrap()
+            .unwrap();
         assert_eq!(
             q1.shape,
-            Shape::Mat { wins: vec![(6144, 6144)], rows: 6144 },
+            Shape::Mat {
+                wins: vec![(6144, 6144)],
+                rows: 6144
+            },
             "attn_q rank1 行窗口"
         );
         // ── ffn_gate(外维 17408 ⇒ 各 8704 行)───────────────────────
         case(
             "blk.0.ffn_gate.weight",
             KeyGeom {
-                shape: Shape::Mat { wins: vec![(0, 8704)], rows: 8704 },
+                shape: Shape::Mat {
+                    wins: vec![(0, 8704)],
+                    rows: 8704,
+                },
                 cols: Cols::Full,
                 col_first: 0,
                 row_atoms: 20, // 内维 = hidden 5120 / 256
@@ -580,7 +648,10 @@ mod tests {
         case(
             "blk.0.attn_gate.weight",
             KeyGeom {
-                shape: Shape::Mat { wins: vec![(0, 3072)], rows: 3072 },
+                shape: Shape::Mat {
+                    wins: vec![(0, 3072)],
+                    rows: 3072,
+                },
                 cols: Cols::Full,
                 col_first: 0,
                 row_atoms: 160,
@@ -593,7 +664,10 @@ mod tests {
         case(
             "blk.0.ssm_alpha.weight",
             KeyGeom {
-                shape: Shape::Mat { wins: vec![(0, 24)], rows: 24 },
+                shape: Shape::Mat {
+                    wins: vec![(0, 24)],
+                    rows: 24,
+                },
                 cols: Cols::Full,
                 col_first: 0,
                 row_atoms: 160,
@@ -604,7 +678,9 @@ mod tests {
         );
         // 1-D 原生 F32:元素窗口(24 个)
         let t = g.get_tensor("blk.0.ssm_a").unwrap();
-        let ga = geom_of("blk.0.ssm_a", &d, &tf(t), Some(sel)).unwrap().unwrap();
+        let ga = geom_of("blk.0.ssm_a", &d, &tf(t), Some(sel))
+            .unwrap()
+            .unwrap();
         assert_eq!(
             ga,
             KeyGeom {
@@ -618,7 +694,12 @@ mod tests {
             }
         );
         // ── Replicate:norm / embed / output(未开词表切)────────────
-        for k in ["blk.0.attn_norm.weight", "blk.0.ssm_norm.weight", "token_embd.weight", "output.weight"] {
+        for k in [
+            "blk.0.attn_norm.weight",
+            "blk.0.ssm_norm.weight",
+            "token_embd.weight",
+            "output.weight",
+        ] {
             let t = g.get_tensor(k).unwrap();
             assert!(
                 geom_of(k, &d, &tf(t), Some(sel)).unwrap().is_none(),
@@ -642,7 +723,11 @@ mod tests {
             "output.weight",
             &d,
             &f,
-            Some(ShardSel { id: 0, world: 2, head_split: true }),
+            Some(ShardSel {
+                id: 0,
+                world: 2,
+                head_split: true,
+            }),
         )
         .expect("geom")
         .expect("head_split 应切");
@@ -650,12 +735,28 @@ mod tests {
             "output.weight",
             &d,
             &f,
-            Some(ShardSel { id: 1, world: 2, head_split: true }),
+            Some(ShardSel {
+                id: 1,
+                world: 2,
+                head_split: true,
+            }),
         )
         .expect("geom")
         .expect("head_split 应切");
-        assert_eq!(g0.shape, Shape::Mat { wins: vec![(0, 124160)], rows: 124160 });
-        assert_eq!(g1.shape, Shape::Mat { wins: vec![(124160, 124160)], rows: 124160 });
+        assert_eq!(
+            g0.shape,
+            Shape::Mat {
+                wins: vec![(0, 124160)],
+                rows: 124160
+            }
+        );
+        assert_eq!(
+            g1.shape,
+            Shape::Mat {
+                wins: vec![(124160, 124160)],
+                rows: 124160
+            }
+        );
         assert_eq!(g0.cols, Cols::Full);
         assert_eq!(g0.row_atoms, 20, "Q6_K 内维 5120 / 256");
         assert_eq!(g0.atom_bytes, 210, "Q6_K 块字节");
@@ -665,7 +766,11 @@ mod tests {
                 "output.weight",
                 &d,
                 &f,
-                Some(ShardSel { id: 0, world: 2, head_split: false }),
+                Some(ShardSel {
+                    id: 0,
+                    world: 2,
+                    head_split: false
+                }),
             )
             .expect("geom")
             .is_none(),
@@ -691,19 +796,40 @@ mod tests {
             let (be, _bb) = t.ty.block();
             let native = t.ty.native_dtype().is_some();
             let geom = |id: usize| {
-                geom_of(key, &d, &f, Some(ShardSel { id, world: 2, head_split: false }))
-                    .unwrap_or_else(|e| panic!("[{key}] rank{id}: {e}"))
+                geom_of(
+                    key,
+                    &d,
+                    &f,
+                    Some(ShardSel {
+                        id,
+                        world: 2,
+                        head_split: false,
+                    }),
+                )
+                .unwrap_or_else(|e| panic!("[{key}] rank{id}: {e}"))
             };
             let (Some(g0), Some(g1)) = (geom(0), geom(1)) else {
                 continue; // Replicate
             };
             n_split += 1;
             assert_eq!(g0.row_atoms, g1.row_atoms, "[{key}] 两侧行宽应相等");
-            let full_len = if native { f.rows * f.inner } else { f.rows * (f.inner / be) * _bb };
-            assert_eq!(g0.len() + g1.len(), full_len, "[{key}] 两 rank 交付量之和 ≠ 全量");
+            let full_len = if native {
+                f.rows * f.inner
+            } else {
+                f.rows * (f.inner / be) * _bb
+            };
+            assert_eq!(
+                g0.len() + g1.len(),
+                full_len,
+                "[{key}] 两 rank 交付量之和 ≠ 全量"
+            );
             // 1-D 原生:元素窗口(行/列概念不适用)
             if matches!(g0.shape, Shape::Elem { .. }) {
-                assert_eq!(g0.len() + g1.len(), f.inner, "[{key}] 1-D 元素窗口不覆盖全量");
+                assert_eq!(
+                    g0.len() + g1.len(),
+                    f.inner,
+                    "[{key}] 1-D 元素窗口不覆盖全量"
+                );
                 continue;
             }
             let rows_of = |s: &Shape| match s {
@@ -720,7 +846,11 @@ mod tests {
                 for (id, gg) in [&g0, &g1].into_iter().enumerate() {
                     assert_eq!(gg.cols, Cols::Full, "[{key}] rank{id} 切行类应列全量");
                 }
-                assert_eq!(g0.row_atoms * g0.elem_per_atom, f.inner, "[{key}] 行宽 ≠ 全量内维");
+                assert_eq!(
+                    g0.row_atoms * g0.elem_per_atom,
+                    f.inner,
+                    "[{key}] 行宽 ≠ 全量内维"
+                );
             } else {
                 // 切列:行必须是全量,列原子两侧之和 == 全量
                 assert_eq!(rows_of(&g0.shape), f.rows, "[{key}] 切列类应行全量");
@@ -740,23 +870,72 @@ mod tests {
     /// 不整除 / 块不对齐 ⇒ **响亮拒**(不许静默 pad)
     #[test]
     fn misalignment_is_loud() {
-        let d = GgufDims { nk: 16, nv: 48, hk: 128, hv: 128, nq: 24, nkv: 4 };
-        let f = TensorFacts { ty: GgmlTy::Q4K, rows: 100, inner: 5120 };
-        let e = geom_of("blk.0.ffn_gate.weight", &d, &f, Some(ShardSel { id: 0, world: 8, head_split: false }))
-            .unwrap_err()
-            .to_string();
+        let d = GgufDims {
+            nk: 16,
+            nv: 48,
+            hk: 128,
+            hv: 128,
+            nq: 24,
+            nkv: 4,
+        };
+        let f = TensorFacts {
+            ty: GgmlTy::Q4K,
+            rows: 100,
+            inner: 5120,
+        };
+        let e = geom_of(
+            "blk.0.ffn_gate.weight",
+            &d,
+            &f,
+            Some(ShardSel {
+                id: 0,
+                world: 8,
+                head_split: false,
+            }),
+        )
+        .unwrap_err()
+        .to_string();
         assert!(e.contains("不被 world"), "{e}");
         // 列切不落块边界:inner 5120 / world 3(量化块 256)⇒ 响亮拒
-        let e = geom_of("blk.0.ffn_down.weight", &d, &f, Some(ShardSel { id: 0, world: 3, head_split: false }))
-            .unwrap_err()
-            .to_string();
+        let e = geom_of(
+            "blk.0.ffn_down.weight",
+            &d,
+            &f,
+            Some(ShardSel {
+                id: 0,
+                world: 3,
+                head_split: false,
+            }),
+        )
+        .unwrap_err()
+        .to_string();
         assert!(e.contains("不落块边界") || e.contains("不被 world"), "{e}");
         // ssm_out 的 hv 与原子互不整除 ⇒ 按头不可分 ⇒ TP 拒
-        let d2 = GgufDims { nk: 16, nv: 48, hk: 128, hv: 100, nq: 24, nkv: 4 };
-        let f2 = TensorFacts { ty: GgmlTy::Q8_0, rows: 5120, inner: 4800 };
-        let e = geom_of("blk.0.ssm_out.weight", &d2, &f2, Some(ShardSel { id: 0, world: 2, head_split: false }))
-            .unwrap_err()
-            .to_string();
+        let d2 = GgufDims {
+            nk: 16,
+            nv: 48,
+            hk: 128,
+            hv: 100,
+            nq: 24,
+            nkv: 4,
+        };
+        let f2 = TensorFacts {
+            ty: GgmlTy::Q8_0,
+            rows: 5120,
+            inner: 4800,
+        };
+        let e = geom_of(
+            "blk.0.ssm_out.weight",
+            &d2,
+            &f2,
+            Some(ShardSel {
+                id: 0,
+                world: 2,
+                head_split: false,
+            }),
+        )
+        .unwrap_err()
+        .to_string();
         assert!(e.contains("互不整除"), "{e}");
     }
 
@@ -770,15 +949,30 @@ mod tests {
     #[test]
     fn ssm_out_atom_tiled_geometry_matches_rank_table() {
         use crate::formats::gguf::transform::{rank_head_order, vhead_q8_blocks_rank};
-        let d = GgufDims { nk: 16, nv: 48, hk: 128, hv: 128, nq: 24, nkv: 4 };
-        let f = TensorFacts { ty: GgmlTy::Q4K, rows: 5120, inner: 6144 };
+        let d = GgufDims {
+            nk: 16,
+            nv: 48,
+            hk: 128,
+            hv: 128,
+            nq: 24,
+            nkv: 4,
+        };
+        let f = TensorFacts {
+            ty: GgmlTy::Q4K,
+            rows: 5120,
+            inner: 6144,
+        };
         let (atom, atom_bytes) = GgmlTy::Q4K.block();
         assert_eq!((atom, atom_bytes), (256, 144), "Q4_K 原子事实");
         let bph = d.hv / 32; // 每头 q8_1 块数 = 4
         let abl = atom / 32; // 每原子 q8_1 块数 = 8
         let mut all_file_blocks: Vec<usize> = Vec::new();
         for rank in 0..2usize {
-            let sel = ShardSel { id: rank, world: 2, head_split: false };
+            let sel = ShardSel {
+                id: rank,
+                world: 2,
+                head_split: false,
+            };
             let g = geom_of("blk.0.ssm_out.weight", &d, &f, Some(sel))
                 .expect("geom")
                 .expect("ssm_out 应切");
@@ -809,7 +1003,12 @@ mod tests {
             for (dc, fblk) in dest_file.iter().enumerate() {
                 let fh = fblk / bph; // 文件头
                 let h = (fh % d.nk) * (d.nv / d.nk) + fh / d.nk; // grouped 头
-                assert_eq!(h, order[dc / bph], "rank{rank} dest 头 {} 的 grouped 头", dc / bph);
+                assert_eq!(
+                    h,
+                    order[dc / bph],
+                    "rank{rank} dest 头 {} 的 grouped 头",
+                    dc / bph
+                );
                 assert_eq!(
                     table[dc],
                     ((h - h0) * bph + fblk % bph) as u32,

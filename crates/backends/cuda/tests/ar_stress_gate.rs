@@ -26,13 +26,13 @@
 //! · `OWL_STRESS_DTYPE`(f16/f32/bf16)。未设 DEV_A/B ⇒ skip。
 
 use half::{bf16, f16};
-use std::time::Instant;
 use owl_cuda::comm::ar::{plan_ar, AllReduce, ArPhase, StagingLayout};
 use owl_cuda::{
     Bytes, Command, DeviceClient as _, DeviceSelector, Dtype, GpuClient, GpuServer, ModelError,
     Shape,
 };
 use owl_kernels::client::comm::{ArReduceCall, ArStageCall};
+use std::time::Instant;
 
 const HDR: usize = 64;
 const SLOT: u64 = 32 << 20;
@@ -124,7 +124,10 @@ fn width(dt: Dtype) -> usize {
 
 fn to_f32(bytes: &[u8], dt: Dtype) -> Vec<f32> {
     match dt {
-        Dtype::F32 => bytes.chunks_exact(4).map(|c| f32::from_le_bytes(c.try_into().unwrap())).collect(),
+        Dtype::F32 => bytes
+            .chunks_exact(4)
+            .map(|c| f32::from_le_bytes(c.try_into().unwrap()))
+            .collect(),
         Dtype::F16 => bytes
             .chunks_exact(2)
             .map(|c| f16::from_bits(u16::from_le_bytes(c.try_into().unwrap())).to_f32())
@@ -155,7 +158,9 @@ fn lcg_vec(n: usize, seed: u64) -> Vec<f32> {
     let mut s = seed;
     (0..n)
         .map(|_| {
-            s = s.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            s = s
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
             ((s >> 40) as f32 / (1u64 << 24) as f32) * 2.0 - 1.0
         })
         .collect()
@@ -174,7 +179,12 @@ async fn write_hdr(client: &mut GpuClient, staging: &Bytes, tag: &str) -> Result
     client.sync().await
 }
 
-async fn reset_payload(client: &mut GpuClient, b: &Bytes, data: &[u8], tag: &str) -> Result<(), ModelError> {
+async fn reset_payload(
+    client: &mut GpuClient,
+    b: &Bytes,
+    data: &[u8],
+    tag: &str,
+) -> Result<(), ModelError> {
     let n = data.len();
     let mut pin = client.alloc_pinned(n, tag).await?;
     pin.slice_bytes_mut()[..n].copy_from_slice(data);
@@ -240,12 +250,20 @@ fn u64of(h: &[u8], off: usize) -> u64 {
 #[tokio::test]
 async fn ar_stress() {
     let (Some(oa), Some(ob)) = (dev("OWL_PEER_TEST_DEV_A"), dev("OWL_PEER_TEST_DEV_B")) else {
-        owl_shared::testkit::report::skip("需 OWL_PEER_TEST_DEV_A / OWL_PEER_TEST_DEV_B(两张可 P2P 的空闲卡)");
+        owl_shared::testkit::report::skip(
+            "需 OWL_PEER_TEST_DEV_A / OWL_PEER_TEST_DEV_B(两张可 P2P 的空闲卡)",
+        );
         return;
     };
     assert_ne!(oa, ob);
-    let iters: u32 = std::env::var("OWL_STRESS_ITERS").ok().and_then(|v| v.parse().ok()).unwrap_or(300);
-    let bytes: usize = std::env::var("OWL_STRESS_BYTES").ok().and_then(|v| v.parse().ok()).unwrap_or(10240);
+    let iters: u32 = std::env::var("OWL_STRESS_ITERS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(300);
+    let bytes: usize = std::env::var("OWL_STRESS_BYTES")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(10240);
     let dt = match std::env::var("OWL_STRESS_DTYPE").as_deref() {
         Ok("f32") => Dtype::F32,
         Ok("bf16") => Dtype::BF16,
@@ -259,18 +277,40 @@ async fn ar_stress() {
     let mut a = assemble(oa, "a");
     let mut b = assemble(ob, "b");
     let staging_bytes = HDR as u64 + SLOT * N_SLOTS as u64;
-    let (staging_a, cred_a) = a.peer_alloc(staging_bytes as usize, "st:staging-a").await.expect("A PeerAlloc");
-    let (staging_b, cred_b) = b.peer_alloc(staging_bytes as usize, "st:staging-b").await.expect("B PeerAlloc");
-    let alias_b_on_a = a.peer_import(cred_b, staging_bytes as usize, &ub, "st:alias-b@a").await.expect("A 导入 B");
-    let alias_a_on_b = b.peer_import(cred_a, staging_bytes as usize, &ua, "st:alias-a@b").await.expect("B 导入 A");
-    write_hdr(&mut a, &staging_a, "st:hdr-a").await.expect("A header");
-    write_hdr(&mut b, &staging_b, "st:hdr-b").await.expect("B header");
+    let (staging_a, cred_a) = a
+        .peer_alloc(staging_bytes as usize, "st:staging-a")
+        .await
+        .expect("A PeerAlloc");
+    let (staging_b, cred_b) = b
+        .peer_alloc(staging_bytes as usize, "st:staging-b")
+        .await
+        .expect("B PeerAlloc");
+    let alias_b_on_a = a
+        .peer_import(cred_b, staging_bytes as usize, &ub, "st:alias-b@a")
+        .await
+        .expect("A 导入 B");
+    let alias_a_on_b = b
+        .peer_import(cred_a, staging_bytes as usize, &ua, "st:alias-a@b")
+        .await
+        .expect("B 导入 A");
+    write_hdr(&mut a, &staging_a, "st:hdr-a")
+        .await
+        .expect("A header");
+    write_hdr(&mut b, &staging_b, "st:hdr-b")
+        .await
+        .expect("B header");
 
     let a_bytes = from_f32(&lcg_vec(n_elems, 0xA5A5_1234), dt);
     let b_bytes = from_f32(&lcg_vec(n_elems, 0x5A5A_9876), dt);
     let want = host_ref(&a_bytes, &b_bytes, dt);
-    let payload_a = a.htod(dt, &Shape::from(vec![n_elems]), &a_bytes, "st:payload-a").await.expect("A htod");
-    let payload_b = b.htod(dt, &Shape::from(vec![n_elems]), &b_bytes, "st:payload-b").await.expect("B htod");
+    let payload_a = a
+        .htod(dt, &Shape::from(vec![n_elems]), &a_bytes, "st:payload-a")
+        .await
+        .expect("A htod");
+    let payload_b = b
+        .htod(dt, &Shape::from(vec![n_elems]), &b_bytes, "st:payload-b")
+        .await
+        .expect("B htod");
 
     eprintln!(
         "[stress] devices A=ord{oa} B=ord{ob} | iters={iters} bytes={bytes} dtype={dt:?} \
@@ -279,12 +319,30 @@ async fn ar_stress() {
 
     for it in 0..iters {
         // 每轮复位(⇒ 期望值恒定 = a+b;htod 的 host 往返不参与判据)
-        reset_payload(&mut a, &payload_a, &a_bytes, "st:rst-a").await.expect("A reset");
-        reset_payload(&mut b, &payload_b, &b_bytes, "st:rst-b").await.expect("B reset");
+        reset_payload(&mut a, &payload_a, &a_bytes, "st:rst-a")
+            .await
+            .expect("A reset");
+        reset_payload(&mut b, &payload_b, &b_bytes, "st:rst-b")
+            .await
+            .expect("B reset");
 
         let (ra, rb) = tokio::join!(
-            emit_rank(&mut a, &payload_a, &staging_a, &alias_b_on_a, bytes as u64, &layout),
-            emit_rank(&mut b, &payload_b, &staging_b, &alias_a_on_b, bytes as u64, &layout),
+            emit_rank(
+                &mut a,
+                &payload_a,
+                &staging_a,
+                &alias_b_on_a,
+                bytes as u64,
+                &layout
+            ),
+            emit_rank(
+                &mut b,
+                &payload_b,
+                &staging_b,
+                &alias_a_on_b,
+                bytes as u64,
+                &layout
+            ),
         );
         ra.expect("A 发射序列");
         rb.expect("B 发射序列");
@@ -314,8 +372,14 @@ async fn ar_stress() {
             let mut got = vec![0u8; n_elems * w];
             cl.dtoh(p, &mut got).await.expect("读 payload");
             if got != want {
-                let pos = got.iter().zip(want.iter()).position(|(x, y)| x != y).unwrap_or(0);
-                let h = read_hdr(cl, if who == "A" { &staging_a } else { &staging_b }).await.expect("hdr");
+                let pos = got
+                    .iter()
+                    .zip(want.iter())
+                    .position(|(x, y)| x != y)
+                    .unwrap_or(0);
+                let h = read_hdr(cl, if who == "A" { &staging_a } else { &staging_b })
+                    .await
+                    .expect("hdr");
                 panic!(
                     "[stress] ✗ 轮 {it} {who} 侧 payload 逐位不符:首个不同字节 @ {pos} \
                      (got={:?} want={:?})| header: produced={} consumed={} wait_done={} \
@@ -355,7 +419,10 @@ async fn ar_stress_graph() {
         owl_shared::testkit::report::skip("需 OWL_PEER_TEST_DEV_A / OWL_PEER_TEST_DEV_B");
         return;
     };
-    let replays: u32 = std::env::var("OWL_STRESS_REPLAYS").ok().and_then(|v| v.parse().ok()).unwrap_or(20);
+    let replays: u32 = std::env::var("OWL_STRESS_REPLAYS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(20);
     // f32 + 窄区间:2^k 精确(不撞精度/溢出)
     let bytes = 1 << 20; // 1MiB(f32 = 262144 元素 > 64KB 门槛 ⇒ 走多 block 路径)
     let dt = Dtype::F32;
@@ -365,27 +432,63 @@ async fn ar_stress_graph() {
     let mut a = assemble(oa, "ga");
     let mut b = assemble(ob, "gb");
     let staging_bytes = HDR as u64 + SLOT * N_SLOTS as u64;
-    let (staging_a, cred_a) = a.peer_alloc(staging_bytes as usize, "sg:staging-a").await.expect("A PeerAlloc");
-    let (staging_b, cred_b) = b.peer_alloc(staging_bytes as usize, "sg:staging-b").await.expect("B PeerAlloc");
-    let alias_b_on_a = a.peer_import(cred_b, staging_bytes as usize, &ub, "sg:alias-b@a").await.expect("A 导入 B");
-    let alias_a_on_b = b.peer_import(cred_a, staging_bytes as usize, &ua, "sg:alias-a@b").await.expect("B 导入 A");
-    write_hdr(&mut a, &staging_a, "sg:hdr-a").await.expect("A header");
-    write_hdr(&mut b, &staging_b, "sg:hdr-b").await.expect("B header");
+    let (staging_a, cred_a) = a
+        .peer_alloc(staging_bytes as usize, "sg:staging-a")
+        .await
+        .expect("A PeerAlloc");
+    let (staging_b, cred_b) = b
+        .peer_alloc(staging_bytes as usize, "sg:staging-b")
+        .await
+        .expect("B PeerAlloc");
+    let alias_b_on_a = a
+        .peer_import(cred_b, staging_bytes as usize, &ub, "sg:alias-b@a")
+        .await
+        .expect("A 导入 B");
+    let alias_a_on_b = b
+        .peer_import(cred_a, staging_bytes as usize, &ua, "sg:alias-a@b")
+        .await
+        .expect("B 导入 A");
+    write_hdr(&mut a, &staging_a, "sg:hdr-a")
+        .await
+        .expect("A header");
+    write_hdr(&mut b, &staging_b, "sg:hdr-b")
+        .await
+        .expect("B header");
 
     let a_bytes = from_f32(&lcg_vec(n, 0x1357_9BDF), dt);
     let b_bytes = from_f32(&lcg_vec(n, 0x2468_ACE0), dt);
-    let payload_a = a.htod(dt, &Shape::from(vec![n]), &a_bytes, "sg:pl-a").await.expect("A htod");
-    let payload_b = b.htod(dt, &Shape::from(vec![n]), &b_bytes, "sg:pl-b").await.expect("B htod");
+    let payload_a = a
+        .htod(dt, &Shape::from(vec![n]), &a_bytes, "sg:pl-a")
+        .await
+        .expect("A htod");
+    let payload_b = b
+        .htod(dt, &Shape::from(vec![n]), &b_bytes, "sg:pl-b")
+        .await
+        .expect("B htod");
 
     // 捕获(窗内只发射;两侧都捕)
     a.graph_begin().await.expect("A graph_begin");
     b.graph_begin().await.expect("B graph_begin");
-    emit_rank(&mut a, &payload_a, &staging_a, &alias_b_on_a, bytes as u64, &layout)
-        .await
-        .expect("A 窗内发射");
-    emit_rank(&mut b, &payload_b, &staging_b, &alias_a_on_b, bytes as u64, &layout)
-        .await
-        .expect("B 窗内发射");
+    emit_rank(
+        &mut a,
+        &payload_a,
+        &staging_a,
+        &alias_b_on_a,
+        bytes as u64,
+        &layout,
+    )
+    .await
+    .expect("A 窗内发射");
+    emit_rank(
+        &mut b,
+        &payload_b,
+        &staging_b,
+        &alias_a_on_b,
+        bytes as u64,
+        &layout,
+    )
+    .await
+    .expect("B 窗内发射");
     let ga = a.graph_end().await.expect("A graph_end");
     let gb = b.graph_end().await.expect("B graph_end");
 
@@ -424,7 +527,11 @@ async fn ar_stress_graph() {
             let mut got = vec![0u8; n * 4];
             cl.dtoh(p, &mut got).await.expect("读 payload");
             if got != exp {
-                let pos = got.iter().zip(exp.iter()).position(|(x, y)| x != y).unwrap_or(0);
+                let pos = got
+                    .iter()
+                    .zip(exp.iter())
+                    .position(|(x, y)| x != y)
+                    .unwrap_or(0);
                 panic!(
                     "[graph-stress] ✗ 回放 {k} {who} 侧逐位不符:首个不同字节 @ {pos} \
                      (got={:?} want={:?})—— 相对游标/回零哪一格烘了绝对值?",
@@ -471,9 +578,18 @@ async fn ce_sm_overlap_probe() {
         owl_shared::testkit::report::skip("需 OWL_PEER_TEST_DEV_A / OWL_PEER_TEST_DEV_B");
         return;
     };
-    let ce_n: u32 = std::env::var("OWL_OVL_CE").ok().and_then(|v| v.parse().ok()).unwrap_or(0);
-    let ar_n: u32 = std::env::var("OWL_OVL_AR").ok().and_then(|v| v.parse().ok()).unwrap_or(8);
-    let k: u32 = std::env::var("OWL_OVL_K").ok().and_then(|v| v.parse().ok()).unwrap_or(20);
+    let ce_n: u32 = std::env::var("OWL_OVL_CE")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(0);
+    let ar_n: u32 = std::env::var("OWL_OVL_AR")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(8);
+    let k: u32 = std::env::var("OWL_OVL_K")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(20);
     let bytes = 1 << 20;
     let dt = Dtype::F32;
     let n = bytes / 4;
@@ -483,32 +599,78 @@ async fn ce_sm_overlap_probe() {
     let mut a = assemble(oa, "ova");
     let mut b = assemble(ob, "ovb");
     let staging_bytes = HDR as u64 + SLOT * n_slots as u64;
-    let (staging_a, cred_a) = a.peer_alloc(staging_bytes as usize, "ov:staging-a").await.expect("A PeerAlloc");
-    let (staging_b, cred_b) = b.peer_alloc(staging_bytes as usize, "ov:staging-b").await.expect("B PeerAlloc");
-    let alias_b_on_a = a.peer_import(cred_b, staging_bytes as usize, &ub, "ov:alias-b@a").await.expect("A 导入 B");
-    let alias_a_on_b = b.peer_import(cred_a, staging_bytes as usize, &ua, "ov:alias-a@b").await.expect("B 导入 A");
-    write_hdr(&mut a, &staging_a, "ov:hdr-a").await.expect("A header");
-    write_hdr(&mut b, &staging_b, "ov:hdr-b").await.expect("B header");
+    let (staging_a, cred_a) = a
+        .peer_alloc(staging_bytes as usize, "ov:staging-a")
+        .await
+        .expect("A PeerAlloc");
+    let (staging_b, cred_b) = b
+        .peer_alloc(staging_bytes as usize, "ov:staging-b")
+        .await
+        .expect("B PeerAlloc");
+    let alias_b_on_a = a
+        .peer_import(cred_b, staging_bytes as usize, &ub, "ov:alias-b@a")
+        .await
+        .expect("A 导入 B");
+    let alias_a_on_b = b
+        .peer_import(cred_a, staging_bytes as usize, &ua, "ov:alias-a@b")
+        .await
+        .expect("B 导入 A");
+    write_hdr(&mut a, &staging_a, "ov:hdr-a")
+        .await
+        .expect("A header");
+    write_hdr(&mut b, &staging_b, "ov:hdr-b")
+        .await
+        .expect("B header");
     let a_bytes = from_f32(&lcg_vec(n, 0x0BAD_F00D), dt);
     let b_bytes = from_f32(&lcg_vec(n, 0xFEED_FACE), dt);
-    let payload_a = a.htod(dt, &Shape::from(vec![n]), &a_bytes, "ov:pl-a").await.expect("A htod");
-    let payload_b = b.htod(dt, &Shape::from(vec![n]), &b_bytes, "ov:pl-b").await.expect("B htod");
+    let payload_a = a
+        .htod(dt, &Shape::from(vec![n]), &a_bytes, "ov:pl-a")
+        .await
+        .expect("A htod");
+    let payload_b = b
+        .htod(dt, &Shape::from(vec![n]), &b_bytes, "ov:pl-b")
+        .await
+        .expect("B htod");
 
     // ── 捕获:SM 链(COMPUTE)+ 可选 CE 链(AUX)──────────────────────
     a.graph_begin().await.expect("A graph_begin");
     b.graph_begin().await.expect("B graph_begin");
     for _ in 0..ar_n {
-        emit_rank(&mut a, &payload_a, &staging_a, &alias_b_on_a, bytes as u64, &layout).await.expect("A AR");
-        emit_rank(&mut b, &payload_b, &staging_b, &alias_a_on_b, bytes as u64, &layout).await.expect("B AR");
+        emit_rank(
+            &mut a,
+            &payload_a,
+            &staging_a,
+            &alias_b_on_a,
+            bytes as u64,
+            &layout,
+        )
+        .await
+        .expect("A AR");
+        emit_rank(
+            &mut b,
+            &payload_b,
+            &staging_b,
+            &alias_a_on_b,
+            bytes as u64,
+            &layout,
+        )
+        .await
+        .expect("B AR");
     }
     if ce_n > 0 {
-        let aux = std::env::var("OWL_OVL_CE_STREAM").map(|v| v != "same").unwrap_or(true);
+        let aux = std::env::var("OWL_OVL_CE_STREAM")
+            .map(|v| v != "same")
+            .unwrap_or(true);
         if aux {
-            a.capture_route_to(owl_cuda::STREAM_COMPUTE_AUX as u8).await.expect("A fork→AUX");
+            a.capture_route_to(owl_cuda::STREAM_COMPUTE_AUX as u8)
+                .await
+                .expect("A fork→AUX");
         }
         for _ in 0..ce_n {
             // 对端 staging → 本端 payload(跨卡 DMA;目的地只为"有个在册终点")
-            a.copy_block_at(&alias_b_on_a, 0, &payload_a, 0, bytes).await.expect("A CE 拷");
+            a.copy_block_at(&alias_b_on_a, 0, &payload_a, 0, bytes)
+                .await
+                .expect("A CE 拷");
         }
         if aux {
             a.capture_route_to(1).await.expect("A 切回 COMPUTE");
@@ -519,17 +681,21 @@ async fn ce_sm_overlap_probe() {
 
     for _ in 0..3 {
         let (la, lb) = tokio::join!(a.graph_launch(ga), b.graph_launch(gb));
-        la.expect("A warm"); lb.expect("B warm");
+        la.expect("A warm");
+        lb.expect("B warm");
         let (sa, sb) = tokio::join!(a.sync(), b.sync());
-        sa.expect("A sync"); sb.expect("B sync");
+        sa.expect("A sync");
+        sb.expect("B sync");
     }
     let t0 = Instant::now();
     for _ in 0..k {
         let (la, lb) = tokio::join!(a.graph_launch(ga), b.graph_launch(gb));
-        la.expect("A replay"); lb.expect("B replay");
+        la.expect("A replay");
+        lb.expect("B replay");
     }
     let (sa, sb) = tokio::join!(a.sync(), b.sync());
-    sa.expect("A sync"); sb.expect("B sync");
+    sa.expect("A sync");
+    sb.expect("B sync");
     let ms = t0.elapsed().as_secs_f64() * 1e3 / f64::from(k);
     // 自证:AR 链真在跑(err != 0 就是超时/校验失败)
     for (cl, st, who) in [(&mut a, &staging_a, "A"), (&mut b, &staging_b, "B")] {
@@ -583,11 +749,18 @@ async fn push_graph_overlap_probe() {
         owl_shared::testkit::report::skip("需 OWL_PEER_TEST_DEV_A / OWL_PEER_TEST_DEV_B");
         return;
     };
-    let chain: u32 =
-        std::env::var("OWL_OVLP_CHAIN").ok().and_then(|v| v.parse().ok()).unwrap_or(128);
-    let bytes: usize =
-        std::env::var("OWL_OVLP_BYTES").ok().and_then(|v| v.parse().ok()).unwrap_or(5_242_880);
-    let k: u32 = std::env::var("OWL_OVLP_K").ok().and_then(|v| v.parse().ok()).unwrap_or(20);
+    let chain: u32 = std::env::var("OWL_OVLP_CHAIN")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(128);
+    let bytes: usize = std::env::var("OWL_OVLP_BYTES")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(5_242_880);
+    let k: u32 = std::env::var("OWL_OVLP_K")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(20);
     const HUGE: u64 = 1u64 << 62;
 
     // ⚠️ metrics store 是**进程级 OnceLock** ⇒ **必须在捕获之前 init**
@@ -597,10 +770,14 @@ async fn push_graph_overlap_probe() {
     let mut a = assemble(oa, "ovlp-a");
     let mut b = assemble(ob, "ovlp-b");
     let staging_bytes = HDR as u64 + SLOT * N_SLOTS as u64;
-    let (staging_a, cred_a) =
-        a.peer_alloc(staging_bytes as usize, "ovlp:st-a").await.expect("A PeerAlloc");
-    let (staging_b, cred_b) =
-        b.peer_alloc(staging_bytes as usize, "ovlp:st-b").await.expect("B PeerAlloc");
+    let (staging_a, cred_a) = a
+        .peer_alloc(staging_bytes as usize, "ovlp:st-a")
+        .await
+        .expect("A PeerAlloc");
+    let (staging_b, cred_b) = b
+        .peer_alloc(staging_bytes as usize, "ovlp:st-b")
+        .await
+        .expect("B PeerAlloc");
     // push 档要写对端 ⇒ 别名必须 RW
     let alias_b_on_a = a
         .peer_import_rw(cred_b, staging_bytes as usize, &ub, "ovlp:rw-b@a")
@@ -637,7 +814,10 @@ async fn push_graph_overlap_probe() {
         aux_write: bool,
         comp_rmw: bool,
     ) -> f64 {
-        arm2(a, payload_a, staging_a, alias_b, bytes, chain, k, aux_write, comp_rmw, false).await
+        arm2(
+            a, payload_a, staging_a, alias_b, bytes, chain, k, aux_write, comp_rmw, false,
+        )
+        .await
     }
 
     /// `aux_rmw`(2026-10-18 §41):AUX 链也放**本地 RMW**(用对端块做 header ⇒ 与
@@ -656,8 +836,10 @@ async fn push_graph_overlap_probe() {
         comp_rmw: bool,
         aux_rmw: bool,
     ) -> f64 {
-        arm3(a, payload_a, staging_a, alias_b, bytes, chain, k, aux_write, comp_rmw, aux_rmw, false)
-            .await
+        arm3(
+            a, payload_a, staging_a, alias_b, bytes, chain, k, aux_write, comp_rmw, aux_rmw, false,
+        )
+        .await
     }
 
     /// `aux_ce`(2026-10-18 §41):AUX 链改用 **CE 写对端**(`copy_block_at` ⇒
@@ -676,8 +858,11 @@ async fn push_graph_overlap_probe() {
         aux_rmw: bool,
         aux_ce: bool,
     ) -> f64 {
-        arm4(a, payload_a, staging_a, alias_b, bytes, chain, k, aux_write, comp_rmw, aux_rmw, aux_ce, 1)
-            .await
+        arm4(
+            a, payload_a, staging_a, alias_b, bytes, chain, k, aux_write, comp_rmw, aux_rmw,
+            aux_ce, 1,
+        )
+        .await
     }
 
     /// ★ **生产 push 绑定的写链**(2026-10-18 §41 收尾):`own = 本端 staging`(header 留本端)、
@@ -697,10 +882,14 @@ async fn push_graph_overlap_probe() {
         rmw_mult: u32,
     ) -> f64 {
         const HUGE: u64 = 1u64 << 62;
-        write_hdr_at(a, staging_a, "ovlp5:hdr-a", 0, 0).await.expect("A hdr");
+        write_hdr_at(a, staging_a, "ovlp5:hdr-a", 0, 0)
+            .await
+            .expect("A hdr");
         // 对端块:`consumed = HUGE` ⇒ 写链的 credit **恒过**(单边可跑);
         // `produced = HUGE` ⇒ 写链的 rendezvous 恒过
-        write_hdr_at(a, alias_b, "ovlp5:hdr-b", HUGE, HUGE).await.expect("B hdr(HUGE,HUGE)");
+        write_hdr_at(a, alias_b, "ovlp5:hdr-b", HUGE, HUGE)
+            .await
+            .expect("B hdr(HUGE,HUGE)");
         // RMW 链用**独立 header**(64B 块)⇒ 与写链的 header 完全解耦
         // (⚠️ 之前把 RMW 链也绑到对端块 ⇒ `cons=HUGE` ⇒ `HUGE > HUGE` 假 ⇒ 自旋死锁)
         // 专用 header 块:`slot_bytes = bytes`(**核会校验 header 声明与实参一致**)⇒
@@ -713,7 +902,9 @@ async fn push_graph_overlap_probe() {
             .await
             .expect("hdr_rmw 值");
         a.graph_begin().await.expect("graph_begin");
-        a.capture_route_to(owl_cuda::STREAM_COMPUTE_AUX as u8).await.expect("fork→AUX");
+        a.capture_route_to(owl_cuda::STREAM_COMPUTE_AUX as u8)
+            .await
+            .expect("fork→AUX");
         for _ in 0..chain {
             a.launch(
                 ArStageCall::new(
@@ -785,12 +976,16 @@ async fn push_graph_overlap_probe() {
     ) -> f64 {
         const HUGE: u64 = 1u64 << 62;
         // A 的 header:`produced = HUGE`(RMW 链的 I2 恒真)、`consumed` 归 0
-        write_hdr_at(a, staging_a, "ovlp:hdr-a", HUGE, 0).await.expect("A hdr");
+        write_hdr_at(a, staging_a, "ovlp:hdr-a", HUGE, 0)
+            .await
+            .expect("A hdr");
         // B 的 header:全 0(写链自洽:代发 credit + 自等自)
         // (B 侧由调用方在臂外设好 —— 这里只碰 A)
         a.graph_begin().await.expect("graph_begin");
         if aux_write || aux_rmw || aux_ce {
-            a.capture_route_to(owl_cuda::STREAM_COMPUTE_AUX as u8).await.expect("fork→AUX");
+            a.capture_route_to(owl_cuda::STREAM_COMPUTE_AUX as u8)
+                .await
+                .expect("fork→AUX");
             for _ in 0..chain {
                 if aux_ce {
                     // CE 写对端:payload_a → 对端块的 slot 区(绕过 SM)
@@ -861,7 +1056,9 @@ async fn push_graph_overlap_probe() {
         // ⚠️ 只在**本臂真的 fork 过**时 join(没有支流的窗调 join = 响亮拒;
         // 这正是纪律㉔要的"静默 no-op 不许存在")
         if aux_write || aux_rmw || aux_ce {
-            a.capture_join().await.expect("join(origin 尾部等 AUX 链尾)");
+            a.capture_join()
+                .await
+                .expect("join(origin 尾部等 AUX 链尾)");
         }
         let gid = a.graph_end().await.expect("graph_end");
         for _ in 0..3 {
@@ -879,7 +1076,9 @@ async fn push_graph_overlap_probe() {
     }
 
     // B 侧 header 归零(写链要读它;一次即可)
-    write_hdr(&mut b, &staging_b, "ovlp:hdr-b").await.expect("B hdr");
+    write_hdr(&mut b, &staging_b, "ovlp:hdr-b")
+        .await
+        .expect("B hdr");
     let _ = &payload_b;
 
     // ★ **采集纪律(用户口径 2026-10-18)**:**攒内存,最后集中 dump** ——
@@ -887,9 +1086,51 @@ async fn push_graph_overlap_probe() {
     // 全部跑完后再一次性出表(表 + CSV)。**热路径零打印。**
     let t_arm = |tag: &str, v: f64| (tag.to_string(), v);
     let mut rows: Vec<(String, f64)> = Vec::new();
-    rows.push(t_arm("S 写链(AUX)", arm(&mut a, &payload_a, &staging_a, &alias_b_on_a, bytes as u64, chain, k, true, false).await));
-    rows.push(t_arm("R RMW 链(COMPUTE)", arm(&mut a, &payload_a, &staging_a, &alias_b_on_a, bytes as u64, chain, k, false, true).await));
-    rows.push(t_arm("D 双流(写‖RMW)", arm(&mut a, &payload_a, &staging_a, &alias_b_on_a, bytes as u64, chain, k, true, true).await));
+    rows.push(t_arm(
+        "S 写链(AUX)",
+        arm(
+            &mut a,
+            &payload_a,
+            &staging_a,
+            &alias_b_on_a,
+            bytes as u64,
+            chain,
+            k,
+            true,
+            false,
+        )
+        .await,
+    ));
+    rows.push(t_arm(
+        "R RMW 链(COMPUTE)",
+        arm(
+            &mut a,
+            &payload_a,
+            &staging_a,
+            &alias_b_on_a,
+            bytes as u64,
+            chain,
+            k,
+            false,
+            true,
+        )
+        .await,
+    ));
+    rows.push(t_arm(
+        "D 双流(写‖RMW)",
+        arm(
+            &mut a,
+            &payload_a,
+            &staging_a,
+            &alias_b_on_a,
+            bytes as u64,
+            chain,
+            k,
+            true,
+            true,
+        )
+        .await,
+    ));
     // ★ **对照臂**(§41):两条**同质本地 RMW** 链(AUX 用对端块做 header)
     //   ⇒ 与 `D` 对照即可把"真串行"与"PCIe 争用"分开。
     // E 臂的 AUX 链用**对端块**做 header ⇒ 它的 I2 等的是 `B.produced` ⇒ 必须先顶满
@@ -897,24 +1138,126 @@ async fn push_graph_overlap_probe() {
     write_hdr_at(&mut a, &alias_b_on_a, "ovlp:hdr-b-huge", HUGE, 0)
         .await
         .expect("B header(HUGE)");
-    rows.push(t_arm("E 双流(RMW‖RMW)", arm2(&mut a, &payload_a, &staging_a, &alias_b_on_a, bytes as u64, chain, k, false, true, true).await));
-    rows.push(t_arm("F 双流(CE写‖RMW)", arm3(&mut a, &payload_a, &staging_a, &alias_b_on_a, bytes as u64, chain, k, false, true, false, true).await));
-    rows.push(t_arm("G CE 写链(AUX 单链)", arm3(&mut a, &payload_a, &staging_a, &alias_b_on_a, bytes as u64, chain, k, false, false, false, true).await));
+    rows.push(t_arm(
+        "E 双流(RMW‖RMW)",
+        arm2(
+            &mut a,
+            &payload_a,
+            &staging_a,
+            &alias_b_on_a,
+            bytes as u64,
+            chain,
+            k,
+            false,
+            true,
+            true,
+        )
+        .await,
+    ));
+    rows.push(t_arm(
+        "F 双流(CE写‖RMW)",
+        arm3(
+            &mut a,
+            &payload_a,
+            &staging_a,
+            &alias_b_on_a,
+            bytes as u64,
+            chain,
+            k,
+            false,
+            true,
+            false,
+            true,
+        )
+        .await,
+    ));
+    rows.push(t_arm(
+        "G CE 写链(AUX 单链)",
+        arm3(
+            &mut a,
+            &payload_a,
+            &staging_a,
+            &alias_b_on_a,
+            bytes as u64,
+            chain,
+            k,
+            false,
+            false,
+            false,
+            true,
+        )
+        .await,
+    ));
     // ★ **串行度扫描**(§41):把 COMPUTE 的 RMW 链拉长,看 `D − S` 是否随 `R` 线性长。
     let rmw_mult: u32 = std::env::var("OWL_OVLP_RMW_MULT")
         .ok()
         .and_then(|v| v.parse().ok())
         .unwrap_or(8);
-    let r8 = arm4(&mut a, &payload_a, &staging_a, &alias_b_on_a, bytes as u64, chain, k, false, true, false, false, rmw_mult).await;
-    let d8 = arm4(&mut a, &payload_a, &staging_a, &alias_b_on_a, bytes as u64, chain, k, true, true, false, false, rmw_mult).await;
+    let r8 = arm4(
+        &mut a,
+        &payload_a,
+        &staging_a,
+        &alias_b_on_a,
+        bytes as u64,
+        chain,
+        k,
+        false,
+        true,
+        false,
+        false,
+        rmw_mult,
+    )
+    .await;
+    let d8 = arm4(
+        &mut a,
+        &payload_a,
+        &staging_a,
+        &alias_b_on_a,
+        bytes as u64,
+        chain,
+        k,
+        true,
+        true,
+        false,
+        false,
+        rmw_mult,
+    )
+    .await;
     rows.push(t_arm("R8 RMW×mult", r8));
     rows.push(t_arm("D8 写‖RMW×mult", d8));
     // ★ **生产绑定**(header 留本端)的写链:单跑 / 与 RMW 同图
-    let h = arm5(&mut a, &payload_a, &staging_a, &alias_b_on_a, bytes as u64, chain, k, false, 1).await;
-    let i_arm = arm5(&mut a, &payload_a, &staging_a, &alias_b_on_a, bytes as u64, chain, k, true, rmw_mult).await;
+    let h = arm5(
+        &mut a,
+        &payload_a,
+        &staging_a,
+        &alias_b_on_a,
+        bytes as u64,
+        chain,
+        k,
+        false,
+        1,
+    )
+    .await;
+    let i_arm = arm5(
+        &mut a,
+        &payload_a,
+        &staging_a,
+        &alias_b_on_a,
+        bytes as u64,
+        chain,
+        k,
+        true,
+        rmw_mult,
+    )
+    .await;
     rows.push(t_arm("H 生产绑定写链(单)", h));
     rows.push(t_arm("I 生产绑定写‖RMW", i_arm));
-    let get = |t: &str| rows.iter().find(|(k, _)| k.starts_with(t)).map(|(_, v)| *v).unwrap_or(0.0);
+    let get = |t: &str| {
+        rows.iter()
+            .find(|(k, _)| k.starts_with(t))
+            .map(|(_, v)| *v)
+            .unwrap_or(0.0)
+    };
     let (s, r, d) = (get("S "), get("R "), get("D "));
 
     // ── 集中出表(跑完之后一次;含图结构统计)──────────────────────
@@ -928,11 +1271,13 @@ async fn push_graph_overlap_probe() {
     for (k, v) in &rows {
         eprintln!("[ovlp]   {k:<22} {v:8.3} ms");
     }
-    eprintln!("[ovlp]   串行预期 {:.3} ms ⇒ **双流/串行 = {:.3}**", s + r, d / (s + r));
-    let e = get("E ");
     eprintln!(
-        "[ovlp] 判据:≈0.5 = 图内真并行;≈1.0 = 图内串行化(双流/微批都没地基)"
+        "[ovlp]   串行预期 {:.3} ms ⇒ **双流/串行 = {:.3}**",
+        s + r,
+        d / (s + r)
     );
+    let e = get("E ");
+    eprintln!("[ovlp] 判据:≈0.5 = 图内真并行;≈1.0 = 图内串行化(双流/微批都没地基)");
     let f = get("F ");
     let g = get("G ");
     let (r8, d8) = (get("R8"), get("D8"));

@@ -53,7 +53,11 @@ fn f16_to_f32(bits: u16) -> f32 {
     } else {
         (1.0 + m / 1024.0) * 2f32.powi(e - 15)
     };
-    if s != 0 { -v } else { v }
+    if s != 0 {
+        -v
+    } else {
+        v
+    }
 }
 
 /// e4m3(不带符号扩展的 8 位浮点)反解 —— 只覆盖量化器会产出的码点
@@ -90,7 +94,11 @@ fn quant_rows(vals: &[f32], rows: usize, k: usize) -> (Vec<f32>, f32) {
     for &v in vals {
         amax = amax.max(v.abs());
     }
-    let g = if amax > 0.0 { amax / (6.0 * 448.0) } else { 1.0 };
+    let g = if amax > 0.0 {
+        amax / (6.0 * 448.0)
+    } else {
+        1.0
+    };
     let mut out = vec![0f32; rows * k];
     for r in 0..rows {
         for kg in 0..k / 16 {

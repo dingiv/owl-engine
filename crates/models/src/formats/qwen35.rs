@@ -78,8 +78,9 @@ impl KeyConvention for Qwen35Convention {
             "gate_proj" | "up_proj" | "gate_up_proj" | "down_proj" => ("mlp.", ".weight"),
             // GDN mixer(norm = 层内门控归一化,非 final norm;刀2:qkvz
             // 虚拟合并键 → linear_attn.in_proj_qkvz,由装载源合成)
-            "in_proj_qkvz" | "in_proj_b" | "in_proj_a" | "out_proj" | "conv1d"
-            | "norm" => ("linear_attn.", ".weight"),
+            "in_proj_qkvz" | "in_proj_b" | "in_proj_a" | "out_proj" | "conv1d" | "norm" => {
+                ("linear_attn.", ".weight")
+            }
             // GDN 裸键(全仓仅有的无 .weight 后缀特例)
             "A_log" | "dt_bias" => ("linear_attn.", ""),
             // Full mixer
@@ -148,7 +149,9 @@ impl Loadable for crate::layers::dflash2::DFlash2Draft {
             }
             // GGUF:线性臂只发 `fc_i`(无量化后缀)⇒ 这里补 `.weight`
             FcShape::G => {
-                let mut o = self.fc_g()[0].layout(ctx).map_keys(|k| format!("{k}.weight"));
+                let mut o = self.fc_g()[0]
+                    .layout(ctx)
+                    .map_keys(|k| format!("{k}.weight"));
                 for l in &self.fc_g()[1..] {
                     o = o.chain(l.layout(ctx).map_keys(|k| format!("{k}.weight")));
                 }
@@ -159,7 +162,11 @@ impl Loadable for crate::layers::dflash2::DFlash2Draft {
         ops = ops.chain(self.hidden_norm().layout(ctx).map_keys(w));
         for (i, layer) in self.layers().iter().enumerate() {
             let conv_tail = |k: &str| {
-                if k == "base_kernel" { k.to_string() } else { format!("{k}.weight") }
+                if k == "base_kernel" {
+                    k.to_string()
+                } else {
+                    format!("{k}.weight")
+                }
             };
             ops = ops
                 .chain(
@@ -188,7 +195,11 @@ impl Loadable for crate::layers::dflash2::DFlash2Draft {
                 )
                 .chain({
                     let conv_tail = |k: &str| {
-                        if k == "base_kernel" { k.to_string() } else { format!("{k}.weight") }
+                        if k == "base_kernel" {
+                            k.to_string()
+                        } else {
+                            format!("{k}.weight")
+                        }
                     };
                     layer
                         .mlp_conv()
@@ -203,12 +214,10 @@ impl Loadable for crate::layers::dflash2::DFlash2Draft {
                 );
         }
         ops.chain(self.norm_head().layout(ctx).map_keys(w)).chain(
-            self.selector()
-                .layout(ctx)
-                .map_keys(|k| match k {
-                    "hidden_projection" => "candidate_selector.hidden_projection.weight".into(),
-                    other => format!("candidate_selector.{other}"),
-                }),
+            self.selector().layout(ctx).map_keys(|k| match k {
+                "hidden_projection" => "candidate_selector.hidden_projection.weight".into(),
+                other => format!("candidate_selector.{other}"),
+            }),
         )
     }
 }
@@ -232,11 +241,7 @@ impl Loadable for crate::layers::mtp::MtpPredictor {
                         .layout(ctx)
                         .map_keys(|_| format!("blk.{b}.nextn.eh_proj.h.weight")),
                 )
-                .chain(
-                    self.layer()
-                        .layout(ctx)
-                        .map_keys(|k| g.layer_key(b, k)),
-                )
+                .chain(self.layer().layout(ctx).map_keys(|k| g.layer_key(b, k)))
                 .chain(
                     self.pre_fc_norm_hidden()
                         .layout(ctx)
@@ -257,7 +262,11 @@ impl Loadable for crate::layers::mtp::MtpPredictor {
         self.fc_e()
             .layout(ctx)
             .map_keys(|k| format!("mtp.{k}.weight"))
-            .chain(self.fc_h().layout(ctx).map_keys(|k| format!("mtp.{k}.weight")))
+            .chain(
+                self.fc_h()
+                    .layout(ctx)
+                    .map_keys(|k| format!("mtp.{k}.weight")),
+            )
             .chain(self.layer().layout(ctx).map_keys(|k| keys.layer_key(0, k)))
             .chain(
                 self.pre_fc_norm_hidden()
@@ -269,7 +278,11 @@ impl Loadable for crate::layers::mtp::MtpPredictor {
                     .layout(ctx)
                     .map_keys(|k| format!("mtp.{k}.weight")),
             )
-            .chain(self.norm_head().layout(ctx).map_keys(|k| format!("mtp.{k}.weight")))
+            .chain(
+                self.norm_head()
+                    .layout(ctx)
+                    .map_keys(|k| format!("mtp.{k}.weight")),
+            )
     }
 }
 
@@ -362,7 +375,13 @@ pub fn dflash2_draft_geom(
         .dflash
         .and_then(|d| d.sliding_window)
         .unwrap_or(crate::layers::dflash2::NC_WINDOW);
-    Ok(DraftGeom { layers: spec.layer_types.len(), hq, hkv, hd, window })
+    Ok(DraftGeom {
+        layers: spec.layer_types.len(),
+        hq,
+        hkv,
+        hd,
+        window,
+    })
 }
 
 /// 草稿检查点是否**量化族**(单一真源;`dflash2_draft` 与 `load_dflash2_draft` 共用)。
@@ -371,7 +390,10 @@ pub fn dflash2_draft_geom(
 pub fn draft_is_quantized(dir: &Path) -> Result<bool, ModelError> {
     use crate::formats::kind::CheckpointKind;
     let kind = crate::formats::kind::detect(dir)?.kind;
-    Ok(matches!(kind, CheckpointKind::PackQuantized | CheckpointKind::AwqGemm))
+    Ok(matches!(
+        kind,
+        CheckpointKind::PackQuantized | CheckpointKind::AwqGemm
+    ))
 }
 
 /// **草稿执行 dtype 单源**(权重 / 激活 / 草稿池三处同一判据)= **恒 BF16**。
@@ -409,7 +431,10 @@ pub fn dflash2_draft(
         );
     }
     let kind = crate::formats::kind::detect(dir)?.kind;
-    let is_q = matches!(kind, CheckpointKind::PackQuantized | CheckpointKind::AwqGemm);
+    let is_q = matches!(
+        kind,
+        CheckpointKind::PackQuantized | CheckpointKind::AwqGemm
+    );
     if !is_q {
         // 未量化原生家族(z-lab,81 键)分支(**2026-10-10 悬案已结**):
         // 旧的“实测全拒 AL=1.0”不是精度/家族问题,而是三个缺陷叠加——
@@ -433,10 +458,7 @@ pub fn dflash2_draft(
     // dt = 草稿执行 dtype 单源(恒 BF16 —— 理由见 `draft_exec_dt`)
     let dt = draft_exec_dt();
     Ok(crate::layers::dflash2::DFlash2Draft::from_spec(
-        &spec,
-        plan,
-        dt,
-        kv_dt,
+        &spec, plan, dt, kv_dt,
     ))
 }
 
@@ -472,8 +494,15 @@ pub fn dflash2_draft_sharded(
         spec.layer_types.len()
     );
     let kind = crate::formats::kind::detect(dir)?.kind;
-    let is_q = matches!(kind, CheckpointKind::PackQuantized | CheckpointKind::AwqGemm);
-    let plan = if is_q { crate::module::QuantPlan::W4A16 } else { crate::module::QuantPlan::F16 };
+    let is_q = matches!(
+        kind,
+        CheckpointKind::PackQuantized | CheckpointKind::AwqGemm
+    );
+    let plan = if is_q {
+        crate::module::QuantPlan::W4A16
+    } else {
+        crate::module::QuantPlan::F16
+    };
     Ok(crate::layers::dflash2::DFlash2Draft::from_spec(
         &spec,
         plan,
@@ -574,16 +603,16 @@ pub fn qwen3_8_27b() -> ModelSpec {
 
 #[cfg(test)]
 mod tests {
-    use owl_macros::owl_test;
     use super::*;
-    use crate::TensorOps;
-    use crate::module::{ForwardCtx, Module};
-    use crate::tensor::Dtype;
-    use std::collections::HashMap;
     use crate::contract::{DeviceClient, ModelError};
     use crate::formats::load::{load_from_dir, manifest_mem_ledger, LoadOpts};
     use crate::model::Model;
+    use crate::module::{ForwardCtx, Module};
+    use crate::tensor::Dtype;
     use crate::testkit::{f32b, manifest_dir};
+    use crate::TensorOps;
+    use owl_macros::owl_test;
+    use std::collections::HashMap;
 
     /// 0.8B 整装(测试路;与 engine/loader.rs 同构:声明 → 通用入口)
     async fn load_0_8b<D: crate::contract::DeviceClient>(
@@ -596,7 +625,8 @@ mod tests {
             Qwen35Convention::new("model.language_model"),
             crate::module::QuantPlan::F16,
             crate::module::QuantPlan::F16,
-        ).expect("Model::new");
+        )
+        .expect("Model::new");
         let opts = LoadOpts::plain(spec.dtype);
         // 逐键分相账:旋钮归 `[load] debug_tap`(生产入口按配置落;本 helper 不读 env)
         load_from_dir(dir, face, &model, opts).await?;
@@ -609,7 +639,13 @@ mod tests {
         face: &mut D,
         kv_dt: crate::contract::Dtype,
         device_repack: Option<bool>,
-    ) -> Result<(crate::layers::dflash2::DFlash2Draft, crate::module::LoadManifest), ModelError> {
+    ) -> Result<
+        (
+            crate::layers::dflash2::DFlash2Draft,
+            crate::module::LoadManifest,
+        ),
+        ModelError,
+    > {
         let draft = dflash2_draft(dir, kv_dt)?;
         let opts = LoadOpts {
             // 与 `dflash2_draft` 的 dt 同一判据(草稿执行 dtype 单源)
@@ -667,10 +703,14 @@ mod tests {
 
         // ① 生产姿势装载(设备重排臂)计时
         let t0 = std::time::Instant::now();
-        let (draft_dev, manifest) =
-            load_dflash2_draft(std::path::Path::new(&dir), &mut gpu, crate::contract::Dtype::BF16, Some(true))
-                .await
-                .expect("草稿装载(设备重排)");
+        let (draft_dev, manifest) = load_dflash2_draft(
+            std::path::Path::new(&dir),
+            &mut gpu,
+            crate::contract::Dtype::BF16,
+            Some(true),
+        )
+        .await
+        .expect("草稿装载(设备重排)");
         eprintln!(
             "[draft-bench] 装载(设备重排) {:?};manifest {} 项",
             t0.elapsed(),
@@ -679,8 +719,8 @@ mod tests {
 
         // ② 逐位对拍:挑 3 个真实张量
         use crate::module::WeightSource as _;
-        let src = crate::formats::w4a16::W4A16Source::open_dir(std::path::Path::new(&dir))
-            .expect("源");
+        let src =
+            crate::formats::w4a16::W4A16Source::open_dir(std::path::Path::new(&dir)).expect("源");
         let all: Vec<_> = manifest
             .entries()
             .iter()
@@ -693,10 +733,18 @@ mod tests {
             all.clone()
         } else {
             let mut v: Vec<_> = all.iter().take(2).cloned().collect();
-            v.extend(all.iter().filter(|e| e.key.starts_with("fc_")).take(2).cloned());
+            v.extend(
+                all.iter()
+                    .filter(|e| e.key.starts_with("fc_"))
+                    .take(2)
+                    .cloned(),
+            );
             v
         };
-        assert!(!picks.is_empty(), "manifest 里应有 .packed_raw 条目(设备重排臂)");
+        assert!(
+            !picks.is_empty(),
+            "manifest 里应有 .packed_raw 条目(设备重排臂)"
+        );
         eprintln!("[draft-bench] 逐位对拍 {} 项设备重排张量", picks.len());
         let mut checked = 0usize;
         for e in &picks {
@@ -706,7 +754,8 @@ mod tests {
             let k = cols * 8;
             // CPU 参考:原始 packed → host fused 重排
             let mut ph = vec![0u8; rows * cols * 4];
-            src.convert_chunk_into_bytes(&e.key, 0, rows * cols, &mut ph, Dtype::U32).expect("源")
+            src.convert_chunk_into_bytes(&e.key, 0, rows * cols, &mut ph, Dtype::U32)
+                .expect("源")
                 .expect("源取 packed_raw");
             let p32: Vec<i32> = ph
                 .chunks_exact(4)
@@ -715,7 +764,10 @@ mod tests {
             let idx = owl_kernels::family::marlin::repack::marlin_fused_indices(k, rows);
             let mut b_ref: Vec<i32> = Vec::new();
             owl_kernels::family::marlin::repack::pack_marlin_b_fused(
-                &p32, &idx, rows * k / 8, &mut b_ref,
+                &p32,
+                &idx,
+                rows * k / 8,
+                &mut b_ref,
             );
             // 引擎旧路(gather 两步)vs 新路(fused 单遍)对拍 —— 若此处不等,
             // 则“字节对拍”的参考选错了(旧路才是生产基线)
@@ -724,13 +776,23 @@ mod tests {
             owl_kernels::family::marlin::repack::unpack_nibbles_into(&p32, rows, k, &mut q_buf);
             let mut b_g: Vec<i32> = Vec::new();
             owl_kernels::family::marlin::repack::pack_marlin_b_gather_into(
-                &q_buf, &idx_g, rows * k / 8, &mut b_g,
+                &q_buf,
+                &idx_g,
+                rows * k / 8,
+                &mut b_g,
             );
             let d_gf = b_g.iter().zip(b_ref.iter()).filter(|(a, b)| a != b).count();
-            eprintln!("[draft-bench] {base}: host gather-vs-fused 差 {d_gf}/{}", b_ref.len());
+            eprintln!(
+                "[draft-bench] {base}: host gather-vs-fused 差 {d_gf}/{}",
+                b_ref.len()
+            );
             // GPU 臂:上传原始 packed → owl_ct_repack_u32 → 回读
-            let raw = owl_iface::htod!(gpu, Dtype::U32, &vec![rows, cols], &ph).await.expect("htod raw");
-            let out_b = owl_iface::alloc_uninit!(gpu, Dtype::U32, rows * k / 8).await.expect("alloc out");
+            let raw = owl_iface::htod!(gpu, Dtype::U32, &vec![rows, cols], &ph)
+                .await
+                .expect("htod raw");
+            let out_b = owl_iface::alloc_uninit!(gpu, Dtype::U32, rows * k / 8)
+                .await
+                .expect("alloc out");
             let env = gpu.op_env().expect("GPU env");
             let pick = owl_kernels::driver::resolve(owl_kernels::driver::OpReq {
                 op: owl_kernels::driver::load::CT_REPACK,
@@ -757,9 +819,7 @@ mod tests {
                 shared_mem: pick.shape.smem,
                 out_elems: rows * k / 8,
             };
-            gpu.launch(msg)
-            .await
-            .expect("CtRepack launch");
+            gpu.launch(msg).await.expect("CtRepack launch");
             gpu.sync().await.expect("sync");
             let mut gbuf = vec![0u8; rows * k / 8 * 4];
             gpu.dtoh(&out_b, &mut gbuf).await.expect("dtoh");
@@ -804,10 +864,14 @@ mod tests {
             return;
         }
         let t_cpu = std::time::Instant::now();
-        let (draft_cpu, _m2) =
-            load_dflash2_draft(std::path::Path::new(&dir), &mut gpu, crate::contract::Dtype::BF16, Some(false))
-                .await
-                .expect("草稿装载(CPU 臂)");
+        let (draft_cpu, _m2) = load_dflash2_draft(
+            std::path::Path::new(&dir),
+            &mut gpu,
+            crate::contract::Dtype::BF16,
+            Some(false),
+        )
+        .await
+        .expect("草稿装载(CPU 臂)");
         eprintln!("[draft-bench] CPU 臂装载(对照) {:?}", t_cpu.elapsed());
         let mk = |k: f32| -> Vec<u8> {
             vec![0.01 * k; 2 * 5120]
@@ -836,8 +900,14 @@ mod tests {
             .zip(got_c.iter())
             .filter(|(a, b)| a.to_bits() != b.to_bits())
             .count();
-        eprintln!("[draft-bench] 设备臂(先算)vs CPU 臂 差 {d_bad0}/{}", got_c.len());
-        eprintln!("[draft-bench] CPU 臂 memory 前 4 值 = {:?}", &got_c[..4.min(got_c.len())]);
+        eprintln!(
+            "[draft-bench] 设备臂(先算)vs CPU 臂 差 {d_bad0}/{}",
+            got_c.len()
+        );
+        eprintln!(
+            "[draft-bench] CPU 臂 memory 前 4 值 = {:?}",
+            &got_c[..4.min(got_c.len())]
+        );
         eprintln!(
             "[draft-bench] memory 输出 CPU-vs-DEV 差 {d_bad}/{}",
             got_c.len()
@@ -922,10 +992,12 @@ mod tests {
             "model.language_model.layers.5.input_layernorm.weight"
         );
         // embed / final norm
-        assert_eq!(c.embed_key("weight"), "model.language_model.embed_tokens.weight");
+        assert_eq!(
+            c.embed_key("weight"),
+            "model.language_model.embed_tokens.weight"
+        );
         assert_eq!(c.norm_key("norm"), "model.language_model.norm.weight");
     }
-
 
     // ==================================================================
     // 真权重装载 + 两步 decode 冒烟(门控 OWL_TEST_DEVICE;数值基准
@@ -937,7 +1009,11 @@ mod tests {
     const HD: usize = 256;
     const SLOTS: usize = 4;
 
-    async fn zero_block(client: &mut owl_cuda::GpuClient, n: usize, shape: Vec<usize>) -> TensorOps {
+    async fn zero_block(
+        client: &mut owl_cuda::GpuClient,
+        n: usize,
+        shape: Vec<usize>,
+    ) -> TensorOps {
         let b = crate::interpreters::eval_ops(
             TensorOps::from_host(Dtype::F32, vec![n], &f32b(&vec![0.0; n])).step(),
             client,
@@ -948,7 +1024,11 @@ mod tests {
     }
 
     /// f16 清零块(F5:KV cache;2B/元素)
-    async fn zero_block_f16(client: &mut owl_cuda::GpuClient, n: usize, shape: Vec<usize>) -> TensorOps {
+    async fn zero_block_f16(
+        client: &mut owl_cuda::GpuClient,
+        n: usize,
+        shape: Vec<usize>,
+    ) -> TensorOps {
         let b = crate::interpreters::eval_ops(
             TensorOps::from_host(Dtype::F16, vec![n], &vec![0u8; n * 2]).step(),
             client,
@@ -995,7 +1075,6 @@ mod tests {
         assert!(model.embed.is_loaded() && model.norm.is_loaded());
     }
 
-
     /// 诊断(tap 单遍):真模型逐层 hidden rms 曲线(定位 step1 塌零层)。
     /// 整模单树单遍归约,StatsTap 只看层根 tag —— 零重放,状态每步只推进
     /// 一次(旧逐层 harvest 重放污染读数,已废;interpreter-tap.md §一)。
@@ -1027,8 +1106,8 @@ mod tests {
                 device_repack: false,
                 verify: false,
                 debug_tap: false,
-            staging_mb: 128,
-            dump: false,
+                staging_mb: 128,
+                dump: false,
             },
         )
         .await?;
@@ -1038,8 +1117,11 @@ mod tests {
         let mut mk_gdns = Vec::new();
         let bt_data: Vec<u8> = [0.0f32].iter().flat_map(|f| f.to_le_bytes()).collect();
         let bt0 = crate::interpreters::eval_ops(
-            TensorOps::from_host(Dtype::F32, vec![1, 1], &bt_data).step(), &mut gpu)
-            .await.expect("恒等块表");
+            TensorOps::from_host(Dtype::F32, vec![1, 1], &bt_data).step(),
+            &mut gpu,
+        )
+        .await
+        .expect("恒等块表");
         for _ in 0..kvs_n {
             mk_kvs.push(KvBuffers {
                 k_cache: zero_block_f16(&mut gpu, 2 * 256 * 32, vec![1, 2, 256 / 8, 32, 8]).await,
@@ -1067,7 +1149,10 @@ mod tests {
 
         // (装载即校验已有专测 gpu_vram_manifest_checksum;此处二次装载
         //  在 f16 时代 = F32 ctx 污染权重 + 双倍耗时,F5-2 删)
-        let steps = [(985.0f32, 0.0f32, 0.0f32, 1.0f32), (4123.0, 1.0, 1.0, 2.0f32)];
+        let steps = [
+            (985.0f32, 0.0f32, 0.0f32, 1.0f32),
+            (4123.0, 1.0, 1.0, 2.0f32),
+        ];
         // 引用重读探针(竞速判决):记录层根块引用与 dtype,步终 sync 后
         // 重读 —— 窗口内读零 + 步终读非零 = D2H 流与 COMPUTE 流无同步的
         // 竞速读。字节口径随 dtype 推导,禁硬编码(×4/×2 均为雷)
@@ -1083,7 +1168,12 @@ mod tests {
                     let elems: usize = ev.shape.iter().product();
                     self.refs.push((
                         t.to_string(),
-                        crate::contract::Bytes::new(ev.out.block_id, elems, ev.dtype, ev.shape.len() as u8),
+                        crate::contract::Bytes::new(
+                            ev.out.block_id,
+                            elems,
+                            ev.dtype,
+                            ev.shape.len() as u8,
+                        ),
                         elems,
                         ev.dtype,
                     ));
@@ -1136,9 +1226,15 @@ mod tests {
             let mut buf = vec![0u8; model.vocab_size() * logits_dt.size_bytes()];
             gpu.dtoh(&logits, &mut buf).await?;
             let lh = crate::interpreters::eval::decode_host(logits_dt, &buf);
-            let (ti, tv) = lh.iter().enumerate()
+            let (ti, tv) = lh
+                .iter()
+                .enumerate()
                 .fold((0usize, f32::NEG_INFINITY), |a, (i, &v)| {
-                    if v > a.1 { (i, v) } else { a }
+                    if v > a.1 {
+                        (i, v)
+                    } else {
+                        a
+                    }
                 });
             eprintln!("[diag]   step{si} top@{ti} logit={tv:.4}");
             // ── 竞速判决:三流 sync 后重读 L0 层根与 final_norm(窗口内读的同一块)──
@@ -1152,14 +1248,16 @@ mod tests {
                 gpu.dtoh(b, &mut buf).await?;
                 let h = crate::interpreters::eval::decode_host(*dt, &buf);
                 let rms = (h.iter().map(|v| v * v).sum::<f32>() / h.len() as f32).sqrt();
-                eprintln!("[diag]   [sync后重读] {tag} rms={rms:.6} zeros={}", h.iter().filter(|v| **v == 0.0).count());
+                eprintln!(
+                    "[diag]   [sync后重读] {tag} rms={rms:.6} zeros={}",
+                    h.iter().filter(|v| **v == 0.0).count()
+                );
             }
             probe.refs.clear();
         }
         gpu.close().await?;
         Ok(())
     }
-
 
     /// ★ 核心校验:VRAM 块数据 vs 独立锚 逐位比较(门控 OWL_TEST_DEVICE)。
     /// 独立锚 = 自建文件读取(不经 SafeTensorsSource)+ 朴素 BF16 解码 +
@@ -1175,7 +1273,8 @@ mod tests {
         let path = dir.join("model.safetensors-00001-of-00001.safetensors");
 
         // ── 独立锚:一次性自读文件 → 键 → (dtype, 字节区间视图)
-        let raw_buf = owl_shared::file_loader::read(&path).map_err(|e| ModelError::Msg(format!("{e}")))?;
+        let raw_buf =
+            owl_shared::file_loader::read(&path).map_err(|e| ModelError::Msg(format!("{e}")))?;
         let raw = std::sync::Arc::new(raw_buf);
         let st = safetensors::SafeTensors::deserialize(&raw)
             .map_err(|e| ModelError::Msg(format!("锚解析: {e}")))?;
@@ -1184,23 +1283,26 @@ mod tests {
             let off = t.data().as_ptr() as usize - raw.as_ptr() as usize;
             anchor.insert(name.to_string(), (t.dtype(), off, t.data().len()));
         }
-        let anchor_decode = |dtype: safetensors::Dtype,
-                             bytes: &[u8],
-                             out: &mut Vec<f32>| {
-            match dtype {
+        let anchor_decode =
+            |dtype: safetensors::Dtype, bytes: &[u8], out: &mut Vec<f32>| match dtype {
                 safetensors::Dtype::F32 => {
                     out.clear();
-                    out.extend(bytes.chunks_exact(4).map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]])));
+                    out.extend(
+                        bytes
+                            .chunks_exact(4)
+                            .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]])),
+                    );
                 }
                 safetensors::Dtype::BF16 => {
                     out.clear();
-                    out.extend(bytes.chunks_exact(2).map(|c| {
-                        f32::from_bits((u16::from_le_bytes([c[0], c[1]]) as u32) << 16)
-                    }));
+                    out.extend(
+                        bytes.chunks_exact(2).map(|c| {
+                            f32::from_bits((u16::from_le_bytes([c[0], c[1]]) as u32) << 16)
+                        }),
+                    );
                 }
                 _ => panic!("锚: 不支持的 dtype"),
-            }
-        };
+            };
 
         // ── 装载(被测链;单次装载保留 manifest —— F5-2 前为重跑 load
         //    生成 manifest,双倍上传;F5-2 删)
@@ -1210,10 +1312,20 @@ mod tests {
             Qwen35Convention::new("model.language_model"),
             crate::module::QuantPlan::F16,
             crate::module::QuantPlan::F16,
-        ).expect("Model::new");
+        )
+        .expect("Model::new");
         let manifest = {
             let src = crate::formats::safetensors::SafeTensorsSource::open_dir(&dir)?;
-            let ctx = crate::module::LoaderCtx { dtype: Dtype::F16, shard: 1, slice_id: 0, device_repack: false, verify: false, debug_tap: false, staging_mb: 128, dump: false };
+            let ctx = crate::module::LoaderCtx {
+                dtype: Dtype::F16,
+                shard: 1,
+                slice_id: 0,
+                device_repack: false,
+                verify: false,
+                debug_tap: false,
+                staging_mb: 128,
+                dump: false,
+            };
             crate::interpreters::eval_load(&model, &mut gpu, &src, &ctx).await?
         };
         eprintln!("[chk] manifest {} 条", manifest.entries().len());
@@ -1276,7 +1388,10 @@ mod tests {
                         got_bytes[p * 2],
                         got_bytes[p * 2 + 1],
                     ]));
-                    eprintln!("[chk] ✗ #{i} {} 首个错位 {p}: gpu {g} vs 锚 f16({})", e.key, want[p]);
+                    eprintln!(
+                        "[chk] ✗ #{i} {} 首个错位 {p}: gpu {g} vs 锚 f16({})",
+                        e.key, want[p]
+                    );
                 }
             }
             if i % 100 == 0 {
@@ -1288,7 +1403,6 @@ mod tests {
         gpu.close().await?;
         Ok(())
     }
-
 
     /// ★ matmul 维度二分探针:同尺寸矩阵直调算子,host 参考逐元素对拍。
     /// 两种数据形态:from_host 叶子 / of_block 上传块(复刻 diag 场景)。
@@ -1309,7 +1423,9 @@ mod tests {
         ];
         for (name, m, k, n) in cases {
             let a: Vec<f32> = (0..m * k).map(|i| ((i % 17) as f32 - 8.0) * 0.25).collect();
-            let b: Vec<f32> = (0..k * n).map(|i| ((i % 13) as f32 - 6.0) * 0.125).collect();
+            let b: Vec<f32> = (0..k * n)
+                .map(|i| ((i % 13) as f32 - 6.0) * 0.125)
+                .collect();
 
             // 形态一:from_host 叶子
             let a_t = TensorOps::from_host(Dtype::F32, vec![m, k], &f32b(&a));
@@ -1332,7 +1448,10 @@ mod tests {
                 .map(|(g, w)| (g - w).abs())
                 .fold(0.0f32, f32::max);
             let zeros = got.iter().filter(|v| **v == 0.0).count();
-            eprintln!("[mm] {name} from_host : maxdiff={maxdiff:.6} zeros={zeros}/{}", got.len());
+            eprintln!(
+                "[mm] {name} from_host : maxdiff={maxdiff:.6} zeros={zeros}/{}",
+                got.len()
+            );
 
             // 形态二:of_block 上传块(htod_f32 后以 Block 叶子引用)
             let sa = vec![m, k];
@@ -1348,7 +1467,10 @@ mod tests {
                 .map(|(g, w)| (g - w).abs())
                 .fold(0.0f32, f32::max);
             let zeros2 = got2.iter().filter(|v| **v == 0.0).count();
-            eprintln!("[mm] {name} of_block  : maxdiff={maxdiff2:.6} zeros={zeros2}/{}", got2.len());
+            eprintln!(
+                "[mm] {name} of_block  : maxdiff={maxdiff2:.6} zeros={zeros2}/{}",
+                got2.len()
+            );
             assert!(
                 maxdiff < 1e-2 && maxdiff2 < 1e-2,
                 "{name} matmul 错误: from_host {maxdiff} / of_block {maxdiff2}"
@@ -1379,21 +1501,41 @@ mod tests {
         let mut gpu = crate::testkit::gpu_client().await;
         let model = load_0_8b(&dir, &mut gpu).await.expect("load_0_8b(真权重)");
         let rp = Rope::new(262_144, HD, 64, 10_000_000.0).expect("rope");
-        crate::interpreters::eval_load(&rp, &mut gpu, &rp.tables(),
-            &crate::module::LoaderCtx { dtype: Dtype::F16, shard: 1, slice_id: 0, device_repack: false, verify: false, debug_tap: false, staging_mb: 128, dump: false })
-            .await.expect("rope 表(f16 正确姿势)");
+        crate::interpreters::eval_load(
+            &rp,
+            &mut gpu,
+            &rp.tables(),
+            &crate::module::LoaderCtx {
+                dtype: Dtype::F16,
+                shard: 1,
+                slice_id: 0,
+                device_repack: false,
+                verify: false,
+                debug_tap: false,
+                staging_mb: 128,
+                dump: false,
+            },
+        )
+        .await
+        .expect("rope 表(f16 正确姿势)");
 
         // 常驻缓冲 ×2 套(ref / prefill;KV 8 槽,GDN 状态格用 0)
         async fn mk(
-            gpu: &mut owl_cuda::GpuClient, slots_n: usize, hd: usize, hkv: usize,
+            gpu: &mut owl_cuda::GpuClient,
+            slots_n: usize,
+            hd: usize,
+            hkv: usize,
         ) -> (Vec<KvBuffers>, Vec<GdnBuffers>) {
             // paged 布局(页 32 = 层分派契约;恒等块表)
             let nb = slots_n.div_ceil(32);
             let kv_len = nb * hkv * hd * 32;
             let bt_data: Vec<u8> = (0..nb).flat_map(|i| (i as f32).to_le_bytes()).collect();
             let bt = crate::interpreters::eval_ops(
-                TensorOps::from_host(Dtype::F32, vec![1, nb], &bt_data).step(), gpu)
-                .await.expect("恒等块表");
+                TensorOps::from_host(Dtype::F32, vec![1, nb], &bt_data).step(),
+                gpu,
+            )
+            .await
+            .expect("恒等块表");
             let mut kvs = Vec::new();
             for _ in 0..6 {
                 kvs.push(KvBuffers {
@@ -1412,7 +1554,8 @@ mod tests {
                     conv_q: zero_block(gpu, slots_n * 2048 * 3, vec![slots_n, 2048, 3]).await,
                     conv_k: zero_block(gpu, slots_n * 2048 * 3, vec![slots_n, 2048, 3]).await,
                     conv_v: zero_block(gpu, slots_n * 2048 * 3, vec![slots_n, 2048, 3]).await,
-                    rec: zero_block(gpu, slots_n * 16 * 128 * 128, vec![slots_n, 16, 128, 128]).await,
+                    rec: zero_block(gpu, slots_n * 16 * 128 * 128, vec![slots_n, 16, 128, 128])
+                        .await,
                     slots: TensorOps::from_host(Dtype::F32, vec![1], &f32b(&[0.0])),
                 });
             }
@@ -1422,7 +1565,8 @@ mod tests {
         let (kvs_pre, gdns_pre) = mk(&mut gpu, slots_n, HD, HKV).await;
 
         // prompt:8 token(合法 id;语义无关 —— 验的是路径等价)
-        let prompt: Vec<f32> = [985.0, 4123.0, 711.0, 2023.0, 1546.0, 884.0, 3001.0, 4195.0].to_vec();
+        let prompt: Vec<f32> =
+            [985.0, 4123.0, 711.0, 2023.0, 1546.0, 884.0, 3001.0, 4195.0].to_vec();
 
         // 参考臂 = **生产 decode 面**(v2 scratch + qkv 融合插池;与 engine
         // 发射同构)。⚠️ 此前本臂走 v1(`attn_v2 = None`)= 参考自身错:
@@ -1469,15 +1613,26 @@ mod tests {
         // 数据,原直接传 8 元素 prompt → from_host 字节断言先炸(8≠32),
         // 测试根本跑不到自己的断言;注释里的 "T=8" 是更早版本的残留)
         let ids_all = TensorOps::from_host(Dtype::F32, vec![t_len], &f32b(&prompt[..t_len]));
-        let pos_all = TensorOps::from_host(Dtype::F32, vec![t_len],
-            &f32b(&(0..t_len).map(|t| t as f32).collect::<Vec<_>>()));
-        let slots_all = TensorOps::from_host(Dtype::F32, vec![t_len],
-            &f32b(&(0..t_len).map(|t| t as f32).collect::<Vec<_>>()));
-        let lens_all = TensorOps::from_host(Dtype::F32, vec![t_len],
-            &f32b(&(0..t_len).map(|t| t as f32 + 1.0).collect::<Vec<_>>()));
+        let pos_all = TensorOps::from_host(
+            Dtype::F32,
+            vec![t_len],
+            &f32b(&(0..t_len).map(|t| t as f32).collect::<Vec<_>>()),
+        );
+        let slots_all = TensorOps::from_host(
+            Dtype::F32,
+            vec![t_len],
+            &f32b(&(0..t_len).map(|t| t as f32).collect::<Vec<_>>()),
+        );
+        let lens_all = TensorOps::from_host(
+            Dtype::F32,
+            vec![t_len],
+            &f32b(&(0..t_len).map(|t| t as f32 + 1.0).collect::<Vec<_>>()),
+        );
         let gdn_slot = TensorOps::from_host(Dtype::F32, vec![1], &f32b(&[0.0]));
-        let ctx = ForwardCtx::model_prefill(t_len, &pos_all, &kvs_pre, &rp, &gdns_pre,
-            &slots_all, &lens_all, &gdn_slot, None, 0, None);
+        let ctx = ForwardCtx::model_prefill(
+            t_len, &pos_all, &kvs_pre, &rp, &gdns_pre, &slots_all, &lens_all, &gdn_slot, None, 0,
+            None,
+        );
         let all = crate::testkit::harvest_f16(&mut gpu, &model.forward(&ids_all, &ctx)).await;
 
         // 池字节对账存档(统一契约 P2 诊断):kvs 全 knhd 化后 K 池差异 =
@@ -1495,8 +1650,27 @@ mod tests {
                 );
             }
             let (tp, tr) = (
-                row.iter().enumerate().fold((0usize, f32::NEG_INFINITY), |a, (i, v)| if *v > a.1 { (i, *v) } else { a }).0,
-                ref_rows[t].iter().enumerate().fold((0usize, f32::NEG_INFINITY), |a, (i, v)| if *v > a.1 { (i, *v) } else { a }).0,
+                row.iter()
+                    .enumerate()
+                    .fold((0usize, f32::NEG_INFINITY), |a, (i, v)| {
+                        if *v > a.1 {
+                            (i, *v)
+                        } else {
+                            a
+                        }
+                    })
+                    .0,
+                ref_rows[t]
+                    .iter()
+                    .enumerate()
+                    .fold((0usize, f32::NEG_INFINITY), |a, (i, v)| {
+                        if *v > a.1 {
+                            (i, *v)
+                        } else {
+                            a
+                        }
+                    })
+                    .0,
             );
             assert_eq!(tp, tr, "prefill 行{t} top-1 不一致: {tp} vs {tr}");
         }
@@ -1508,7 +1682,13 @@ mod tests {
         let mut next = all[(t_len - 1) * VOCAB..t_len * VOCAB]
             .iter()
             .enumerate()
-            .fold((0usize, f32::NEG_INFINITY), |a, (i, v)| if *v > a.1 { (i, *v) } else { a })
+            .fold((0usize, f32::NEG_INFINITY), |a, (i, v)| {
+                if *v > a.1 {
+                    (i, *v)
+                } else {
+                    a
+                }
+            })
             .0 as u32;
         for step in 0..4u32 {
             gen_ids.push(next);
@@ -1541,8 +1721,16 @@ mod tests {
             prod_decode_attn(&mut ctx, &scratch);
             let logits = model.forward(&ids1, &ctx);
             let row = crate::testkit::harvest_f16(&mut gpu, &logits).await;
-            next = row.iter().enumerate()
-                .fold((0usize, f32::NEG_INFINITY), |a, (i, v)| if *v > a.1 { (i, *v) } else { a })
+            next = row
+                .iter()
+                .enumerate()
+                .fold((0usize, f32::NEG_INFINITY), |a, (i, v)| {
+                    if *v > a.1 {
+                        (i, *v)
+                    } else {
+                        a
+                    }
+                })
                 .0 as u32;
         }
         let text = tok.decode(&gen_ids);
@@ -1595,7 +1783,10 @@ mod tests {
             &rp,
             &mut gpu,
             &rp.tables(),
-            &crate::module::LoaderCtx { dtype: Dtype::F16, ..Default::default() },
+            &crate::module::LoaderCtx {
+                dtype: Dtype::F16,
+                ..Default::default()
+            },
         )
         .await
         .expect("rope 表");
@@ -1606,8 +1797,11 @@ mod tests {
         let kv_len = nb * HKV * HD * 32;
         let bt_data: Vec<u8> = (0..nb).flat_map(|i| (i as f32).to_le_bytes()).collect();
         let bt = crate::interpreters::eval_ops(
-            TensorOps::from_host(Dtype::F32, vec![1, nb], &bt_data).step(), &mut gpu)
-            .await.expect("恒等块表");
+            TensorOps::from_host(Dtype::F32, vec![1, nb], &bt_data).step(),
+            &mut gpu,
+        )
+        .await
+        .expect("恒等块表");
         let kvs: Vec<KvBuffers> = {
             let mut v = Vec::new();
             for _ in 0..6 {
@@ -1630,10 +1824,14 @@ mod tests {
             let mut v = Vec::new();
             for _ in 0..18 {
                 v.push(GdnBuffers {
-                    conv_q: zero_block(&mut gpu, SLOTS * key_dim * 3, vec![SLOTS, key_dim, 3]).await,
-                    conv_k: zero_block(&mut gpu, SLOTS * key_dim * 3, vec![SLOTS, key_dim, 3]).await,
-                    conv_v: zero_block(&mut gpu, SLOTS * key_dim * 3, vec![SLOTS, key_dim, 3]).await,
-                    rec: zero_block(&mut gpu, SLOTS * 16 * 128 * 128, vec![SLOTS, 16, 128, 128]).await,
+                    conv_q: zero_block(&mut gpu, SLOTS * key_dim * 3, vec![SLOTS, key_dim, 3])
+                        .await,
+                    conv_k: zero_block(&mut gpu, SLOTS * key_dim * 3, vec![SLOTS, key_dim, 3])
+                        .await,
+                    conv_v: zero_block(&mut gpu, SLOTS * key_dim * 3, vec![SLOTS, key_dim, 3])
+                        .await,
+                    rec: zero_block(&mut gpu, SLOTS * 16 * 128 * 128, vec![SLOTS, 16, 128, 128])
+                        .await,
                     slots: TensorOps::from_host(Dtype::F32, vec![1], &f32b(&[0.0])),
                 });
             }
@@ -1678,11 +1876,17 @@ mod tests {
             assert_eq!(logits.shape(), &[1, VOCAB]);
             // f16 logits(F5 整模切换):harvest_f16 解码回 f32(top 判读口径不变)
             let got = crate::testkit::harvest_f16(&mut gpu, &logits).await;
-            assert!(got.iter().all(|v| v.is_finite()), "step{si} logits 应全有限");
+            assert!(
+                got.iter().all(|v| v.is_finite()),
+                "step{si} logits 应全有限"
+            );
             let top = (0..VOCAB)
                 .max_by(|&a, &b| got[a].abs().total_cmp(&got[b].abs()))
                 .unwrap();
-            println!("  [smoke] step{si}: id {id} → top@{top} (logit {:.4})", got[top]);
+            println!(
+                "  [smoke] step{si}: id {id} → top@{top} (logit {:.4})",
+                got[top]
+            );
             if let Some(p) = prev_top {
                 assert_ne!(p, top, "两步状态应推进(top1 不应不变)");
             }
@@ -1701,9 +1905,10 @@ mod tests {
         };
         let dir = std::path::Path::new(&dir);
         let mut gpu = crate::testkit::gpu_client().await;
-        let (draft, manifest) = load_dflash2_draft(dir, &mut gpu, crate::contract::Dtype::BF16, None)
-            .await
-            .expect("DFlash2 装载");
+        let (draft, manifest) =
+            load_dflash2_draft(dir, &mut gpu, crate::contract::Dtype::BF16, None)
+                .await
+                .expect("DFlash2 装载");
         assert_eq!(draft.hidden(), 5120);
 
         // 键集断言:BF16 = 81 键;W4A16 = 量化三槽 × 41 线性 + passthrough
@@ -1737,7 +1942,11 @@ mod tests {
                 assert!(keys.iter().any(|k| k == expect), "缺键 {expect}");
             }
             // 量化线性主键:两臂命名二选一(CPU `.qweight` / 设备 `.packed_raw`)
-            for base in ["fc_0", "layers.0.self_attn.q_proj", "layers.4.mlp.down_proj"] {
+            for base in [
+                "fc_0",
+                "layers.0.self_attn.q_proj",
+                "layers.4.mlp.down_proj",
+            ] {
                 let cpu = format!("{base}.qweight");
                 let dev = format!("{base}.packed_raw");
                 assert!(
@@ -1767,7 +1976,10 @@ mod tests {
         use crate::module::WeightSource;
         // host 参考:fc 反量化值(W4A16Source 反量化臂;BF16 源同键直读)
         let src = crate::formats::w4a16::W4A16Source::open_dir(dir).unwrap();
-        let w_fc = src.dequant_linear("fc").expect("源").expect("fc 源(反量化)");
+        let w_fc = src
+            .dequant_linear("fc")
+            .expect("源")
+            .expect("fc 源(反量化)");
         let hn = src.take("hidden_norm.weight").expect("源").expect("hn 源");
         let fan = 5 * 5120usize;
         let (hidden_d, row_n) = (5120usize, 5120usize);
@@ -1777,17 +1989,32 @@ mod tests {
         let row_t = crate::TensorOps::from_host(
             crate::contract::Dtype::F16,
             vec![1, row_n],
-            &row.iter().flat_map(|f| half::f16::from_f32(*f).to_le_bytes()).collect::<Vec<u8>>(),
+            &row.iter()
+                .flat_map(|f| half::f16::from_f32(*f).to_le_bytes())
+                .collect::<Vec<u8>>(),
         );
         let ctx = crate::module::ForwardCtx::minimal(1);
-        let mem = draft.project_memory(&[row_t.clone(), row_t.clone(), row_t.clone(), row_t.clone(), row_t.clone()], &ctx);
+        let mem = draft.project_memory(
+            &[
+                row_t.clone(),
+                row_t.clone(),
+                row_t.clone(),
+                row_t.clone(),
+                row_t.clone(),
+            ],
+            &ctx,
+        );
         // **收割口径 = 张量声明**(2026-10-17 定谳 §P/§R):本档 opts.dtype=BF16
         // ⇒ memory 是 **BF16** 块;此前用 `harvest_f16` 收割 = 把 bf16 位型按
         // f16 读(同指数域、仅尾数截断 ⇒ **随量级漂移的 ~2× 假幅度错**,
         // cos≈0.85、比值 0.48~0.85)。§P 追了一整轮的“尺度按错格式读”全是
         // 它的伪影:探针(同 tap 同权)实测设备侧 fc 逐 tap cos=1.0000、
         // |d|/|h|=1.000,norm 逐点相等 —— 设备无罪。
-        assert_eq!(mem.dtype, crate::contract::Dtype::BF16, "草稿 memory 档 = bf16");
+        assert_eq!(
+            mem.dtype,
+            crate::contract::Dtype::BF16,
+            "草稿 memory 档 = bf16"
+        );
         let got = crate::testkit::harvest_bf16(&mut gpu, &mem).await;
         let r16 = |x: f32| half::f16::from_f32(x).to_f32();
         let bn = |x: f32| half::bf16::from_f32(x).to_f32();
@@ -1823,7 +2050,10 @@ mod tests {
         let logits_t = crate::TensorOps::from_host(
             crate::contract::Dtype::F16,
             vec![rows, vocab],
-            &logits.iter().flat_map(|f| half::f16::from_f32(*f).to_le_bytes()).collect::<Vec<u8>>(),
+            &logits
+                .iter()
+                .flat_map(|f| half::f16::from_f32(*f).to_le_bytes())
+                .collect::<Vec<u8>>(),
         );
         // Topk16 线契约 = **out r1 单缓冲** [rows·2K]扁平(台账
         // `elems::Topk16F16`:t_out rank 1;行数走 aux)。此处曾声明
@@ -1832,9 +2062,9 @@ mod tests {
         // 生产调用点(dflash2.rs `select_with_logits`)始终 r1。
         let topk = crate::TensorOps::call(crate::ops::SemanticKernel::Topk16)
             .aux(&[rows])
-        .arg(&logits_t)
-        .arg_i32(vocab as i32)
-        .with_shape(crate::contract::Dtype::F32, vec![rows * 2 * 16]);
+            .arg(&logits_t)
+            .arg_i32(vocab as i32)
+            .with_shape(crate::contract::Dtype::F32, vec![rows * 2 * 16]);
         let topk_full = crate::testkit::harvest(&mut gpu, &topk).await;
         // 布局 = **两段连续**(值区 [rows·K) + 索引区 [rows·K, rows·2K);
         // 非逐行交错 —— 旧切法 `[r*32+16..]` 读的是错位数据(旧对拍只查
@@ -1851,41 +2081,62 @@ mod tests {
         let hidden_t = crate::TensorOps::from_host(
             crate::contract::Dtype::BF16,
             vec![rows + 1, 5120],
-            &hidden.iter().flat_map(|f| half::bf16::from_f32(*f).to_le_bytes()).collect::<Vec<u8>>(),
+            &hidden
+                .iter()
+                .flat_map(|f| half::bf16::from_f32(*f).to_le_bytes())
+                .collect::<Vec<u8>>(),
         );
         let pred = hidden_t.slice_view(5120, vec![rows, 5120]);
         let proj = crate::interpreters::eval_ops(
-            draft.selector().proj().forward(&pred, &ctx).step(), &mut gpu)
-            .await
-            .expect("proj eval");
-        let proj_t = crate::TensorOps::of_block(proj.id, crate::contract::Dtype::BF16, vec![rows, 256]);
+            draft.selector().proj().forward(&pred, &ctx).step(),
+            &mut gpu,
+        )
+        .await
+        .expect("proj eval");
+        let proj_t =
+            crate::TensorOps::of_block(proj.id, crate::contract::Dtype::BF16, vec![rows, 256]);
         let anchor_t = crate::TensorOps::from_host(
-            crate::contract::Dtype::F32, vec![1], &crate::testkit::f32b(&[42.0]),
+            crate::contract::Dtype::F32,
+            vec![1],
+            &crate::testkit::f32b(&[42.0]),
         );
         let sel_out = crate::TensorOps::call(crate::ops::SemanticKernel::DflashSelect)
             // 臂 = **模型声明**(与生产同式 dflash2.rs:574 `(self.dt == BF16) as usize`);
             // 漂移≠节点 dt(输出恒 f32)⇒ 路由只能吃 aux。此处曾写死 0(f16)
             // ⇒ bf16 proj/码本 被 f16 表拒(“proj 期望 F16 实得 BF16”)
             .aux(&[(draft.dtype() == crate::contract::Dtype::BF16) as usize])
-        .arg(&crate::TensorOps::from_host(crate::contract::Dtype::F32, vec![rows, 16], &crate::testkit::f32b(&cand)))
-        .arg(&crate::TensorOps::from_host(crate::contract::Dtype::F32, vec![rows, 16], &crate::testkit::f32b(&unary)))
-        .arg(&proj_t)
-        .arg(&anchor_t)
-        .arg(&draft.selector().a_code().decl())
-        .arg(&draft.selector().b_code().decl())
-        .arg_i32(rows as i32)
-        .arg_i32(16)
-        .arg_i32(256)
-        .with_shape(crate::contract::Dtype::F32, vec![rows * (16 * 16 + 1)]);
+            .arg(&crate::TensorOps::from_host(
+                crate::contract::Dtype::F32,
+                vec![rows, 16],
+                &crate::testkit::f32b(&cand),
+            ))
+            .arg(&crate::TensorOps::from_host(
+                crate::contract::Dtype::F32,
+                vec![rows, 16],
+                &crate::testkit::f32b(&unary),
+            ))
+            .arg(&proj_t)
+            .arg(&anchor_t)
+            .arg(&draft.selector().a_code().decl())
+            .arg(&draft.selector().b_code().decl())
+            .arg_i32(rows as i32)
+            .arg_i32(16)
+            .arg_i32(256)
+            .with_shape(crate::contract::Dtype::F32, vec![rows * (16 * 16 + 1)]);
         let sel_full = crate::testkit::harvest(&mut gpu, &sel_out).await;
         for (e, &tok) in sel_full[..rows].iter().enumerate() {
-            assert!(tok >= 0.0 && tok < vocab as f32, "walk token 越界 e{e} = {tok}");
+            assert!(
+                tok >= 0.0 && tok < vocab as f32,
+                "walk token 越界 e{e} = {tok}"
+            );
             assert!(tok.fract() == 0.0, "walk token 非整 e{e} = {tok}");
         }
-        eprintln!("[dflash2] 27B 装载 + fc 对拍 + selector 冒烟全绿({} 键,W4A16 = {is_q})", keys.len());
+        eprintln!(
+            "[dflash2] 27B 装载 + fc 对拍 + selector 冒烟全绿({} 键,W4A16 = {is_q})",
+            keys.len()
+        );
         gpu.close().await.expect("关机");
     }
-
 
     /// 0.8B 逐层 KV 格式对照(诊断):同一权重/prompt/GDN 状态,只切
     /// `KvEnv`。T / stage 由测试环境变量给(仅测试;生产零读取)。
@@ -2158,13 +2409,13 @@ mod tests {
         }
 
         let fp8 = run_arm(
-            &mut gpu, &model, &rp, &ids_t, &pos_t, &slots_t, &lens_t, &gslot, &cu,
-            fp8_env, 0, u32_n, kv_bytes, nb, t, stage, &bt,
+            &mut gpu, &model, &rp, &ids_t, &pos_t, &slots_t, &lens_t, &gslot, &cu, fp8_env, 0,
+            u32_n, kv_bytes, nb, t, stage, &bt,
         )
         .await?;
         let int8 = run_arm(
-            &mut gpu, &model, &rp, &ids_t, &pos_t, &slots_t, &lens_t, &gslot, &cu,
-            int8_env, 1, u32_n, kv_bytes, nb, t, stage, &bt,
+            &mut gpu, &model, &rp, &ids_t, &pos_t, &slots_t, &lens_t, &gslot, &cu, int8_env, 1,
+            u32_n, kv_bytes, nb, t, stage, &bt,
         )
         .await?;
         let int8b = if long {
@@ -2200,8 +2451,8 @@ mod tests {
         } else {
             Some(
                 run_arm(
-                    &mut gpu, &model, &rp, &ids_t, &pos_t, &slots_t, &lens_t, &gslot, &cu,
-                    f16_env, 2, u32_n, kv_bytes, nb, t, stage, &bt,
+                    &mut gpu, &model, &rp, &ids_t, &pos_t, &slots_t, &lens_t, &gslot, &cu, f16_env,
+                    2, u32_n, kv_bytes, nb, t, stage, &bt,
                 )
                 .await?,
             )
@@ -2236,10 +2487,21 @@ mod draft_shard_tests {
     fn draft_spec_shards_heads_only() {
         let full = qwen3_8_27b();
         let s = shard_draft_spec(full.clone(), TpPlan::new(0, 2).expect("plan")).expect("可切");
-        assert_eq!(s.hidden, full.hidden, "hidden 不切(来自 target taps 的复制态)");
+        assert_eq!(
+            s.hidden, full.hidden,
+            "hidden 不切(来自 target taps 的复制态)"
+        );
         assert_eq!(s.vocab, full.vocab, "vocab 不切(embed/lm_head 共享 target)");
         assert_eq!(s.inter, full.inter / 2, "inter 切半");
-        assert_eq!(s.full_heads, (full.full_heads.0 / 2, full.full_heads.1 / 2, full.full_heads.2), "(hq,hkv) 切半");
+        assert_eq!(
+            s.full_heads,
+            (
+                full.full_heads.0 / 2,
+                full.full_heads.1 / 2,
+                full.full_heads.2
+            ),
+            "(hq,hkv) 切半"
+        );
         assert_eq!(s.gdn_heads.0, full.gdn_heads.0 / 2, "nk 切半");
         assert_eq!(s.gdn_heads.1, full.gdn_heads.1, "hk 不切");
     }
@@ -2249,7 +2511,10 @@ mod draft_shard_tests {
     fn draft_spec_single_is_identity() {
         let full = qwen3_8_27b();
         let s = shard_draft_spec(full.clone(), TpPlan::single()).expect("单卡");
-        assert_eq!((s.hidden, s.vocab, s.inter), (full.hidden, full.vocab, full.inter));
+        assert_eq!(
+            (s.hidden, s.vocab, s.inter),
+            (full.hidden, full.vocab, full.inter)
+        );
         assert_eq!(s.full_heads, full.full_heads);
     }
 

@@ -483,7 +483,11 @@ pub fn pad_image_spans(
         ));
     }
     pads.sort_by_key(|p| p.0);
-    Ok(PaddedSeq { ids: out, spans, pads })
+    Ok(PaddedSeq {
+        ids: out,
+        spans,
+        pads,
+    })
 }
 
 /// **删除识别(文本坐标)**:客户端这一轮是不是"正好删了一段已标记图像"。
@@ -496,11 +500,7 @@ pub fn pad_image_spans(
 /// **旧账兼容口**（`img_tag == 0` / 无指纹）：相邻已标记图像段先合并，
 /// 只能识别“整组一起删”。新账请走 [`detect_text_delete_tagged`]。
 /// 返回命中的文本区间 + 对应的 padded 删除区间。
-pub fn detect_text_delete(
-    old_text: &[u32],
-    raw: &[u32],
-    spans: &[ImgSpan],
-) -> Option<TextDelete> {
+pub fn detect_text_delete(old_text: &[u32], raw: &[u32], spans: &[ImgSpan]) -> Option<TextDelete> {
     detect_text_delete_inner(old_text, raw, spans, None)
 }
 
@@ -601,7 +601,10 @@ pub fn detect_all_images_deleted_tagged(
         required,
         survivors.len(),
         last_b,
-        ranges.iter().map(|r| (r.text_a, r.text_b, r.a, r.b)).collect::<Vec<_>>()
+        ranges
+            .iter()
+            .map(|r| (r.text_a, r.text_b, r.a, r.b))
+            .collect::<Vec<_>>()
     );
     if common < required || common == 0 {
         return None;
@@ -617,9 +620,7 @@ fn detect_text_delete_inner(
 ) -> Option<TextDelete> {
     // 指纹不可用（旧账 tag=0 / 未传）时保持旧行为：只试完整相邻游程，
     // 宁可少吸收，也不做 token 盲猜。
-    let use_tags = new_tags.is_some()
-        && !spans.is_empty()
-        && spans.iter().all(|s| s.img_tag != 0);
+    let use_tags = new_tags.is_some() && !spans.is_empty() && spans.iter().all(|s| s.img_tag != 0);
     let old_tags: Vec<u64> = spans.iter().map(|s| s.img_tag).collect();
     // 相邻已标记图像 = 一个游程（下标闭开区间）。
     let mut runs: Vec<(usize, usize)> = Vec::new();
@@ -749,7 +750,6 @@ fn fold_tag(acc: u64, tag: u64) -> u64 {
     const PRIME: u64 = 0x0000_0100_0000_01b3;
     (acc ^ tag).wrapping_mul(PRIME).rotate_left(7)
 }
-
 
 /// **带位置签名的块指纹**（2026-11-13）。
 ///
@@ -965,7 +965,12 @@ pub fn compact_positions(
             ])
         })
         .collect::<Result<Vec<_>, String>>()?;
-    let max_pos = pos.iter().flat_map(|p| p.iter()).copied().max().unwrap_or(0);
+    let max_pos = pos
+        .iter()
+        .flat_map(|p| p.iter())
+        .copied()
+        .max()
+        .unwrap_or(0);
     Ok((pos, max_pos))
 }
 
@@ -1032,7 +1037,10 @@ pub fn positions_after_splice(
     }
     // 位置账只能从旧账**连续**拼;跨 tail_start 的图像段说明删除点落在图内,
     // 这种形状不允许(页对齐 pad 律保证删点在图段边界)。
-    if spans.iter().any(|s| s.start < tail_start && s.end > tail_start) {
+    if spans
+        .iter()
+        .any(|s| s.start < tail_start && s.end > tail_start)
+    {
         return Err(format!(
             "positions_after_splice: 图像段跨越尾巴起点 {tail_start}(spans={:?})",
             spans.iter().map(|s| (s.start, s.end)).collect::<Vec<_>>()
@@ -1060,8 +1068,7 @@ pub fn positions_after_splice(
             .rope_index(tail, &tt, &grids, &[])
             .map_err(|e| format!("positions_after_splice: 新尾巴 rope_index: {e}"))?;
         let base: i32 = if deletion.is_none() && compact_old {
-            i32::try_from(tail_start)
-                .map_err(|_| "positions_after_splice: tail_start 越 i32")?
+            i32::try_from(tail_start).map_err(|_| "positions_after_splice: tail_start 越 i32")?
         } else {
             old_pos
                 .iter()
@@ -1088,7 +1095,12 @@ pub fn positions_after_splice(
             new_ids.len()
         ));
     }
-    let max_pos = pos.iter().flat_map(|p| p.iter()).copied().max().unwrap_or(0);
+    let max_pos = pos
+        .iter()
+        .flat_map(|p| p.iter())
+        .copied()
+        .max()
+        .unwrap_or(0);
     // 洞的判据 = 删除（leave-gap）**或** 非紧凑序列上的分歧；紧凑文本的分歧
     // 已按 `tail_start` 连续续写，不再产生洞。
     let gap = deletion.is_some() || (tail_start < old_tokens.len() && !compact_old);
@@ -1182,7 +1194,12 @@ pub fn positions_after_deletes(
             new_ids.len()
         ));
     }
-    let max_pos = pos.iter().flat_map(|p| p.iter()).copied().max().unwrap_or(0);
+    let max_pos = pos
+        .iter()
+        .flat_map(|p| p.iter())
+        .copied()
+        .max()
+        .unwrap_or(0);
     Ok((pos, max_pos, true))
 }
 
@@ -1216,8 +1233,7 @@ mod tests {
     }
 
     fn pad(ids: &[u32], marks: &[bool], grids: &[GridThw]) -> PaddedSeq {
-        pad_image_spans(ids, marks, grids, IMG, Some(VS), Some(VE), PAGE, PAD, &[])
-            .expect("pad")
+        pad_image_spans(ids, marks, grids, IMG, Some(VS), Some(VE), PAGE, PAD, &[]).expect("pad")
     }
 
     #[test]
@@ -1241,8 +1257,14 @@ mod tests {
     fn unmarked_image_gets_no_pad_and_unpad_round_trips() {
         let ids = build(&[1, 1], 5);
         let seq = pad(&ids, &[false, true], &[grid(), grid()]);
-        assert_eq!(seq.spans[0].start, seq.spans[0].text_start, "未标记段不 pad");
-        assert_eq!(seq.ids[..seq.spans[0].text_start], ids[..seq.spans[0].text_start]);
+        assert_eq!(
+            seq.spans[0].start, seq.spans[0].text_start,
+            "未标记段不 pad"
+        );
+        assert_eq!(
+            seq.ids[..seq.spans[0].text_start],
+            ids[..seq.spans[0].text_start]
+        );
         let back = unpad(&seq.ids, &seq.pads).expect("unpad");
         assert_eq!(back, ids, "unpad(pad(x)) 必须回到客户端可见序列");
     }
@@ -1330,18 +1352,19 @@ mod tests {
         }
         let mut raw = survivors.clone();
         raw.extend([777u32, 778, 779]);
-        let plan = super::detect_all_images_deleted_tagged(
-            &text,
-            &raw,
-            &seq.spans,
-            &[0xD4],
-        )
-        .expect("三张旧图全删应识别");
+        let plan = super::detect_all_images_deleted_tagged(&text, &raw, &seq.spans, &[0xD4])
+            .expect("三张旧图全删应识别");
         assert_eq!(plan.ranges.len(), 3);
         assert_eq!(plan.ranges[0].text_a, seq.spans[0].text_start);
         assert_eq!(plan.ranges[2].text_b, seq.spans[2].text_end);
 
-        let (old_pos, _) = compact_positions(&seq.ids, &seq.spans, IMG, &MropeCfg::new([11, 11, 10], 64, 1e7, 2).expect("mrope")).expect("pos");
+        let (old_pos, _) = compact_positions(
+            &seq.ids,
+            &seq.spans,
+            IMG,
+            &MropeCfg::new([11, 11, 10], 64, 1e7, 2).expect("mrope"),
+        )
+        .expect("pos");
         let next_spans: Vec<ImgSpan> = Vec::new();
         let mut pos_ids = seq.ids.clone();
         for r in plan.ranges.iter().rev() {
@@ -1368,7 +1391,13 @@ mod tests {
         }
         expected.extend_from_slice(&old_pos[cursor..]);
         assert_eq!(&pos[..expected.len()], expected.as_slice());
-        let base = old_pos.iter().flat_map(|p| p.iter()).copied().max().unwrap_or(0) + 1;
+        let base = old_pos
+            .iter()
+            .flat_map(|p| p.iter())
+            .copied()
+            .max()
+            .unwrap_or(0)
+            + 1;
         assert_eq!(pos[expected.len()], [base; 3]);
     }
 
@@ -1398,13 +1427,8 @@ mod tests {
             detect_text_delete(&text, &raw_first, &seq.spans).is_none(),
             "legacy 合并游程不能识别半删"
         );
-        let hit = detect_text_delete_tagged(
-            &text,
-            &raw_first,
-            &seq.spans,
-            &[b.img_tag],
-        )
-        .expect("内容指纹应识别第一张删除");
+        let hit = detect_text_delete_tagged(&text, &raw_first, &seq.spans, &[b.img_tag])
+            .expect("内容指纹应识别第一张删除");
         assert_eq!((hit.text_a, hit.text_b), (a.text_start, a.text_end));
         assert_eq!((hit.a, hit.b), (a.start, a.end));
 
@@ -1414,13 +1438,8 @@ mod tests {
             .chain(&text[b.text_end..])
             .copied()
             .collect();
-        let hit2 = detect_text_delete_tagged(
-            &text,
-            &raw_second,
-            &seq.spans,
-            &[a.img_tag],
-        )
-        .expect("内容指纹应识别第二张删除");
+        let hit2 = detect_text_delete_tagged(&text, &raw_second, &seq.spans, &[a.img_tag])
+            .expect("内容指纹应识别第二张删除");
         assert_eq!((hit2.text_a, hit2.text_b), (b.text_start, b.text_end));
 
         // 两张一起删：tail 为空标签，整段游程命中。
@@ -1429,8 +1448,8 @@ mod tests {
             .chain(&text[b.text_end..])
             .copied()
             .collect();
-        let hit3 = detect_text_delete_tagged(&text, &raw_both, &seq.spans, &[])
-            .expect("两张一起删");
+        let hit3 =
+            detect_text_delete_tagged(&text, &raw_both, &seq.spans, &[]).expect("两张一起删");
         assert_eq!((hit3.text_a, hit3.text_b), (a.text_start, b.text_end));
     }
 
@@ -1452,8 +1471,12 @@ mod tests {
         let hit = detect_text_delete(&text, &raw, &seq.spans).expect("必须识别中间图");
         assert_eq!((hit.text_a, hit.text_b), (del.text_start, del.text_end));
         let rebuilt = rebuild_after_delete(&seq.ids, &raw, &hit).expect("重建");
-        let inherited: Vec<(usize, usize)> =
-            seq.pads.iter().copied().filter(|(_, hi)| *hi <= hit.a).collect();
+        let inherited: Vec<(usize, usize)> = seq
+            .pads
+            .iter()
+            .copied()
+            .filter(|(_, hi)| *hi <= hit.a)
+            .collect();
         let next = pad_image_spans(
             &rebuilt,
             &[true, true],
@@ -1466,7 +1489,11 @@ mod tests {
             &inherited,
         )
         .expect("pad2");
-        assert_eq!(&next.ids[..hit.a], &seq.ids[..hit.a], "删点之前必须逐字节不变");
+        assert_eq!(
+            &next.ids[..hit.a],
+            &seq.ids[..hit.a],
+            "删点之前必须逐字节不变"
+        );
         assert_eq!(unpad(&next.ids, &next.pads).expect("unpad2"), raw);
     }
 
@@ -1517,7 +1544,10 @@ mod tests {
             },
         ];
         // 纯文本:空 tags(零回归面)
-        assert!(block_tags(ids.len(), PAGE, &spans).is_empty(), "无指纹时必须是纯文本身份");
+        assert!(
+            block_tags(ids.len(), PAGE, &spans).is_empty(),
+            "无指纹时必须是纯文本身份"
+        );
 
         // 两张**内容不同**的图 ⇒ 两次请求的指纹不同
         let mut spans_a = spans.clone();
@@ -1539,7 +1569,8 @@ mod tests {
         let mut kv = KvStore::new(8, PAGE, 1 << 20, 16);
         let mut table = Vec::new();
         kv.ensure_for_len(&mut table, ids.len()).expect("块表");
-        kv.register_chain_tagged(&ids, &table, &tags_a).expect("登记 A");
+        kv.register_chain_tagged(&ids, &table, &tags_a)
+            .expect("登记 A");
 
         let hit_a = kv.match_prefix_tagged(&ids, &tags_a);
         assert_eq!(hit_a.matched_blocks, ids.len() / PAGE, "同图必须整链命中");
@@ -1552,7 +1583,10 @@ mod tests {
         // 忘了带指纹(纯文本口径)也不许**吃到**图像链:含图块身份带指纹 ⇒
         // 空 tags 只能命中纯文本块。失败模式退化为"少复用",而不是"错用旧图"。
         let hit_plain = kv.match_prefix_tagged(&ids, &[]);
-        assert_eq!(hit_plain.matched_blocks, 1, "空 tags 只能复用纯文本块(宁少不错)");
+        assert_eq!(
+            hit_plain.matched_blocks, 1,
+            "空 tags 只能复用纯文本块(宁少不错)"
+        );
     }
 
     /// **可删图锚点门（2026-11-13）**：每张 `evict` 图段起点都要出锚点
@@ -1561,8 +1595,8 @@ mod tests {
     #[test]
     fn evict_snap_points_cover_each_marked_image() {
         let page = 32usize;
-        let span = |start: usize, len: usize, text_start: usize, text_end: usize, evict: bool| {
-            ImgSpan {
+        let span =
+            |start: usize, len: usize, text_start: usize, text_end: usize, evict: bool| ImgSpan {
                 start,
                 end: start + len,
                 text_start,
@@ -1572,8 +1606,7 @@ mod tests {
                 grid: (1, 8, 8),
                 evict,
                 img_tag: if evict { 1 } else { 0 },
-            }
-        };
+            };
         // 无图 / 全部未标记 ⇒ 不拍
         assert!(evict_snap_points(&[], 320, page).is_empty());
         assert!(evict_snap_points(&[span(64, 64, 32, 96, false)], 320, page).is_empty());
@@ -1584,10 +1617,7 @@ mod tests {
         );
         // 同游程两段（无文本间隔）⇒ **各段起点都出点**（只删后一张时，
         // 前一张的页仍可复用）；顺序升序。
-        let run = [
-            span(64, 64, 32, 96, true),
-            span(160, 64, 96, 160, true),
-        ];
+        let run = [span(64, 64, 32, 96, true), span(160, 64, 96, 160, true)];
         assert_eq!(evict_snap_points(&run, 320, page), vec![64, 160]);
         // 中间夹未标记图 ⇒ 只出可删的那两张
         let mixed = [
@@ -1644,18 +1674,27 @@ mod tests {
         // ② 内容 token 改了（不是纯空白）⇒ 不插
         let mut edited = [10u32, 11, 99].to_vec();
         edited.extend_from_slice(&tail);
-        assert_eq!(restore_trimmed_prefix(&old, &mut edited, &[span], is_ws), None);
+        assert_eq!(
+            restore_trimmed_prefix(&old, &mut edited, &[span], is_ws),
+            None
+        );
         // ③ 未标记的图 ⇒ 引擎不自作主张
         let mut unmarked = span;
         unmarked.evict = false;
         let mut raw2 = text.to_vec();
         raw2.extend_from_slice(&tail);
-        assert_eq!(restore_trimmed_prefix(&old, &mut raw2, &[unmarked], is_ws), None);
+        assert_eq!(
+            restore_trimmed_prefix(&old, &mut raw2, &[unmarked], is_ws),
+            None
+        );
         // ④ 图片仍在场（raw 在删点处是图片首 token）⇒ 不插
         let mut keep = text.to_vec();
         keep.extend_from_slice(&img);
         keep.extend_from_slice(&tail);
-        assert_eq!(restore_trimmed_prefix(&old, &mut keep, &[span], is_ws), None);
+        assert_eq!(
+            restore_trimmed_prefix(&old, &mut keep, &[span], is_ws),
+            None
+        );
         // ⑤ 只复原**第一个分歧**处的空白：模板 `|trim` 只会剪消息内容的
         //    外尾部 ⇒ 真实形态只有一个缺口；后续缺口交给识别拒绝（宁少不错）。
     }
@@ -1824,8 +1863,8 @@ mod tests {
         let mrope = MropeCfg::new([11, 11, 10], 64, 1e7, 2).expect("mrope");
         let ids = build(&[1, 1, 1], 5);
         let seq = pad(&ids, &[true, true, true], &[grid(), grid(), grid()]);
-        let (old_pos, old_max) = compact_positions(&seq.ids, &seq.spans, IMG, &mrope)
-            .expect("旧位置账");
+        let (old_pos, old_max) =
+            compact_positions(&seq.ids, &seq.spans, IMG, &mrope).expect("旧位置账");
         let text = unpad(&seq.ids, &seq.pads).expect("unpad");
         let del = seq.spans[1];
         let raw: Vec<u32> = text[..del.text_start]
@@ -1835,8 +1874,12 @@ mod tests {
             .collect();
         let hit = detect_text_delete(&text, &raw, &seq.spans).expect("识别中间图");
         let rebuilt = rebuild_after_delete(&seq.ids, &raw, &hit).expect("重建");
-        let inherited: Vec<(usize, usize)> =
-            seq.pads.iter().copied().filter(|(_, hi)| *hi <= hit.a).collect();
+        let inherited: Vec<(usize, usize)> = seq
+            .pads
+            .iter()
+            .copied()
+            .filter(|(_, hi)| *hi <= hit.a)
+            .collect();
         let next = pad_image_spans(
             &rebuilt,
             &[true, true],
@@ -1860,29 +1903,30 @@ mod tests {
         )
         .expect("leave-gap 位置");
         assert!(gap, "删除后必须标记位置洞");
-        assert_eq!(&pos[..hit.a], &old_pos[..hit.a], "删点之前位置逐 token 不变");
+        assert_eq!(
+            &pos[..hit.a],
+            &old_pos[..hit.a],
+            "删点之前位置逐 token 不变"
+        );
         let k = seq.ids[hit.b..]
             .iter()
             .zip(&next.ids[hit.a..])
             .take_while(|(x, y)| x == y)
             .count();
-        assert_eq!(&pos[hit.a..hit.a + k], &old_pos[hit.b..hit.b + k], "幸存后缀位置不移动");
+        assert_eq!(
+            &pos[hit.a..hit.a + k],
+            &old_pos[hit.b..hit.b + k],
+            "幸存后缀位置不移动"
+        );
         assert_eq!(max_pos, old_max, "无新尾巴时 max_pos 不回退");
         assert_eq!(pos.len(), next.ids.len());
 
         // 普通追加:旧前缀位置不动,新尾巴从 max_pos+1 起。
         let mut appended = seq.ids.clone();
         appended.extend([777u32, 778, 779]);
-        let (pos2, max2, gap2) = positions_after_splice(
-            &seq.ids,
-            &old_pos,
-            &appended,
-            &seq.spans,
-            None,
-            IMG,
-            &mrope,
-        )
-        .expect("append 位置");
+        let (pos2, max2, gap2) =
+            positions_after_splice(&seq.ids, &old_pos, &appended, &seq.spans, None, IMG, &mrope)
+                .expect("append 位置");
         assert!(!gap2, "纯追加仍是紧凑连续位置");
         assert_eq!(&pos2[..seq.ids.len()], &old_pos[..], "旧前缀位置不动");
         assert_eq!(pos2[seq.ids.len()], [old_max + 1; 3], "新尾巴从 max+1 起");
@@ -1896,9 +1940,16 @@ mod tests {
         let text = unpad(&seq.ids, &seq.pads).expect("unpad");
         let del = seq.spans[0];
         // ① 删点之前被改写 ⇒ 不许吸收(正确性优先)
-        let mut raw: Vec<u32> = text[..del.text_start].iter().chain(&text[del.text_end..]).copied().collect();
+        let mut raw: Vec<u32> = text[..del.text_start]
+            .iter()
+            .chain(&text[del.text_end..])
+            .copied()
+            .collect();
         raw[3] = 424242;
-        assert!(detect_text_delete(&text, &raw, &seq.spans).is_none(), "前缀改写不许吸收");
+        assert!(
+            detect_text_delete(&text, &raw, &seq.spans).is_none(),
+            "前缀改写不许吸收"
+        );
         // ② 未标记的段不许吸收
         let un = pad(&ids, &[false, true], &[grid(), grid()]);
         let utext = unpad(&un.ids, &un.pads).expect("unpad");
@@ -1908,11 +1959,21 @@ mod tests {
             .chain(&utext[ud.text_end..])
             .copied()
             .collect();
-        assert!(detect_text_delete(&utext, &uraw, &un.spans).is_none(), "未标记不许吸收");
+        assert!(
+            detect_text_delete(&utext, &uraw, &un.spans).is_none(),
+            "未标记不许吸收"
+        );
         // ③ 尾部追加(真实 agent 形态)仍然识别
-        let mut raw2: Vec<u32> = text[..del.text_start].iter().chain(&text[del.text_end..]).copied().collect();
+        let mut raw2: Vec<u32> = text[..del.text_start]
+            .iter()
+            .chain(&text[del.text_end..])
+            .copied()
+            .collect();
         raw2.extend([777u32, 778]);
-        assert!(detect_text_delete(&text, &raw2, &seq.spans).is_some(), "追加尾部必须仍识别");
+        assert!(
+            detect_text_delete(&text, &raw2, &seq.spans).is_some(),
+            "追加尾部必须仍识别"
+        );
     }
 }
 
@@ -1927,7 +1988,11 @@ mod padded_prefix_tests {
         let pads = [(2usize, 4usize)];
         assert_eq!(padded_prefix_for_raw(&tokens, &pads, 0).unwrap(), 0);
         assert_eq!(padded_prefix_for_raw(&tokens, &pads, 1).unwrap(), 1);
-        assert_eq!(padded_prefix_for_raw(&tokens, &pads, 2).unwrap(), 4, "切点后的 pad 必须留下");
+        assert_eq!(
+            padded_prefix_for_raw(&tokens, &pads, 2).unwrap(),
+            4,
+            "切点后的 pad 必须留下"
+        );
         assert_eq!(padded_prefix_for_raw(&tokens, &pads, 4).unwrap(), 6);
         assert!(padded_prefix_for_raw(&tokens, &pads, 5).is_err());
     }

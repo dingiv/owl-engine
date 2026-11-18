@@ -148,7 +148,11 @@ impl KvTable {
         }
     }
 
-    fn opt<T>(&self, key: &str, f: impl FnOnce(&GgufValue) -> Option<T>) -> Result<Option<T>, String> {
+    fn opt<T>(
+        &self,
+        key: &str,
+        f: impl FnOnce(&GgufValue) -> Option<T>,
+    ) -> Result<Option<T>, String> {
         match self.get(key) {
             None => Ok(None),
             Some(v) => match f(v) {
@@ -231,14 +235,20 @@ impl KvTable {
         match self.get(key) {
             None => Err(format!("缺键 `{key}`")),
             Some(GgufValue::String(s)) => Ok(s.as_str()),
-            Some(v) => Err(format!("键 `{key}` 类型不符(应 STRING):实得 {}", v.type_name())),
+            Some(v) => Err(format!(
+                "键 `{key}` 类型不符(应 STRING):实得 {}",
+                v.type_name()
+            )),
         }
     }
     pub fn opt_str(&self, key: &str) -> Result<Option<&str>, String> {
         match self.get(key) {
             None => Ok(None),
             Some(GgufValue::String(s)) => Ok(Some(s.as_str())),
-            Some(v) => Err(format!("键 `{key}` 类型不符(应 STRING):实得 {}", v.type_name())),
+            Some(v) => Err(format!(
+                "键 `{key}` 类型不符(应 STRING):实得 {}",
+                v.type_name()
+            )),
         }
     }
     /// 数组 → u32 序列(如 `attention.sliding_window_pattern` / `rope.dimension_sections`)
@@ -254,7 +264,10 @@ impl KvTable {
                 }
                 Ok(Some(out))
             }
-            Some(v) => Err(format!("键 `{key}` 类型不符(应 ARRAY):实得 {}", v.type_name())),
+            Some(v) => Err(format!(
+                "键 `{key}` 类型不符(应 ARRAY):实得 {}",
+                v.type_name()
+            )),
         }
     }
     /// 数组 → bool 序列(`attention.sliding_window_pattern` 的布尔写法)
@@ -276,7 +289,10 @@ impl KvTable {
                 }
                 Ok(Some(out))
             }
-            Some(v) => Err(format!("键 `{key}` 类型不符(应 ARRAY):实得 {}", v.type_name())),
+            Some(v) => Err(format!(
+                "键 `{key}` 类型不符(应 ARRAY):实得 {}",
+                v.type_name()
+            )),
         }
     }
     /// 数组 → 字符串序列(tokenizer 词表用)
@@ -298,7 +314,10 @@ impl KvTable {
                 }
                 Ok(Some(out))
             }
-            Some(v) => Err(format!("键 `{key}` 类型不符(应 ARRAY):实得 {}", v.type_name())),
+            Some(v) => Err(format!(
+                "键 `{key}` 类型不符(应 ARRAY):实得 {}",
+                v.type_name()
+            )),
         }
     }
     /// 数组 → f32 序列
@@ -308,13 +327,18 @@ impl KvTable {
             Some(GgufValue::Array(v)) => {
                 let mut out = Vec::with_capacity(v.len());
                 for x in v {
-                    out.push(Self::as_f64(x).ok_or_else(|| {
-                        format!("键 `{key}` 数组元素非数值:{}", x.type_name())
-                    })? as f32);
+                    out.push(
+                        Self::as_f64(x)
+                            .ok_or_else(|| format!("键 `{key}` 数组元素非数值:{}", x.type_name()))?
+                            as f32,
+                    );
                 }
                 Ok(Some(out))
             }
-            Some(v) => Err(format!("键 `{key}` 类型不符(应 ARRAY):实得 {}", v.type_name())),
+            Some(v) => Err(format!(
+                "键 `{key}` 类型不符(应 ARRAY):实得 {}",
+                v.type_name()
+            )),
         }
     }
 }
@@ -371,11 +395,17 @@ impl Gguf {
     pub fn open(path: &Path) -> Result<Gguf, ModelError> {
         let ctx = |m: String| ModelError::Msg(format!("gguf: {}: {m}", path.display()));
         if path.is_dir() {
-            return Err(ctx("是目录;GGUF 是单文件格式(设计 §四 L4:model.dir 需支持文件路径)".into()));
+            return Err(ctx(
+                "是目录;GGUF 是单文件格式(设计 §四 L4:model.dir 需支持文件路径)".into(),
+            ));
         }
         let map = Mmap::open(path)?;
         let buf: &[u8] = &map;
-        let mut c = Cur { buf, pos: 0, ctx: &ctx };
+        let mut c = Cur {
+            buf,
+            pos: 0,
+            ctx: &ctx,
+        };
 
         let magic = c.u32()?;
         if magic != MAGIC {
@@ -409,7 +439,9 @@ impl Gguf {
             let name = c.string()?;
             let n_dims = c.u32()?;
             if n_dims == 0 || n_dims > MAX_TENSOR_DIMS {
-                return Err(c.err(format!("张量 `{name}` 维数 {n_dims} 越界(1..={MAX_TENSOR_DIMS})")));
+                return Err(c.err(format!(
+                    "张量 `{name}` 维数 {n_dims} 越界(1..={MAX_TENSOR_DIMS})"
+                )));
             }
             let mut ne = Vec::with_capacity(n_dims as usize);
             for _ in 0..n_dims {
@@ -436,11 +468,20 @@ impl Gguf {
             }
             let rows: u64 = ne[1..].iter().product();
             let nbytes = (ne[0] / be as u64) * bb as u64 * rows;
-            tensors.push(TensorInfo { name, ty, ne, offset, nbytes });
+            tensors.push(TensorInfo {
+                name,
+                ty,
+                ne,
+                offset,
+                nbytes,
+            });
         }
 
         // ---- 对齐 + 数据区起点 ----
-        let alignment = kv.opt_u64("general.alignment").map_err(&ctx)?.unwrap_or(DEFAULT_ALIGNMENT);
+        let alignment = kv
+            .opt_u64("general.alignment")
+            .map_err(&ctx)?
+            .unwrap_or(DEFAULT_ALIGNMENT);
         if alignment == 0 || !alignment.is_power_of_two() {
             return Err(ctx(format!("general.alignment = {alignment} 非 2 的幂")));
         }
@@ -483,7 +524,16 @@ impl Gguf {
             }
         }
 
-        Ok(Gguf { path: path.to_path_buf(), version, kv, tensors, alignment, data_offset, map, by_name })
+        Ok(Gguf {
+            path: path.to_path_buf(),
+            version,
+            kv,
+            tensors,
+            alignment,
+            data_offset,
+            map,
+            by_name,
+        })
     }
 
     /// 按名取条目索引
@@ -513,7 +563,8 @@ impl Gguf {
     /// 数据区归还(mmadvise DONTNEED;**只对已消费区间**调用 —— 再访问会重新缺页)
     pub fn release(&self, ix: usize) {
         let t = &self.tensors[ix];
-        self.map.dontneed((self.data_offset + t.offset) as usize, t.nbytes as usize);
+        self.map
+            .dontneed((self.data_offset + t.offset) as usize, t.nbytes as usize);
     }
 
     /// 摘要(诊断;条目数 + 型直方图 + 架构)
@@ -528,7 +579,10 @@ impl Gguf {
             bytes += t.nbytes;
         }
         hist.sort_by_key(|(t, _)| t.code());
-        let h: Vec<String> = hist.iter().map(|(t, n)| format!("{}×{n}", t.name())).collect();
+        let h: Vec<String> = hist
+            .iter()
+            .map(|(t, n)| format!("{}×{n}", t.name()))
+            .collect();
         format!(
             "v{} · arch {} · {} 张 / {:.2}G · {}",
             self.version,
@@ -764,7 +818,15 @@ mod tests {
     #[test]
     fn matches_gguf_py() {
         let Some(py) = owl_shared::env_reader::str("OWL_GGUF_PY")
-            .or_else(|| Some(concat!(env!("CARGO_MANIFEST_DIR"), "/../../../../repos/llama.cpp/gguf-py").to_string()))
+            .or_else(|| {
+                Some(
+                    concat!(
+                        env!("CARGO_MANIFEST_DIR"),
+                        "/../../../../repos/llama.cpp/gguf-py"
+                    )
+                    .to_string(),
+                )
+            })
             .filter(|p| Path::new(p).is_dir())
         else {
             owl_shared::testkit::report::skip("gguf-py 源码树不在(OWL_GGUF_PY 可指路)");
@@ -795,7 +857,8 @@ mod tests {
 
             // ---- python 侧事实 ----
             let mut py_version = 0u32;
-            let mut py_kv: std::collections::HashMap<String, (String, u64, u64)> = Default::default();
+            let mut py_kv: std::collections::HashMap<String, (String, u64, u64)> =
+                Default::default();
             let mut py_tensors: Vec<(String, String, String, u64, u64)> = Vec::new();
             for line in text.lines() {
                 let f: Vec<&str> = line.split('\t').collect();
@@ -805,7 +868,11 @@ mod tests {
                         let key = f[1].to_string();
                         let prev = py_kv.insert(
                             key.clone(),
-                            (f[2].to_string(), f[3].parse().expect("len"), u64::from_str_radix(f[4], 16).expect("fnv")),
+                            (
+                                f[2].to_string(),
+                                f[3].parse().expect("len"),
+                                u64::from_str_radix(f[4], 16).expect("fnv"),
+                            ),
                         );
                         assert!(prev.is_none(), "[{key}] python 侧 KV 键重复 `{key}`");
                     }
@@ -835,7 +902,8 @@ mod tests {
                 let (len, fnv) = canonical(v);
                 assert_eq!(len, *plen, "[{key}] KV `{k}` 长度(实值 {})", v.render(60));
                 assert_eq!(
-                    fnv, *pfnv,
+                    fnv,
+                    *pfnv,
                     "[{key}] KV `{k}` 内容指纹(自算 {fnv:016x} vs gguf-py {pfnv:016x};实值 {})",
                     v.render(60)
                 );
@@ -852,7 +920,11 @@ mod tests {
                 assert_eq!(t.offset, *off, "[{key}] #{i} `{name}` 相对偏移");
                 assert_eq!(t.nbytes, *nb, "[{key}] #{i} `{name}` 字节数");
                 // 内部自洽:行跨 × 行数 == 字节数;块轴整除已在 open 期门住
-                assert_eq!(t.row_bytes() * t.rows(), t.nbytes, "[{key}] #{i} `{name}` 行跨账");
+                assert_eq!(
+                    t.row_bytes() * t.rows(),
+                    t.nbytes,
+                    "[{key}] #{i} `{name}` 行跨账"
+                );
                 assert_eq!(t.elems(), t.ne.iter().product::<u64>());
             }
             eprintln!("[{key}] 对拍绿:{} (KV {} 键)", g.summary(), g.kv.len());
@@ -880,10 +952,13 @@ mod tests {
         b.extend(3u32.to_le_bytes());
         b.extend(1u64.to_le_bytes()); // 声称 1 张
         b.extend(0u64.to_le_bytes()); // 0 KV
-        assert!(Gguf::open(&{
-            std::fs::write(&trunc, &b).expect("write");
-            trunc.clone()
-        })
-        .is_err(), "截断必须拒");
+        assert!(
+            Gguf::open(&{
+                std::fs::write(&trunc, &b).expect("write");
+                trunc.clone()
+            })
+            .is_err(),
+            "截断必须拒"
+        );
     }
 }

@@ -70,7 +70,13 @@ pub struct BlockStats {
 impl BlockStats {
     pub fn of(host: &[f32]) -> Self {
         if host.is_empty() {
-            return Self { rms: 0.0, min: 0.0, max: 0.0, zeros: 0, first8: [0.0; 8] };
+            return Self {
+                rms: 0.0,
+                min: 0.0,
+                max: 0.0,
+                zeros: 0,
+                first8: [0.0; 8],
+            };
         }
         let mut sum2 = 0f32;
         let mut min = f32::INFINITY;
@@ -88,7 +94,13 @@ impl BlockStats {
         let mut first8 = [0f32; 8];
         let k = host.len().min(8);
         first8[..k].copy_from_slice(&host[..k]);
-        Self { rms: (sum2 / n).sqrt(), min, max, zeros, first8 }
+        Self {
+            rms: (sum2 / n).sqrt(),
+            min,
+            max,
+            zeros,
+            first8,
+        }
     }
 }
 
@@ -197,17 +209,32 @@ pub struct StatsTap {
 impl StatsTap {
     /// 全节点统计(不打印;weights Block 叶子也会统计 —— 大块 dtoh,慎用)
     pub fn all() -> Self {
-        Self { tagged_only: false, log: false, step: 0, ..Default::default() }
+        Self {
+            tagged_only: false,
+            log: false,
+            step: 0,
+            ..Default::default()
+        }
     }
 
     /// 层根曲线姿势(带 tag 节点 + 打印;step = 步号标注)
     pub fn curve(step: usize) -> Self {
-        Self { tagged_only: true, log: true, step, ..Default::default() }
+        Self {
+            tagged_only: true,
+            log: true,
+            step,
+            ..Default::default()
+        }
     }
 
     /// 静默收集姿势(带 tag 节点,不打印;golden 锁用)
     pub fn golden() -> Self {
-        Self { tagged_only: true, log: false, step: 0, ..Default::default() }
+        Self {
+            tagged_only: true,
+            log: false,
+            step: 0,
+            ..Default::default()
+        }
     }
 }
 

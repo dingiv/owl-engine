@@ -185,7 +185,10 @@ pub struct QueueFacts {
 
 impl QueueFacts {
     /// 从引擎取一份（容量面**只在需要时**采 —— 它要遍历前缀树）。
-    pub fn sample<D: DeviceClient>(running: &RunningEngine<D>, capacity: Option<CapacityFacts>) -> Self {
+    pub fn sample<D: DeviceClient>(
+        running: &RunningEngine<D>,
+        capacity: Option<CapacityFacts>,
+    ) -> Self {
         Self {
             queue_len: running.queue_len(),
             active: running.active_len(),
@@ -266,7 +269,12 @@ pub async fn snapshot<D: DeviceClient>(running: &mut RunningEngine<D>) -> DiagSn
         .block_ledger_probe()
         .await
         .into_iter()
-        .map(|(rank, rows)| (rank, rows.map(|rs| rs.into_iter().map(BlockRow::from).collect())))
+        .map(|(rank, rows)| {
+            (
+                rank,
+                rows.map(|rs| rs.into_iter().map(BlockRow::from).collect()),
+            )
+        })
         .collect();
     let pools = running.pool_probe().await;
     let report = running.store_report();

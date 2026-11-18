@@ -18,7 +18,8 @@ use std::sync::{Arc, Mutex};
 use owl_cpu::{CpuFace, MockLimits};
 use owl_iface::contract::{DeviceClient, Dtype, Shape};
 use owl_iface::handle::{
-    AllocEvent, AllocLedger, AssetClass, Command, DeviceHandle, FreeEvent, MoveEvent, Outcome, Owner,
+    AllocEvent, AllocLedger, AssetClass, Command, DeviceHandle, FreeEvent, MoveEvent, Outcome,
+    Owner,
 };
 
 /// 记账桩:只记录事件(验证钩子序列)。
@@ -79,13 +80,19 @@ fn handle() -> (DeviceHandle<CpuFace>, Rec) {
 
 fn capture_handle() -> (DeviceHandle<CpuFace>, Rec) {
     let (cell, rec) = cell();
-    let face = CpuFace::mock(MockLimits { graph_capture: true, ..Default::default() });
+    let face = CpuFace::mock(MockLimits {
+        graph_capture: true,
+        ..Default::default()
+    });
     (DeviceHandle::new(face, Some(cell)), rec)
 }
 
 fn msg(name: &str) -> owl_iface::contract::LaunchMsg {
     owl_iface::contract::LaunchMsg {
-        kernel: owl_iface::contract::KernelSource { name: name.into(), source: String::new() },
+        kernel: owl_iface::contract::KernelSource {
+            name: name.into(),
+            source: String::new(),
+        },
         args: vec![],
         grid: (1, 1, 1),
         block: (1, 1, 1),
@@ -103,9 +110,11 @@ fn msg(name: &str) -> owl_iface::contract::LaunchMsg {
 async fn exec_emits_alloc_event_with_owner() {
     let (mut dev, rec) = handle();
     dev.set_owner(Owner::Turn(7));
-    let out = owl_iface::alloc!(dev, AssetClass::Temp, Dtype::F16, 1024, "kv.workspace")
-        .expect("alloc");
-    let Outcome::Buf(b) = out else { panic!("应是 Alloc 结果") };
+    let out =
+        owl_iface::alloc!(dev, AssetClass::Temp, Dtype::F16, 1024, "kv.workspace").expect("alloc");
+    let Outcome::Buf(b) = out else {
+        panic!("应是 Alloc 结果")
+    };
     assert_eq!(b.len, 1024);
     let r = lock(&rec);
     assert_eq!(r.allocs.len(), 1, "一次分配一条事件");
@@ -113,7 +122,11 @@ async fn exec_emits_alloc_event_with_owner() {
     assert_eq!(ev.owner, Owner::Turn(7), "owner 来自上下文");
     assert_eq!(ev.class, AssetClass::Temp);
     assert_eq!(ev.name, "kv.workspace");
-    assert_eq!(ev.bytes, 1024 * Dtype::F16.size_bytes(), "字节 = 元素 × dtype");
+    assert_eq!(
+        ev.bytes,
+        1024 * Dtype::F16.size_bytes(),
+        "字节 = 元素 × dtype"
+    );
     assert_eq!(ev.id, b.id, "事件 id 与返回块同源");
     assert_eq!(ev.rank, 0, "单卡恒 rank 0");
 }
@@ -123,8 +136,8 @@ async fn exec_emits_alloc_event_with_owner() {
 async fn free_command_emits_free_event() {
     let (mut dev, rec) = handle();
     dev.set_owner(Owner::Session(3));
-    let Outcome::Buf(b) = owl_iface::alloc!(dev, AssetClass::KvBlock, Dtype::F16, 64, "kv.chain")
-        .expect("alloc")
+    let Outcome::Buf(b) =
+        owl_iface::alloc!(dev, AssetClass::KvBlock, Dtype::F16, 64, "kv.chain").expect("alloc")
     else {
         panic!("应是 Alloc")
     };
@@ -143,7 +156,11 @@ async fn batch_reports_first_err_and_skips_failed_alloc() {
     let out = dev
         .batch([
             Command::alloc(AssetClass::Temp, Dtype::F16, 16, "ok.0"),
-            Command::Htod { id: 1, off: 0, bytes: 8 }, // 骨架期未接线 ⇒ 必失败
+            Command::Htod {
+                id: 1,
+                off: 0,
+                bytes: 8,
+            }, // 骨架期未接线 ⇒ 必失败
             Command::alloc(AssetClass::Temp, Dtype::F16, 16, "ok.1"),
         ])
         .await
@@ -164,8 +181,16 @@ async fn batch_reports_first_err_and_skips_failed_alloc() {
 async fn unwired_commands_fail_loudly() {
     let (mut dev, _rec) = handle();
     for cmd in [
-        Command::Htod { id: 1, off: 0, bytes: 8 },
-        Command::Dtoh { id: 1, off: 0, bytes: 8 },
+        Command::Htod {
+            id: 1,
+            off: 0,
+            bytes: 8,
+        },
+        Command::Dtoh {
+            id: 1,
+            off: 0,
+            bytes: 8,
+        },
     ] {
         let e = dev.exec(cmd).await.expect_err("骨架期必须拒");
         assert!(format!("{e}").contains("尚未接线"), "得 {e:?}");
@@ -185,7 +210,10 @@ async fn none_ledger_is_pure_forwarding() {
 #[tokio::test]
 async fn batch_runs_sync() {
     let (mut dev, _rec) = handle();
-    let out = dev.batch([Command::Sync, Command::Sync]).await.expect("batch");
+    let out = dev
+        .batch([Command::Sync, Command::Sync])
+        .await
+        .expect("batch");
     assert!(out.all_ok(), "{:?}", out.first_err);
     assert_eq!(out.segments, 2);
 }
@@ -196,10 +224,16 @@ async fn batch_runs_sync() {
 async fn launch_is_forwarded_and_is_not_a_birth() {
     let (mut dev, rec) = handle();
     let e = dev
-        .exec(Command::Launch { msg: msg("k"), name: "k".into() })
+        .exec(Command::Launch {
+            msg: msg("k"),
+            name: "k".into(),
+        })
         .await
         .expect_err("未知核名:client 必须拒");
-    assert!(!format!("{e}").contains("尚未接线"), "必须已转发到 client;得 {e}");
+    assert!(
+        !format!("{e}").contains("尚未接线"),
+        "必须已转发到 client;得 {e}"
+    );
     assert!(lock(&rec).allocs.is_empty(), "launch 不产出生事件");
 }
 
@@ -214,7 +248,10 @@ async fn forwarded_births_are_hooked() {
     dev.set_owner(Owner::Turn(2));
     dev.set_class(AssetClass::Weight);
     let a = dev.alloc(Dtype::F16, 32, "fwd.alloc").await.expect("alloc");
-    let u = dev.alloc_uninit(Dtype::F32, 8, "fwd.uninit").await.expect("alloc_uninit");
+    let u = dev
+        .alloc_uninit(Dtype::F32, 8, "fwd.uninit")
+        .await
+        .expect("alloc_uninit");
     let h = dev
         .htod(Dtype::F32, &Shape::from(vec![4]), &[0u8; 16], "fwd.htod")
         .await
@@ -261,7 +298,7 @@ async fn graph_destroy_follows_backend_self_report() {
     let b = dev.alloc(Dtype::F16, 8, "win.1").await.expect("窗内分配");
     // 窗内发射一次(CPU 面 graph_end 要求窗非空)
     dev.launch(msg("k")).await.expect_err("未知核名"); // 不计数 → 用 copy_batch/memset?
-    // CPU mock 的"发射数"只认 launch 成功;这里改用真实路径:直接 alloc + abort
+                                                       // CPU mock 的"发射数"只认 launch 成功;这里改用真实路径:直接 alloc + abort
     dev.graph_abort().await.expect("作废窗");
     // CpuFace 自述 false(块交调用方 free)⇒ abort 不销账
     assert_eq!(lock(&rec).frees.len(), 0, "后端不回收 ⇒ 本层不销账");
@@ -280,8 +317,14 @@ async fn window_failure_is_not_guessed() {
     assert_eq!(dev.window_unclosed(), 1, "窗未收要计数(可见,不静默)");
     assert_eq!(lock(&rec).frees.len(), 0, "去向未定 ⇒ 不销账");
     assert_eq!(dev.open_window_blocks(), 1, "窗仍在场");
-    dev.graph_abort().await.expect("abort 收口(CpuFace 保留捕获态)");
-    assert_eq!(lock(&rec).frees.len(), 0, "CpuFace 自述不回收 ⇒ abort 也不销账");
+    dev.graph_abort()
+        .await
+        .expect("abort 收口(CpuFace 保留捕获态)");
+    assert_eq!(
+        lock(&rec).frees.len(),
+        0,
+        "CpuFace 自述不回收 ⇒ abort 也不销账"
+    );
     dev.free(&[b.id]).await.expect("显式归还");
     assert_eq!(lock(&rec).frees.len(), 1);
 }
@@ -292,7 +335,10 @@ async fn adopt_ledger_is_boot_only() {
     let (mut dev, _rec0) = handle();
     let (cell1, rec1) = cell();
     dev.adopt_ledger(cell1).expect("零事件时可接管");
-    let _ = dev.alloc(Dtype::F16, 4, "after.adopt").await.expect("alloc");
+    let _ = dev
+        .alloc(Dtype::F16, 4, "after.adopt")
+        .await
+        .expect("alloc");
     assert_eq!(lock(&rec1).allocs.len(), 1, "接管后事件进新账");
     // 已发过事件再接管 = 响亮拒(不许把已有事件丢进孤儿账)
     let (cell2, _rec2) = cell();
@@ -325,15 +371,25 @@ fn token_cell(t: usize) -> owl_iface::handle::LedgerCell {
 async fn adopt_same_book_is_idempotent_after_events() {
     let (mut dev, _rec0) = handle();
     dev.adopt_ledger(token_cell(7)).expect("零事件时可接管");
-    let _ = dev.alloc(Dtype::F16, 4, "after.adopt").await.expect("alloc");
-    dev.adopt_ledger(token_cell(7)).expect("同一本书 ⇒ 幂等放行(不丢事件)");
-    let e = dev.adopt_ledger(token_cell(8)).expect_err("另一本书 + 已记账 ⇒ 必须拒");
+    let _ = dev
+        .alloc(Dtype::F16, 4, "after.adopt")
+        .await
+        .expect("alloc");
+    dev.adopt_ledger(token_cell(7))
+        .expect("同一本书 ⇒ 幂等放行(不丢事件)");
+    let e = dev
+        .adopt_ledger(token_cell(8))
+        .expect_err("另一本书 + 已记账 ⇒ 必须拒");
     assert!(format!("{e}").contains("boot 期"), "得 {e}");
     // 令牌 0 = 不表态 ⇒ 一律按"另一本书"(没有身份就没有幂等)
     let (mut dev2, _rec2) = handle();
     dev2.adopt_ledger(token_cell(0)).expect("零事件接管");
-    let _ = dev2.alloc(Dtype::F16, 4, "after.adopt2").await.expect("alloc");
-    dev2.adopt_ledger(token_cell(0)).expect_err("token=0 不构成幂等判据");
+    let _ = dev2
+        .alloc(Dtype::F16, 4, "after.adopt2")
+        .await
+        .expect("alloc");
+    dev2.adopt_ledger(token_cell(0))
+        .expect_err("token=0 不构成幂等判据");
 }
 
 /// 门 ⑬:`face_clone` **上下文同源**(节点设一次全族生效;事件进同一本账)
@@ -343,7 +399,10 @@ async fn face_clone_shares_context_and_ledger() {
     let mut clone = dev.face_clone().expect("StubFace 可克隆");
     clone.set_owner(Owner::Session(9));
     assert_eq!(dev.owner(), Owner::Session(9), "克隆设的上下文对本体可见");
-    let _ = clone.alloc(Dtype::F16, 4, "clone.alloc").await.expect("alloc");
+    let _ = clone
+        .alloc(Dtype::F16, 4, "clone.alloc")
+        .await
+        .expect("alloc");
     assert_eq!(lock(&rec).allocs.len(), 1, "同一本账");
     assert_eq!(lock(&rec).allocs[0].owner, Owner::Session(9));
 }
@@ -413,16 +472,20 @@ impl DeviceClient for StubFace {
         use owl_iface::command::{Command as C, Outcome};
         match cmd {
             // 测试替身不在乎清零语义(存根面只看事件)
-            C::Alloc { dtype, elems, name, .. } => {
-                Ok(Outcome::Buf(self.alloc(dtype, elems, &name).await?))
-            }
+            C::Alloc {
+                dtype, elems, name, ..
+            } => Ok(Outcome::Buf(self.alloc(dtype, elems, &name).await?)),
             C::Free { ids } => {
                 self.free(&ids).await?;
                 Ok(Outcome::Done)
             }
-            C::Htod { dtype, shape, src, name, .. } => {
-                Ok(Outcome::Buf(self.htod(dtype, &shape, &src, &name).await?))
-            }
+            C::Htod {
+                dtype,
+                shape,
+                src,
+                name,
+                ..
+            } => Ok(Outcome::Buf(self.htod(dtype, &shape, &src, &name).await?)),
             C::Dtoh { want_bytes, .. } => Ok(Outcome::Bytes(vec![0u8; want_bytes])),
             C::CopyBlock { .. } => Err(owl_iface::contract::ModelError::Msg(
                 "StubFace: CopyBlock 未实现(仅测试替身)".into(),
@@ -480,10 +543,14 @@ impl DeviceClient for StubFace {
         self.nodes.store(0, Ordering::Relaxed);
         Ok(())
     }
-    async fn graph_end(&mut self) -> Result<owl_iface::contract::GraphId, owl_iface::contract::ModelError> {
+    async fn graph_end(
+        &mut self,
+    ) -> Result<owl_iface::contract::GraphId, owl_iface::contract::ModelError> {
         // 空窗判据(与 cuda/cpu 同律)
         if self.nodes.load(Ordering::Relaxed) == 0 {
-            return Err(owl_iface::contract::ModelError::Msg("StubFace: 空捕获窗".into()));
+            return Err(owl_iface::contract::ModelError::Msg(
+                "StubFace: 空捕获窗".into(),
+            ));
         }
         Ok(self.take_id())
     }
@@ -515,7 +582,12 @@ impl DeviceClient for StubFace {
                 available: 0,
             });
         }
-        Ok(owl_iface::contract::Bytes::new(self.take_id(), elems, dtype, 0))
+        Ok(owl_iface::contract::Bytes::new(
+            self.take_id(),
+            elems,
+            dtype,
+            0,
+        ))
     }
 
     async fn free(&mut self, ids: &[u64]) -> Result<(), owl_iface::contract::ModelError> {
@@ -532,7 +604,12 @@ impl DeviceClient for StubFace {
         src: &[u8],
         _name: &str,
     ) -> Result<owl_iface::contract::Bytes, owl_iface::contract::ModelError> {
-        Ok(owl_iface::contract::Bytes::new(self.take_id(), src.len(), dtype, 0))
+        Ok(owl_iface::contract::Bytes::new(
+            self.take_id(),
+            src.len(),
+            dtype,
+            0,
+        ))
     }
     async fn dtoh(
         &mut self,

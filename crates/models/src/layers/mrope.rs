@@ -60,14 +60,21 @@ impl MropeCfg {
             )));
         }
         if merge == 0 {
-            return Err(ModelError::Msg("MropeCfg::new: spatial_merge_size = 0".into()));
+            return Err(ModelError::Msg(
+                "MropeCfg::new: spatial_merge_size = 0".into(),
+            ));
         }
         if theta.partial_cmp(&0.0) != Some(std::cmp::Ordering::Greater) {
             return Err(ModelError::Msg(format!(
                 "MropeCfg::new: theta {theta} 非法"
             )));
         }
-        Ok(MropeCfg { sections, rotary_dim, theta, merge })
+        Ok(MropeCfg {
+            sections,
+            rotary_dim,
+            theta,
+            merge,
+        })
     }
 
     /// 旋转半维(表宽 = 每行频率数)
@@ -294,13 +301,25 @@ mod tests {
     fn config_validation_is_loud() {
         assert!(MropeCfg::new([11, 11, 10], 64, 1e7, 2).is_ok());
         // 段和 ≠ half
-        assert!(MropeCfg::new([11, 11, 11], 64, 1e7, 2).is_err(), "段和 33 ≠ 32 应拒");
+        assert!(
+            MropeCfg::new([11, 11, 11], 64, 1e7, 2).is_err(),
+            "段和 33 ≠ 32 应拒"
+        );
         // 奇数旋转维
-        assert!(MropeCfg::new([1, 1, 1], 7, 1e7, 2).is_err(), "奇数 rotary_dim 应拒");
+        assert!(
+            MropeCfg::new([1, 1, 1], 7, 1e7, 2).is_err(),
+            "奇数 rotary_dim 应拒"
+        );
         // merge = 0
-        assert!(MropeCfg::new([1, 1, 1], 6, 1e7, 0).is_err(), "merge = 0 应拒");
+        assert!(
+            MropeCfg::new([1, 1, 1], 6, 1e7, 0).is_err(),
+            "merge = 0 应拒"
+        );
         // theta ≤ 0
-        assert!(MropeCfg::new([1, 1, 1], 6, 0.0, 2).is_err(), "theta = 0 应拒");
+        assert!(
+            MropeCfg::new([1, 1, 1], 6, 0.0, 2).is_err(),
+            "theta = 0 应拒"
+        );
     }
 
     /// 交错映射:j 的三分律(11 T / 11 H / 10 W),与 HF slice(offset, ·, 3) 同
@@ -325,14 +344,20 @@ mod tests {
         ids.extend(vec![248056u32; 6]);
         ids.extend(vec![0u32; 2]);
         let tt = token_types(&ids, 248056, Some(248057));
-        let out = c.rope_index(&ids, &tt, &[(1, 4, 6)], &[]).expect("rope_index");
+        let out = c
+            .rope_index(&ids, &tt, &[(1, 4, 6)], &[])
+            .expect("rope_index");
         let want = vec![
             [0, 0, 0], // 文本 0
             [1, 1, 1],
             [2, 2, 2],
             // 图像段:start = 3,T 恒 3;H = 3 + hi;W = 3 + wi(h-major)
-            [3, 3, 3], [3, 3, 4], [3, 3, 5],
-            [3, 4, 3], [3, 4, 4], [3, 4, 5],
+            [3, 3, 3],
+            [3, 3, 4],
+            [3, 3, 5],
+            [3, 4, 3],
+            [3, 4, 4],
+            [3, 4, 5],
             // 段末 cur += max(4, 6) / 2 = 3 → 6
             [6, 6, 6],
             [7, 7, 7],
@@ -488,14 +513,20 @@ mod tests {
             let outp = tmp_path(&format!("mrope_out_{name}"));
             let f32v = |v: &[u32]| v.iter().map(|&x| x as f32).collect::<Vec<f32>>();
             let flat_grid = |g: &[GridThw]| {
-                g.iter().flat_map(|&(t, h, w)| [t as f32, h as f32, w as f32]).collect::<Vec<f32>>()
+                g.iter()
+                    .flat_map(|&(t, h, w)| [t as f32, h as f32, w as f32])
+                    .collect::<Vec<f32>>()
             };
             let (gi, gv) = (flat_grid(&images), flat_grid(&videos));
             st_write(
                 &inp,
                 &[
                     ("ids", &f32v(&ids), vec![l]),
-                    ("ttypes", &f32v(&ttypes.iter().map(|&x| x as u32).collect::<Vec<u32>>()), vec![l]),
+                    (
+                        "ttypes",
+                        &f32v(&ttypes.iter().map(|&x| x as u32).collect::<Vec<u32>>()),
+                        vec![l],
+                    ),
                     ("image_grid_thw", &gi, vec![images.len(), 3]),
                     ("video_grid_thw", &gv, vec![videos.len(), 3]),
                 ],

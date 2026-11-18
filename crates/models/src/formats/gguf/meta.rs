@@ -61,7 +61,10 @@ pub fn spec_from_gguf(g: &Gguf) -> Result<(ModelSpec, GgufSpecReport), ModelErro
     let kv = &g.kv;
     let m = |e: String| ModelError::Msg(format!("gguf spec({arch}): {e}"));
     let p = |k: &str| format!("{arch}.{k}");
-    let mut rep = GgufSpecReport { arch: arch.clone(), issues: Vec::new() };
+    let mut rep = GgufSpecReport {
+        arch: arch.clone(),
+        issues: Vec::new(),
+    };
 
     // ---- 超参(必须在场)----
     let hidden = kv.usize(&p("embedding_length")).map_err(&m)?;
@@ -80,14 +83,17 @@ pub fn spec_from_gguf(g: &Gguf) -> Result<(ModelSpec, GgufSpecReport), ModelErro
     let nv = kv.usize(&p("ssm.time_step_rank")).map_err(&m)?; // nv
     let inner = kv.usize(&p("ssm.inner_size")).map_err(&m)?; // nv·hv_dim
     if nv == 0 || inner % nv != 0 {
-        return Err(m(format!("ssm.inner_size={inner} 不被 time_step_rank={nv} 整除")));
+        return Err(m(format!(
+            "ssm.inner_size={inner} 不被 time_step_rank={nv} 整除"
+        )));
     }
     let hv_dim = inner / nv;
     let gdn_heads = (group, state, nv, hv_dim);
 
     // ---- 形状事实(必须在场;逐条复核超参)----
     let tensor = |name: &str| -> Result<&super::reader::TensorInfo, ModelError> {
-        g.get_tensor(name).ok_or_else(|| m(format!("缺张量 `{name}`(维度事实无法自证)")))
+        g.get_tensor(name)
+            .ok_or_else(|| m(format!("缺张量 `{name}`(维度事实无法自证)")))
     };
     let emb = tensor("token_embd.weight")?;
     if emb.ne.len() != 2 {
@@ -96,7 +102,11 @@ pub fn spec_from_gguf(g: &Gguf) -> Result<(ModelSpec, GgufSpecReport), ModelErro
     // GGML 序:ne[0] = 最内维 = hidden
     let vocab = emb.ne[1] as usize;
     let shape_facts = [
-        ("token_embd.weight ne[0](hidden)", hidden, emb.ne[0] as usize),
+        (
+            "token_embd.weight ne[0](hidden)",
+            hidden,
+            emb.ne[0] as usize,
+        ),
         (
             "blk.0.attn_qkv.weight ne[1](2·nk·hk+nv·hv)",
             2 * group * state + nv * hv_dim,
@@ -115,7 +125,9 @@ pub fn spec_from_gguf(g: &Gguf) -> Result<(ModelSpec, GgufSpecReport), ModelErro
     ];
     for (what, want, got) in shape_facts {
         if want != got {
-            return Err(m(format!("超参↔形状不符:{what} 超参推出 {want},实测 {got}(拒:文件自相矛盾)")));
+            return Err(m(format!(
+                "超参↔形状不符:{what} 超参推出 {want},实测 {got}(拒:文件自相矛盾)"
+            )));
         }
     }
     // 首个 full 层的 q/k/v 形状(kv 头 × head_dim)
@@ -131,11 +143,16 @@ pub fn spec_from_gguf(g: &Gguf) -> Result<(ModelSpec, GgufSpecReport), ModelErro
         ("attn_q ne[0](hidden)", hidden, q.ne[0] as usize),
     ] {
         if want != got {
-            return Err(m(format!("超参↔形状不符:{what} 超参推出 {want},实测 {got}")));
+            return Err(m(format!(
+                "超参↔形状不符:{what} 超参推出 {want},实测 {got}"
+            )));
         }
     }
     // q_norm/k_norm 维数 = head_dim(二次复核)
-    for name in [format!("blk.{first_full}.attn_q_norm.weight"), format!("blk.{first_full}.attn_k_norm.weight")] {
+    for name in [
+        format!("blk.{first_full}.attn_q_norm.weight"),
+        format!("blk.{first_full}.attn_k_norm.weight"),
+    ] {
         let t = tensor(&name)?;
         if t.ne != vec![hd as u64] {
             return Err(m(format!("`{name}` ne={:?} ≠ [head_dim={hd}]", t.ne)));
@@ -148,7 +165,9 @@ pub fn spec_from_gguf(g: &Gguf) -> Result<(ModelSpec, GgufSpecReport), ModelErro
     let declared = kv.usize(&p("block_count")).map_err(&m)?;
     let mut n_layers = declared;
     for i in 0..declared {
-        if g.index_of(&format!("blk.{i}.nextn.eh_proj.weight")).is_some() {
+        if g.index_of(&format!("blk.{i}.nextn.eh_proj.weight"))
+            .is_some()
+        {
             n_layers = i;
             rep.issues.push(format!(
                 "块 {i} 带 `nextn.*` = MTP/NextN 头(非解码层)⇒ 解码层数 = {i}(声明 {declared});M1 不载 MTP"
@@ -189,7 +208,8 @@ pub fn spec_from_gguf(g: &Gguf) -> Result<(ModelSpec, GgufSpecReport), ModelErro
     // ---- tied:untied 的判据 = `output.weight` 在场 ----
     let tied = g.index_of("output.weight").is_none();
     if tied {
-        rep.issues.push("无 `output.weight` ⇒ tied(lm_head 复用 token_embd)".into());
+        rep.issues
+            .push("无 `output.weight` ⇒ tied(lm_head 复用 token_embd)".into());
     }
 
     let spec = ModelSpec {
@@ -268,7 +288,9 @@ pub fn rope_facts(g: &Gguf) -> Result<GgufRopeFacts, ModelError> {
     let theta = kv.f32(&p("rope.freq_base")).map_err(&m)?;
     let max_pos = kv.usize(&p("context_length")).map_err(&m)?;
     if rotary_dim == 0 || rotary_dim % 2 != 0 {
-        return Err(m(format!("rope.dimension_count={rotary_dim} 非法(须非零偶数)")));
+        return Err(m(format!(
+            "rope.dimension_count={rotary_dim} 非法(须非零偶数)"
+        )));
     }
     if !(theta.is_finite() && theta > 0.0) {
         return Err(m(format!("rope.freq_base={theta} 非法")));
@@ -276,7 +298,11 @@ pub fn rope_facts(g: &Gguf) -> Result<GgufRopeFacts, ModelError> {
     if max_pos == 0 {
         return Err(m("context_length=0".into()));
     }
-    Ok(GgufRopeFacts { rotary_dim, theta, max_pos })
+    Ok(GgufRopeFacts {
+        rotary_dim,
+        theta,
+        max_pos,
+    })
 }
 
 #[cfg(test)]
@@ -300,11 +326,35 @@ mod tests {
     #[allow(clippy::type_complexity)]
     fn gguf_spec_matches_family_presets() {
         // (资源键, 期望: hidden, inter, 层数, full_heads, gdn_heads, tied)
-        let want: &[(&str, usize, usize, usize, (usize, usize, usize), (usize, usize, usize, usize), bool)] = &[
+        let want: &[(
+            &str,
+            usize,
+            usize,
+            usize,
+            (usize, usize, usize),
+            (usize, usize, usize, usize),
+            bool,
+        )] = &[
             // 4B:M1 靶位;**tied**(无 output.weight)+ MTP 块 32(非解码层)
-            ("gguf:4b", 2560, 9216, 32, (16, 4, 256), (16, 128, 32, 128), true),
+            (
+                "gguf:4b",
+                2560,
+                9216,
+                32,
+                (16, 4, 256),
+                (16, 128, 32, 128),
+                true,
+            ),
             // 27B 与手写预设同(24,4,256)/(16,128,48,128),层数 64
-            ("gguf:27b", 5120, 17408, 64, (24, 4, 256), (16, 128, 48, 128), false),
+            (
+                "gguf:27b",
+                5120,
+                17408,
+                64,
+                (24, 4, 256),
+                (16, 128, 48, 128),
+                false,
+            ),
         ];
         for (key, hidden, inter, n, fh, gh, tied) in want {
             let Some(path) = res(key) else {
@@ -326,7 +376,11 @@ mod tests {
             assert_eq!(spec.gdn_heads, *gh, "[{key}] gdn heads");
             assert_eq!(spec.tied, *tied, "[{key}] tied(4B=untied 的反面:tied)");
             assert!((spec.eps - 1e-6).abs() < 1e-12, "[{key}] eps");
-            assert_eq!(spec.layer_types, crate::formats::qwen35::hybrid_3to1(*n), "[{key}] 层型表");
+            assert_eq!(
+                spec.layer_types,
+                crate::formats::qwen35::hybrid_3to1(*n),
+                "[{key}] 层型表"
+            );
             assert_eq!(spec.dtype, Dtype::F16);
             assert_eq!(spec.tokenizer.eos_tokens, QWEN35_EOS);
             // 27B 与手写预设逐字段同源(9B 无预设,查 27B)

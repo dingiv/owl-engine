@@ -4,8 +4,8 @@
 
 use crate::ffi::{CudaStream, LaunchConfig, PushKernelArg};
 use crate::state::{GpuCtx, KernelCache};
-use owl_iface::contract::{Arg, LaunchMsg};
 use owl_iface::contract::ModelError;
+use owl_iface::contract::{Arg, LaunchMsg};
 use std::sync::Arc;
 
 /// 参数槽(发射前装配;与 kernel 形参宽度严格对位 —— 坑 I)
@@ -45,7 +45,9 @@ pub(super) fn issue_launch(
                 })?;
                 slots.push(Slot::Ptr(p));
             }
-            Arg::BlockSlice { id, byte_offset, .. } => {
+            Arg::BlockSlice {
+                id, byte_offset, ..
+            } => {
                 let (p, _len) = ctx.block_ptr(*id, stream).map_err(|e| {
                     ModelError::Msg(format!(
                         "[launch-arg] kernel={} arg_idx={} id={id}(slice) :: {e}",
@@ -77,30 +79,45 @@ pub(super) fn issue_launch(
     }
 
     if debug {
-        let addrs: Vec<String> = slots.iter().map(|s| match s {
-            Slot::Ptr(v) => format!("ptr {v:#x}"),
-            Slot::U(v) => format!("u64 {v}"),
-            Slot::I(v) => format!("i32 {v}"),
-            Slot::F(v) => format!("f32 {v}"),
-        }).collect();
-        sink.logf(owl_shared::log::LVL_DEBUG, "dbg", format_args!("launch-ptr {} = {addrs:?}", msg.kernel.name));
+        let addrs: Vec<String> = slots
+            .iter()
+            .map(|s| match s {
+                Slot::Ptr(v) => format!("ptr {v:#x}"),
+                Slot::U(v) => format!("u64 {v}"),
+                Slot::I(v) => format!("i32 {v}"),
+                Slot::F(v) => format!("f32 {v}"),
+            })
+            .collect();
         sink.logf(
-            owl_shared::log::LVL_DEBUG, "dbg", format_args!(
-            "launch {} slots = {:?}",
-            msg.kernel.name,
-            msg.args
-                .iter()
-                .map(|a| match a {
-                    Arg::Block { id, .. } => format!("Block({id})"),
-                    Arg::BlockSlice { id, byte_offset, elems, .. } => {
-                        format!("Slice({id}+{byte_offset}B,{elems}e)")
-                    }
-                    Arg::U64(v) => format!("U64({v})"),
-                    Arg::I32(v) => format!("I32({v})"),
-                    Arg::F32(v) => format!("F32({v})"),
-                })
-                .collect::<Vec<_>>()
-        ));
+            owl_shared::log::LVL_DEBUG,
+            "dbg",
+            format_args!("launch-ptr {} = {addrs:?}", msg.kernel.name),
+        );
+        sink.logf(
+            owl_shared::log::LVL_DEBUG,
+            "dbg",
+            format_args!(
+                "launch {} slots = {:?}",
+                msg.kernel.name,
+                msg.args
+                    .iter()
+                    .map(|a| match a {
+                        Arg::Block { id, .. } => format!("Block({id})"),
+                        Arg::BlockSlice {
+                            id,
+                            byte_offset,
+                            elems,
+                            ..
+                        } => {
+                            format!("Slice({id}+{byte_offset}B,{elems}e)")
+                        }
+                        Arg::U64(v) => format!("U64({v})"),
+                        Arg::I32(v) => format!("I32({v})"),
+                        Arg::F32(v) => format!("F32({v})"),
+                    })
+                    .collect::<Vec<_>>()
+            ),
+        );
     }
 
     // 2. 懒编译(缓存命中直返)
@@ -114,7 +131,9 @@ pub(super) fn issue_launch(
         return Err(ModelError::Msg(format!(
             "launch({}): 动态 smem {}B 超设备 opt-in 上限 {}B —— \
              检查 smem 契约推导(长 ctx 候选:v2 分块核,vLLM 同款弃 v1)",
-            msg.kernel.name, msg.shared_mem, ctx.smem_optin()
+            msg.kernel.name,
+            msg.shared_mem,
+            ctx.smem_optin()
         )));
     }
 
@@ -125,15 +144,26 @@ pub(super) fn issue_launch(
     // 图回放不经)
     if msg.shared_mem as usize > 49152 {
         use cudarc::driver::sys::CUfunction_attribute_enum as Attr;
-        let r = func.set_attribute(Attr::CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES,
-            msg.shared_mem as i32);
-        sink.logf(owl_shared::log::LVL_DEBUG, "dbg", format_args!(
-            "optin {} smem={} set_attr={r:?} max_dyn_attr={:?}",
-            msg.kernel.name, msg.shared_mem,
-            func.get_attribute(Attr::CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES)));
-        r.map_err(|e| ModelError::Msg(format!(
-            "launch({}): cudaFuncSetAttribute(MAX_DYNAMIC_SHARED_SIZE, {}) 失败: {e:?}",
-            msg.kernel.name, msg.shared_mem)))?;
+        let r = func.set_attribute(
+            Attr::CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES,
+            msg.shared_mem as i32,
+        );
+        sink.logf(
+            owl_shared::log::LVL_DEBUG,
+            "dbg",
+            format_args!(
+                "optin {} smem={} set_attr={r:?} max_dyn_attr={:?}",
+                msg.kernel.name,
+                msg.shared_mem,
+                func.get_attribute(Attr::CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES)
+            ),
+        );
+        r.map_err(|e| {
+            ModelError::Msg(format!(
+                "launch({}): cudaFuncSetAttribute(MAX_DYNAMIC_SHARED_SIZE, {}) 失败: {e:?}",
+                msg.kernel.name, msg.shared_mem
+            ))
+        })?;
     }
 
     // 3. 发射(非阻塞:提交进流即返回)

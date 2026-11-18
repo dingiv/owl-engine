@@ -12,11 +12,11 @@
 //! 运行纪律:OWL_TEST_DEVICE + `--test-threads=1`(坑册 §16)。
 
 use cudarc::driver::{CudaContext, CudaSlice, DevicePtr, PushKernelArg};
-use owl_kernels::server::gdn_chunked::GdnChunkedRuntime;
+use owl_kernels::client::gdn_chunked::GdnChunkedCall;
 use owl_kernels::contract::{Bytes, Dtype, LaunchMsg};
 use owl_kernels::device::{DeviceRes, Exec, ScratchBuf};
-use owl_kernels::client::gdn_chunked::GdnChunkedCall;
 use owl_kernels::registry::KernelFamily;
+use owl_kernels::server::gdn_chunked::GdnChunkedRuntime;
 use std::cell::RefCell;
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -37,7 +37,15 @@ impl TestRes {
         let ctx = CudaContext::new(dev).expect("ctx");
         ctx.bind_to_thread().expect("bind");
         let stream = ctx.default_stream();
-        Self { dev_ordinal: dev as i32, ctx, stream, blocks: HashMap::new(), tags: HashMap::new(), next_id: 1, notes: RefCell::default() }
+        Self {
+            dev_ordinal: dev as i32,
+            ctx,
+            stream,
+            blocks: HashMap::new(),
+            tags: HashMap::new(),
+            next_id: 1,
+            notes: RefCell::default(),
+        }
     }
 
     fn alloc_id(&mut self, bytes: usize) -> (u64, CudaSlice<u8>) {
@@ -95,19 +103,26 @@ impl DeviceRes for TestRes {
         Ok(self.stream.clone())
     }
     fn resolve(&self, id: u64) -> Result<u64, owl_kernels::contract::OpError> {
-        self.blocks.get(&id).map(|s| s.device_ptr(&self.stream).0).ok_or_else(|| {
-            let mut keys: Vec<u64> = self.blocks.keys().copied().collect();
-            keys.sort();
-            eprintln!("[resolve miss] id={id} 在册 keys={keys:?}");
-            owl_kernels::contract::OpError::Contract {
-                op: "test".into(),
-                field: "resolve",
-                expect: "块在册".into(),
-                got: id.to_string(),
-            }
-        })
+        self.blocks
+            .get(&id)
+            .map(|s| s.device_ptr(&self.stream).0)
+            .ok_or_else(|| {
+                let mut keys: Vec<u64> = self.blocks.keys().copied().collect();
+                keys.sort();
+                eprintln!("[resolve miss] id={id} 在册 keys={keys:?}");
+                owl_kernels::contract::OpError::Contract {
+                    op: "test".into(),
+                    field: "resolve",
+                    expect: "块在册".into(),
+                    got: id.to_string(),
+                }
+            })
     }
-    fn alloc(&mut self, bytes: usize, tag: &str) -> Result<ScratchBuf, owl_kernels::contract::OpError> {
+    fn alloc(
+        &mut self,
+        bytes: usize,
+        tag: &str,
+    ) -> Result<ScratchBuf, owl_kernels::contract::OpError> {
         let (id, d) = self.alloc_id(bytes);
         let ptr = d.device_ptr(&self.stream).0;
         self.blocks.insert(id, d);
@@ -128,8 +143,13 @@ impl DeviceRes for TestRes {
             }
         })
     }
-    fn record_capture(&mut self, note: owl_kernels::device::LaunchNote) -> Result<(), owl_kernels::contract::OpError> {
-        self.notes.borrow_mut().push(format!("{}/{}", note.op, note.kernel));
+    fn record_capture(
+        &mut self,
+        note: owl_kernels::device::LaunchNote,
+    ) -> Result<(), owl_kernels::contract::OpError> {
+        self.notes
+            .borrow_mut()
+            .push(format!("{}/{}", note.op, note.kernel));
         Ok(())
     }
     fn device_ordinal(&self) -> Result<i32, owl_kernels::contract::OpError> {
@@ -147,7 +167,10 @@ impl DeviceRes for TestRes {
             return Ok(());
         }
         Err(owl_kernels::contract::OpError::Contract {
-            op: "test".into(), field: "upload", expect: "指针在册".into(), got: format!("{dst:#x}"),
+            op: "test".into(),
+            field: "upload",
+            expect: "指针在册".into(),
+            got: format!("{dst:#x}"),
         })
     }
     fn upload_block(
@@ -157,20 +180,23 @@ impl DeviceRes for TestRes {
     ) -> Result<(), owl_kernels::contract::OpError> {
         // 测试面:按块 id 直查(账房即 self.blocks)
         let stream = self.stream.clone();
-        let s = self.blocks.get_mut(&b.id).ok_or_else(|| {
-            owl_kernels::contract::OpError::Contract {
+        let s =
+            self.blocks
+                .get_mut(&b.id)
+                .ok_or_else(|| owl_kernels::contract::OpError::Contract {
+                    op: "test".into(),
+                    field: "upload_block",
+                    expect: "块在册".into(),
+                    got: format!("id={}", b.id),
+                })?;
+        stream
+            .memcpy_htod(src, s)
+            .map_err(|e| owl_kernels::contract::OpError::Contract {
                 op: "test".into(),
                 field: "upload_block",
-                expect: "块在册".into(),
-                got: format!("id={}", b.id),
-            }
-        })?;
-        stream.memcpy_htod(src, s).map_err(|e| owl_kernels::contract::OpError::Contract {
-            op: "test".into(),
-            field: "upload_block",
-            expect: "htod".into(),
-            got: format!("{e:?}"),
-        })
+                expect: "htod".into(),
+                got: format!("{e:?}"),
+            })
     }
 
     fn alloc_block(
@@ -179,13 +205,14 @@ impl DeviceRes for TestRes {
         tag: &str,
     ) -> Result<owl_kernels::contract::Bytes, owl_kernels::contract::OpError> {
         // 测试面:走裸分配 + 在册登记(resolve 可解析)
-        let s = unsafe { self.stream.alloc::<u8>(bytes.max(1)) }
-            .map_err(|e| owl_kernels::contract::OpError::Contract {
+        let s = unsafe { self.stream.alloc::<u8>(bytes.max(1)) }.map_err(|e| {
+            owl_kernels::contract::OpError::Contract {
                 op: "test".into(),
                 field: "alloc_block",
                 expect: "-".into(),
                 got: format!("{e:?}"),
-            })?;
+            }
+        })?;
         let id = self.next_id;
         self.next_id += 1;
         self.blocks.insert(id, s);
@@ -204,7 +231,6 @@ impl DeviceRes for TestRes {
             got: "-".into(),
         })
     }
-
 }
 
 // ── 金标读取 + host 铸造(与金标测试同款)──
@@ -213,7 +239,6 @@ const NK: usize = 16;
 const NV: usize = 48;
 const KD: usize = 128;
 const VD: usize = 128;
-
 
 /// P-6b:序列表(cu|coff|idx)现造一块(内容按 t_real = 调用 shape 的 t;测试面)
 fn make_tables(res: &mut TestRes, t: usize) -> (Bytes, usize) {
@@ -284,39 +309,59 @@ fn max_dev(got: &[f32], want: &[f32]) -> f32 {
         .fold(0.0f32, f32::max)
 }
 
-    /// 诊断:scratch 槽位读回(f32 视角)+ 统计
-    fn scratch_stats(res: &TestRes, tag: &str, n: usize) -> (usize, usize, f32, f32) {
-        let (id, bytes) = res.tags.get(tag).copied().unwrap_or((0, 0));
-        let n = n.min(bytes / 4);
-        if id == 0 { return (0, 0, 0.0, 0.0); }
-        let s = res.blocks.get(&id).expect("在册");
-        let host = res.stream.clone_dtoh(s).expect("dtoh");
-        let mut nan = 0; let mut inf = 0;
-        let mut mn = f32::INFINITY; let mut mx = f32::NEG_INFINITY;
-        for c in host.chunks_exact(4).take(n) {
-            let v = f32::from_le_bytes([c[0], c[1], c[2], c[3]]);
-            if v.is_nan() { nan += 1; } else if v.is_infinite() { inf += 1; }
-            else { mn = mn.min(v); mx = mx.max(v); }
-        }
-        (nan, inf, mn, mx)
+/// 诊断:scratch 槽位读回(f32 视角)+ 统计
+fn scratch_stats(res: &TestRes, tag: &str, n: usize) -> (usize, usize, f32, f32) {
+    let (id, bytes) = res.tags.get(tag).copied().unwrap_or((0, 0));
+    let n = n.min(bytes / 4);
+    if id == 0 {
+        return (0, 0, 0.0, 0.0);
     }
+    let s = res.blocks.get(&id).expect("在册");
+    let host = res.stream.clone_dtoh(s).expect("dtoh");
+    let mut nan = 0;
+    let mut inf = 0;
+    let mut mn = f32::INFINITY;
+    let mut mx = f32::NEG_INFINITY;
+    for c in host.chunks_exact(4).take(n) {
+        let v = f32::from_le_bytes([c[0], c[1], c[2], c[3]]);
+        if v.is_nan() {
+            nan += 1;
+        } else if v.is_infinite() {
+            inf += 1;
+        } else {
+            mn = mn.min(v);
+            mx = mx.max(v);
+        }
+    }
+    (nan, inf, mn, mx)
+}
 
-    /// 诊断:scratch 槽位读回(bf16 视角)
-    fn scratch_stats_bf16(res: &TestRes, tag: &str, n: usize) -> (usize, usize, f32, f32) {
-        let (id, bytes) = res.tags.get(tag).copied().unwrap_or((0, 0));
-        let n = n.min(bytes / 2);
-        if id == 0 { return (0, 0, 0.0, 0.0); }
-        let s = res.blocks.get(&id).expect("在册");
-        let host = res.stream.clone_dtoh(s).expect("dtoh");
-        let mut nan = 0; let mut inf = 0;
-        let mut mn = f32::INFINITY; let mut mx = f32::NEG_INFINITY;
-        for c in host.chunks_exact(2).take(n) {
-            let v = half::bf16::from_le_bytes([c[0], c[1]]).to_f32();
-            if v.is_nan() { nan += 1; } else if v.is_infinite() { inf += 1; }
-            else { mn = mn.min(v); mx = mx.max(v); }
-        }
-        (nan, inf, mn, mx)
+/// 诊断:scratch 槽位读回(bf16 视角)
+fn scratch_stats_bf16(res: &TestRes, tag: &str, n: usize) -> (usize, usize, f32, f32) {
+    let (id, bytes) = res.tags.get(tag).copied().unwrap_or((0, 0));
+    let n = n.min(bytes / 2);
+    if id == 0 {
+        return (0, 0, 0.0, 0.0);
     }
+    let s = res.blocks.get(&id).expect("在册");
+    let host = res.stream.clone_dtoh(s).expect("dtoh");
+    let mut nan = 0;
+    let mut inf = 0;
+    let mut mn = f32::INFINITY;
+    let mut mx = f32::NEG_INFINITY;
+    for c in host.chunks_exact(2).take(n) {
+        let v = half::bf16::from_le_bytes([c[0], c[1]]).to_f32();
+        if v.is_nan() {
+            nan += 1;
+        } else if v.is_infinite() {
+            inf += 1;
+        } else {
+            mn = mn.min(v);
+            mx = mx.max(v);
+        }
+    }
+    (nan, inf, mn, mx)
+}
 
 #[test]
 #[allow(clippy::too_many_lines)]
@@ -328,11 +373,14 @@ fn gdn_chunked_new_chain_matches_golden() {
     let dev: usize = owl_cuda::test_device_ordinal();
     let mut res = TestRes::new(dev);
     let mut exec = Exec::new();
-    let mut rt = <GdnChunkedRuntime as KernelFamily>::assemble(&mut res, &mut exec).expect("runtime assemble");
+    let mut rt = <GdnChunkedRuntime as KernelFamily>::assemble(&mut res, &mut exec)
+        .expect("runtime assemble");
 
     let dir = concat!(env!("CARGO_MANIFEST_DIR"), "/../../testdata/gdn_fla/cases");
     if !std::path::Path::new(dir).join("c1_t64.q.bin").is_file() {
-        owl_shared::testkit::report::skip(format_args!("金标 bin 不在({dir};`gen.py` 生成,或从主树 testdata/gdn_fla/cases 链接)"));
+        owl_shared::testkit::report::skip(format_args!(
+            "金标 bin 不在({dir};`gen.py` 生成,或从主树 testdata/gdn_fla/cases 链接)"
+        ));
         return;
     }
     // (tag, T, tight)
@@ -355,7 +403,10 @@ fn gdn_chunked_new_chain_matches_golden() {
 
         // ── face builder(host 铸造:bf16×4 + f16 gate;引擎配方)──
         let shape = owl_kernels::client::gdn_chunked::GdnShape {
-            t: *t as u32, nv: NV as u32, nk: NK as u32, kd: KD as u32,
+            t: *t as u32,
+            nv: NV as u32,
+            nk: NK as u32,
+            kd: KD as u32,
         };
         // ⚠️ 引擎输入契约:层侧 q/k/v/beta = **f16**(runtime cast-in 再铸
         // bf16/f32);喂 bf16 = 位型错读(±1.453 = 0.1 的 bf16 位当 f16)
@@ -372,7 +423,9 @@ fn gdn_chunked_new_chain_matches_golden() {
             vec![0f32; NV * KD * VD]
         };
         let mut s0_bytes = Vec::with_capacity(s0v.len() * 4);
-        for f in &s0v { s0_bytes.extend_from_slice(&f.to_le_bytes()); }
+        for f in &s0v {
+            s0_bytes.extend_from_slice(&f.to_le_bytes());
+        }
         let state_b = res.upload_new(&s0_bytes);
         let (out_id, out_slice) = res.alloc_id(t * NV * VD * 2);
         res.blocks.insert(out_id, out_slice); // 直取路径必须自己落表(upload 路径内含)
@@ -380,15 +433,22 @@ fn gdn_chunked_new_chain_matches_golden() {
 
         let (tbl_b, tbl_nt) = make_tables(&mut res, *t);
         let call = GdnChunkedCall::builder(shape)
-            .q(&q_b).unwrap()
-            .k(&k_b).unwrap()
-            .v(&v_b).unwrap()
-            .beta(&beta_b).unwrap()
-            .gate_raw(&g_b).unwrap()
-            .state(&state_b, 0).unwrap()
+            .q(&q_b)
+            .unwrap()
+            .k(&k_b)
+            .unwrap()
+            .v(&v_b)
+            .unwrap()
+            .beta(&beta_b)
+            .unwrap()
+            .gate_raw(&g_b)
+            .unwrap()
+            .state(&state_b, 0)
+            .unwrap()
             .tables(&tbl_b, tbl_nt)
             .unwrap()
-            .build().unwrap();
+            .build()
+            .unwrap();
         let msg: LaunchMsg = call.to_launch(out_b.clone());
 
         // ── 新链执行(run;Result 全链)──
@@ -399,40 +459,65 @@ fn gdn_chunked_new_chain_matches_golden() {
         {
             let s = res.slice_of(out_id);
             let host = res.stream.clone_dtoh(s).expect("dtoh");
-            let f16s: Vec<u16> = host.chunks_exact(2).take(8).map(|c| u16::from_le_bytes([c[0], c[1]])).collect();
-            let f16s_all: Vec<u16> = host.chunks_exact(2).map(|c| u16::from_le_bytes([c[0], c[1]])).collect();
+            let f16s: Vec<u16> = host
+                .chunks_exact(2)
+                .take(8)
+                .map(|c| u16::from_le_bytes([c[0], c[1]]))
+                .collect();
+            let f16s_all: Vec<u16> = host
+                .chunks_exact(2)
+                .map(|c| u16::from_le_bytes([c[0], c[1]]))
+                .collect();
             let nz = f16s_all.iter().filter(|v| **v != 0).count();
-            eprintln!("[{tag}] out_id={out_id} 前8 f16 位型={f16s:x?} 非零总数={nz}/{}", f16s_all.len());
+            eprintln!(
+                "[{tag}] out_id={out_id} 前8 f16 位型={f16s:x?} 非零总数={nz}/{}",
+                f16s_all.len()
+            );
         }
         let (oid, _ob) = res.tags.get("gdn.o_b16").copied().expect("o_b16 tag");
         let got = res.take_bytes_bf16(oid);
-        let (atol, rtol) = if *tight { (1e-4f32, 1e-3f32) } else { (5e-2f32, 6e-2f32) };
+        let (atol, rtol) = if *tight {
+            (1e-4f32, 1e-3f32)
+        } else {
+            (5e-2f32, 6e-2f32)
+        };
         let (mut nan_g, mut inf_g, mut nan_w) = (0usize, 0usize, 0usize);
         let (mut gmax, mut wmax) = (0f32, 0f32);
         for (a, b) in got.iter().zip(&golden_o) {
-            if a.is_nan() { nan_g += 1; }
-            if a.is_infinite() { inf_g += 1; }
-            if b.is_nan() { nan_w += 1; }
-            if !a.is_nan() { gmax = gmax.max(a.abs()); }
+            if a.is_nan() {
+                nan_g += 1;
+            }
+            if a.is_infinite() {
+                inf_g += 1;
+            }
+            if b.is_nan() {
+                nan_w += 1;
+            }
+            if !a.is_nan() {
+                gmax = gmax.max(a.abs());
+            }
             wmax = wmax.max(b.abs());
         }
         let mut worst = 0f32;
         for (a, b) in got.iter().zip(&golden_o) {
-            if a.is_nan() || a.is_infinite() { worst = f32::INFINITY; break; }
+            if a.is_nan() || a.is_infinite() {
+                worst = f32::INFINITY;
+                break;
+            }
             let n = (a - b).abs() / (atol + rtol * b.abs());
             worst = worst.max(n);
         }
         eprintln!("[{tag}] 新链 o 对拍: ×{worst:.2} gotNaN={nan_g} gotInf={inf_g} wantNaN={nan_w} gotMax={gmax:.4} wantMax={wmax:.4}(nt={nt})");
         // ── 阶段验尸(scratch 逐槽统计;f32 槽 vs bf16 槽)──
-        let (tn, ti_, tmn, tmx) = scratch_stats(&res,"gdn.in_g", t * NV);
+        let (tn, ti_, tmn, tmx) = scratch_stats(&res, "gdn.in_g", t * NV);
         eprintln!("  in_g(f32): nan={tn} inf={ti_} [{tmn:.3},{tmx:.3}](期望 ≈ g 域)");
-        let (tn, ti_, tmn, tmx) = scratch_stats(&res,"gdn.g_cum", t * NV);
+        let (tn, ti_, tmn, tmx) = scratch_stats(&res, "gdn.g_cum", t * NV);
         eprintln!("  g_cum(f32): nan={tn} inf={ti_} [{tmn:.3},{tmx:.3}](期望全负)");
-        let (tn, ti_, tmn, tmx) = scratch_stats_bf16(&res,"gdn.in_q", t * NK * KD);
+        let (tn, ti_, tmn, tmx) = scratch_stats_bf16(&res, "gdn.in_q", t * NK * KD);
         eprintln!("  in_q(bf16): nan={tn} inf={ti_} [{tmn:.3},{tmx:.3}](期望 q 域)");
-        let (tn, ti_, tmn, tmx) = scratch_stats_bf16(&res,"gdn.w", t * NV * KD);
+        let (tn, ti_, tmn, tmx) = scratch_stats_bf16(&res, "gdn.w", t * NV * KD);
         eprintln!("  w(bf16): nan={tn} inf={ti_} [{tmn:.3},{tmx:.3}]");
-        let (tn, ti_, tmn, tmx) = scratch_stats_bf16(&res,"gdn.o_b16", t * NV * VD);
+        let (tn, ti_, tmn, tmx) = scratch_stats_bf16(&res, "gdn.o_b16", t * NV * VD);
         eprintln!("  o_b16(bf16): nan={tn} inf={ti_} [{tmn:.3},{tmx:.3}]");
         let (tn, ti_, tmn, tmx) = scratch_stats(&res, "gdn.a_buf", t * NV * 64);
         eprintln!("  A(f32): nan={tn} inf={ti_} [{tmn:.3},{tmx:.3}](期望 |A|≲0.5)");
@@ -443,7 +528,13 @@ fn gdn_chunked_new_chain_matches_golden() {
         let (tn, ti_, tmn, tmx) = scratch_stats_bf16(&res, "gdn.in_beta", t * NV);
         eprintln!("  in_beta(bf16): nan={tn} inf={ti_} [{tmn:.3},{tmx:.3}](期望 (0,1))");
         assert!(worst <= 1.0, "{tag}: 新链 o 超容差 ×{worst:.2}");
-        let _ = (max_dev, transpose_kv_nt, take_f32_unused, rcp_ln2, &golden_o);
+        let _ = (
+            max_dev,
+            transpose_kv_nt,
+            take_f32_unused,
+            rcp_ln2,
+            &golden_o,
+        );
     }
 }
 
@@ -471,7 +562,8 @@ fn gdn_chunked_nt_decomposition_identity() {
     let dev: usize = owl_cuda::test_device_ordinal();
     let mut res = TestRes::new(dev);
     let mut exec = Exec::new();
-    let mut rt = <GdnChunkedRuntime as KernelFamily>::assemble(&mut res, &mut exec).expect("runtime assemble");
+    let mut rt = <GdnChunkedRuntime as KernelFamily>::assemble(&mut res, &mut exec)
+        .expect("runtime assemble");
 
     const T_BIG: usize = 1024;
     const T_SM: usize = 64;
@@ -484,7 +576,10 @@ fn gdn_chunked_nt_decomposition_identity() {
             .wrapping_add((i as u32).wrapping_mul(0x85EB_CA6B));
         ((x >> 8) as f32) / 16777216.0
     };
-    let g_depth = std::env::var("OWL_NT_G_DEPTH").ok().and_then(|v| v.parse().ok()).unwrap_or(8.0f32);
+    let g_depth = std::env::var("OWL_NT_G_DEPTH")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(8.0f32);
     let n_qk = T_BIG * NK * KD;
     let n_v = T_BIG * NV * VD;
     let n_h = T_BIG * NV;
@@ -511,7 +606,12 @@ fn gdn_chunked_nt_decomposition_identity() {
         for r in 0..rows {
             for h in 0..heads {
                 let base = r * heads * d + h * d;
-                let n: f32 = xs[base..base + d].iter().map(|x| x * x).sum::<f32>().sqrt().max(1e-6);
+                let n: f32 = xs[base..base + d]
+                    .iter()
+                    .map(|x| x * x)
+                    .sum::<f32>()
+                    .sqrt()
+                    .max(1e-6);
                 for i in base..base + d {
                     xs[i] /= n;
                 }
@@ -520,24 +620,36 @@ fn gdn_chunked_nt_decomposition_identity() {
     };
     normalize_rows(&mut q, T_BIG, NK, KD);
     normalize_rows(&mut k, T_BIG, NK, KD);
-    let v_scale: f32 = std::env::var("OWL_NT_VSCALE").ok().and_then(|x| x.parse().ok()).unwrap_or(2.0);
+    let v_scale: f32 = std::env::var("OWL_NT_VSCALE")
+        .ok()
+        .and_then(|x| x.parse().ok())
+        .unwrap_or(2.0);
     for x in v.iter_mut() {
         *x *= v_scale;
     }
     let to_f16 = |xs: &[f32]| -> Vec<u8> {
-        xs.iter().flat_map(|x| half::f16::from_f32(*x).to_le_bytes()).collect()
+        xs.iter()
+            .flat_map(|x| half::f16::from_f32(*x).to_le_bytes())
+            .collect()
     };
 
     // ── 输入块(整块 + 8 段切片各一套)──
-    let run_arm = |rt: &mut Box<dyn KernelFamily>, res: &mut TestRes, exec: &mut Exec,
-                       t: usize, slice: Option<usize>| -> (Vec<f32>, Vec<f32>) {
+    let run_arm = |rt: &mut Box<dyn KernelFamily>,
+                   res: &mut TestRes,
+                   exec: &mut Exec,
+                   t: usize,
+                   slice: Option<usize>|
+     -> (Vec<f32>, Vec<f32>) {
         // slice = Some(i) → 取第 i 段 T_SM 行;None → 整块 T_BIG 行
         let (off_qk, rows_qk, off_v, rows_v, off_h, rows_h) = match slice {
             None => (0, t, 0, t, 0, t),
             Some(i) => (
-                i * T_SM * NK * KD, t,
-                i * T_SM * NV * VD, t,
-                i * T_SM * NV, t,
+                i * T_SM * NK * KD,
+                t,
+                i * T_SM * NV * VD,
+                t,
+                i * T_SM * NV,
+                t,
             ),
         };
         let cut = |xs: &[f32], off: usize, rows: usize, per_row: usize| -> Vec<u8> {
@@ -553,16 +665,29 @@ fn gdn_chunked_nt_decomposition_identity() {
         res.blocks.insert(out_id, out_slice);
         let out_b = Bytes::new(out_id, t * NV * VD, Dtype::F16, 3); // [t, NV, VD] f16
         let shape = owl_kernels::client::gdn_chunked::GdnShape {
-            t: t as u32, nv: NV as u32, nk: NK as u32, kd: KD as u32,
+            t: t as u32,
+            nv: NV as u32,
+            nk: NK as u32,
+            kd: KD as u32,
         };
         let (tbl_b, tbl_nt) = make_tables(res, t);
         let call = GdnChunkedCall::builder(shape)
-            .q(&q_b).unwrap().k(&k_b).unwrap().v(&v_b).unwrap()
-            .beta(&beta_b).unwrap().gate_raw(&g_b).unwrap()
-            .state(&state_b, 0).unwrap()
+            .q(&q_b)
+            .unwrap()
+            .k(&k_b)
+            .unwrap()
+            .v(&v_b)
+            .unwrap()
+            .beta(&beta_b)
+            .unwrap()
+            .gate_raw(&g_b)
+            .unwrap()
+            .state(&state_b, 0)
+            .unwrap()
             .tables(&tbl_b, tbl_nt)
             .unwrap()
-            .build().unwrap();
+            .build()
+            .unwrap();
         let msg: LaunchMsg = call.to_launch(out_b.clone());
         rt.run(&msg, res, exec).expect("runtime run");
         res.stream.synchronize().expect("sync");
@@ -575,7 +700,10 @@ fn gdn_chunked_nt_decomposition_identity() {
     // arm A:一次 T=512(NT=8)
     let (o_a, st_a) = run_arm(&mut rt, &mut res, &mut exec, T_BIG, None);
     let st_a_snapshot = st_a.clone();
-    let (w_a, vn_a) = (res.tags.get("gdn.w").copied(), res.tags.get("gdn.v_new").copied());
+    let (w_a, vn_a) = (
+        res.tags.get("gdn.w").copied(),
+        res.tags.get("gdn.v_new").copied(),
+    );
 
     // arm B:8 次 T=64(NT=1),**态链式**(每次调用写回同一 state 块 ⇒ 直接复用)
     // ⚠️ 为让链式生效,必须用**同一个 state 块**:见下面的循环版本
@@ -583,14 +711,27 @@ fn gdn_chunked_nt_decomposition_identity() {
     let mut st_b = vec![0f32; NV * KD * VD];
     {
         // 重建输入(与 arm A 同源切片),但 state 块跨调用共享
-        let qs: Vec<Bytes> = (0..NT).map(|i| res.upload_new(&to_f16(&q[i * T_SM * NK * KD..(i + 1) * T_SM * NK * KD]))).collect();
-        let ks: Vec<Bytes> = (0..NT).map(|i| res.upload_new(&to_f16(&k[i * T_SM * NK * KD..(i + 1) * T_SM * NK * KD]))).collect();
-        let vs: Vec<Bytes> = (0..NT).map(|i| res.upload_new(&to_f16(&v[i * T_SM * NV * VD..(i + 1) * T_SM * NV * VD]))).collect();
-        let bs: Vec<Bytes> = (0..NT).map(|i| res.upload_new(&to_f16(&beta[i * T_SM * NV..(i + 1) * T_SM * NV]))).collect();
-        let gs: Vec<Bytes> = (0..NT).map(|i| res.upload_new(&to_f16(&g[i * T_SM * NV..(i + 1) * T_SM * NV]))).collect();
+        let qs: Vec<Bytes> = (0..NT)
+            .map(|i| res.upload_new(&to_f16(&q[i * T_SM * NK * KD..(i + 1) * T_SM * NK * KD])))
+            .collect();
+        let ks: Vec<Bytes> = (0..NT)
+            .map(|i| res.upload_new(&to_f16(&k[i * T_SM * NK * KD..(i + 1) * T_SM * NK * KD])))
+            .collect();
+        let vs: Vec<Bytes> = (0..NT)
+            .map(|i| res.upload_new(&to_f16(&v[i * T_SM * NV * VD..(i + 1) * T_SM * NV * VD])))
+            .collect();
+        let bs: Vec<Bytes> = (0..NT)
+            .map(|i| res.upload_new(&to_f16(&beta[i * T_SM * NV..(i + 1) * T_SM * NV])))
+            .collect();
+        let gs: Vec<Bytes> = (0..NT)
+            .map(|i| res.upload_new(&to_f16(&g[i * T_SM * NV..(i + 1) * T_SM * NV])))
+            .collect();
         let state_b = res.upload_new(&vec![0u8; NV * KD * VD * 4]);
         let shape = owl_kernels::client::gdn_chunked::GdnShape {
-            t: T_SM as u32, nv: NV as u32, nk: NK as u32, kd: KD as u32,
+            t: T_SM as u32,
+            nv: NV as u32,
+            nk: NK as u32,
+            kd: KD as u32,
         };
         for i in 0..NT {
             let (out_id, out_slice) = res.alloc_id(T_SM * NV * VD * 2);
@@ -598,11 +739,22 @@ fn gdn_chunked_nt_decomposition_identity() {
             let out_b = Bytes::new(out_id, T_SM * NV * VD, Dtype::F16, 3); // [T_SM, NV, VD] f16
             let (tbl_b, tbl_nt) = make_tables(&mut res, T_SM);
             let call = GdnChunkedCall::builder(shape)
-                .q(&qs[i]).unwrap().k(&ks[i]).unwrap().v(&vs[i]).unwrap()
-                .beta(&bs[i]).unwrap().gate_raw(&gs[i]).unwrap()
-                .state(&state_b, 0).unwrap()
-                .tables(&tbl_b, tbl_nt).unwrap()
-                .build().unwrap();
+                .q(&qs[i])
+                .unwrap()
+                .k(&ks[i])
+                .unwrap()
+                .v(&vs[i])
+                .unwrap()
+                .beta(&bs[i])
+                .unwrap()
+                .gate_raw(&gs[i])
+                .unwrap()
+                .state(&state_b, 0)
+                .unwrap()
+                .tables(&tbl_b, tbl_nt)
+                .unwrap()
+                .build()
+                .unwrap();
             let msg: LaunchMsg = call.to_launch(out_b.clone());
             rt.run(&msg, &mut res, &mut exec).expect("runtime run");
             res.stream.synchronize().expect("sync");
@@ -615,12 +767,18 @@ fn gdn_chunked_nt_decomposition_identity() {
     let (mut worst_o, mut at_o) = (0f32, 0usize);
     for (i, (a, b)) in o_a.iter().zip(&o_b).enumerate() {
         let d = (a - b).abs();
-        if d > worst_o { worst_o = d; at_o = i; }
+        if d > worst_o {
+            worst_o = d;
+            at_o = i;
+        }
     }
     let (mut worst_s, mut at_s) = (0f32, 0usize);
     for (i, (a, b)) in st_a_snapshot.iter().zip(&st_b).enumerate() {
         let d = (a - b).abs();
-        if d > worst_s { worst_s = d; at_s = i; }
+        if d > worst_s {
+            worst_s = d;
+            at_s = i;
+        }
     }
     let omax = o_a.iter().fold(0f32, |m, x| m.max(x.abs()));
     eprintln!(
@@ -629,9 +787,18 @@ fn gdn_chunked_nt_decomposition_identity() {
          state: max|Δ|={worst_s:.3e} @{at_s} (|st|max={:.3e})",
         st_a_snapshot.iter().fold(0f32, |m, x| m.max(x.abs()))
     );
-    if let Some((id, n)) = w_a { let _ = n; let _ = id; }
-    if let Some((id, n)) = vn_a { let _ = n; let _ = id; }
-    let tol = std::env::var("OWL_NT_TOL").ok().and_then(|v| v.parse().ok()).unwrap_or(2e-2f32);
+    if let Some((id, n)) = w_a {
+        let _ = n;
+        let _ = id;
+    }
+    if let Some((id, n)) = vn_a {
+        let _ = n;
+        let _ = id;
+    }
+    let tol = std::env::var("OWL_NT_TOL")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(2e-2f32);
     assert!(
         worst_o <= tol * omax.max(1.0),
         "NT 分解恒等门破:o max|Δ|={worst_o:.3e} > tol={tol}(|o|max={omax:.3e})—— NT≥3 的链内多 chunk 路径错(A13)"
@@ -662,22 +829,38 @@ fn gdn_chunked_matches_varlen_fn_level() {
     let dev: usize = owl_cuda::test_device_ordinal();
     let mut res = TestRes::new(dev);
     let mut exec = Exec::new();
-    let mut rt = <GdnChunkedRuntime as KernelFamily>::assemble(&mut res, &mut exec).expect("runtime assemble");
+    let mut rt = <GdnChunkedRuntime as KernelFamily>::assemble(&mut res, &mut exec)
+        .expect("runtime assemble");
 
     // varlen 核(nvrtc;与 gdn_big_t_arms_parity 同款发射)
     let ptx = cudarc::nvrtc::compile_ptx_with_opts(
-        owl_kernels::cu_sig::cu_text(owl_kernels::ops::source("owl_gdn_recurrence_varlen_gqa_f16")).as_str(),
-        cudarc::nvrtc::CompileOptions { arch: Some("compute_86"), include_paths: vec!["/usr/local/cuda/include".into()], ..Default::default() },
-    ).expect("nvrtc gdn_recurrence");
+        owl_kernels::cu_sig::cu_text(owl_kernels::ops::source(
+            "owl_gdn_recurrence_varlen_gqa_f16",
+        ))
+        .as_str(),
+        cudarc::nvrtc::CompileOptions {
+            arch: Some("compute_86"),
+            include_paths: vec!["/usr/local/cuda/include".into()],
+            ..Default::default()
+        },
+    )
+    .expect("nvrtc gdn_recurrence");
     let m_var = res.ctx.load_module(ptx).expect("module");
-    let f_var = m_var.load_function("owl_gdn_recurrence_varlen_gqa_f16").expect("fn varlen");
+    let f_var = m_var
+        .load_function("owl_gdn_recurrence_varlen_gqa_f16")
+        .expect("fn varlen");
     let scale: f32 = 1.0 / (KD as f32).sqrt();
 
     let lcg = |seed: u32, i: usize| -> f32 {
-        let x = seed.wrapping_mul(0x9E37_79B9).wrapping_add((i as u32).wrapping_mul(0x85EB_CA6B));
+        let x = seed
+            .wrapping_mul(0x9E37_79B9)
+            .wrapping_add((i as u32).wrapping_mul(0x85EB_CA6B));
         ((x >> 8) as f32) / 16777216.0
     };
-    let g_depth: f32 = std::env::var("OWL_XARM_G").ok().and_then(|v| v.parse().ok()).unwrap_or(9.0);
+    let g_depth: f32 = std::env::var("OWL_XARM_G")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(9.0);
     let cases: Vec<usize> = std::env::var("OWL_XARM_T")
         .ok()
         .and_then(|v| v.split(',').map(|s| s.trim().parse().ok()).collect())
@@ -689,24 +872,37 @@ fn gdn_chunked_matches_varlen_fn_level() {
         let mut k: Vec<f32> = (0..t * NK * KD).map(|i| (lcg(23, i) - 0.5) * 0.2).collect();
         let v: Vec<f32> = (0..t * NV * VD).map(|i| (lcg(37, i) - 0.5) * 2.0).collect();
         let beta: Vec<f32> = (0..t * NV).map(|i| 0.1 + 0.8 * lcg(53, i)).collect();
-        let g: Vec<f32> = (0..t * NV).map(|i| -(0.01 + g_depth * lcg(71, i))).collect();
+        let g: Vec<f32> = (0..t * NV)
+            .map(|i| -(0.01 + g_depth * lcg(71, i)))
+            .collect();
         for (xs, heads) in [(&mut q, NK), (&mut k, NK)] {
             for r in 0..t {
                 for h in 0..heads {
                     let b = r * heads * KD + h * KD;
-                    let n: f32 = xs[b..b + KD].iter().map(|x| x * x).sum::<f32>().sqrt().max(1e-6);
+                    let n: f32 = xs[b..b + KD]
+                        .iter()
+                        .map(|x| x * x)
+                        .sum::<f32>()
+                        .sqrt()
+                        .max(1e-6);
                     for i in b..b + KD {
                         xs[i] /= n;
                     }
                 }
             }
         }
-        let f16b = |xs: &[f32]| -> Vec<u8> { xs.iter().flat_map(|x| half::f16::from_f32(*x).to_le_bytes()).collect() };
+        let f16b = |xs: &[f32]| -> Vec<u8> {
+            xs.iter()
+                .flat_map(|x| half::f16::from_f32(*x).to_le_bytes())
+                .collect()
+        };
         let (qb, kb, vb, bb, gb) = (f16b(&q), f16b(&k), f16b(&v), f16b(&beta), f16b(&g));
 
         // 初态(生产里第二块起是非零态;两种都测)
         let st0: Vec<f32> = match std::env::var("OWL_XARM_ST0").as_deref() {
-            Ok("rand") => (0..NV * KD * VD).map(|i| (lcg(97, i) - 0.5) * 2.0).collect(),
+            Ok("rand") => (0..NV * KD * VD)
+                .map(|i| (lcg(97, i) - 0.5) * 2.0)
+                .collect(),
             _ => vec![0f32; NV * KD * VD],
         };
         let st0_bytes: Vec<u8> = st0.iter().flat_map(|x| x.to_le_bytes()).collect();
@@ -721,21 +917,38 @@ fn gdn_chunked_matches_varlen_fn_level() {
         let (out_id, out_slice) = res.alloc_id(t * NV * VD * 2);
         res.blocks.insert(out_id, out_slice);
         let out_b = Bytes::new(out_id, t * NV * VD, Dtype::F16, 3); // [t, NV, VD] f16
-        let shape = owl_kernels::client::gdn_chunked::GdnShape { t: t as u32, nv: NV as u32, nk: NK as u32, kd: KD as u32 };
+        let shape = owl_kernels::client::gdn_chunked::GdnShape {
+            t: t as u32,
+            nv: NV as u32,
+            nk: NK as u32,
+            kd: KD as u32,
+        };
         let (tbl_b, tbl_nt) = make_tables(&mut res, t);
         let call = GdnChunkedCall::builder(shape)
-            .q(&q_b).unwrap().k(&k_b).unwrap().v(&v_b).unwrap()
-            .beta(&beta_b).unwrap().gate_raw(&g_b).unwrap()
-            .state(&state_b, 0).unwrap()
+            .q(&q_b)
+            .unwrap()
+            .k(&k_b)
+            .unwrap()
+            .v(&v_b)
+            .unwrap()
+            .beta(&beta_b)
+            .unwrap()
+            .gate_raw(&g_b)
+            .unwrap()
+            .state(&state_b, 0)
+            .unwrap()
             .tables(&tbl_b, tbl_nt)
             .unwrap()
-            .build().unwrap();
+            .build()
+            .unwrap();
         let msg: LaunchMsg = call.to_launch(out_b.clone());
         rt.run(&msg, &mut res, &mut exec).expect("chain run");
         res.stream.synchronize().expect("sync");
         let o_chain: Vec<f32> = {
             let host = res.stream.clone_dtoh(res.slice_of(out_id)).expect("dtoh");
-            host.chunks_exact(2).map(|c| half::f16::from_le_bytes([c[0], c[1]]).to_f32()).collect()
+            host.chunks_exact(2)
+                .map(|c| half::f16::from_le_bytes([c[0], c[1]]).to_f32())
+                .collect()
         };
         let st_chain = res.take_bytes_f32(state_b.id);
 
@@ -761,20 +974,36 @@ fn gdn_chunked_matches_varlen_fn_level() {
         let d_out = unsafe { res.stream.alloc::<u16>(t * NV * VD) }.unwrap();
         {
             let (qp, kp, vp, gp, bp) = (
-                d_q.device_ptr(&res.stream).0, d_k.device_ptr(&res.stream).0,
-                d_v.device_ptr(&res.stream).0, d_g.device_ptr(&res.stream).0,
+                d_q.device_ptr(&res.stream).0,
+                d_k.device_ptr(&res.stream).0,
+                d_v.device_ptr(&res.stream).0,
+                d_g.device_ptr(&res.stream).0,
                 d_b.device_ptr(&res.stream).0,
             );
             let (stp, slp, cup, op) = (
-                d_st.device_ptr(&res.stream).0, d_slots.device_ptr(&res.stream).0,
-                d_cu.device_ptr(&res.stream).0, d_out.device_ptr(&res.stream).0,
+                d_st.device_ptr(&res.stream).0,
+                d_slots.device_ptr(&res.stream).0,
+                d_cu.device_ptr(&res.stream).0,
+                d_out.device_ptr(&res.stream).0,
             );
-            let (batch_u, nv_u, nk_u, kd_u, vd_u) = (1u64, NV as u64, NK as u64, KD as u64, VD as u64);
+            let (batch_u, nv_u, nk_u, kd_u, vd_u) =
+                (1u64, NV as u64, NK as u64, KD as u64, VD as u64);
             let mut b = res.stream.launch_builder(&f_var);
-            b.arg(&qp).arg(&kp).arg(&vp).arg(&gp).arg(&bp)
-                .arg(&stp).arg(&slp).arg(&cup)
-                .arg(&batch_u).arg(&nv_u).arg(&nk_u).arg(&kd_u).arg(&vd_u)
-                .arg(&scale).arg(&op);
+            b.arg(&qp)
+                .arg(&kp)
+                .arg(&vp)
+                .arg(&gp)
+                .arg(&bp)
+                .arg(&stp)
+                .arg(&slp)
+                .arg(&cup)
+                .arg(&batch_u)
+                .arg(&nv_u)
+                .arg(&nk_u)
+                .arg(&kd_u)
+                .arg(&vd_u)
+                .arg(&scale)
+                .arg(&op);
             unsafe {
                 b.launch(cudarc::driver::LaunchConfig {
                     grid_dim: (VD.div_ceil(8) as u32, NV as u32, 1),
@@ -787,7 +1016,10 @@ fn gdn_chunked_matches_varlen_fn_level() {
         res.stream.synchronize().expect("sync");
         let mut o_var16 = vec![0u16; t * NV * VD];
         res.stream.memcpy_dtoh(&d_out, &mut o_var16).unwrap();
-        let o_var: Vec<f32> = o_var16.iter().map(|&x| half::f16::from_bits(x).to_f32()).collect();
+        let o_var: Vec<f32> = o_var16
+            .iter()
+            .map(|&x| half::f16::from_bits(x).to_f32())
+            .collect();
         let mut st_var = vec![0f32; NV * KD * VD];
         res.stream.memcpy_dtoh(&d_st, &mut st_var).unwrap();
 
@@ -809,7 +1041,13 @@ fn gdn_chunked_matches_varlen_fn_level() {
             t.div_ceil(64),
             if st0.iter().any(|x| *x != 0.0) { "rand" } else { "zero" },
         );
-        let tol: f64 = std::env::var("OWL_XARM_TOL").ok().and_then(|v| v.parse().ok()).unwrap_or(5e-2);
-        assert!(ro <= tol && rs <= tol, "[x-arm] T={t} 两臂函数级分歧:o 噪声/RMS={ro:.4} 终态={rs:.4} > tol={tol}");
+        let tol: f64 = std::env::var("OWL_XARM_TOL")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(5e-2);
+        assert!(
+            ro <= tol && rs <= tol,
+            "[x-arm] T={t} 两臂函数级分歧:o 噪声/RMS={ro:.4} 终态={rs:.4} > tol={tol}"
+        );
     }
 }
