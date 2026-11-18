@@ -850,14 +850,12 @@ pub struct StoreCfg {
     pub ram_pool_size: usize,
     /// **宿主状态腿**(MiB;0 = 关层)。GDN 快照下沉的落点 ——
     /// ⚠️ 超卖档会把压力推给它(实测 27B 单快照 607 MiB),别只给 KV 腿留量。
-    #[serde(default, skip_serializing_if = "is_zero_usize")]
     pub snap_host_mb: usize,
     /// **磁盘 KV 腿**(MiB;0 = 关层;S6)。宿主装不下时的第二落点(内容不丢)。
     ///
     /// 目录由 `disk_dir` 指定;进程重启后**扫目录回填账**(内容惰性读回)。
     pub disk_pool_size: usize,
     /// **磁盘状态腿**(MiB;0 = 关层;与 [`Self::disk_pool_size`] 同属盘层总账的两个分片)。
-    #[serde(default, skip_serializing_if = "is_zero_usize")]
     pub snap_disk_mb: usize,
     /// **磁盘内容目录**(空 = 关层;两腿子目录 `kv/` 与 `snap/` 自动分)。
     ///
@@ -875,7 +873,6 @@ pub struct StoreCfg {
     pub vram_activation_reserve: u64,
     /// **关掉解释器活性中途回收**(诊断/对照臂;缺省 false = 开回收)。
     /// 原 `OWL_NO_RECLAIM` env。⚠️ 开会无界常驻(长请求 OOM),只作取证。
-    #[serde(default, skip_serializing_if = "is_false")]
     pub no_reclaim: bool,
     /// 主 KV 池子域（`[store.kv]`）。
     pub kv: StoreKvCfg,
@@ -1184,7 +1181,6 @@ pub struct KvmemCfg {
     /// 扫**全 ctx**)+ 论文口径对照 + 方案 A/B 对照 + 覆盖率/上界报告。
     /// 单边界成本**含 ctx 因子** ⇒ 全军 O(ctx²)(27B/8k 实测单次 6.3s = 墙钟 32%)。
     /// 🔴 **测性能不要开它** —— 生产面只需 `select_decode`。
-    #[serde(default, skip_serializing_if = "is_false")]
     pub coverage_probe: bool,
     /// **分析边界目标 ctx**(诊断面;0/未设 = **最后一个边界**)。
     ///
@@ -1193,17 +1189,13 @@ pub struct KvmemCfg {
     /// (实测 chunk 1024/512/256 ⇒ 分析@3072/3584/3840 ⇒ top8 87.5%/12.4%/6.8%)。
     /// 钉住 ctx 后:query 面 `[ctx−8, ctx)` 与块数 `ctx/page` **都与 chunk 无关**
     /// ⇒ 读数逐位可比。要求该 ctx 是 chunk 的整数倍(否则取不到该边界)。
-    #[serde(default, skip_serializing_if = "is_zero_usize")]
     pub analyze_at_ctx: usize,
     /// **方案 A/B 对照档**（诊断面；2026-11-05 从 env 收编）：多读一份 V +
     /// host 侧算 A/B/dense。只在 `coverage_probe` 时有意义。
-    #[serde(default, skip_serializing_if = "is_false")]
     pub coverage_scheme_probe: bool,
     /// 方案对照的最小 ctx（0 = 每个边界都算）。
-    #[serde(default, skip_serializing_if = "is_zero_usize")]
     pub coverage_scheme_min_ctx: usize,
     /// **重诊断步进**（0 = 每个边界都诊断；诊断面）。
-    #[serde(default, skip_serializing_if = "is_zero_usize")]
     pub coverage_analyze_every: usize,
     /// **驱逐策略**(缺省 `lru`):`lru` = 纯近期;`lrfu[:λ]` = attention-aware
     /// LRFU(召回点选中的块抬 keep-score)⇒ 出序时"又冷又没被注意力用过"的先下沉。
@@ -1324,7 +1316,6 @@ impl DflashWalk {
 pub struct SpecCfg {
     pub depth: usize,
     /// 草稿族(缺省 auto;显式选择见 [`SpecDraft`])
-    #[serde(default, skip_serializing_if = "SpecDraft::is_auto")]
     pub draft: SpecDraft,
     /// **DFlash2 草稿检查点目录**(⚠️ 须 W4A16 量化家族 syvai 系;BF16 源
     /// (z-lab)喂引擎 = 草稿全噪声 AL=0;装载期家族嗅探拒启)。
@@ -1419,9 +1410,7 @@ pub struct SamplingCfg {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct LoadCfg {
-    #[serde(default, skip_serializing_if = "is_false")]
     pub verify: bool,
-    #[serde(default, skip_serializing_if = "is_false")]
     pub debug_tap: bool,
     /// **暂存槽上限 MiB**(原 `OWL_LOAD_STAGING_MB`;缺省 128)。
     /// 单键超过它就按段流式装载(`0` = 不设上限)。**从配置来,不读 env**(用户裁决 2026-10-19)。
@@ -1430,7 +1419,6 @@ pub struct LoadCfg {
     /// 装载旋钮入配置面(此前只有隐式裁决,无显式入口)。
     pub repack: String,
     /// 逐键字节 dump(原 `OWL_LOAD_DUMP`;诊断面)
-    #[serde(default, skip_serializing_if = "is_false")]
     pub dump: bool,
 }
 
@@ -1602,7 +1590,6 @@ pub struct KernelCfg {
     /// 诊断二分:强制 naive 回退(paged 数值质量 A/B)。
     /// (原 `prefill_split` 已退役:2026-10-19 审计定谳"主路走 FI,
     ///  split 只在 FI 缺席时上阵";FI 面自 2026-10-13 起恒在 ⇒ 分支不可达。)
-    #[serde(default, skip_serializing_if = "is_false")]
     pub force_naive_prefill: bool,
     /// verify(T=depth+1)走的注意力臂 —— **单键、有序、互斥**(2026-10-21)。
     ///
@@ -1675,15 +1662,11 @@ pub struct KernelCfg {
     pub gguf_mmq: bool,
     /// smem 复用臂(`m ≥ 64`)
     pub gguf_smem: bool,
-    #[serde(default, skip_serializing_if = "is_false")]
     pub resolve_trace: bool,
-    #[serde(default, skip_serializing_if = "is_false")]
     pub host_argmax: bool,
-    #[serde(default, skip_serializing_if = "is_false")]
     pub ts_probe: bool,
     /// **tag 过滤通配符**(诊断/兜底;`true` = `*`,全部放行)。
     /// 生产缺省 false;配置派生 `TagFilter` 仍按 W4A16/GGUF/KV/feature 过滤。
-    #[serde(default, skip_serializing_if = "is_false")]
     pub tag_wildcard: bool,
 }
 
@@ -1774,15 +1757,6 @@ fn default_true() -> bool {
     true
 }
 
-/// 诊断/内部键的默认值判定：默认时不出现在公开 schema。
-fn is_false(v: &bool) -> bool {
-    !*v
-}
-
-fn is_zero_usize(v: &usize) -> bool {
-    *v == 0
-}
-
 /// 诊断探针族(boot 一次解析,热路径零 env)
 ///
 /// ⚠️ 非 `Copy`(2026-10-21):`gdn_touch`/`gdn_zero_scratch` 是名单串,
@@ -1852,13 +1826,6 @@ pub struct ProbesCfg {
     pub step_gate_every: u64,
 }
 
-impl ProbesCfg {
-    /// 全默认 ⇒ 公开模板不显示 `[probes]`；需要诊断时用 `--set`。
-    fn is_default(&self) -> bool {
-        self == &Self::default()
-    }
-}
-
 fn default_step_gate_ms() -> u64 {
     50
 }
@@ -1899,13 +1866,6 @@ pub struct CudaCfg {
     // 构建期 cubin 资产(源哈希查表),include 路径是构建期 `nvcc` 的事。
     // 键已从配置面移除(不许留死键,`deny_unknown_fields` 会让旧档拒启 →
     // 显式暴露"该档还在用已退役旋钮")。
-}
-
-impl CudaCfg {
-    /// 全默认（`graph = true`，其余诊断关闭）⇒ 公开模板不显示本段。
-    fn is_default(&self) -> bool {
-        self == &Self::default()
-    }
 }
 
 impl Default for CudaCfg {
@@ -2018,10 +1978,8 @@ pub struct OwlConfig {
     pub kernel: KernelCfg,
     pub parallel: ParallelCfg,
     /// 诊断探针：全默认时不进入公开 schema / `full.toml`；高级用户仍可 `--set`。
-    #[serde(default, skip_serializing_if = "ProbesCfg::is_default")]
     pub probes: ProbesCfg,
     /// CUDA 诊断/调优：全默认时不进入公开 schema / `full.toml`；`graph` 缺省即生产值。
-    #[serde(default, skip_serializing_if = "CudaCfg::is_default")]
     pub cuda: CudaCfg,
     pub server: ServerCfg,
     pub log: LogCfg,
@@ -2233,18 +2191,30 @@ fn check_explicit_complete(file_v: &toml::Value, path: &Path) -> Result<(), Stri
     let schema = toml::Value::try_from(OwlConfig::default())
         .map_err(|e| format!("内部:schema 序列化失败 {e}"))?;
     let mut missing: Vec<String> = Vec::new();
+    let mut extra: Vec<String> = Vec::new();
     collect_missing(&schema, file_v, "", &mut missing);
-    if missing.is_empty() {
+    collect_extra(&schema, file_v, "", &mut extra);
+    if missing.is_empty() && extra.is_empty() {
         return Ok(());
     }
     missing.sort();
-    Err(format!(
-        "配置档 `{}` 未显式声明 {} 个字段(缺省不再隐式兜底 ⇒ 拒启):\n  {}\n\
-         生成完整档的最快方式:\n  server -p <旧档> --print-config > <新档>.toml",
+    extra.sort();
+    let mut msg = format!(
+        "配置档 `{}` 与 full schema 不精确匹配(缺 {} / 多 {}；缺省不再隐式兜底 ⇒ 拒启):",
         path.display(),
         missing.len(),
-        missing.join("\n  ")
-    ))
+        extra.len()
+    );
+    if !missing.is_empty() {
+        msg.push_str("\n缺:\n  ");
+        msg.push_str(&missing.join("\n  "));
+    }
+    if !extra.is_empty() {
+        msg.push_str("\n多:\n  ");
+        msg.push_str(&extra.join("\n  "));
+    }
+    msg.push_str("\n生成完整档的最快方式:\n  server -p <旧档> --print-config > <新档>.toml");
+    Err(msg)
 }
 
 /// 递归比对:schema 有的键,文件里必须有。
@@ -2266,6 +2236,50 @@ fn collect_missing(schema: &toml::Value, got: &toml::Value, prefix: &str, out: &
                     if let toml::Value::Table(_) = gv {
                         collect_missing(sv, gv, &path, out);
                     }
+                }
+            }
+        }
+    }
+}
+
+/// `Option` 字段的 NULL 值无法在 TOML 里表达；这些键允许在 full 中显式给出，
+/// 也允许缺省（其余键必须精确匹配）。
+const OPTIONAL_SCHEMA_KEYS: &[&str] = &[
+    "kvmem.dense_floor_mib",
+    "model.name",
+    "model.path",
+    "server.template_path",
+    "spec.draft_path",
+    "vision.path",
+];
+
+/// 递归比对:文件里有、schema 没有的键 = 多配（Option 键豁免）。
+fn collect_extra(schema: &toml::Value, got: &toml::Value, prefix: &str, out: &mut Vec<String>) {
+    let toml::Value::Table(gt) = got else {
+        return;
+    };
+    let schema_table = match schema {
+        toml::Value::Table(st) => Some(st),
+        _ => None,
+    };
+    for (k, gv) in gt {
+        let path = if prefix.is_empty() {
+            k.clone()
+        } else {
+            format!("{prefix}.{k}")
+        };
+        if OPTIONAL_SCHEMA_KEYS.contains(&path.as_str()) {
+            continue;
+        }
+        let Some(st) = schema_table else {
+            out.push(path);
+            continue;
+        };
+        match st.get(k) {
+            None => out.push(path),
+            Some(sv) => {
+                if let (toml::Value::Table(_), toml::Value::Table(_)) = (sv, gv) {
+                    collect_extra(sv, gv, &path, out);
                 }
             }
         }
@@ -3921,7 +3935,7 @@ mod extends_tests {
         write(&lone, "[runtime]\nmax_context_length = 8192\n");
         let e = OwlConfig::load_resolved(Some(&lone), &[], &[], Completeness::Enforce)
             .expect_err("半份档必须拒");
-        assert!(e.contains("未显式声明"), "{e}");
+        assert!(e.contains("未显式声明") || e.contains("不精确匹配"), "{e}");
         let _ = std::fs::remove_dir_all(&d);
     }
 

@@ -139,6 +139,6 @@ fn incomplete_profile_is_rejected_with_key_list() {
     let out = run(&["-p", path.to_str().expect("路径"), "--check"]);
     assert!(!out.status.success(), "缺字段应拒启");
     let s = format!("{}{}", String::from_utf8_lossy(&out.stderr), String::from_utf8_lossy(&out.stdout));
-    assert!(s.contains("未显式声明"), "应点名缺字段:\n{s}");
+    assert!(s.contains("未显式声明") || s.contains("不精确匹配"), "应点名缺字段:\n{s}");
     assert!(s.contains("kernel.gguf_tile"), "缺项应列出键路径:\n{s}");
 }

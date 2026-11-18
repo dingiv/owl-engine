@@ -34,11 +34,10 @@ template_vars = ""
 [runtime]
 # 满员姿态：reject | queue | queue:<ms>
 admission_on_full = "reject"
-# 单请求生成上限（未带 max_tokens 时默认用它；给了则 min(客户端, 本值)；
-# 另受 max_context_length − prompt 夹紧）
-max_generation_length = 32768
 # 上下文上限（token，prompt + 生成）
 max_context_length = 32768
+# 单请求生成上限（未带 max_tokens 时默认用它；给了则 min(客户端, 本值)；
+max_generation_length = 32768
 # prefill 块长；越大吞吐越高，但激活工作区也越大
 prefill_chunk = 512
 # 最大同时活跃请求数（gdn_slots / max_batch 由它派生）
@@ -101,6 +100,9 @@ disk_pool_size = 0
 disk_dir = ""
 # 前缀缓存（跨 turn / 跨会话复用）
 prefix_cache = true
+no_reclaim = false
+snap_host_mb = 0
+snap_disk_mb = 0
 
 [store.kv]
 # 主 KV 池 dtype：f16 | fp8 | int8
@@ -123,6 +125,7 @@ snap_tail = 12
 # [spec] —— 投机解码
 # ---------------------------------------------------------------------------
 [spec]
+draft = "auto"
 # 深度（0 = 关）
 depth = 0
 # 草稿检查点目录（depth > 0 时必填）
@@ -186,6 +189,9 @@ rep_penalty = 1.0
 staging_mb = 128
 # auto | device | cpu
 repack = "auto"
+verify = false
+debug_tap = false
+dump = false
 
 # ---------------------------------------------------------------------------
 # [kvmem] —— 池虚拟化 / 选择层（高级）
@@ -214,6 +220,11 @@ evict_policy = "lru"
 bulk_drop_when_tier_full = false
 pool_overcommit = false
 dense_floor_mib = 0
+coverage_probe = false
+analyze_at_ctx = 0
+coverage_scheme_probe = false
+coverage_scheme_min_ctx = 0
+coverage_analyze_every = 0
 
 # ---------------------------------------------------------------------------
 # [kernel] —— 算子臂（高级）
@@ -237,10 +248,51 @@ gguf_cublas = true
 gguf_mmq2 = true
 gguf_mmq = true
 gguf_smem = true
+force_naive_prefill = false
+resolve_trace = false
+host_argmax = false
+ts_probe = false
+tag_wildcard = false
 
 # ---------------------------------------------------------------------------
 # [log]
 # ---------------------------------------------------------------------------
+
+[probes]
+step_profile = false
+perf_level = "host"
+gdn_dump = false
+debug = false
+trace_gate = false
+dflash_probe = false
+draft_trace = false
+dflash_walk = "conditional"
+raw_completion = false
+q_dump = ""
+prompt_dump = false
+prefill_bisect = false
+live_diag = false
+step_gate = "off"
+step_gate_ms = 0
+step_gate_us = 0
+step_gate_every = 0
+
+[cuda]
+graph = true
+srv_timing = false
+cap_prof = false
+launch_sync = false
+sync_mask = 0
+launch_time = false
+d2h_prof = false
+gpu_prof = false
+free_legacy = false
+capture_slab_mb = 0
+trace_ring = 0
+
+[cuda.graph_flags]
+upload = false
+
 [log]
 # off | error | warn | info | debug | trace
 level = "warn"
