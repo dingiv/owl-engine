@@ -847,6 +847,188 @@ fn int8_decode_matches_host() {
 /// Fused NormRope→INT8 writers (production Q/K path): host reference.
 /// 这两个核是 prefill/decode 的生产写者,之前的 probe 只测了旧
 /// `quant_int8_qk` / `reshape_and_cache_int8`,覆盖不到这里的 group scale。
+/// PTH 两行 pack 核:与单行 PTH 在同一批 B=4/lens 递增长度上对拍。
+/// 这里刻意让 4 行共享同一条 bt 页链(verify 的真实契约)。
+#[test]
+fn int8_pth2_pair_matches_pth() {
+    let Some(dev) = owl_cuda::test_device_ordinal_opt() else {
+        owl_shared::testkit::report::skip("OWL_TEST_DEVICE 未设");
+        return;
+    };
+    const B: usize = 4;
+    const HQ: usize = 12;
+    const L: usize = 4096;
+    const PAGES: usize = L / PAGE;
+    const NP: usize = 4;
+    let mut res = fi_support::TestRes::new(dev);
+    let mut exec = Exec::new();
+    let mut r = Runner {
+        res: &mut res,
+        exec: &mut exec,
+        registry: None,
+    };
+
+    let q = (0..B * HQ * D)
+        .map(|i| {
+            let x = 0x1111u32
+                .wrapping_mul(0x9E37_79B9)
+                .wrapping_add((i as u32).wrapping_mul(0x85EB_CA6B));
+            (x >> 13) as u8
+        })
+        .collect::<Vec<u8>>();
+    let qs = lcg_f32(B * HQ * 8, 0x2222, 0.004, 0.004);
+    let k = (0..L * HKV * D)
+        .map(|i| {
+            let x = 0x3333u32
+                .wrapping_mul(0x9E37_79B9)
+                .wrapping_add((i as u32).wrapping_mul(0x85EB_CA6B));
+            (x >> 13) as u8
+        })
+        .collect::<Vec<u8>>();
+    let ks = lcg_f32(L * HKV * 8, 0x4444, 0.004, 0.004);
+    let vp = (0..L * HKV * D)
+        .map(|i| {
+            let x = 0x5555u32
+                .wrapping_mul(0x9E37_79B9)
+                .wrapping_add((i as u32).wrapping_mul(0x85EB_CA6B));
+            (x >> 13) as u8
+        })
+        .collect::<Vec<u8>>();
+    let vs = lcg_f32(L * HKV, 0x6666, 0.005, 0.005);
+    let mut bt: Vec<f32> = Vec::with_capacity(B * PAGES);
+    for _b in 0..B {
+        for p in 0..PAGES {
+            bt.push(p as f32);
+        }
+    }
+    let lens: Vec<f32> = (0..B).map(|b| (L - (B - b)) as f32).collect();
+    let qsb: Vec<u8> = qs.iter().flat_map(|x| x.to_le_bytes()).collect();
+    let ksb: Vec<u8> = ks.iter().flat_map(|x| x.to_le_bytes()).collect();
+    let vsb: Vec<u8> = vs.iter().flat_map(|x| x.to_le_bytes()).collect();
+    let btb: Vec<u8> = bt.iter().flat_map(|x| x.to_le_bytes()).collect();
+    let lensb: Vec<u8> = lens.iter().flat_map(|x| x.to_le_bytes()).collect();
+
+    let dq = r.alloc(q.len(), "p2.q").unwrap();
+    let dqs = r.alloc(qsb.len(), "p2.qs").unwrap();
+    let dk = r.alloc(k.len(), "p2.k").unwrap();
+    let dks = r.alloc(ksb.len(), "p2.ks").unwrap();
+    let dvp = r.alloc(vp.len(), "p2.vp").unwrap();
+    let dvs = r.alloc(vsb.len(), "p2.vs").unwrap();
+    let dbt = r.alloc(btb.len(), "p2.bt").unwrap();
+    let dlens = r.alloc(lensb.len(), "p2.lens").unwrap();
+    let dpart = r.alloc(B * HQ * NP * D * 4, "p2.part").unwrap();
+    let dstat = r.alloc(B * HQ * NP * 2 * 4, "p2.stat").unwrap();
+    let dout = r.alloc(B * HQ * D * 2, "p2.out").unwrap();
+    let dold = r.alloc(B * HQ * D * 2, "p2.old").unwrap();
+    r.upload(dq, &q).unwrap();
+    r.upload(dqs, &qsb).unwrap();
+    r.upload(dk, &k).unwrap();
+    r.upload(dks, &ksb).unwrap();
+    r.upload(dvp, &vp).unwrap();
+    r.upload(dvs, &vsb).unwrap();
+    r.upload(dbt, &btb).unwrap();
+    r.upload(dlens, &lensb).unwrap();
+    r.sync().unwrap();
+
+    let mut run = |name: &'static str, grid_y: usize, smem: u32, dst: CheckBuf| {
+        let vals = [
+            LaunchVal::Ptr(dq.ptr),
+            LaunchVal::Ptr(dqs.ptr),
+            LaunchVal::Ptr(dk.ptr),
+            LaunchVal::Ptr(dks.ptr),
+            LaunchVal::Ptr(dvp.ptr),
+            LaunchVal::Ptr(dvs.ptr),
+            LaunchVal::Ptr(dbt.ptr),
+            LaunchVal::Ptr(dlens.ptr),
+            LaunchVal::Ptr(dpart.ptr),
+            LaunchVal::Ptr(dstat.ptr),
+            LaunchVal::Ptr(dout.ptr),
+            LaunchVal::I32(B as i32),
+            LaunchVal::I32(HQ as i32),
+            LaunchVal::I32(HKV as i32),
+            LaunchVal::I32(PAGE as i32),
+            LaunchVal::I32(PAGES as i32),
+            LaunchVal::I32(NP as i32),
+            LaunchVal::I32(-1),
+            LaunchVal::Ptr(dout.ptr),
+            LaunchVal::Ptr(dout.ptr),
+        ];
+        let block = if name.contains("pth2") { 384 } else { 256 };
+        r.launch_aot(
+            name,
+            "cu/attn/int8_decode.cu",
+            (HKV as u32, grid_y as u32, NP as u32),
+            (block, 1, 1),
+            smem,
+            &vals,
+        )
+        .unwrap();
+        let rrvals = [
+            LaunchVal::Ptr(dpart.ptr),
+            LaunchVal::Ptr(dstat.ptr),
+            LaunchVal::Ptr(dout.ptr),
+            LaunchVal::Ptr(dst.ptr),
+            LaunchVal::I32(B as i32),
+            LaunchVal::I32(HQ as i32),
+            LaunchVal::I32(NP as i32),
+            LaunchVal::I32(D as i32),
+        ];
+        r.launch_aot(
+            "owl_int8_decode_reduce",
+            "cu/attn/int8_decode.cu",
+            (HQ as u32, B as u32, 1),
+            (256, 1, 1),
+            0,
+            &rrvals,
+        )
+        .unwrap();
+    };
+
+    run("owl_int8_decode_pth_pc_split", B, 78944, dold);
+    run("owl_int8_decode_pth2_pc_split", (B + 1) / 2, 81344, dout);
+    r.sync().unwrap();
+    let mut old = vec![0u8; B * HQ * D * 2];
+    let mut new = vec![0u8; B * HQ * D * 2];
+    r.download(
+        CheckBuf {
+            ptr: dold.ptr,
+            bytes: old.len(),
+        },
+        &mut old,
+    )
+    .unwrap();
+    r.download(
+        CheckBuf {
+            ptr: dout.ptr,
+            bytes: new.len(),
+        },
+        &mut new,
+    )
+    .unwrap();
+    let oldf: Vec<f32> = old
+        .chunks_exact(2)
+        .map(|c| f16_to_f32(u16::from_le_bytes([c[0], c[1]])))
+        .collect();
+    let newf: Vec<f32> = new
+        .chunks_exact(2)
+        .map(|c| f16_to_f32(u16::from_le_bytes([c[0], c[1]])))
+        .collect();
+    let mut mx = 0f32;
+    let mut dot = 0f64;
+    let mut na = 0f64;
+    let mut nb = 0f64;
+    for (a, b) in oldf.iter().zip(&newf) {
+        mx = mx.max((a - b).abs());
+        dot += *a as f64 * *b as f64;
+        na += *a as f64 * *a as f64;
+        nb += *b as f64 * *b as f64;
+    }
+    let cos = dot / (na.sqrt() * nb.sqrt() + 1e-30);
+    println!("[int8-pth2] pair vs pth max|d|={mx:.6} cos={cos:.9}");
+    assert!(cos > 0.9999, "pth2 cos {cos}");
+    assert!(mx < 8e-2, "pth2 max|d| {mx}");
+}
+
 #[test]
 fn fused_qk_writers_match_host() {
     let Some(dev) = owl_cuda::test_device_ordinal_opt() else {
@@ -1375,5 +1557,155 @@ fn int8_decode_nparts_timing_65k() {
             both,
             both.saturating_sub(split)
         );
+    }
+}
+
+/// **spec verify B=8 / 147k 分片计时**（2026-11-19）：PTH vs GQA TC。
+/// 只测 attention 核本身，不跑整模；用生产 TP2 形状 HQ=12/HKV=2。
+#[test]
+fn int8_verify_b8_147k_timing() {
+    let Some(dev) = owl_cuda::test_device_ordinal_opt() else {
+        owl_shared::testkit::report::skip("OWL_TEST_DEVICE 未设");
+        return;
+    };
+    const HQ: usize = 12;
+    const HKV: usize = 2;
+    const B: usize = 8;
+    let l: usize = std::env::var("OWL_VERIFY_LEN")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(147_456);
+    let pages = l / PAGE;
+    const NP_MAX: usize = 128;
+    let mut res = fi_support::TestRes::new(dev);
+    let mut exec = Exec::new();
+    let mut r = Runner {
+        res: &mut res,
+        exec: &mut exec,
+        registry: None,
+    };
+
+    let q = (0..B * HQ * D)
+        .map(|i| {
+            let x = 0x1111u32
+                .wrapping_mul(0x9E37_79B9)
+                .wrapping_add((i as u32).wrapping_mul(0x85EB_CA6B));
+            (x >> 13) as u8
+        })
+        .collect::<Vec<u8>>();
+    let qs = lcg_f32(B * HQ * 8, 0x2222, 0.004, 0.004);
+    let k = (0..l * HKV * D)
+        .map(|i| {
+            let x = 0x3333u32
+                .wrapping_mul(0x9E37_79B9)
+                .wrapping_add((i as u32).wrapping_mul(0x85EB_CA6B));
+            (x >> 13) as u8
+        })
+        .collect::<Vec<u8>>();
+    let ks = lcg_f32(l * HKV * 8, 0x4444, 0.004, 0.004);
+    let vp = (0..l * HKV * D)
+        .map(|i| {
+            let x = 0x5555u32
+                .wrapping_mul(0x9E37_79B9)
+                .wrapping_add((i as u32).wrapping_mul(0x85EB_CA6B));
+            (x >> 13) as u8
+        })
+        .collect::<Vec<u8>>();
+    let vs = lcg_f32(l * HKV, 0x6666, 0.005, 0.005);
+    let mut bt: Vec<f32> = Vec::with_capacity(B * pages);
+    for _b in 0..B {
+        for p in 0..pages {
+            bt.push(p as f32);
+        }
+    }
+    let lens: Vec<f32> = (0..B).map(|b| (l - (B - b)) as f32).collect();
+    let qsb: Vec<u8> = qs.iter().flat_map(|x| x.to_le_bytes()).collect();
+    let ksb: Vec<u8> = ks.iter().flat_map(|x| x.to_le_bytes()).collect();
+    let vsb: Vec<u8> = vs.iter().flat_map(|x| x.to_le_bytes()).collect();
+    let btb: Vec<u8> = bt.iter().flat_map(|x| x.to_le_bytes()).collect();
+    let lensb: Vec<u8> = lens.iter().flat_map(|x| x.to_le_bytes()).collect();
+
+    let dq = r.alloc(q.len(), "v8.q").unwrap();
+    let dqs = r.alloc(qsb.len(), "v8.qs").unwrap();
+    let dk = r.alloc(k.len(), "v8.k").unwrap();
+    let dks = r.alloc(ksb.len(), "v8.ks").unwrap();
+    let dvp = r.alloc(vp.len(), "v8.vp").unwrap();
+    let dvs = r.alloc(vsb.len(), "v8.vs").unwrap();
+    let dbt = r.alloc(btb.len(), "v8.bt").unwrap();
+    let dlens = r.alloc(lensb.len(), "v8.lens").unwrap();
+    let dpart = r.alloc(B * HQ * NP_MAX * D * 4, "v8.part").unwrap();
+    let dstat = r.alloc(B * HQ * NP_MAX * 2 * 4, "v8.stat").unwrap();
+    let ddep = r.alloc(B * HQ * D * 2, "v8.dep").unwrap();
+    r.upload(dq, &q).unwrap();
+    r.upload(dqs, &qsb).unwrap();
+    r.upload(dk, &k).unwrap();
+    r.upload(dks, &ksb).unwrap();
+    r.upload(dvp, &vp).unwrap();
+    r.upload(dvs, &vsb).unwrap();
+    r.upload(dbt, &btb).unwrap();
+    r.upload(dlens, &lensb).unwrap();
+    r.sync().unwrap();
+
+    for nparts in [21usize, 34, 56, 64, 128] {
+        let svals = [
+            LaunchVal::Ptr(dq.ptr),
+            LaunchVal::Ptr(dqs.ptr),
+            LaunchVal::Ptr(dk.ptr),
+            LaunchVal::Ptr(dks.ptr),
+            LaunchVal::Ptr(dvp.ptr),
+            LaunchVal::Ptr(dvs.ptr),
+            LaunchVal::Ptr(dbt.ptr),
+            LaunchVal::Ptr(dlens.ptr),
+            LaunchVal::Ptr(dpart.ptr),
+            LaunchVal::Ptr(dstat.ptr),
+            LaunchVal::Ptr(ddep.ptr),
+            LaunchVal::I32(B as i32),
+            LaunchVal::I32(HQ as i32),
+            LaunchVal::I32(HKV as i32),
+            LaunchVal::I32(PAGE as i32),
+            LaunchVal::I32(pages as i32),
+            LaunchVal::I32(nparts as i32),
+            LaunchVal::I32(-1),
+            LaunchVal::Ptr(ddep.ptr),
+            LaunchVal::Ptr(ddep.ptr),
+        ];
+        for (tag, name, smem) in [
+            ("pth", "owl_int8_decode_pth_pc_split", 78944u32),
+            ("pth2", "owl_int8_decode_pth2_pc_split", 81344u32),
+            ("gqa", "owl_int8_decode_gqa_tc_split", 0u32),
+        ] {
+            let grid_y = if tag == "pth2" { B.div_ceil(2) } else { B };
+            for _ in 0..2 {
+                let block = if tag == "pth2" { 384 } else { 256 };
+                r.launch_aot(
+                    name,
+                    "cu/attn/int8_decode.cu",
+                    (HKV as u32, grid_y as u32, nparts as u32),
+                    (block, 1, 1),
+                    smem,
+                    &svals,
+                )
+                .unwrap();
+            }
+            r.sync().unwrap();
+            let t0 = std::time::Instant::now();
+            for _ in 0..3 {
+                let block = if tag == "pth2" { 384 } else { 256 };
+                r.launch_aot(
+                    name,
+                    "cu/attn/int8_decode.cu",
+                    (HKV as u32, grid_y as u32, nparts as u32),
+                    (block, 1, 1),
+                    smem,
+                    &svals,
+                )
+                .unwrap();
+            }
+            r.sync().unwrap();
+            println!(
+                "[int8-verify-b8] {tag} nparts={nparts} split={:?}",
+                t0.elapsed() / 3
+            );
+        }
     }
 }

@@ -1370,7 +1370,11 @@ impl Attention {
         }
         let partial_out = s2.tmp_out.slice_view(0, vec![partial_elems]);
         let partial_stat = s2.tmp_out.slice_view(partial_elems, vec![stat_elems]);
-        let split = TensorOps::call(if pth_ok {
+        // verify 的 bt8 是同一页链的 depth1 行平铺(逐行 kv_lens 不同),
+        // 相邻两行共享 K/V ⇒ tokens>1 走两行 pack 核,K/V 只读一遍。
+        let split = TensorOps::call(if pth_ok && tokens > 1 {
+            SemanticKernel::Int8DecodePth2PcSplit
+        } else if pth_ok {
             SemanticKernel::Int8DecodePthPcSplit
         } else {
             SemanticKernel::Int8DecodeGqaTcSplit
@@ -1394,6 +1398,7 @@ impl Attention {
         .arg_i32(pol.page as i32)
         .arg_i32(bt_stride as i32)
         .arg_i32(nparts as i32)
+        .arg_i32(-1) // verify: 逐行 kv_lens
         .with_shape(Dtype::F16, vec![1]);
         let y = TensorOps::call(SemanticKernel::Int8DecodeReduce)
             .aux(&[tokens, self.hq, nparts])

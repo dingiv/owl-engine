@@ -278,6 +278,7 @@ pub fn resolve(req: OpReq) -> KernelPick {
         "attn.int8_decode_split" => attn::int8_decode_split(ax(0), ax(1), ax(2)), // aux=[B,hq,nparts]
         "attn.int8_decode_gqa_tc" => attn::int8_decode_gqa_tc_split(ax(0), ax(2), ax(3)), // aux=[B,hq,hkv,nparts]
         "attn.int8_decode_pth_pc" => attn::int8_decode_pth_pc_split(ax(0), ax(2), ax(3)), // aux=[B,hq,hkv,nparts]
+        "attn.int8_decode_pth2_pc" => attn::int8_decode_pth2_pc_split(ax(0), ax(2), ax(3)), // aux=[B,hq,hkv,nparts]
         "attn.int8_decode_reduce" => attn::int8_decode_reduce(ax(0), ax(1)), // aux=[B,hq]
         "attn.paged_decode" => attn::paged_decode_v1(req.env, dt, ax(0), ax(1), ax(2), ax(3)), // aux = [hd, hq, hkv, nb]
         "attn.paged_decode_v2" => {
@@ -2302,6 +2303,15 @@ pub mod attn {
             grid: (hkv as u32, batch as u32, nparts as u32),
             block: (256, 1, 1),
             smem: 78944,
+        })
+    }
+
+    /// int8 verify PTH 两行 pack:grid.y = ceil(B/2);其余几何同 PTH。
+    pub fn int8_decode_pth2_pc_split(batch: usize, hkv: usize, nparts: usize) -> KernelPick {
+        KernelPick::of::<crate::ops::attn::Int8DecodePth2PcSplit>(Shape {
+            grid: (hkv as u32, batch.div_ceil(2) as u32, nparts as u32),
+            block: (384, 1, 1),
+            smem: 81344,
         })
     }
 

@@ -1171,15 +1171,27 @@ fn build_ops_table(out_dir: &std::path::Path) {
         // 本项目的稳定分段约定(所有 ops 文件都把测试放文件尾)。
         let prod = text.split("#[cfg(test)]").next().unwrap_or(&text);
         let mut names = Vec::new();
-        for (lineno, line) in prod.lines().enumerate() {
+        // 声明可以跨行（rustfmt 会把长 `meta_of::<T>()` 折到下一行）——按
+        // **分号**收完整条声明再解析，不能只看首行。否则被折行的算子会从
+        // total 表静默消失（2026-11-19 FP8 qknorm 准入事故的根因）。
+        let mut lines = prod.lines().enumerate();
+        while let Some((lineno, line)) = lines.next() {
             let t = line.trim();
             let Some(rest) = t.strip_prefix("pub static ") else {
                 continue;
             };
-            if !rest.contains(": KernelMeta = meta_of::<") {
+            let mut decl = rest.to_string();
+            while !decl.contains(';') {
+                let Some((_, next)) = lines.next() else {
+                    break;
+                };
+                decl.push(' ');
+                decl.push_str(next.trim());
+            }
+            if !decl.contains(": KernelMeta = meta_of::<") {
                 continue;
             }
-            let name = rest.split(':').next().unwrap().trim();
+            let name = decl.split(':').next().unwrap_or("").trim();
             assert!(
                 !name.is_empty()
                     && name

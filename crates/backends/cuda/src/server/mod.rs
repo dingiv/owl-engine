@@ -1163,6 +1163,93 @@ impl GpuServer {
         self.sink.timer("srv.seg.alloc", t0.elapsed());
     }
 
+    /// **硬预算 + 池缓存应急回收（alloc / htod 共用，2026-11-22）**。
+    ///
+    /// 单请求在窗口内时，`vram-guard` 不能因为“池里还有已 free 的缓存页”就
+    /// 拒发：`RELEASE_THRESHOLD=∞` 下这些页仍算 reserved，驱动 free 看起来
+    /// 很小；先排空流再 `cuMemPoolTrimTo(0)`，复判通过就放行。两条入口
+    /// （`Alloc` 与 `Htod`）必须走同一条判据，否则图像上传路径会绕过回收。
+    pub(crate) fn vram_guard_with_reclaim(&mut self, n_bytes: usize) -> Result<(), ModelError> {
+        let reserve_b = self.diag.vram_activation_reserve << 20;
+        let first = self.vram_guard.check(n_bytes, reserve_b, &self.vram);
+        let e = match first {
+            Ok(()) => return Ok(()),
+            Err(e) => e,
+        };
+        // 异步 free 要等事件落地才进池的空闲页表；先排空四条流，再 trim。
+        for sid in [STREAM_H2D, STREAM_COMPUTE, STREAM_COMPUTE_AUX, STREAM_D2H] {
+            if let Ok(st) = self.ctx().stream(sid) {
+                if let Err(e) = st.synchronize() {
+                    self.sink.logf(
+                        owl_shared::log::LVL_WARN,
+                        "vram-budget",
+                        format_args!("硬预算前排空失败(stream {sid}): {e:?}"),
+                    );
+                }
+            }
+        }
+        let trimmed = self.ctx_mut().mem_pool_trim();
+        let freed = trimmed.as_ref().ok().copied().unwrap_or(0);
+        let retry_ok = trimmed.is_ok()
+            && freed > 0
+            && self
+                .vram_guard
+                .check(n_bytes, reserve_b, &self.vram)
+                .is_ok();
+        if retry_ok {
+            self.sink.logf(
+                owl_shared::log::LVL_INFO,
+                "vram-budget",
+                format_args!(
+                    "硬预算前回收默认池缓存 {freed}B({:.1}MiB)⇒ 复判通过(本次分配 {}B)",
+                    freed as f64 / 1048576.0,
+                    n_bytes
+                ),
+            );
+            return Ok(());
+        }
+        if trimmed.is_err() {
+            self.sink.logf(
+                owl_shared::log::LVL_WARN,
+                "vram-budget",
+                format_args!(
+                    "硬预算前池缓存回收失败:{}",
+                    trimmed
+                        .as_ref()
+                        .err()
+                        .map(|t| t.to_string())
+                        .unwrap_or_default()
+                ),
+            );
+        }
+        let pool = crate::state::pool_ledger_snapshot()
+            .map(|(u, uh, r, rh)| {
+                format!(
+                    "池 used={}MiB(高水 {}MiB)/reserved={}MiB(高水 {}MiB)",
+                    u >> 20,
+                    uh >> 20,
+                    r >> 20,
+                    rh >> 20
+                )
+            })
+            .unwrap_or_else(|| "池账不可读".to_string());
+        let free = cudarc::driver::result::mem_get_info()
+            .map(|(f, t)| format!("驱动 free={}MiB/total={}MiB", f >> 20, t >> 20))
+            .unwrap_or_else(|e| format!("mem_get_info 失败: {e:?}"));
+        self.dump_vram_on_oom();
+        self.sink.logf(
+            owl_shared::log::LVL_WARN,
+            "vram-budget",
+            format_args!(
+                "硬预算拒发 {}B / {:.1}MiB:{e} ‖ {pool} ‖ {free} ‖ 引擎 live={}MiB",
+                n_bytes,
+                n_bytes as f64 / 1048576.0,
+                owl_shared::vram::live_bytes() >> 20
+            ),
+        );
+        Err(e)
+    }
+
     fn handle_alloc_inner(
         &mut self,
         n_bytes: usize,
@@ -1200,89 +1287,10 @@ impl GpuServer {
             return ack.send(result);
         }
         // ── 显存硬预算(2026-10-16):**主动拒发**,不去 malloc ──
-        // 判据见 `crate::state::VramGuard::check`（驱动 free − reserve；可选叠
-        // live 账上限）。拒发 = 结构化 `PoolExhausted` + 一条 WARN（带池账/驱动账）。
-        let guard_check = |g: &mut crate::state::VramGuard,
-                           vram: &VramAccount,
-                           reserve: u64|
-         -> Result<(), ModelError> { g.check(n_bytes, reserve, vram) };
-        let reserve_b = self.diag.vram_activation_reserve << 20;
-        let first = guard_check(&mut self.vram_guard, &self.vram, reserve_b);
-        if let Err(e) = first {
-            // **池缓存应急回收(2026-10-20 §23.9)**:`RELEASE_THRESHOLD=∞` 下
-            // 已 free 的块仍占物理显存 ⇒ "驱动 free 告急"常是**池缓存**不是 live。
-            // 拒发前先 trim 一次(块账不变),复判通过就放行;不通过才响亮拒。
-            // 先把四条流排空(异步 free 要等事件落地才进池的"空闲页"表),再 trim
-            for sid in [STREAM_H2D, STREAM_COMPUTE, STREAM_COMPUTE_AUX, STREAM_D2H] {
-                if let Ok(st) = self.ctx().stream(sid) {
-                    if let Err(e) = st.synchronize() {
-                        self.sink.logf(
-                            owl_shared::log::LVL_WARN,
-                            "vram-budget",
-                            format_args!("硬预算前排空失败(stream {sid}): {e:?}"),
-                        );
-                    }
-                }
-            }
-            let trimmed = self.ctx_mut().mem_pool_trim();
-            let freed = trimmed.as_ref().ok().copied().unwrap_or(0);
-            let retry_ok = trimmed.is_ok()
-                && freed > 0
-                && guard_check(&mut self.vram_guard, &self.vram, reserve_b).is_ok();
-            if retry_ok {
-                self.sink.logf(
-                    owl_shared::log::LVL_INFO,
-                    "vram-budget",
-                    format_args!(
-                        "硬预算前回收默认池缓存 {freed}B({:.1}MiB)⇒ 复判通过(本次分配 {}B)",
-                        freed as f64 / 1048576.0,
-                        n_bytes
-                    ),
-                );
-            } else {
-                if trimmed.is_err() {
-                    self.sink.logf(
-                        owl_shared::log::LVL_WARN,
-                        "vram-budget",
-                        format_args!(
-                            "硬预算前池缓存回收失败:{}",
-                            trimmed
-                                .as_ref()
-                                .err()
-                                .map(|t| t.to_string())
-                                .unwrap_or_default()
-                        ),
-                    );
-                }
-                let pool = crate::state::pool_ledger_snapshot()
-                    .map(|(u, uh, r, rh)| {
-                        format!(
-                            "池 used={}MiB(高水 {}MiB)/reserved={}MiB(高水 {}MiB)",
-                            u >> 20,
-                            uh >> 20,
-                            r >> 20,
-                            rh >> 20
-                        )
-                    })
-                    .unwrap_or_else(|| "池账不可读".to_string());
-                let free = cudarc::driver::result::mem_get_info()
-                    .map(|(f, t)| format!("驱动 free={}MiB/total={}MiB", f >> 20, t >> 20))
-                    .unwrap_or_else(|e| format!("mem_get_info 失败: {e:?}"));
-                // 守卫失败也是"现场":把块账落盘(`OWL_VRAM_DUMP` 门控),否则只能看到
-                // 总数,看不到"谁还活着"。
-                self.dump_vram_on_oom();
-                self.sink.logf(
-                    owl_shared::log::LVL_WARN,
-                    "vram-budget",
-                    format_args!(
-                        "硬预算拒发 {}B / {:.1}MiB:{e} ‖ {pool} ‖ {free} ‖ 引擎 live={}MiB",
-                        n_bytes,
-                        n_bytes as f64 / 1048576.0,
-                        owl_shared::vram::live_bytes() >> 20
-                    ),
-                );
-                return ack.send(Err(e));
-            }
+        // 判据 = `VramGuard::check`（驱动 free − reserve）；失败先走池缓存
+        // 应急回收，复判不过才响亮拒。`Htod` 走同一条 helper（图像上传）。
+        if let Err(e) = self.vram_guard_with_reclaim(n_bytes) {
+            return ack.send(Err(e));
         }
         // **大额分配取证**(2026-10-20 §23.9):池 `used_high` 高出 live 基线 GB 级
         // 时,先要知道"谁";≥256 MiB 的单笔在 info 级别点名(每 turn 至多几笔)。

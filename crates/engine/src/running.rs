@@ -2809,6 +2809,41 @@ impl<D: DeviceClient> RunningEngine<D> {
         Ok((freed, slots, host_kv, host_snap))
     }
 
+    /// **准入兜底：淘汰最冷空闲会话**（2026-11-22 用户裁决）。
+    ///
+    /// 单请求只要 `ctx < max_context_length`，就不能因为 idle 会话的
+    /// `session_held` 历史被拒；先按 LRU 关掉最冷空闲会话并逐掉其缓存独占块
+    /// （内容真丢），把设备页还给池，再让调用方重判。活跃/排队会话不参与。
+    ///
+    /// 返回 `true` = 确实淘汰了会话（调用方必须重新 `rel.check`）。
+    pub(crate) fn evict_cold_sessions_for_admission(
+        &mut self,
+        floor: owl_store::TurnFloor,
+        new_ctx_tokens: usize,
+    ) -> Result<bool> {
+        let page = self.dev.pool.geom.page.max(1);
+        let need_pages = floor.floor_pages(new_ctx_tokens, page);
+        let free = self.bank.parts().rel.slots_free();
+        let total = self.bank.parts().rel.slots_total();
+        let want_free = free.saturating_add(need_pages).min(total);
+        let held = self.bank.parts().rel.admission().session_held_bytes();
+        if held == 0 || want_free <= free {
+            return Ok(false);
+        }
+        let (n, pages) = self.evict_cold_sessions(want_free);
+        if n == 0 {
+            return Ok(false);
+        }
+        self.sync_pool_account()?;
+        owl_shared::log_warn!(
+            "store",
+            "准入兜底：淘汰最冷空闲会话 {n} 个 / 腾 {pages} 页\
+             （地板 {need_pages} 页，free {free}→{}）",
+            self.bank.parts().rel.slots_free()
+        );
+        Ok(true)
+    }
+
     /// **整会话淘汰到自由页目标**（原始算法 §30/§32；2026-11-16）。
     ///
     /// 次序（每淘汰一个会话）：
@@ -3565,7 +3600,22 @@ impl<D: DeviceClient> RunningEngine<D> {
             self.reject_queued_turn(turn_id, "no_memory", format!("准入拒绝：{reason}"), None)?;
             return Ok(());
         }
-        match self.bank.parts().rel.check(floor, new_ctx_tokens) {
+        let mut verdict = self.bank.parts().rel.check(floor, new_ctx_tokens);
+        // **准入兜底（2026-11-22 用户裁决）**：单请求只要在窗口内，就不能被
+        // idle 会话的 `session_held` 历史挡住。`session_held` 当前是“不可动面”
+        // （引用 > 1），所以 `evictable` 会算成 0 ⇒ Strict 直接拒；这里先按
+        // LRU 淘汰最冷空闲会话（内容真丢，等价于用户允许的“过期掉已有 KV”），
+        // 再重判。活跃/排队会话由 `evict_cold_sessions` 自己排除。
+        if matches!(
+            verdict,
+            AdmissionVerdict::Reject { .. } | AdmissionVerdict::Queue { .. }
+        ) {
+            let evicted = self.evict_cold_sessions_for_admission(floor, new_ctx_tokens)?;
+            if evicted {
+                verdict = self.bank.parts().rel.check(floor, new_ctx_tokens);
+            }
+        }
+        match verdict {
             AdmissionVerdict::Admit { floor_bytes } => {
                 self.turns.admit_wait = None;
                 // **实得地板回吐**(设计卷 §2.4 报告面):请求页 / 实得页 / 上下文页。

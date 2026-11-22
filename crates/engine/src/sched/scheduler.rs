@@ -2485,6 +2485,29 @@ impl<D: DeviceClient> RunningEngine<D> {
             reserved_slots,
             alloc_slots,
         );
+        // **准入兜底（2026-11-22 用户裁决）**：`admission_gate` 的地板预检
+        // 可能放行，但完整预算（ctx + max_new）仍可能被 idle 会话的
+        // `session_held` 挡住。单请求只要在窗口内，就先淘汰最冷空闲会话，
+        // 再按同一组参数重 plan；不允许在“池装得下”的情况下返回 429。
+        let plan = if matches!(
+            plan.verdict,
+            owl_store::AdmissionVerdict::Reject { .. } | owl_store::AdmissionVerdict::Queue { .. }
+        ) {
+            let evicted = self.evict_cold_sessions_for_admission(floor, ctx_tokens)?;
+            if evicted {
+                self.bank.parts().rel.plan_admission(
+                    turn,
+                    floor,
+                    ctx_tokens,
+                    reserved_slots,
+                    alloc_slots,
+                )
+            } else {
+                plan
+            }
+        } else {
+            plan
+        };
         let plan = match plan.verdict.clone() {
             owl_store::AdmissionVerdict::EvictThen { need_bytes, .. } => {
                 // store 说“先腾位”：engine 按 need 执行搬迁/下沉；

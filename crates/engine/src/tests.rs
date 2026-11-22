@@ -487,6 +487,66 @@ async fn pressure_evicts_cold_sessions_whole() {
     );
 }
 
+/// **单请求不得被 idle 会话历史拒绝**（2026-11-22 用户裁决）。
+///
+/// 场景 = 3 条已收口的空闲会话占着 `session_held`，池还剩不到一条
+/// 180-token 请求的空间。旧行为：`evictable_bytes=0` ⇒ Strict 直接
+/// `no_memory`；新行为：准入兜底先淘汰最冷空闲会话（内容真丢），
+/// 再放行。请求本身 < max_context，必须 Completed。
+#[cfg(test)]
+#[tokio::test]
+async fn admission_evicts_cold_sessions_instead_of_rejecting_single_request() {
+    let mut knobs = EngineKnobs {
+        sampler_enabled: false,
+        max_batch: 1,
+        gdn_slots: 2,
+        raw_completion: true,
+        prefix_cache: true,
+        ..Default::default()
+    };
+    knobs.pool_tokens = Some(256);
+    knobs.ram_pool_size = 72;
+    knobs.snap_max = 1;
+    let mut running = mock_engine_with(knobs).await;
+
+    for i in 0..3u32 {
+        let mut p = format!("{i} ");
+        while running.boot.tok.encode(&p).len() < 80 {
+            p.push_str("alpha beta gamma delta ");
+        }
+        let (_sid, tid) = running
+            .submit_session_opts(None, p, 4, Default::default())
+            .expect("submit old");
+        loop {
+            match running.pump().await.expect("pump old") {
+                TurnEvent::Completed { turn, .. } if turn == tid => break,
+                TurnEvent::Failed { turn, err } => panic!("old turn {turn} 失败: {err}"),
+                TurnEvent::Idle => panic!("old turn {tid} 丢失"),
+                _ => {}
+            }
+        }
+    }
+    assert_eq!(running.bank.parts().sessions.len(), 3);
+
+    let mut p = "99 ".to_string();
+    while running.boot.tok.encode(&p).len() < 180 {
+        p.push_str("omega sigma tau ");
+    }
+    let (_sid, tid) = running
+        .submit_session_opts(None, p, 4, Default::default())
+        .expect("submit single request");
+    loop {
+        match running.pump().await.expect("pump single") {
+            TurnEvent::Completed { turn, .. } if turn == tid => break,
+            TurnEvent::Failed { turn, err } => {
+                panic!("单请求被拒（应淘汰空闲会话）: turn {turn}: {err}")
+            }
+            TurnEvent::Idle => panic!("单请求 turn {tid} 丢失"),
+            _ => {}
+        }
+    }
+}
+
 /// **准入预留 = 上下文 + 本请求的 max_tokens**（2026-11-17 裁决 A）。
 ///
 /// - 预留 = 请求值（先被 `max_generation_length` 与 `max_context_length − prompt` 夹过）；

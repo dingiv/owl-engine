@@ -2324,3 +2324,174 @@ PTH 对照实验定谳“V 池布局也是 decode 的一半收益”后，生产
 - 313 models / 215 engine / 5 pipeline / 6 prefill 单测全绿；3090 65k
   kernel 160.5us，3080 TP2 65k e2e 51.8 t/s（旧 47.1~47.4）。
   prefill transpose 向量化后 65k e2e 1629 t/s（旧 1691，−3.7%）。
+
+## 2026-11-19：147k verify(B=8) 算子级复核与 PTH 小刀
+
+### 口径
+
+- 2×3080 20G TP2，W4A8 + INT8 KV，DFlash2 d7，147,829 tok / 320 out。
+- 引擎 CUPTI（`--perf-level gpu` + `--features perf,cupti`），
+  `/debug/perf/epoch/gpu`；微基准
+  `int8_pipeline_probe::int8_verify_b8_147k_timing`（B=8，HQ=12/HKV=2）。
+
+### 真账（单 rank，121 轮）
+
+| 项 | 数值 |
+|---|---:|
+| verify 图 GPU 总时 | 2.66 s / 121 = **22.0 ms/轮** |
+| `owl_int8_decode_pth_pc_split` | 1.96 s / 121 = **16.2 ms/轮** |
+| 每层 PTH | **1.01 ms/layer** |
+| `owl_int8_decode_reduce` | 15 ms / 1936 ≈ 0.008 ms/层 |
+
+⇒ spec verify 的 GPU 主体是 INT8 PTH，不是 reduce、不是 GDN；
+PTH 的 8 行各读一遍 K/V，是当前 decode 的第一大头。
+
+### 微基准（147k，nparts sweep）
+
+| nparts | PTH split | GQA TC split |
+|---:|---:|---:|
+| 21 | 1.095 ms | 5.38 ms |
+| 34 | 1.095 ms | 4.42 ms |
+| 56 | 1.110 ms | 4.73 ms |
+| 128 | 1.011 ms | 4.00 ms |
+
+nparts 对 PTH 基本不敏感（21/34/56 同档）；GQA 256 片慢 4×。
+生产 verify 仍取 34（65k 最优档），不要改成 128——端到端实测
+`spec.verify` 39.6ms，反而比 34 的 38.7ms 慢（AL/文本也不同）。
+
+### 已试但**不落**的结构改动
+
+| 改动 | 微基准 B=8/147k | 结论 |
+|---|---:|---|
+| 8 compute warps（4+8） | 1.05 ms | 无收益；1 CTA/SM，寄存器/同步抵掉 |
+| 单缓冲 K/V（43.9KiB，2 CTA/SM） | 1.44 ms | 更慢；失去 producer/consumer 预取 |
+| B-fast grid（batch 放 grid.x） | 1.10 ms | 无收益；K/V 不是单纯 HBM 瓶颈 |
+| GQA TC split 替 PTH | 4.0–4.4 ms | 否决 |
+
+### 落地的唯一小刀：PTH softmax `ex2.approx`
+
+`pthpc` softmax 原用 libdevice `expf`；改为文档 §0.17.6 同款
+`ex2.approx.ftz.f32`（乘 log2e）：
+
+```text
+alpha/p0/p1 = ex2f_fast(delta * 1.4426950408889634f)
+```
+
+- host parity：`int8_decode_matches_host` 仍过（cos 0.999999964，
+  max|d| 0.015625，阈值 8e-2）；
+- 147k B=8 微基准：1.095 → **1.063 ms/layer**（约 −3%）；
+- 生产 147k：`spec.verify` 38.7 → **37.9 ms**（AL/文本不同，
+  仅作方向；单轮噪声约 ±1ms）。
+
+### 还没做的大刀
+
+PTH 的 8 个 verify 行仍各读一遍同一段 K/V。真正能再降一档的是
+**两行/CTA 的 pack 变体**（QK m16 的 padding 8 行装第二行，K/V 只读
+一次，PV 两份 acc），预期把 16.2ms/轮压到 ~9–11ms；本轮未落，
+因为 PTH 的 QK/PV 寄存器与 P 行映射需要单独重构并过 needle 门。
+在此之前，**不要**再把 nparts/occupancy 当杠杆（本轮已证否）。
+
+## 2026-11-19 晚：verify 两行 pack 实验（agent 追问）
+
+> ⚠️ **实验臂，不是上线结论**：最终上线的 INT8 decode 算子族待确认；
+> 历史判决卷指向 GQA TC（65k 42.65 vs FP8 44.02，−3.1%），而当前 main
+> 的 `paged_verify_int8_output` 仍选 PTH。两者冲突，本文只记录 PTH/pair
+> 实验读数，不宣称生产上线。
+
+上一节把“两行/CTA”列为未做的大刀；本晚落地，且修正了“8 compute
+warps 没收益”的旧结论——旧结论只对单行 PTH 成立，对两行 pack 不成立。
+
+### 新核
+
+`owl_int8_decode_pth2_pc_split`（`cu/attn/int8_decode.cu`）：
+
+- **8 compute + 4 producer / 384 threads**，smem **81344B**（1 CTA/SM）；
+- 相邻两行 verify(2g / 2g+1) 共用一条 `block_table` 页链，K/V 只载一次；
+  `kv_lens` 仍逐行 mask（B1 可以用到 B0 之后的新 token）；
+- QK：m16 的 **0..5 行装 B0、8..13 行装 B1**，一次 `mma_s8` 覆盖 12 行；
+- PV：保留 swap-AB（V 仍是 A-fragment，避免 int8→f16 B-fragment 的
+  逐字节 LDS），但 **B0/B1 各一份 P B-fragment + 两份 f32 acc**；
+- 单 token decode 仍走旧 `owl_int8_decode_pth_pc_split`，本核只给
+  `paged_verify_int8_output` 的 `tokens>1` 用；`tokens` 偶数时两两配对，
+  奇数最后一行单跑。
+
+契约：**相邻两行必须共享同一条页链**。verify 的 dense `bt8` 是页链
+×depth1 平铺，view `bt8` 每行也写同一 `pages` 列表，构造上成立。
+
+### 正确性
+
+- `int8_pth2_pair_matches_pth`（B=4，lens 递增，HQ=12/HKV=2，nparts=4）：
+  与旧 PTH 输出 **max|d|=0.000000，cos=1.000000000**；
+- 32k needle（fresh 请求）：`ZXCVBNM12345` RETRIEVED；
+- 17×23 仍答 `391`。
+
+### 微基准（2×3080，3080 01:00，B=8，nparts=34）
+
+| ctx | 旧 PTH | 两行 pack(8w) | 变化 |
+|---:|---:|---:|---:|
+| 32k | 260.4 µs | **192.4 µs** | −26% |
+| 65k | 486.8 µs | **350.4 µs** | −28% |
+| 147k | 986.0 µs | **746.3 µs** | −24% |
+
+nparts 仍取 34（3080 68 SM）：21 在 147k 反而 889µs，56 为 812µs；
+pair 核的 CTA 数减半，34 仍是 3080 最优档。
+
+### 生产 e2e（2×3080 INT8 / W4A8 / DFlash2 d7）
+
+agent 追问探针：固定长前缀 + 后续短追问，`cached` 约 99.9%。
+
+| ctx | 旧 PTH `spec.verify` | pair `spec.verify` | `spec.round` |
+|---:|---:|---:|---:|
+| 36k | 26.35 ms | **24.98 ms**（−5.2%） | 35.67 → 34.21 ms（−4.1%） |
+| 132k | 36.41 ms | **31.88 ms**（−12.4%） | 45.95 → 41.32 ms（−10.1%） |
+
+**固定 prompt / 固定 salt 的 A/B**（两边输出长度相同，temperature 0）：
+
+decode 口径 = `completion_tokens / (total − TTFT)`，**不含 TTFT**。
+早先把 TTFT 算进 total，132k 被压低约 25–30%，已修正。
+
+| ctx | 旧 PTH decode | pair decode | 变化 |
+|---:|---:|---:|---:|
+| 36k | 94.9 / 98.0 / 130.5 t/s | 99.0 / 101.8 / 136.3 t/s | 加权 107.0 → 111.5（+4.2%） |
+| 132k | 69.0 / 94.3 / 84.5 t/s | 76.5 / 105.1 / 94.1 t/s | 加权 81.7 → 90.8（+11.1%） |
+
+TTFT（cached ≈99.9%）：36k 0.465s / 132k 0.77s；冷前缀 36k 15.3s /
+132k 77.7s（与本次核改动无关）。
+
+**判读**：核级 −24~28% 在长 ctx 转成 `spec.verify` −12.4%、
+生成吞吐加权 **+11.1%**；36k 因 verify 份额更小，转成 **+4.2%**。
+修正口径后 132k INT8 约 91 t/s，与历史 FP8 同形 147k 的约 94 t/s
+只差约 3%；这只是 PTH 实验臂达到的历史量级，**不作为上线族结论**。
+
+⚠️ **A/B 测量纪律**：本轮一度发现孤儿 server（父进程被 kill 后
+worker 仍占 8135/双 3080），新旧两臂实际落在同一进程上，读数完全
+失真。A/B 前必须用 `nvidia-smi --query-compute-apps=pid` + `ss -ltnp
+:8135` 双验证；kill 后确认两张卡 compute-apps 为空、端口无监听，
+再起下一臂。
+
+### GQA TC 对照（同 36k，强制 `pth_ok=false` / nparts=256）
+
+为确认“最终上线不是 PTH”这一线索，临时把 verify 强制切回
+`owl_int8_decode_gqa_tc_split`，固定 prompt/salt 跑同一 36k 追问：
+
+| 臂 | `spec.verify` | `spec.round` | 生成吞吐（不含 TTFT） |
+|---|---:|---:|---:|
+| PTH pair（8w） | **24.98 ms** | **34.21 ms** | 加权 **111.5 t/s** |
+| GQA TC 256 片 | 39.05 ms | 50.01 ms | 加权约 **89.7 t/s** |
+
+GQA TC 在当前 3080 形状下 verify 慢 **56%**，与历史“GQA TC 65k 只比
+FP8 慢 3.1%”不矛盾——那条是 3090 单卡 65k 的旧档；3080 verify 的
+8 行伪序列 + token-major V transpose 不是它的优势形状。若最终上线确为
+GQA TC，需要给出**具体变体/nparts/档位**，不能直接用当前这个 256 片臂
+做 A/B 结论。
+
+### 没落地的分支
+
+- **标准 PV（P 为 A、V 为 B）**：一份 acc 覆盖 12 行，但 V 的 int8→f16
+  B-fragment 要每 lane 4 次 byte LDS；147k 微基准 698µs（4w）/未跑 8w，
+  仍慢于 swap-AB 两 acc 的 629µs（4w），故保留 swap-AB。
+- **V f16 shadow 不是 INT8 的方案**：shadow 属于 FP8 KV 路径；INT8 的
+  生产布局就是 token-major int8 V，PTH 在寄存器 `cvt4` 成 f16
+  A-fragment。不要再把 shadow 写回 INT8 路线。
+- **nparts 21**：3090 84 SM 上 147k 542µs 优于 34（但 3090 生产档仍 21）；
+  3080 68 SM 上 34 最优，不要按 3090 的数改 3080。

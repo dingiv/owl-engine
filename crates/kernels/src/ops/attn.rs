@@ -680,6 +680,50 @@ impl KernelSpec for Int8DecodePthPcSplit {
     };
 }
 
+/// `owl_int8_decode_pth2_pc_split` —— verify 两行 pack 变体:
+/// 相邻两行 verify 共享 K/V 页链,一行 CTA 同时算 6+6 个 q head。
+pub struct Int8DecodePth2PcSplit;
+
+#[kernel_tags("dom.attn", "role.attn", "phase.decode", "kv.main.int8")]
+impl KernelSpec for Int8DecodePth2PcSplit {
+    const ENTRY: &'static str = "owl_int8_decode_pth2_pc_split";
+    const SRC: &'static str = "cu/attn/int8_decode.cu";
+    const PARAMS: &'static [Param] = &[
+        Param::t_in("q", Dtype::I8, 2),
+        Param::t_in("qscale", Dtype::F32, 1),
+        Param::t_in("k", Dtype::I8, 1),
+        Param::t_in("kscale", Dtype::F32, 1),
+        Param::t_in("v", Dtype::I8, 1),
+        Param::t_in("vscale", Dtype::F32, 1),
+        Param::t_in("block_table", Dtype::F32, 2),
+        Param::t_in("kv_lens", Dtype::F32, 0),
+        Param::t_in("partial_out", Dtype::F32, 1),
+        Param::t_in("partial_stat", Dtype::F32, 1),
+        Param::t_out("out_dummy", Dtype::F16, 1),
+        Param::i32("B"),
+        Param::i32("Hq"),
+        Param::i32("Hkv"),
+        Param::i32("page"),
+        Param::i32("bt_stride"),
+        Param::i32("nparts"),
+        Param::i32("base_pos"),
+        Param::t_in("dep_k", Dtype::F16, 0),
+        Param::t_in("dep_v", Dtype::F16, 0),
+    ];
+    const POOL: &'static [PoolAccess] =
+        &[PoolAccess::read(pools::KV_MAIN, LayoutTag::Knhd, Dtype::I8)];
+    const LAWS: &'static [Law] = &[Law::OutputFinite];
+    const CAPTURE: CaptureEvidence = CaptureEvidence::NoHostWork;
+    const DETERMINISM: Determinism = Determinism::Deterministic;
+    const SHAPE: crate::spec::ShapeFamily = crate::spec::ShapeFamily {
+        kv_dtype: Some(Dtype::I8),
+        head_dim: &[256],
+        page: &[32],
+        grp: None,
+        tile: None,
+    };
+}
+
 /// `owl_int8_decode_reduce` —— 合并 split partial(在线 softmax LSE)。
 pub struct Int8DecodeReduce;
 
@@ -1067,6 +1111,7 @@ pub static INT8_DECODE_PAGED: KernelMeta = meta_of::<Int8DecodePaged>();
 pub static INT8_DECODE_SPLIT: KernelMeta = meta_of::<Int8DecodeSplit>();
 pub static INT8_DECODE_GQA_TC_SPLIT: KernelMeta = meta_of::<Int8DecodeGqaTcSplit>();
 pub static INT8_DECODE_PTH_PC_SPLIT: KernelMeta = meta_of::<Int8DecodePthPcSplit>();
+pub static INT8_DECODE_PTH2_PC_SPLIT: KernelMeta = meta_of::<Int8DecodePth2PcSplit>();
 pub static INT8_DECODE_REDUCE: KernelMeta = meta_of::<Int8DecodeReduce>();
 pub static OWL_INT8_PREFILL_PAGED: KernelMeta = meta_of::<Int8PrefillPaged>();
 pub static OWL_INT8_PREFILL_PAGED_F16PV: KernelMeta = meta_of::<Int8PrefillPagedF16Pv>();

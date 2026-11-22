@@ -694,6 +694,14 @@ extern "C" __global__ void owl_int8_decode_gqa_tc_split(
 //   K scale / per-token V scale；QK 仍 u8s8，PV 走 cvt4+f16 m16n8k16。
 // ============================================================================
 namespace pthpc {
+// PTH softmax 的 expf 走 libdevice 精确序列；prefill 的 ex2.approx
+// 实测 −5~6%(docs int8-kv-attention-project §0.17.6)。这里用同一 PTX
+// 指令，乘 log2(e) 后进 ex2.approx.ftz.f32；PTH 的 host parity 门仍过。
+__device__ __forceinline__ float ex2f_fast(float x) {
+  float y;
+  asm("ex2.approx.ftz.f32 %0, %1;" : "=f"(y) : "f"(x));
+  return y;
+}
 constexpr int TILE = 64;      // 2 pages
 constexpr int TILE_PAGES = 2;
 
@@ -747,6 +755,7 @@ __device__ __forceinline__ void v_b_fragments(const uint32_t (&w)[4],
 constexpr int kBarFull0 = 2;
 constexpr int kBarEmpty0 = 4;
 constexpr int kBarThreads = 256;
+constexpr int kBarThreads2 = 384;  // 8 compute + 4 producer
 
 __device__ __forceinline__ void named_sync(int id, int n) {
   asm volatile("bar.sync %0, %1;" ::"r"(id), "r"(n) : "memory");
@@ -1016,9 +1025,11 @@ extern "C" __global__ void owl_int8_decode_pth_pc_split(
         const float old_m = s_m[h];
         __syncwarp();
         const float nm = fmaxf(old_m, bm);
-        const float alpha = (old_m == -CUDART_INF_F) ? 0.0f : expf(old_m - nm);
-        const float p0 = (s0 == -CUDART_INF_F) ? 0.0f : expf(s0 - nm);
-        const float p1 = (s1 == -CUDART_INF_F) ? 0.0f : expf(s1 - nm);
+        constexpr float kLog2e = 1.4426950408889634f;
+        const float alpha =
+            (old_m == -CUDART_INF_F) ? 0.0f : ex2f_fast((old_m - nm) * kLog2e);
+        const float p0 = (s0 == -CUDART_INF_F) ? 0.0f : ex2f_fast((s0 - nm) * kLog2e);
+        const float p1 = (s1 == -CUDART_INF_F) ? 0.0f : ex2f_fast((s1 - nm) * kLog2e);
         s_p[h * PPITCH + k0] = __float2half_rn(p0 * s_vs[st][k0]);
         s_p[h * PPITCH + k1] = __float2half_rn(p1 * s_vs[st][k1]);
         float sum = p0 + p1;
@@ -1118,6 +1129,380 @@ extern "C" __global__ void owl_int8_decode_pth_pc_split(
         const int stat_base = ((b * Hq + h) * nparts + part) * 2;
         partial_stat[stat_base] = s_m[r];
         partial_stat[stat_base + 1] = s_l[r];
+      }
+    }
+  }
+}
+
+// ============================================================================
+// PTH 两行 pack verify 臂(2026-11-19):
+//   * 一行 CTA 同时服务相邻两行 verify(B=2g / 2g+1)。
+//   * K/V 只读一遍(两行共享同一 block_table 页链;verify 的 bt8 构造保证)。
+//   * QK 用 m16 的 0..5 + 8..13 行装两行 Q;PV 改成标准 P(m16 rows x K)
+//     * V(K x 8 dims),一次 mma 同时覆盖 6+6 个 q head。
+//   * 单行 decode 仍走 owl_int8_decode_pth_pc_split,本核只给 verify 用。
+// 契约:B 行中相邻两行必须共享同一页链;kv_lens 可不同(逐行 mask)。
+// ============================================================================
+extern "C" __global__ void owl_int8_decode_pth2_pc_split(
+    const int8_t* __restrict__ q, const float* __restrict__ qscale,
+    const int8_t* __restrict__ k, const float* __restrict__ kscale,
+    const int8_t* __restrict__ v, const float* __restrict__ vscale,
+    const float* __restrict__ block_table, const float* __restrict__ kv_lens,
+    float* __restrict__ partial_out, float* __restrict__ partial_stat,
+    __half* __restrict__ out_dummy,
+    int B, int Hq, int Hkv, int page, int bt_stride, int nparts, int base_pos,
+    const __half* __restrict__ dep_k, const __half* __restrict__ dep_v) {
+  using namespace tc;
+  using namespace owl_int8_attn;
+  using namespace pthpc;
+  (void)out_dummy; (void)dep_k; (void)dep_v;
+  if (page != PAGE) return;
+
+  extern __shared__ __align__(16) uint8_t smem[];
+  constexpr int Q_OFF = 0;
+  constexpr int K_OFF = Q_OFF + 16 * D;
+  constexpr int V_OFF = K_OFF + 2 * TILE * D;
+  constexpr int PPITCH = 72;
+  constexpr int P_OFF = V_OFF + 2 * D * 32 * 2;
+  constexpr int S_OFF = P_OFF + 16 * PPITCH * 2;
+  constexpr int KS_OFF = S_OFF + 16 * TILE * 4;
+  constexpr int VS_OFF = KS_OFF + 2 * TILE * 8 * 4;
+  constexpr int QS_OFF = VS_OFF + 2 * TILE * 4;
+  constexpr int A_OFF = QS_OFF + 16 * 8 * 4;
+  constexpr int M_OFF = A_OFF + 16 * 4;
+  constexpr int L_OFF = M_OFF + 16 * 4;
+  constexpr int SMEM_BYTES = L_OFF + 16 * 4;
+  static_assert(SMEM_BYTES == 81344, "pth2 shared layout");
+
+  int8_t* s_q = reinterpret_cast<int8_t*>(smem + Q_OFF);
+  int8_t (*s_k)[TILE * D] = reinterpret_cast<int8_t (*)[TILE * D]>(smem + K_OFF);
+  int8_t (*s_v)[TILE * D] = reinterpret_cast<int8_t (*)[TILE * D]>(smem + V_OFF);
+  __half* s_p = reinterpret_cast<__half*>(smem + P_OFF);
+  float* s_score = reinterpret_cast<float*>(smem + S_OFF);
+  float (*s_ks)[TILE * 8] = reinterpret_cast<float (*)[TILE * 8]>(smem + KS_OFF);
+  float (*s_vs)[TILE] = reinterpret_cast<float (*)[TILE]>(smem + VS_OFF);
+  float* s_qs = reinterpret_cast<float*>(smem + QS_OFF);
+  float* s_alpha = reinterpret_cast<float*>(smem + A_OFF);
+  float* s_m = reinterpret_cast<float*>(smem + M_OFF);
+  float* s_l = reinterpret_cast<float*>(smem + L_OFF);
+
+  const int kh = blockIdx.x;
+  const int pair = blockIdx.y;
+  const int part = blockIdx.z;
+  const int b0 = pair * 2;
+  const int b1 = b0 + 1;
+  const bool has_b1 = b1 < B;
+  if (b0 >= B || kh >= Hkv || part >= nparts) return;
+  const int grp = Hq / Hkv;
+  if (grp <= 0 || grp > 6) return;
+
+  const int tid = threadIdx.x;
+  const int warp = tid >> 5;
+  const int lane = tid & 31;
+  // base_pos >= 0 = prefill causal 模式(bt_stride=0,单页链);
+  // base_pos < 0 = verify 模式(逐行 kv_lens)。
+  const int len0 = base_pos >= 0 ? base_pos + b0 + 1 : static_cast<int>(kv_lens[b0]);
+  const int len1 = has_b1
+                       ? (base_pos >= 0 ? base_pos + b1 + 1 : static_cast<int>(kv_lens[b1]))
+                       : 0;
+  const int len_max = max(len0, len1);
+  const int pages = (len_max + page - 1) / page;
+  const int tiles = (pages + 1) / 2;
+  const int per = (tiles + nparts - 1) / nparts;
+  const int t0 = part * per;
+  const int t1 = min(tiles, t0 + per);
+
+  if (t0 >= tiles) {
+    for (int bi = 0; bi < 2; ++bi) {
+      if (bi == 1 && !has_b1) break;
+      const int b = bi == 0 ? b0 : b1;
+      for (int j = 0; j < grp; ++j) {
+        const int h = kh * grp + j;
+        const int out_base = ((b * Hq + h) * nparts + part) * D;
+        const int stat_base = ((b * Hq + h) * nparts + part) * 2;
+        for (int d = tid; d < D; d += blockDim.x) partial_out[out_base + d] = 0.0f;
+        if (tid == 0) {
+          partial_stat[stat_base] = -CUDART_INF_F;
+          partial_stat[stat_base + 1] = 0.0f;
+        }
+      }
+    }
+    return;
+  }
+
+  const int gid = lane >> 2;
+  const int lid = lane & 3;
+  const int a_mat = lane >> 3;
+  const int a_rin = lane & 7;
+  const int a_rowoff = a_rin + ((a_mat & 1) << 3);
+  const int a_coloff = (a_mat >> 1) << 3;
+  const int b_rin = lane & 7;
+  const int b_koff = ((lane >> 3) & 1) << 3;
+
+  if (warp < 8) {
+    for (int i = tid; i < 16 * D; i += 256) s_q[i] = 0;
+    for (int i = tid; i < 16 * PPITCH; i += 256) s_p[i] = __float2half_rn(0.0f);
+    for (int i = tid; i < 16; ++i) {
+      s_alpha[i] = 0.0f;
+      s_m[i] = -CUDART_INF_F;
+      s_l[i] = 0.0f;
+    }
+    for (int i = tid; i < 16 * 8; i += 256) s_qs[i] = 0.0f;
+    asm volatile("bar.sync 1, 256;" ::: "memory");
+    for (int bi = 0; bi < 2; ++bi) {
+      if (bi == 1 && !has_b1) break;
+      const int b = bi == 0 ? b0 : b1;
+      const int row0 = bi * 8;
+      for (int i = tid; i < grp * (D / 16); i += 256) {
+        const int j = i / (D / 16);
+        const int off = (i % (D / 16)) * 16;
+        const int h = kh * grp + j;
+        const int8_t* src = q + static_cast<long long>(b * Hq + h) * D + off;
+        const int row = row0 + j;
+        *reinterpret_cast<int4*>(&s_q[row * D + swz(row, off / 2) * 2]) =
+            *reinterpret_cast<const int4*>(src);
+      }
+      for (int i = tid; i < grp * 8; i += 256) {
+        const int row = row0 + i / 8;
+        const int g = i % 8;
+        s_qs[row * 8 + g] = qscale[(b * Hq + kh * grp + (row - row0)) * 8 + g];
+      }
+      if (tid < grp) {
+        s_m[row0 + tid] = -CUDART_INF_F;
+        s_l[row0 + tid] = 0.0f;
+      }
+    }
+    asm volatile("bar.sync 1, 256;" ::: "memory");
+  } else {
+    const int pw = warp - 8;
+    for (int t = t0; t < t1; ++t) {
+      const int st = (t - t0) & 1;
+      if ((t - t0) >= 2) named_sync(kBarEmpty0 + st, kBarThreads2);
+      const int page0 = 2 * t;
+      const int page1 = page0 + 1;
+      load_tile16(k, v, kscale, vscale, block_table, bt_stride, b0, kh, Hkv,
+                  page0, page1, pages, len_max, pw, lane,
+                  s_k[st], s_v[st], s_ks[st], s_vs[st]);
+      cp_wait<0>();
+      named_arrive(kBarFull0 + st, kBarThreads2);
+    }
+    return;
+  }
+
+  // swap-AB PV:acc0 = B0 的 6 行,acc1 = B1 的 6 行;8 warps x 32 dims。
+  float acc0[2][4];
+  float acc1[2][4];
+#pragma unroll
+  for (int mt = 0; mt < 2; ++mt)
+#pragma unroll
+    for (int j = 0; j < 4; ++j) {
+      acc0[mt][j] = 0.0f;
+      acc1[mt][j] = 0.0f;
+    }
+
+  for (int t = t0; t < t1; ++t) {
+    const int st = (t - t0) & 1;
+    const int tile_key0 = t * TILE;
+    named_sync(kBarFull0 + st, kBarThreads2);
+    {
+      // QK: 8 warps x 8 keys, one n-tile each.
+      const int nkey = warp * 8;
+      float sc[4];
+#pragma unroll
+      for (int j = 0; j < 4; ++j) sc[j] = 0.0f;
+#pragma unroll
+      for (int kk = 0; kk < 8; ++kk) {
+        unsigned af[4];
+        ldmatrix_x4(af[0], af[1], af[2], af[3],
+                    smem_addr(&s_q[a_rowoff * D +
+                                  swz(a_rowoff, kk * 16 + a_coloff) * 2]));
+        unsigned bf[2];
+        ldmatrix_x2(bf[0], bf[1],
+                    smem_addr(&s_k[st][(nkey + b_rin) * D +
+                                  swz(nkey + b_rin, kk * 16 + b_koff) * 2]));
+        int c0 = 0, c1 = 0, c2 = 0, c3 = 0;
+        mma_s8(c0, c1, c2, c3, af[0], af[1], af[2], af[3], bf[0], bf[1]);
+        const int key0 = nkey + lid * 2;
+        const int key1 = key0 + 1;
+        const float ks0 = s_ks[st][key0 * 8 + kk];
+        const float ks1 = s_ks[st][key1 * 8 + kk];
+        const float qg0 = s_qs[gid * 8 + kk] * kAttnScale;
+        const float qg1 = (gid < grp && has_b1)
+                              ? s_qs[(gid + 8) * 8 + kk] * kAttnScale
+                              : 0.0f;
+        sc[0] += static_cast<float>(c0) * (ks0 * qg0);
+        sc[1] += static_cast<float>(c1) * (ks1 * qg0);
+        sc[2] += static_cast<float>(c2) * (ks0 * qg1);
+        sc[3] += static_cast<float>(c3) * (ks1 * qg1);
+      }
+      if (gid < grp) {
+        const int key0 = nkey + lid * 2;
+        s_score[gid * TILE + key0] = sc[0];
+        s_score[gid * TILE + key0 + 1] = sc[1];
+        if (has_b1) {
+          s_score[(gid + 8) * TILE + key0] = sc[2];
+          s_score[(gid + 8) * TILE + key0 + 1] = sc[3];
+        }
+      }
+      asm volatile("bar.sync 1, 256;" ::: "memory");
+
+      // softmax: 12 logical rows(B0 0..5,B1 8..13),4 warps 各 3 行。
+      for (int r = warp; r < 2 * grp; r += 8) {
+        const int bi = r / grp;
+        if (bi == 1 && !has_b1) continue;
+        const int srow = bi * 8 + (r - bi * grp);
+        const int b = bi == 0 ? b0 : b1;
+        const int len_i = base_pos >= 0 ? base_pos + b + 1 : static_cast<int>(kv_lens[b]);
+        const int k0 = lane;
+        const int k1 = lane + 32;
+        const int g0 = tile_key0 + k0;
+        const int g1 = tile_key0 + k1;
+        const float s0 = (g0 < len_i) ? s_score[srow * TILE + k0] : -CUDART_INF_F;
+        const float s1 = (g1 < len_i) ? s_score[srow * TILE + k1] : -CUDART_INF_F;
+        float bm = fmaxf(s0, s1);
+#pragma unroll
+        for (int off = 16; off > 0; off >>= 1)
+          bm = fmaxf(bm, __shfl_xor_sync(0xffffffffu, bm, off));
+        const float old_m = s_m[srow];
+        __syncwarp();
+        const float nm = fmaxf(old_m, bm);
+        constexpr float kLog2e = 1.4426950408889634f;
+        const float alpha =
+            (old_m == -CUDART_INF_F) ? 0.0f : ex2f_fast((old_m - nm) * kLog2e);
+        const float p0 = (s0 == -CUDART_INF_F) ? 0.0f : ex2f_fast((s0 - nm) * kLog2e);
+        const float p1 = (s1 == -CUDART_INF_F) ? 0.0f : ex2f_fast((s1 - nm) * kLog2e);
+        s_p[srow * PPITCH + k0] = __float2half_rn(p0 * s_vs[st][k0]);
+        s_p[srow * PPITCH + k1] = __float2half_rn(p1 * s_vs[st][k1]);
+        float sum = p0 + p1;
+#pragma unroll
+        for (int off = 16; off > 0; off >>= 1)
+          sum += __shfl_xor_sync(0xffffffffu, sum, off);
+        if (lane == 0) {
+          s_alpha[srow] = alpha;
+          s_m[srow] = nm;
+          s_l[srow] = s_l[srow] * alpha + sum;
+        }
+      }
+      asm volatile("bar.sync 1, 256;" ::: "memory");
+
+      // PV(swap-AB,两份 acc):O^T[dim][row] = V^T[dim][token] * P[token][row]。
+      // B0/B1 各一份 P B-fragment + acc;V A-fragment 只构造一次。
+      unsigned bp0[4][2], bp1[4][2];
+      const int l8 = lane & 7;
+      const int mi = lane >> 3;
+#pragma unroll
+      for (int j = 0; j < 4; ++j) {
+        ldmatrix_x2(bp0[j][0], bp0[j][1],
+                    smem_addr(&s_p[l8 * PPITCH + j * 16 + ((mi & 1) << 3)]));
+        if (has_b1) {
+          ldmatrix_x2(bp1[j][0], bp1[j][1],
+                      smem_addr(&s_p[(l8 + 8) * PPITCH + j * 16 + ((mi & 1) << 3)]));
+        }
+      }
+      const int row0 = 2 * (lane & 3);
+      const int row1 = row0 + 1;
+      const float a00 = (row0 < grp) ? s_alpha[row0] : 0.0f;
+      const float a01 = (row1 < grp) ? s_alpha[row1] : 0.0f;
+      const float a10 = (has_b1 && row0 < grp) ? s_alpha[row0 + 8] : 0.0f;
+      const float a11 = (has_b1 && row1 < grp) ? s_alpha[row1 + 8] : 0.0f;
+#pragma unroll
+      for (int mt = 0; mt < 2; ++mt) {
+        if (row0 < grp) {
+          acc0[mt][0] *= a00;
+          acc0[mt][2] *= a00;
+        }
+        if (row1 < grp) {
+          acc0[mt][1] *= a01;
+          acc0[mt][3] *= a01;
+        }
+        if (has_b1 && row0 < grp) {
+          acc1[mt][0] *= a10;
+          acc1[mt][2] *= a10;
+        }
+        if (has_b1 && row1 < grp) {
+          acc1[mt][1] *= a11;
+          acc1[mt][3] *= a11;
+        }
+      }
+      const int g = lane >> 2;
+      const int q = lane & 3;
+#pragma unroll
+      for (int j = 0; j < 4; ++j) {
+        uint32_t w[4];
+#pragma unroll
+        for (int i = 0; i < 4; ++i) {
+          const int tok = 16 * j + 2 * q + v_token_offset(i);
+          const int dim = 32 * warp + 4 * g;
+          w[i] = *reinterpret_cast<const uint32_t*>(
+              s_v[st] + v_swz64(tok, dim));
+        }
+        uint32_t b[4][2];
+        v_b_fragments(w, b);
+#pragma unroll
+        for (int h = 0; h < 2; ++h) {
+          const uint32_t am[4] = {b[2 * h][0], b[2 * h + 1][0],
+                                  b[2 * h][1], b[2 * h + 1][1]};
+          mma_f16(acc0[h][0], acc0[h][1], acc0[h][2], acc0[h][3],
+                  am[0], am[1], am[2], am[3], bp0[j][0], bp0[j][1]);
+          if (has_b1) {
+            mma_f16(acc1[h][0], acc1[h][1], acc1[h][2], acc1[h][3],
+                    am[0], am[1], am[2], am[3], bp1[j][0], bp1[j][1]);
+          }
+        }
+      }
+    }
+    asm volatile("bar.sync 1, 256;" ::: "memory");
+    if (t + 2 < t1) named_arrive(kBarEmpty0 + st, kBarThreads2);
+  }
+
+  if (warp < 8) {
+    const int g = lane >> 2;
+    const int q = lane & 3;
+#pragma unroll
+    for (int h = 0; h < 2; ++h) {
+      {
+        const int mt = h;
+        const int d0 = warp * 32 + 4 * g + 2 * h;
+        const int d1 = d0 + 1;
+        const int row0 = 2 * q;
+        const int row1 = row0 + 1;
+        if (row0 < grp) {
+          const int hh = kh * grp + row0;
+          const int base = ((b0 * Hq + hh) * nparts + part) * D;
+          partial_out[base + d0] = acc0[mt][0];
+          partial_out[base + d1] = acc0[mt][2];
+        }
+        if (row1 < grp) {
+          const int hh = kh * grp + row1;
+          const int base = ((b0 * Hq + hh) * nparts + part) * D;
+          partial_out[base + d0] = acc0[mt][1];
+          partial_out[base + d1] = acc0[mt][3];
+        }
+        if (has_b1 && row0 < grp) {
+          const int hh = kh * grp + row0;
+          const int base = ((b1 * Hq + hh) * nparts + part) * D;
+          partial_out[base + d0] = acc1[mt][0];
+          partial_out[base + d1] = acc1[mt][2];
+        }
+        if (has_b1 && row1 < grp) {
+          const int hh = kh * grp + row1;
+          const int base = ((b1 * Hq + hh) * nparts + part) * D;
+          partial_out[base + d0] = acc1[mt][1];
+          partial_out[base + d1] = acc1[mt][3];
+        }
+      }
+    }
+    if (lane == 0) {
+      for (int r = 0; r < grp; ++r) {
+        const int h = kh * grp + r;
+        const int st0 = ((b0 * Hq + h) * nparts + part) * 2;
+        partial_stat[st0] = s_m[r];
+        partial_stat[st0 + 1] = s_l[r];
+        if (has_b1) {
+          const int st1 = ((b1 * Hq + h) * nparts + part) * 2;
+          partial_stat[st1] = s_m[r + 8];
+          partial_stat[st1 + 1] = s_l[r + 8];
+        }
       }
     }
   }

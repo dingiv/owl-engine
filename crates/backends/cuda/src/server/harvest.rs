@@ -67,11 +67,10 @@ impl GpuServer {
             Ok(s) => s.clone(),
             Err(e) => return ack.take().unwrap().send(Err(e)),
         };
-        // 硬预算(与 alloc 同一条闸;权重/上传块也吃设备内存)
-        if let Err(e) =
-            self.vram_guard
-                .check(n, self.diag.vram_activation_reserve << 20, &self.vram)
-        {
+        // 硬预算(与 alloc 同一条闸;权重/图像上传块也吃设备内存)。
+        // `vram_guard_with_reclaim` 在拒绝前会 trim 池缓存 —— 图像上传
+        // 60MiB 这类“池里明明有 free 页”的路径不能再直接拒。
+        if let Err(e) = self.vram_guard_with_reclaim(n) {
             self.sink.logf(
                 owl_shared::log::LVL_WARN,
                 "vram-budget",
