@@ -59,7 +59,7 @@ __device__ __forceinline__ float ex2f_fast(float x) {
 extern "C" __global__ void owl_int8_prefill_paged_f16pv(const int8_t* __restrict__ q,
                               const float* __restrict__ qscale,
                               const int8_t* __restrict__ k,
-                              const float* __restrict__ kscale,
+                              const __half* __restrict__ kscale,
                               const __half* __restrict__ v16,
                               const float* __restrict__ block_table,
                               __half* __restrict__ out, int T, int L, int Hq, int Hkv,
@@ -110,7 +110,7 @@ extern "C" __global__ void owl_int8_prefill_paged_f16pv(const int8_t* __restrict
         const int key = i % Bc;
         const int phys = static_cast<int>(block_table[0]);
         kscale0[i] = (key < L)
-                         ? kscale[((size_t)(phys * page + key) * Hkv + kv_head) * 8 + g]
+                         ? __half2float(kscale[((size_t)(phys * page + key) * Hkv + kv_head) * 8 + g])
                          : 0.0f;
     }
     cp_commit(); cp_wait<0>(); __syncthreads();
@@ -296,7 +296,7 @@ extern "C" __global__ void owl_int8_prefill_paged_f16pv(const int8_t* __restrict
                 const int key = nk * Bc + key_l;
                 const int phys = static_cast<int>(block_table[nk]);
                 kscale0[i] = (key < L)
-                                 ? kscale[((size_t)(phys * page + key_l) * Hkv + kv_head) * 8 + g]
+                                 ? __half2float(kscale[((size_t)(phys * page + key_l) * Hkv + kv_head) * 8 + g])
                                  : 0.0f;
             }
             cp_commit();

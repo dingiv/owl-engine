@@ -1371,8 +1371,13 @@ impl Attention {
         let partial_out = s2.tmp_out.slice_view(0, vec![partial_elems]);
         let partial_stat = s2.tmp_out.slice_view(partial_elems, vec![stat_elems]);
         // verify 的 bt8 是同一页链的 depth1 行平铺(逐行 kv_lens 不同),
-        // 相邻两行共享 K/V ⇒ tokens>1 走两行 pack 核,K/V 只读一遍。
-        let split = TensorOps::call(if pth_ok && tokens > 1 {
+        // 相邻行共享 K/V ⇒ tokens>1 走 pack 核(K/V 只读一遍)。
+        // 2026-11-23:四行 pack 在 3090 上比两行再快 12–15%;
+        // `tokens >= 4` 才启用,不足四行走两行/单行。
+        let pack4 = ctx.env.int8_verify_pack4 && tokens >= 4;
+        let split = TensorOps::call(if pth_ok && pack4 {
+            SemanticKernel::Int8DecodePth4PcSplit
+        } else if pth_ok && tokens > 1 {
             SemanticKernel::Int8DecodePth2PcSplit
         } else if pth_ok {
             SemanticKernel::Int8DecodePthPcSplit

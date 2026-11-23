@@ -855,7 +855,7 @@ fn int8_pth2_pair_matches_pth() {
         owl_shared::testkit::report::skip("OWL_TEST_DEVICE 未设");
         return;
     };
-    const B: usize = 4;
+    const B: usize = 8;
     const HQ: usize = 12;
     const L: usize = 4096;
     const PAGES: usize = L / PAGE;
@@ -885,7 +885,10 @@ fn int8_pth2_pair_matches_pth() {
             (x >> 13) as u8
         })
         .collect::<Vec<u8>>();
-    let ks = lcg_f32(L * HKV * 8, 0x4444, 0.004, 0.004);
+    let ks: Vec<u16> = lcg_f32(L * HKV * 8, 0x4444, 0.004, 0.004)
+        .iter()
+        .map(|&x| f32_to_f16_rn(x))
+        .collect();
     let vp = (0..L * HKV * D)
         .map(|i| {
             let x = 0x5555u32
@@ -894,7 +897,10 @@ fn int8_pth2_pair_matches_pth() {
             (x >> 13) as u8
         })
         .collect::<Vec<u8>>();
-    let vs = lcg_f32(L * HKV, 0x6666, 0.005, 0.005);
+    let vs: Vec<u16> = lcg_f32(L * HKV, 0x6666, 0.005, 0.005)
+        .iter()
+        .map(|&x| f32_to_f16_rn(x))
+        .collect();
     let mut bt: Vec<f32> = Vec::with_capacity(B * PAGES);
     for _b in 0..B {
         for p in 0..PAGES {
@@ -920,6 +926,7 @@ fn int8_pth2_pair_matches_pth() {
     let dstat = r.alloc(B * HQ * NP * 2 * 4, "p2.stat").unwrap();
     let dout = r.alloc(B * HQ * D * 2, "p2.out").unwrap();
     let dold = r.alloc(B * HQ * D * 2, "p2.old").unwrap();
+    let dnew4 = r.alloc(B * HQ * D * 2, "p2.new4").unwrap();
     r.upload(dq, &q).unwrap();
     r.upload(dqs, &qsb).unwrap();
     r.upload(dk, &k).unwrap();
@@ -953,7 +960,7 @@ fn int8_pth2_pair_matches_pth() {
             LaunchVal::Ptr(dout.ptr),
             LaunchVal::Ptr(dout.ptr),
         ];
-        let block = if name.contains("pth2") { 384 } else { 256 };
+        let block = if name.contains("pth2") || name.contains("pth4") { 384 } else { 256 };
         r.launch_aot(
             name,
             "cu/attn/int8_decode.cu",
@@ -986,6 +993,7 @@ fn int8_pth2_pair_matches_pth() {
 
     run("owl_int8_decode_pth_pc_split", B, 78944, dold);
     run("owl_int8_decode_pth2_pc_split", (B + 1) / 2, 81344, dout);
+    run("owl_int8_decode_pth4_pc_split", B.div_ceil(4), 92544, dnew4);
     r.sync().unwrap();
     let mut old = vec![0u8; B * HQ * D * 2];
     let mut new = vec![0u8; B * HQ * D * 2];
@@ -1005,11 +1013,24 @@ fn int8_pth2_pair_matches_pth() {
         &mut new,
     )
     .unwrap();
+    let mut new4 = vec![0u8; B * HQ * D * 2];
+    r.download(
+        CheckBuf {
+            ptr: dnew4.ptr,
+            bytes: new4.len(),
+        },
+        &mut new4,
+    )
+    .unwrap();
     let oldf: Vec<f32> = old
         .chunks_exact(2)
         .map(|c| f16_to_f32(u16::from_le_bytes([c[0], c[1]])))
         .collect();
     let newf: Vec<f32> = new
+        .chunks_exact(2)
+        .map(|c| f16_to_f32(u16::from_le_bytes([c[0], c[1]])))
+        .collect();
+    let new4f: Vec<f32> = new4
         .chunks_exact(2)
         .map(|c| f16_to_f32(u16::from_le_bytes([c[0], c[1]])))
         .collect();
@@ -1027,6 +1048,20 @@ fn int8_pth2_pair_matches_pth() {
     println!("[int8-pth2] pair vs pth max|d|={mx:.6} cos={cos:.9}");
     assert!(cos > 0.9999, "pth2 cos {cos}");
     assert!(mx < 8e-2, "pth2 max|d| {mx}");
+    let mut mx4 = 0f32;
+    let mut dot4 = 0f64;
+    let mut n4a = 0f64;
+    let mut n4b = 0f64;
+    for (a, b) in newf.iter().zip(&new4f) {
+        mx4 = mx4.max((a - b).abs());
+        dot4 += *a as f64 * *b as f64;
+        n4a += *a as f64 * *a as f64;
+        n4b += *b as f64 * *b as f64;
+    }
+    let cos4 = dot4 / (n4a.sqrt() * n4b.sqrt() + 1e-30);
+    println!("[int8-pth4] quad vs pth2 max|d|={mx4:.6} cos={cos4:.9}");
+    assert!(cos4 > 0.9999, "pth4 cos {cos4}");
+    assert!(mx4 < 8e-2, "pth4 max|d| {mx4}");
 }
 
 #[test]
@@ -1602,7 +1637,10 @@ fn int8_verify_b8_147k_timing() {
             (x >> 13) as u8
         })
         .collect::<Vec<u8>>();
-    let ks = lcg_f32(l * HKV * 8, 0x4444, 0.004, 0.004);
+    let ks: Vec<u16> = lcg_f32(l * HKV * 8, 0x4444, 0.004, 0.004)
+        .iter()
+        .map(|&x| f32_to_f16_rn(x))
+        .collect();
     let vp = (0..l * HKV * D)
         .map(|i| {
             let x = 0x5555u32
@@ -1611,7 +1649,10 @@ fn int8_verify_b8_147k_timing() {
             (x >> 13) as u8
         })
         .collect::<Vec<u8>>();
-    let vs = lcg_f32(l * HKV, 0x6666, 0.005, 0.005);
+    let vs: Vec<u16> = lcg_f32(l * HKV, 0x6666, 0.005, 0.005)
+        .iter()
+        .map(|&x| f32_to_f16_rn(x))
+        .collect();
     let mut bt: Vec<f32> = Vec::with_capacity(B * pages);
     for _b in 0..B {
         for p in 0..pages {
@@ -1672,11 +1713,18 @@ fn int8_verify_b8_147k_timing() {
         for (tag, name, smem) in [
             ("pth", "owl_int8_decode_pth_pc_split", 78944u32),
             ("pth2", "owl_int8_decode_pth2_pc_split", 81344u32),
+            ("pth4", "owl_int8_decode_pth4_pc_split", 92544u32),
             ("gqa", "owl_int8_decode_gqa_tc_split", 0u32),
         ] {
-            let grid_y = if tag == "pth2" { B.div_ceil(2) } else { B };
+            let grid_y = if tag == "pth4" {
+                B.div_ceil(4)
+            } else if tag == "pth2" {
+                B.div_ceil(2)
+            } else {
+                B
+            };
             for _ in 0..2 {
-                let block = if tag == "pth2" { 384 } else { 256 };
+                let block = if tag == "pth2" || tag == "pth4" { 384 } else { 256 };
                 r.launch_aot(
                     name,
                     "cu/attn/int8_decode.cu",
@@ -1690,7 +1738,7 @@ fn int8_verify_b8_147k_timing() {
             r.sync().unwrap();
             let t0 = std::time::Instant::now();
             for _ in 0..3 {
-                let block = if tag == "pth2" { 384 } else { 256 };
+                let block = if tag == "pth2" || tag == "pth4" { 384 } else { 256 };
                 r.launch_aot(
                     name,
                     "cu/attn/int8_decode.cu",

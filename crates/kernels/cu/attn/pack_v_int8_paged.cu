@@ -60,7 +60,7 @@ extern "C" __global__ void owl_v_pack_int8_prefill(
     int Hkv,
     int D,
     int page,
-    float* __restrict__ vscale,         // [nb, page, Hkv]
+    __half* __restrict__ vscale,        // [nb, page, Hkv]
     int8_t* __restrict__ v8) {          // [nb, page, Hkv, D]
   const int lp = blockIdx.x;
   const int h = blockIdx.y;
@@ -91,7 +91,7 @@ extern "C" __global__ void owl_v_pack_int8_prefill(
     amax = warp_max(amax);
     const float scale = fmaxf(amax / 127.0f, 1e-6f);
     if (lane == 0) {
-      vscale[(long long)slot * Hkv + h] = scale;
+      vscale[(long long)slot * Hkv + h] = __float2half_rn(scale);
     }
     const float inv = 1.0f / scale;
     int8_t q[8];
@@ -113,7 +113,7 @@ extern "C" __global__ void owl_v_append_int8_paged(
     int Hkv,
     int D,
     int page,
-    float* __restrict__ vscale,         // [nb, page, Hkv]
+    __half* __restrict__ vscale,        // [nb, page, Hkv]
     int8_t* __restrict__ v8,            // [nb, page, Hkv, D]
     const __half* __restrict__ dep,     // 树序依赖边(不解引用)
     __half* __restrict__ out) {         // 哑输出(槽序契约 4)
@@ -141,7 +141,7 @@ extern "C" __global__ void owl_v_append_int8_paged(
   amax = warp_max(amax);
   const float scale = fmaxf(amax / 127.0f, 1e-6f);
   if (lane == 0) {
-    vscale[(long long)slot * Hkv + h] = scale;
+    vscale[(long long)slot * Hkv + h] = __float2half_rn(scale);
   }
   const float inv = 1.0f / scale;
   int8_t q[8];

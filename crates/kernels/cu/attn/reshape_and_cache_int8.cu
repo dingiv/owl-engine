@@ -50,8 +50,8 @@ extern "C" __global__ void owl_reshape_and_cache_int8_knhd(
     const __half* __restrict__ value,     // [num_tokens, num_heads, head_size]
     int8_t* __restrict__ key_cache,       // [nb, block_size, num_heads, head_size]
     int8_t* __restrict__ value_cache,     // [nb, block_size, num_heads, head_size]
-    float* __restrict__ k_scale,          // [nb, block_size, num_heads]
-    float* __restrict__ v_scale,          // [nb, block_size, num_heads]
+    __half* __restrict__ k_scale,         // [nb, block_size, num_heads]
+    __half* __restrict__ v_scale,         // [nb, block_size, num_heads]
     const float* __restrict__ slot_mapping,
     const int key_stride,
     const int value_stride,
@@ -107,15 +107,15 @@ extern "C" __global__ void owl_reshape_and_cache_int8_knhd(
     value_cache[row_base + d] = quant_i8(__half2float(value[src + d]), vinv);
   }
   if (lane == 0) {
-    k_scale[scale_idx] = ks;
-    v_scale[scale_idx] = vs;
+    k_scale[scale_idx] = __float2half_rn(ks);
+    v_scale[scale_idx] = __float2half_rn(vs);
   }
 }
 
 extern "C" __global__ void owl_reshape_and_cache_int8_k_only_knhd(
     const __half* __restrict__ key,       // [num_tokens, num_heads, head_size]
     int8_t* __restrict__ key_cache,       // [nb, block_size, num_heads, head_size]
-    float* __restrict__ k_scale,          // [nb, block_size, num_heads]
+    __half* __restrict__ k_scale,         // [nb, block_size, num_heads]
     const float* __restrict__ slot_mapping,
     const int key_stride,
     const int num_heads,
@@ -165,6 +165,6 @@ extern "C" __global__ void owl_reshape_and_cache_int8_k_only_knhd(
     key_cache[row_base + d] = quant_i8(__half2float(key[src + d]), 1.0f / ks[d / 32]);
   }
   if (lane < 8) {
-    k_scale[scale_idx * 8 + lane] = ks[lane];
+    k_scale[scale_idx * 8 + lane] = __float2half_rn(ks[lane]);
   }
 }

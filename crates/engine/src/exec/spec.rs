@@ -2709,7 +2709,7 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
         // 行解码/scale 槽由 `KvPageCodec` 多态提供；调用点不写格式分支。
         let codec = crate::exec::kvpage::KvPageFormat::of_pool(self.dev.pool.geom.kv_dtype).codec();
         let k_scale_elems = codec.k_scale_elems(page, hkv);
-        let k_scale_bytes = k_scale_elems * std::mem::size_of::<f32>();
+        let k_scale_bytes = k_scale_elems * std::mem::size_of::<u16>();
         let todo: Vec<&(owl_store::ChainHash, usize, usize)> = items
             .iter()
             .filter(|(h, _, _)| {
@@ -2762,8 +2762,8 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
             face.dtoh_batch(&scale_pieces).await?
         };
         let scale_f32: Vec<f32> = scale_all
-            .chunks_exact(4)
-            .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+            .chunks_exact(2)
+            .map(|c| half::f16::from_le_bytes([c[0], c[1]]).to_f32())
             .collect();
         // **cos/sin 表在主机线程取好**(位置 = 逻辑块;`Rope` 句柄不跨线程共享)
         let ropes: Vec<Vec<(Vec<f32>, Vec<f32>)>> = todo

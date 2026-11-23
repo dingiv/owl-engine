@@ -556,6 +556,8 @@ pub struct EnvProvider {
     /// 设备 SM 数(0 = 未知/CPU;引擎 boot 从 iface 合入)。
     /// 只作选核几何提示(INT8 PTH decode 的 nparts),不是能力判定。
     pub sm_count: usize,
+    /// INT8 verify 是否走四行 pack(`tokens >= 4` 时;false = 两行 pack)。
+    pub int8_verify_pack4: bool,
     /// 量化方案(F16 / W4A16 / W4A16Awq;W4A8 = REQ-CTX-01 一 flag 宿主)
     pub quant: QuantPlan,
     pub kv: KvEnv,
@@ -643,6 +645,7 @@ impl EnvProvider {
                 block_pool_bytes: 0,
                 no_reclaim: cfg.store.no_reclaim,
             },
+            int8_verify_pack4: d.int8_verify_pack4,
             ..Self::default()
         }
     }

@@ -23,7 +23,7 @@ const T: usize = 4;
 /// token3 = padding(slot < 0)⇒ 不许写任何字节
 const SLOTS: [f32; T] = [0.0, 31.0, 32.0, -1.0];
 const POISON_I8: i8 = 0x7F;
-const POISON_F32: f32 = f32::NAN;
+const POISON_F16: u16 = 0x7e00; // f16 NaN
 
 pub struct Case {
     pub key: Vec<u16>,
@@ -66,8 +66,8 @@ fn quantize_row(row: &[u16]) -> (Vec<i8>, f32) {
 pub fn reference(c: &Case) -> (Vec<i8>, Vec<i8>, Vec<f32>, Vec<f32>) {
     let mut kc = vec![POISON_I8; pool_elems()];
     let mut vc = vec![POISON_I8; pool_elems()];
-    let mut ks = vec![POISON_F32; scale_elems()];
-    let mut vs = vec![POISON_F32; scale_elems()];
+    let mut ks = vec![f32::NAN; scale_elems()];
+    let mut vs = vec![f32::NAN; scale_elems()];
 
     for (t, slot) in SLOTS.iter().enumerate() {
         if *slot < 0.0 {
@@ -94,8 +94,10 @@ fn bytes_i8(v: &[i8]) -> Vec<u8> {
     v.iter().map(|&x| x as u8).collect()
 }
 
-fn bytes_f32(v: &[f32]) -> Vec<u8> {
-    v.iter().flat_map(|x| x.to_bits().to_le_bytes()).collect()
+fn bytes_f16(v: &[f32]) -> Vec<u8> {
+    v.iter()
+        .flat_map(|x| half::f16::from_f32(*x).to_le_bytes())
+        .collect()
 }
 
 /// 跑一次核,返回原始池字节与 scale 字节(毒值灌池 → 发射 → 回读)。
@@ -109,8 +111,8 @@ pub fn run_case(
     let d_val = r.alloc(c.value.len() * 2, "selfcheck.int8.val")?;
     let d_kc = r.alloc(n, "selfcheck.int8.kc")?;
     let d_vc = r.alloc(n, "selfcheck.int8.vc")?;
-    let d_ks = r.alloc(sn * 4, "selfcheck.int8.ks")?;
-    let d_vs = r.alloc(sn * 4, "selfcheck.int8.vs")?;
+    let d_ks = r.alloc(sn * 2, "selfcheck.int8.ks")?;
+    let d_vs = r.alloc(sn * 2, "selfcheck.int8.vs")?;
     let d_slots = r.alloc(T * 4, "selfcheck.int8.slots")?;
     let d_out = r.alloc(2, "selfcheck.int8.out")?;
 
@@ -119,8 +121,12 @@ pub fn run_case(
     r.upload(d_val, &hb(&c.value))?;
     r.upload(d_kc, &vec![POISON_I8 as u8; n])?;
     r.upload(d_vc, &vec![POISON_I8 as u8; n])?;
-    r.upload(d_ks, &bytes_f32(&vec![POISON_F32; sn]))?;
-    r.upload(d_vs, &bytes_f32(&vec![POISON_F32; sn]))?;
+    let poison_bytes: Vec<u8> = vec![POISON_F16; sn]
+        .iter()
+        .flat_map(|h| h.to_le_bytes())
+        .collect();
+    r.upload(d_ks, &poison_bytes)?;
+    r.upload(d_vs, &poison_bytes)?;
     r.upload(
         d_slots,
         &SLOTS
@@ -152,8 +158,8 @@ pub fn run_case(
 
     let mut kc = vec![0u8; n];
     let mut vc = vec![0u8; n];
-    let mut ks = vec![0u8; sn * 4];
-    let mut vs = vec![0u8; sn * 4];
+    let mut ks = vec![0u8; sn * 2];
+    let mut vs = vec![0u8; sn * 2];
     r.download(
         CheckBuf {
             ptr: d_kc.ptr,
@@ -171,14 +177,14 @@ pub fn run_case(
     r.download(
         CheckBuf {
             ptr: d_ks.ptr,
-            bytes: sn * 4,
+            bytes: sn * 2,
         },
         &mut ks,
     )?;
     r.download(
         CheckBuf {
             ptr: d_vs.ptr,
-            bytes: sn * 4,
+            bytes: sn * 2,
         },
         &mut vs,
     )?;
@@ -198,8 +204,8 @@ impl BootCheck for K0Int8KnhdOracle {
         let (wk, wv, wks, wvs) = reference(&c);
         let wk = bytes_i8(&wk);
         let wv = bytes_i8(&wv);
-        let wks = bytes_f32(&wks);
-        let wvs = bytes_f32(&wvs);
+        let wks = bytes_f16(&wks);
+        let wvs = bytes_f16(&wvs);
 
         for (got, want, tag) in [
             (&kc, &wk, "K"),
@@ -238,15 +244,13 @@ impl BootCheck for K0Int8KnhdOracle {
                 untouched += 1;
             }
         }
-        for chunk in wks.chunks_exact(4) {
-            if u32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]) == POISON_F32.to_bits()
-            {
+        for chunk in wks.chunks_exact(2) {
+            if u16::from_le_bytes([chunk[0], chunk[1]]) == POISON_F16 {
                 untouched += 1;
             }
         }
-        for chunk in wvs.chunks_exact(4) {
-            if u32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]) == POISON_F32.to_bits()
-            {
+        for chunk in wvs.chunks_exact(2) {
+            if u16::from_le_bytes([chunk[0], chunk[1]]) == POISON_F16 {
                 untouched += 1;
             }
         }

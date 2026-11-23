@@ -1612,6 +1612,11 @@ pub struct KernelCfg {
     /// —— `ssm_alpha/beta`(n=48)每发 34.2 µs → 5.1 µs,verify −2.8 ms/轮。
     #[serde(default = "default_gguf_mmvq_l2_mib")]
     pub gguf_mmvq_l2_mib: usize,
+    /// **INT8 verify 四行 pack**(2026-11-23):`true` = 相邻四行 verify
+    /// 共享 K/V 页链(一行 CTA 算 4×6 个 q head,K/V 只读一遍);
+    /// `false` = 退回两行 pack。仅 `tokens >= 4` 生效。
+    #[serde(default)]
+    pub int8_verify_pack4: bool,
     /// 诊断二分:强制 naive 回退(paged 数值质量 A/B)。
     /// (原 `prefill_split` 已退役:2026-10-19 审计定谳"主路走 FI,
     ///  split 只在 FI 缺席时上阵";FI 面自 2026-10-13 起恒在 ⇒ 分支不可达。)
@@ -2118,6 +2123,7 @@ impl Default for KernelCfg {
     fn default() -> Self {
         Self {
             qkv_fuse: true,
+            int8_verify_pack4: true,
             gguf_mmvq_l2_mib: default_gguf_mmvq_l2_mib(),
             force_naive_prefill: false,
             verify_arm: VerifyArm::V2,

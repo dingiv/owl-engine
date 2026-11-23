@@ -2280,8 +2280,8 @@ mod tests {
                 };
                 let int8_planes = if mode == 1 {
                     Some(KvInt8Planes {
-                        k_scale: zero_block(gpu, nb * 32 * HKV * 8, vec![nb * 32 * HKV * 8]).await,
-                        v_scale: zero_block(gpu, nb * 32 * HKV, vec![nb * 32 * HKV]).await,
+                        k_scale: zero_block_f16(gpu, nb * 32 * HKV * 8, vec![nb * 32 * HKV * 8]).await,
+                        v_scale: zero_block_f16(gpu, nb * 32 * HKV, vec![nb * 32 * HKV]).await,
                     })
                 } else {
                     None

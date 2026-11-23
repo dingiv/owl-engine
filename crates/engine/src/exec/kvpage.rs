@@ -373,9 +373,7 @@ mod tests {
         for c in codes {
             bytes.push(c as u8);
         }
-        let ks = [
-            0.5f32, 0.25, 2.0, 4.0, 1.0, 1.5, 2.5, 3.5, 9.0, 9.0, 9.0, 9.0, 9.0, 9.0, 9.0, 9.0,
-        ];
+        let ks = [0.5f32, 0.25, 2.0, 4.0, 1.0, 1.5, 2.5, 3.5, 9.0, 9.0, 9.0, 9.0, 9.0, 9.0, 9.0, 9.0];
         let scale = KvRowScale { k: &ks, v: &[] };
         let codec = KvPageFormat::Int8.codec();
         assert_eq!(codec.k_scale_elems(page, hkv), 16);

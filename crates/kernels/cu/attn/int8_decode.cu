@@ -31,9 +31,9 @@ extern "C" __global__ void owl_int8_decode_paged(
     const int8_t* __restrict__ q,        // [B*Hq, D]
     const float* __restrict__ qscale,    // [B*Hq]
     const int8_t* __restrict__ k,        // [nb, page, Hkv, D]
-    const float* __restrict__ kscale,    // [nb, page, Hkv]
+    const __half* __restrict__ kscale,    // [nb, page, Hkv]
     const int8_t* __restrict__ v,        // [nb, page, Hkv, D]
-    const float* __restrict__ vscale,    // [nb, Hkv, 32]
+    const __half* __restrict__ vscale,    // [nb, Hkv, 32]
     const float* __restrict__ block_table,  // [B, bt_stride] f32 物理页号
     const float* __restrict__ kv_lens,   // [B] 含当前 token
     float* __restrict__ out,             // [B, Hq, D]
@@ -106,7 +106,7 @@ extern "C" __global__ void owl_int8_decode_paged(
 #pragma unroll
         for (int g = 0; g < 8; ++g) {
           dot += gdot[g] * qsc[g] *
-                 kscale[((static_cast<long long>(phys) * page + group) * Hkv + kh) * 8 + g];
+                 __half2float(kscale[((static_cast<long long>(phys) * page + group) * Hkv + kh) * 8 + g]);
         }
         s_score[group] = dot * kAttnScale;
       } else {
@@ -142,7 +142,7 @@ extern "C" __global__ void owl_int8_decode_paged(
       acc *= alpha;
       for (int i = 0; i < kKeys; ++i) {
         const float p = s_p[i] *
-            vscale[((static_cast<long long>(phys) * page + i) * Hkv) + kh];
+            __half2float(vscale[((static_cast<long long>(phys) * page + i) * Hkv) + kh]);
         if (p == 0.0f) {
           continue;
         }
@@ -169,9 +169,9 @@ extern "C" __global__ void owl_int8_decode_paged_split(
     const int8_t* __restrict__ q,
     const float* __restrict__ qscale,
     const int8_t* __restrict__ k,
-    const float* __restrict__ kscale,
+    const __half* __restrict__ kscale,
     const int8_t* __restrict__ v,
-    const float* __restrict__ vscale,
+    const __half* __restrict__ vscale,
     const float* __restrict__ block_table,
     const float* __restrict__ kv_lens,
     float* __restrict__ partial_out,   // [B,Hq,nparts,D]
@@ -262,7 +262,7 @@ extern "C" __global__ void owl_int8_decode_paged_split(
 #pragma unroll
         for (int g = 0; g < 8; ++g) {
           dot += gdot[g] * qsc[g] *
-                 kscale[((static_cast<long long>(phys) * page + group) * Hkv + kh) * 8 + g];
+                 __half2float(kscale[((static_cast<long long>(phys) * page + group) * Hkv + kh) * 8 + g]);
         }
         s_score[group] = dot * kAttnScale;
       } else {
@@ -298,7 +298,7 @@ extern "C" __global__ void owl_int8_decode_paged_split(
       acc *= alpha;
       for (int i = 0; i < kKeys; ++i) {
         const float p = s_p[i] *
-            vscale[((static_cast<long long>(phys) * page + i) * Hkv) + kh];
+            __half2float(vscale[((static_cast<long long>(phys) * page + i) * Hkv) + kh]);
         if (p == 0.0f) {
           continue;
         }
@@ -375,8 +375,8 @@ __device__ __forceinline__ int swz_v(int row, int col) {
 // ============================================================================
 extern "C" __global__ void owl_int8_decode_gqa_tc_split(
     const int8_t* __restrict__ q, const float* __restrict__ qscale,
-    const int8_t* __restrict__ k, const float* __restrict__ kscale,
-    const int8_t* __restrict__ v, const float* __restrict__ vscale,
+    const int8_t* __restrict__ k, const __half* __restrict__ kscale,
+    const int8_t* __restrict__ v, const __half* __restrict__ vscale,
     const float* __restrict__ block_table, const float* __restrict__ kv_lens,
     float* __restrict__ partial_out, float* __restrict__ partial_stat,
     __half* __restrict__ out_dummy,
@@ -508,13 +508,13 @@ extern "C" __global__ void owl_int8_decode_gqa_tc_split(
       const int key_in = i % PAGE;
       const int key = base + key_in;
       s_ks[i] = (key < len)
-                    ? kscale[((static_cast<long long>(phys) * page + key_in) * Hkv + kh) * 8 + g]
+                    ? __half2float(kscale[((static_cast<long long>(phys) * page + key_in) * Hkv + kh) * 8 + g])
                     : 0.0f;
     }
     for (int i = tid; i < PAGE; i += blockDim.x) {
       const int key = base + i;
       s_vs[i] = (key < len)
-                    ? vscale[(static_cast<long long>(phys) * page + i) * Hkv + kh]
+                    ? __half2float(vscale[(static_cast<long long>(phys) * page + i) * Hkv + kh])
                     : 1.0f;
     }
     cp_commit();
@@ -767,7 +767,7 @@ __device__ __forceinline__ void named_arrive(int id, int n) {
 // One producer warp loads 16 tokens (half a page) of K/V + K/V scales.
 __device__ __forceinline__ void load_tile16(
     const int8_t* __restrict__ k, const int8_t* __restrict__ v,
-    const float* __restrict__ kscale, const float* __restrict__ vscale,
+    const __half* __restrict__ kscale, const __half* __restrict__ vscale,
     const float* __restrict__ block_table, int bt_stride, int b,
     int kh, int hkv, int page0, int page1, int pages, int len,
     int pw, int lane,
@@ -811,8 +811,8 @@ __device__ __forceinline__ void load_tile16(
     const int global = page * tc::PAGE + page_key + key;
     dst_ks[kk * 8 + g] =
         (page_ok && global < len)
-            ? kscale[((static_cast<long long>(phys) * tc::PAGE + page_key + key) *
-                          hkv + kh) * 8 + g]
+            ? __half2float(kscale[((static_cast<long long>(phys) * tc::PAGE + page_key + key) *
+                          hkv + kh) * 8 + g])
             : 0.0f;
   }
   if (lane < 16) {
@@ -820,8 +820,8 @@ __device__ __forceinline__ void load_tile16(
     const int global = page * tc::PAGE + page_key + lane;
     dst_vs[kk] =
         (page_ok && global < len)
-            ? vscale[((static_cast<long long>(phys) * tc::PAGE + page_key + lane) *
-                          hkv + kh)]
+            ? __half2float(vscale[((static_cast<long long>(phys) * tc::PAGE + page_key + lane) *
+                          hkv + kh)])
             : 1.0f;
   }
   owl_int8_attn::cp_commit();
@@ -830,8 +830,8 @@ __device__ __forceinline__ void load_tile16(
 
 extern "C" __global__ void owl_int8_decode_pth_pc_split(
     const int8_t* __restrict__ q, const float* __restrict__ qscale,
-    const int8_t* __restrict__ k, const float* __restrict__ kscale,
-    const int8_t* __restrict__ v, const float* __restrict__ vscale,
+    const int8_t* __restrict__ k, const __half* __restrict__ kscale,
+    const int8_t* __restrict__ v, const __half* __restrict__ vscale,
     const float* __restrict__ block_table, const float* __restrict__ kv_lens,
     float* __restrict__ partial_out, float* __restrict__ partial_stat,
     __half* __restrict__ out_dummy,
@@ -1145,8 +1145,8 @@ extern "C" __global__ void owl_int8_decode_pth_pc_split(
 // ============================================================================
 extern "C" __global__ void owl_int8_decode_pth2_pc_split(
     const int8_t* __restrict__ q, const float* __restrict__ qscale,
-    const int8_t* __restrict__ k, const float* __restrict__ kscale,
-    const int8_t* __restrict__ v, const float* __restrict__ vscale,
+    const int8_t* __restrict__ k, const __half* __restrict__ kscale,
+    const int8_t* __restrict__ v, const __half* __restrict__ vscale,
     const float* __restrict__ block_table, const float* __restrict__ kv_lens,
     float* __restrict__ partial_out, float* __restrict__ partial_stat,
     __half* __restrict__ out_dummy,
@@ -1502,6 +1502,384 @@ extern "C" __global__ void owl_int8_decode_pth2_pc_split(
           const int st1 = ((b1 * Hq + h) * nparts + part) * 2;
           partial_stat[st1] = s_m[r + 8];
           partial_stat[st1 + 1] = s_l[r + 8];
+        }
+      }
+    }
+  }
+}
+
+// ============================================================================
+// PTH 四行 pack verify 臂(2026-11-23):
+//   * 一个 CTA 同时服务相邻四行 verify(B=4g..4g+3)。
+//   * 四行共享同一 block_table 页链,K/V 只读一遍(B=8 时 HBM 流量再减半)。
+//   * QK 分两趟 m16:第一趟 B0/B1,第二趟 B2/B3;K fragment 复用。
+//   * PV 四份 acc,每趟两行;V fragment 每 tile 只构造一次。
+//   * 单行 decode 仍走 PTH;B<4 时由调用方退回 pth2/pth。
+// 契约:相邻四行必须共享同一页链;kv_lens 可不同(逐行 mask)。
+// ============================================================================
+extern "C" __global__ void owl_int8_decode_pth4_pc_split(
+    const int8_t* __restrict__ q, const float* __restrict__ qscale,
+    const int8_t* __restrict__ k, const __half* __restrict__ kscale,
+    const int8_t* __restrict__ v, const __half* __restrict__ vscale,
+    const float* __restrict__ block_table, const float* __restrict__ kv_lens,
+    float* __restrict__ partial_out, float* __restrict__ partial_stat,
+    __half* __restrict__ out_dummy,
+    int B, int Hq, int Hkv, int page, int bt_stride, int nparts, int base_pos,
+    const __half* __restrict__ dep_k, const __half* __restrict__ dep_v) {
+  using namespace tc;
+  using namespace owl_int8_attn;
+  using namespace pthpc;
+  (void)out_dummy; (void)dep_k; (void)dep_v;
+  if (page != PAGE) return;
+
+  extern __shared__ __align__(16) uint8_t smem[];
+  constexpr int Q_OFF = 0;
+  constexpr int K_OFF = Q_OFF + 32 * D;
+  constexpr int V_OFF = K_OFF + 2 * TILE * D;
+  constexpr int PPITCH = 72;
+  constexpr int P_OFF = V_OFF + 2 * D * 32 * 2;
+  constexpr int S_OFF = P_OFF + 32 * PPITCH * 2;
+  constexpr int KS_OFF = S_OFF + 32 * TILE * 4;
+  constexpr int VS_OFF = KS_OFF + 2 * TILE * 8 * 4;
+  constexpr int QS_OFF = VS_OFF + 2 * TILE * 4;
+  constexpr int A_OFF = QS_OFF + 32 * 8 * 4;
+  constexpr int M_OFF = A_OFF + 32 * 4;
+  constexpr int L_OFF = M_OFF + 32 * 4;
+  constexpr int SMEM_BYTES = L_OFF + 32 * 4;
+  static_assert(SMEM_BYTES == 92544, "pth4 shared layout");
+
+  int8_t* s_q = reinterpret_cast<int8_t*>(smem + Q_OFF);
+  int8_t (*s_k)[TILE * D] = reinterpret_cast<int8_t (*)[TILE * D]>(smem + K_OFF);
+  int8_t (*s_v)[TILE * D] = reinterpret_cast<int8_t (*)[TILE * D]>(smem + V_OFF);
+  __half* s_p = reinterpret_cast<__half*>(smem + P_OFF);
+  float* s_score = reinterpret_cast<float*>(smem + S_OFF);
+  float (*s_ks)[TILE * 8] = reinterpret_cast<float (*)[TILE * 8]>(smem + KS_OFF);
+  float (*s_vs)[TILE] = reinterpret_cast<float (*)[TILE]>(smem + VS_OFF);
+  float* s_qs = reinterpret_cast<float*>(smem + QS_OFF);
+  float* s_alpha = reinterpret_cast<float*>(smem + A_OFF);
+  float* s_m = reinterpret_cast<float*>(smem + M_OFF);
+  float* s_l = reinterpret_cast<float*>(smem + L_OFF);
+
+  const int kh = blockIdx.x;
+  const int group = blockIdx.y;
+  const int part = blockIdx.z;
+  const int b0 = group * 4;
+  const int b1 = b0 + 1;
+  const int b2 = b0 + 2;
+  const int b3 = b0 + 3;
+  const bool has_b1 = b1 < B;
+  const bool has_b2 = b2 < B;
+  const bool has_b3 = b3 < B;
+  if (b0 >= B || kh >= Hkv || part >= nparts) return;
+  const int grp = Hq / Hkv;
+  if (grp <= 0 || grp > 6) return;
+
+  const int tid = threadIdx.x;
+  const int warp = tid >> 5;
+  const int lane = tid & 31;
+  const int len0 = base_pos >= 0 ? base_pos + b0 + 1 : static_cast<int>(kv_lens[b0]);
+  const int len1 = has_b1
+                       ? (base_pos >= 0 ? base_pos + b1 + 1 : static_cast<int>(kv_lens[b1]))
+                       : 0;
+  const int len2 = has_b2
+                       ? (base_pos >= 0 ? base_pos + b2 + 1 : static_cast<int>(kv_lens[b2]))
+                       : 0;
+  const int len3 = has_b3
+                       ? (base_pos >= 0 ? base_pos + b3 + 1 : static_cast<int>(kv_lens[b3]))
+                       : 0;
+  const int len_max = max(max(len0, len1), max(len2, len3));
+  const int pages = (len_max + page - 1) / page;
+  const int tiles = (pages + 1) / 2;
+  const int per = (tiles + nparts - 1) / nparts;
+  const int t0 = part * per;
+  const int t1 = min(tiles, t0 + per);
+
+  if (t0 >= tiles) {
+    for (int p = 0; p < 4; ++p) {
+      if (p == 1 && !has_b1) continue;
+      if (p == 2 && !has_b2) continue;
+      if (p == 3 && !has_b3) continue;
+      const int b = b0 + p;
+      for (int j = 0; j < grp; ++j) {
+        const int h = kh * grp + j;
+        const int out_base = ((b * Hq + h) * nparts + part) * D;
+        const int stat_base = ((b * Hq + h) * nparts + part) * 2;
+        for (int d = tid; d < D; d += blockDim.x) partial_out[out_base + d] = 0.0f;
+        if (tid == 0) {
+          partial_stat[stat_base] = -CUDART_INF_F;
+          partial_stat[stat_base + 1] = 0.0f;
+        }
+      }
+    }
+    return;
+  }
+
+  const int gid = lane >> 2;
+  const int lid = lane & 3;
+  const int a_mat = lane >> 3;
+  const int a_rin = lane & 7;
+  const int a_rowoff = a_rin + ((a_mat & 1) << 3);
+  const int a_coloff = (a_mat >> 1) << 3;
+  const int b_rin = lane & 7;
+  const int b_koff = ((lane >> 3) & 1) << 3;
+
+  if (warp < 8) {
+    for (int i = tid; i < 32 * D; i += 256) s_q[i] = 0;
+    for (int i = tid; i < 32 * PPITCH; i += 256) s_p[i] = __float2half_rn(0.0f);
+    for (int i = tid; i < 32; ++i) {
+      s_alpha[i] = 0.0f;
+      s_m[i] = -CUDART_INF_F;
+      s_l[i] = 0.0f;
+    }
+    for (int i = tid; i < 32 * 8; i += 256) s_qs[i] = 0.0f;
+    asm volatile("bar.sync 1, 256;" ::: "memory");
+    for (int p = 0; p < 4; ++p) {
+      if (p == 1 && !has_b1) continue;
+      if (p == 2 && !has_b2) continue;
+      if (p == 3 && !has_b3) continue;
+      const int b = b0 + p;
+      const int row0 = p * 8;
+      for (int i = tid; i < grp * (D / 16); i += 256) {
+        const int j = i / (D / 16);
+        const int off = (i % (D / 16)) * 16;
+        const int h = kh * grp + j;
+        const int8_t* src = q + static_cast<long long>(b * Hq + h) * D + off;
+        const int row = row0 + j;
+        *reinterpret_cast<int4*>(&s_q[row * D + swz(row, off / 2) * 2]) =
+            *reinterpret_cast<const int4*>(src);
+      }
+      for (int i = tid; i < grp * 8; i += 256) {
+        const int row = row0 + i / 8;
+        const int g = i % 8;
+        s_qs[row * 8 + g] = qscale[(b * Hq + kh * grp + (row - row0)) * 8 + g];
+      }
+      if (tid < grp) {
+        s_m[row0 + tid] = -CUDART_INF_F;
+        s_l[row0 + tid] = 0.0f;
+      }
+    }
+    asm volatile("bar.sync 1, 256;" ::: "memory");
+  } else {
+    const int pw = warp - 8;
+    for (int t = t0; t < t1; ++t) {
+      const int st = (t - t0) & 1;
+      if ((t - t0) >= 2) named_sync(kBarEmpty0 + st, kBarThreads2);
+      const int page0 = 2 * t;
+      const int page1 = page0 + 1;
+      load_tile16(k, v, kscale, vscale, block_table, bt_stride, b0, kh, Hkv,
+                  page0, page1, pages, len_max, pw, lane,
+                  s_k[st], s_v[st], s_ks[st], s_vs[st]);
+      cp_wait<0>();
+      named_arrive(kBarFull0 + st, kBarThreads2);
+    }
+    return;
+  }
+
+  float acc[4][2][4];
+#pragma unroll
+  for (int p = 0; p < 4; ++p)
+#pragma unroll
+    for (int mt = 0; mt < 2; ++mt)
+#pragma unroll
+      for (int j = 0; j < 4; ++j) acc[p][mt][j] = 0.0f;
+
+  for (int t = t0; t < t1; ++t) {
+    const int st = (t - t0) & 1;
+    const int tile_key0 = t * TILE;
+    named_sync(kBarFull0 + st, kBarThreads2);
+    {
+      // QK 两趟:B0/B1 用 Q 行 0..15,B2/B3 用 Q 行 16..31。
+      for (int pass = 0; pass < (has_b2 ? 2 : 1); ++pass) {
+        const int qbase = pass * 16;
+        const int nkey = warp * 8;
+        float sc[4];
+#pragma unroll
+        for (int j = 0; j < 4; ++j) sc[j] = 0.0f;
+#pragma unroll
+        for (int kk = 0; kk < 8; ++kk) {
+          unsigned af[4];
+          ldmatrix_x4(af[0], af[1], af[2], af[3],
+                      smem_addr(&s_q[(qbase + a_rowoff) * D +
+                                    swz(qbase + a_rowoff, kk * 16 + a_coloff) * 2]));
+          unsigned bf[2];
+          ldmatrix_x2(bf[0], bf[1],
+                      smem_addr(&s_k[st][(nkey + b_rin) * D +
+                                    swz(nkey + b_rin, kk * 16 + b_koff) * 2]));
+          int c0 = 0, c1 = 0, c2 = 0, c3 = 0;
+          mma_s8(c0, c1, c2, c3, af[0], af[1], af[2], af[3], bf[0], bf[1]);
+          const int key0 = nkey + lid * 2;
+          const int key1 = key0 + 1;
+          const float ks0 = s_ks[st][key0 * 8 + kk];
+          const float ks1 = s_ks[st][key1 * 8 + kk];
+          const float qg0 = s_qs[(qbase + gid) * 8 + kk] * kAttnScale;
+          const bool has_hi = pass == 0 ? has_b1 : has_b3;
+          const float qg1 = (gid < grp && has_hi)
+                                ? s_qs[(qbase + gid + 8) * 8 + kk] * kAttnScale
+                                : 0.0f;
+          sc[0] += static_cast<float>(c0) * (ks0 * qg0);
+          sc[1] += static_cast<float>(c1) * (ks1 * qg0);
+          sc[2] += static_cast<float>(c2) * (ks0 * qg1);
+          sc[3] += static_cast<float>(c3) * (ks1 * qg1);
+        }
+        const bool has_lo = pass == 0 ? true : has_b2;
+        const bool has_hi = pass == 0 ? has_b1 : has_b3;
+        if (gid < grp) {
+          const int key0 = nkey + lid * 2;
+          if (has_lo) {
+            s_score[(qbase + gid) * TILE + key0] = sc[0];
+            s_score[(qbase + gid) * TILE + key0 + 1] = sc[1];
+          }
+          if (has_hi) {
+            s_score[(qbase + gid + 8) * TILE + key0] = sc[2];
+            s_score[(qbase + gid + 8) * TILE + key0 + 1] = sc[3];
+          }
+        }
+      }
+      asm volatile("bar.sync 1, 256;" ::: "memory");
+
+      // softmax:最多 24 个逻辑行(四行 × 6 head),8 warps 各 3 行。
+      for (int r = warp; r < 4 * grp; r += 8) {
+        const int bi = r / grp;
+        if (bi == 1 && !has_b1) continue;
+        if (bi == 2 && !has_b2) continue;
+        if (bi == 3 && !has_b3) continue;
+        const int srow = bi * 8 + (r - bi * grp);
+        const int b = b0 + bi;
+        const int len_i = base_pos >= 0 ? base_pos + b + 1 : static_cast<int>(kv_lens[b]);
+        const int k0 = lane;
+        const int k1 = lane + 32;
+        const int g0 = tile_key0 + k0;
+        const int g1 = tile_key0 + k1;
+        const float s0 = (g0 < len_i) ? s_score[srow * TILE + k0] : -CUDART_INF_F;
+        const float s1 = (g1 < len_i) ? s_score[srow * TILE + k1] : -CUDART_INF_F;
+        float bm = fmaxf(s0, s1);
+#pragma unroll
+        for (int off = 16; off > 0; off >>= 1)
+          bm = fmaxf(bm, __shfl_xor_sync(0xffffffffu, bm, off));
+        const float old_m = s_m[srow];
+        __syncwarp();
+        const float nm = fmaxf(old_m, bm);
+        constexpr float kLog2e = 1.4426950408889634f;
+        const float alpha =
+            (old_m == -CUDART_INF_F) ? 0.0f : ex2f_fast((old_m - nm) * kLog2e);
+        const float p0 = (s0 == -CUDART_INF_F) ? 0.0f : ex2f_fast((s0 - nm) * kLog2e);
+        const float p1 = (s1 == -CUDART_INF_F) ? 0.0f : ex2f_fast((s1 - nm) * kLog2e);
+        s_p[srow * PPITCH + k0] = __float2half_rn(p0 * s_vs[st][k0]);
+        s_p[srow * PPITCH + k1] = __float2half_rn(p1 * s_vs[st][k1]);
+        float sum = p0 + p1;
+#pragma unroll
+        for (int off = 16; off > 0; off >>= 1)
+          sum += __shfl_xor_sync(0xffffffffu, sum, off);
+        if (lane == 0) {
+          s_alpha[srow] = alpha;
+          s_m[srow] = nm;
+          s_l[srow] = s_l[srow] * alpha + sum;
+        }
+      }
+      asm volatile("bar.sync 1, 256;" ::: "memory");
+
+      // PV(swap-AB,四份 acc):O^T[dim][row] = V^T[dim][token] * P[token][row]。
+      const int l8 = lane & 7;
+      const int mi = lane >> 3;
+      const int row0 = 2 * (lane & 3);
+      const int row1 = row0 + 1;
+      float a[4][2];
+#pragma unroll
+      for (int p = 0; p < 4; ++p) {
+        const bool hp = !((p == 1 && !has_b1) || (p == 2 && !has_b2) ||
+                          (p == 3 && !has_b3));
+        a[p][0] = (hp && row0 < grp) ? s_alpha[p * 8 + row0] : 0.0f;
+        a[p][1] = (hp && row1 < grp) ? s_alpha[p * 8 + row1] : 0.0f;
+        if (hp) {
+#pragma unroll
+          for (int h = 0; h < 2; ++h) {
+            if (row0 < grp) {
+              acc[p][h][0] *= a[p][0];
+              acc[p][h][2] *= a[p][0];
+            }
+            if (row1 < grp) {
+              acc[p][h][1] *= a[p][1];
+              acc[p][h][3] *= a[p][1];
+            }
+          }
+        }
+      }
+      const int g = lane >> 2;
+      const int q = lane & 3;
+#pragma unroll
+      for (int j = 0; j < 4; ++j) {
+        uint32_t w[4];
+#pragma unroll
+        for (int i = 0; i < 4; ++i) {
+          const int tok = 16 * j + 2 * q + v_token_offset(i);
+          const int dim = 32 * warp + 4 * g;
+          w[i] = *reinterpret_cast<const uint32_t*>(s_v[st] + v_swz64(tok, dim));
+        }
+        uint32_t b[4][2];
+        v_b_fragments(w, b);
+#pragma unroll
+        for (int p = 0; p < 4; ++p) {
+          if (p == 1 && !has_b1) continue;
+          if (p == 2 && !has_b2) continue;
+          if (p == 3 && !has_b3) continue;
+          unsigned bp0, bp1;
+          ldmatrix_x2(bp0, bp1,
+                      smem_addr(&s_p[(p * 8 + l8) * PPITCH + j * 16 +
+                                    ((mi & 1) << 3)]));
+#pragma unroll
+          for (int h = 0; h < 2; ++h) {
+            const uint32_t am[4] = {b[2 * h][0], b[2 * h + 1][0],
+                                    b[2 * h][1], b[2 * h + 1][1]};
+            mma_f16(acc[p][h][0], acc[p][h][1], acc[p][h][2], acc[p][h][3],
+                    am[0], am[1], am[2], am[3], bp0, bp1);
+          }
+        }
+      }
+    }
+    asm volatile("bar.sync 1, 256;" ::: "memory");
+    if (t + 2 < t1) named_arrive(kBarEmpty0 + st, kBarThreads2);
+  }
+
+  if (warp < 8) {
+    const int g = lane >> 2;
+    const int q = lane & 3;
+#pragma unroll
+    for (int p = 0; p < 4; ++p) {
+      if (p == 1 && !has_b1) continue;
+      if (p == 2 && !has_b2) continue;
+      if (p == 3 && !has_b3) continue;
+      const int b = b0 + p;
+#pragma unroll
+      for (int h = 0; h < 2; ++h) {
+        const int d0 = warp * 32 + 4 * g + 2 * h;
+        const int d1 = d0 + 1;
+        const int row0 = 2 * q;
+        const int row1 = row0 + 1;
+        if (row0 < grp) {
+          const int hh = kh * grp + row0;
+          const int base = ((b * Hq + hh) * nparts + part) * D;
+          partial_out[base + d0] = acc[p][h][0];
+          partial_out[base + d1] = acc[p][h][2];
+        }
+        if (row1 < grp) {
+          const int hh = kh * grp + row1;
+          const int base = ((b * Hq + hh) * nparts + part) * D;
+          partial_out[base + d0] = acc[p][h][1];
+          partial_out[base + d1] = acc[p][h][3];
+        }
+      }
+    }
+    if (lane == 0) {
+      for (int p = 0; p < 4; ++p) {
+        if (p == 1 && !has_b1) continue;
+        if (p == 2 && !has_b2) continue;
+        if (p == 3 && !has_b3) continue;
+        const int b = b0 + p;
+        for (int r = 0; r < grp; ++r) {
+          const int h = kh * grp + r;
+          const int stp = ((b * Hq + h) * nparts + part) * 2;
+          partial_stat[stp] = s_m[p * 8 + r];
+          partial_stat[stp + 1] = s_l[p * 8 + r];
         }
       }
     }

@@ -2495,3 +2495,40 @@ GQA TC，需要给出**具体变体/nparts/档位**，不能直接用当前这�
   A-fragment。不要再把 shadow 写回 INT8 路线。
 - **nparts 21**：3090 84 SM 上 147k 542µs 优于 34（但 3090 生产档仍 21）；
   3080 68 SM 上 34 最优，不要按 3090 的数改 3080。
+
+## 2026-11-23：verify 四行 pack（pth4，生产默认）
+
+两行 pack（pth2）之后，继续把 verify 的 pack 宽度加到四行：
+`owl_int8_decode_pth4_pc_split`（`cu/attn/int8_decode.cu`）。
+
+- **形状**：8 compute + 4 producer / 384 threads，smem **92,544 B**，1 CTA/SM；
+  grid = `(hkv, ceil(B/4), nparts)`；B=8 / nparts=21 / 84 SM 正好一波。
+- **QK**：m16 两趟，B0/B1 用 Q 行 0..15、B2/B3 用 16..31；K fragment 复用。
+- **PV**：四份 acc；V fragment 每 tile 只构造一次；P 行 0..29。
+- **选择**：`tokens >= 4` 且 `kernel.int8_verify_pack4=true`（默认）走 pth4；
+  否则 pth2 / pth；单 token decode 仍走 PTH。
+
+### alpha bug（已修）
+
+首版 `partial_stat` 与 pth2 逐位一致，但 `partial_out` 差到 12.6，100K
+needle MISSED。根因：PV 的 alpha 缩放只乘了 `acc[p][0]` 的 `[0]/[2]`，
+漏掉 h=1 的 `[0]/[2]` 与两行的 `[1]/[3]`。按 h=0/1 分别乘 row0/row1 的
+alpha 后，pth4 vs pth2 **max|d|=0，cos=1.0**；100K needle 恢复 RETRIEVED。
+**门**：四行 pack 必须过 100K needle，短上下文看不出来。
+
+### 实测（2×3090 Ti，INT8 f16 scale，d7）
+
+核级 B=8/HQ=12/HKV=2（µs/层）：32K 135.8→119.0（−12.3%）、65K 252.9→221.2
+（−12.5%）、147K 550.0→480.3（−12.7%）、200K 727.0→616.5（−15.2%）。
+nparts=21 仍是 3090 各档最优。
+
+e2e 同 nonce A/B（pth2 → pth4）：32K 104.82→111.36（+6.2%）、
+131K 83.29→86.32（+3.6%）、200K 88.02→91.54（+4.0%）；prefill 不变。
+报告：`docs/bench/int8-pth4-2026-11-23.md`；数据
+`docs/bench/data/int8-pth4-2026-11-23/`。
+
+### prefill 旁证
+
+- `prefill_chunk=3072`：32K +2.2%、200K +0.1%，方差内，不算收益；
+- `prefill_chunk=4096`：TP allreduce 载荷 40MB > slot 32MB，硬拒（v1 单块）；
+- 下一刀仍是 GQA M2（块内 6 q head 共享 staged K/V），不是 nparts/单 K scale/网格序。

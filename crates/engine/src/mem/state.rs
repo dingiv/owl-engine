@@ -1361,12 +1361,12 @@ impl StatePool {
             k_scale: block_leaf_dt(
                 &b.k_scale.0,
                 vec![self.geom.nb_kv * self.geom.page * d.hkv * 8],
-                Dtype::F32,
+                Dtype::F16,
             ),
             v_scale: block_leaf_dt(
                 &b.v_scale.0,
                 vec![self.geom.nb_kv * self.geom.page * d.hkv],
-                Dtype::F32,
+                Dtype::F16,
             ),
         })
     }
@@ -2101,8 +2101,8 @@ impl<'a> AllocCtx<'a> {
             // Kscale `[nb,page,hkv,8]` 每 token 每层 32·hkv B;Vscale
             // `[nb,page,hkv]` 每 token 4·hkv B。
             per_tok.main_kv += n_full
-                * (dims.hkv * 8 * std::mem::size_of::<f32>()
-                    + dims.hkv * 32 * std::mem::size_of::<f32>() / 32);
+                * (dims.hkv * 8 * std::mem::size_of::<u16>()
+                    + dims.hkv * 32 * std::mem::size_of::<u16>() / 32);
         }
         // 治理器之后的固定分配(GDN 格/快照 f32 同式;图 slab + warmup + 草稿 ring)
         let gdn_slot_elems =
@@ -2417,12 +2417,12 @@ impl KvBank {
             let k_cache = zero_block_dt(face, k_elems, k_dt, &format!("kv.k.{l}")).await?;
             let v_cache = zero_block_dt(face, v_elems, v_dt, &format!("kv.v.{l}")).await?;
             let int8 = if is_int8 {
-                // Kscale 每 token/头/8 个 32-dim group;Vscale 每 token/头。
+                // Kscale/Vscale 均每 token/头。
                 let ks = nb_kv * page * dims.hkv * 8;
                 let vs = nb_kv * page * dims.hkv;
                 Some(KvInt8Blocks {
-                    k_scale: zero_block_dt(face, ks, Dtype::F32, &format!("kv.ks.{l}")).await?,
-                    v_scale: zero_block_dt(face, vs, Dtype::F32, &format!("kv.vs.{l}")).await?,
+                    k_scale: zero_block_dt(face, ks, Dtype::F16, &format!("kv.ks.{l}")).await?,
+                    v_scale: zero_block_dt(face, vs, Dtype::F16, &format!("kv.vs.{l}")).await?,
                 })
             } else {
                 None

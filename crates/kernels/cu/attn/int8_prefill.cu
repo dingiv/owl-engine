@@ -102,9 +102,9 @@ __device__ __forceinline__ StageGeom stage_geom(int tid, int Hkv, int page) {
 extern "C" __global__ void owl_int8_prefill_paged(const int8_t* __restrict__ q,
                               const float* __restrict__ qscale,
                               const int8_t* __restrict__ k,
-                              const float* __restrict__ kscale,
+                              const __half* __restrict__ kscale,
                               const int8_t* __restrict__ v,
-                              const float* __restrict__ vscale,
+                              const __half* __restrict__ vscale,
                               const float* __restrict__ block_table,
                               __half* __restrict__ out, int T, int L, int Hq, int Hkv,
                               int page, int base_pos,
@@ -157,16 +157,15 @@ extern "C" __global__ void owl_int8_prefill_paged(const int8_t* __restrict__ q,
                 store_vec(dst, make_int4(0, 0, 0, 0));
             }
         }
-        const float* sbase =
+        const __half* sbase =
             kscale + (size_t)phys0 * page * Hkv * 8 + (size_t)kv_head * 8;
 #pragma unroll
         for (int j = 0; j < sg.s_iters; ++j) {
-            // 无条件读(页已分配,槽必在池内)+ FSEL:免掉 BSSY/条件 LDG 分支
-            const float raw = sbase[sg.s_off0 + j * sg.s_step];
+            const float raw = __half2float(sbase[sg.s_off0 + j * sg.s_step]);
             kscale0[sg.s_smem0 + j * (sg.s_step * Bc)] = (sg.s_key < L) ? raw : 0.0f;
         }
         if (tid < Bc) {
-            const float raw = vscale[(size_t)(phys0 * page + tid) * Hkv + kv_head];
+            const float raw = __half2float(vscale[(size_t)(phys0 * page + tid) * Hkv + kv_head]);
             vscale_s[tid] = (tid < L) ? raw : 1.0f;
         }
     }
@@ -393,16 +392,16 @@ extern "C" __global__ void owl_int8_prefill_paged(const int8_t* __restrict__ q,
                     }
                 }
             }
-            const float* sbase =
+            const __half* sbase =
                 kscale + (size_t)phys * page * Hkv * 8 + (size_t)kv_head * 8;
 #pragma unroll
             for (int j = 0; j < sg.s_iters; ++j) {
-                const float raw = sbase[sg.s_off0 + j * sg.s_step];
+                const float raw = __half2float(sbase[sg.s_off0 + j * sg.s_step]);
                 kscale0[sg.s_smem0 + j * (sg.s_step * Bc)] =
                     (nk * Bc + sg.s_key < L) ? raw : 0.0f;
             }
             if (tid < Bc) {
-                const float raw = vscale[(size_t)(phys * page + tid) * Hkv + kv_head];
+                const float raw = __half2float(vscale[(size_t)(phys * page + tid) * Hkv + kv_head]);
                 vscale_s[tid] = (nk * Bc + tid < L) ? raw : 1.0f;
             }
             cp_commit();

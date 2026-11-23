@@ -261,7 +261,7 @@ extern "C" __global__ void owl_norm_rope_k_int8_write_f16(
     int w_off,
     const float* __restrict__ slots,
     int8_t* __restrict__ k_cache,
-    float* __restrict__ k_scale,
+    __half* __restrict__ k_scale,
     int num_heads,
     int head_size,
     int block_size,
@@ -339,7 +339,6 @@ extern "C" __global__ void owl_norm_rope_k_int8_write_f16(
     __syncthreads();
     const float scale0 = fmaxf(smem[192 + d / 32] / 127.0f, 1e-6f);
     const float qinv0 = 1.0f / scale0;
-    // rotate-half 的 v1 落在 d+half,属于另一个 32-dim group,必须用自己的 scale。
     const float scale1 = fmaxf(smem[192 + (d + half) / 32] / 127.0f, 1e-6f);
     const float qinv1 = 1.0f / scale1;
 
@@ -356,7 +355,7 @@ extern "C" __global__ void owl_norm_rope_k_int8_write_f16(
     }
     if (d < 8) {
         k_scale[((static_cast<long long>(block) * block_size + offset) * num_heads + h) * 8 + d] =
-            fmaxf(smem[192 + d] / 127.0f, 1e-6f);
+            __float2half_rn(fmaxf(smem[192 + d] / 127.0f, 1e-6f));
     }
     if (d == 0) out[0] = __float2half(0.0f);
 }

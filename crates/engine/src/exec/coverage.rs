@@ -2228,8 +2228,8 @@ impl<D: DeviceClient> RunningEngine<D> {
         let codec = crate::exec::kvpage::KvPageFormat::of_pool(self.dev.pool.geom.kv_dtype).codec();
         let k_scale_elems = codec.k_scale_elems(page, hkv);
         let v_scale_elems = codec.v_scale_elems(page, hkv);
-        let k_scale_bytes = k_scale_elems * std::mem::size_of::<f32>();
-        let v_scale_bytes = v_scale_elems * std::mem::size_of::<f32>();
+        let k_scale_bytes = k_scale_elems * std::mem::size_of::<u16>();
+        let v_scale_bytes = v_scale_elems * std::mem::size_of::<u16>();
         let page_bytes = codec.page_bytes(page, hkv, hd);
         let mut v_post: Vec<Vec<f32>> = if want_scheme {
             vec![vec![0.0f32; ctx_tokens * hkv * hd]; layers]
@@ -2284,8 +2284,8 @@ impl<D: DeviceClient> RunningEngine<D> {
             face.dtoh_batch(&scale_pieces).await?
         };
         let scale_f32: Vec<f32> = scale_all
-            .chunks_exact(4)
-            .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+            .chunks_exact(2)
+            .map(|c| half::f16::from_le_bytes([c[0], c[1]]).to_f32())
             .collect();
         let mut cursor = 0usize;
         let mut scale_cursor = 0usize;
