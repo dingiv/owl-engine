@@ -37,10 +37,10 @@ ram_pool_size = 10240
 # 单槽快照；宿主面默认关闭，避免「下沉后再 land」撞块层不变量
 
 [store.gdn]
-snap_max = 1
+snap_device_slots = 1
 snap_msg_delim = ""
 snap_session_cap = 4
-snap_tail = 2
+snap_tail_keep = 2
 
 [vision]
 enabled = true

@@ -162,7 +162,7 @@ fn knobs_for(plan: QuantPlan, dir: &Path) -> EngineKnobs {
         // 质量门隔离:lookup 是 host 侧草稿增强,不改变 head 路径;默认关,
         // 需要跟生产档同参时显式 OWL_TP_HEAD_LOOKUP=1。
         k.draft.lookup = std::env::var("OWL_TP_HEAD_LOOKUP").as_deref() == Ok("1");
-        k.snap_max = 1;
+        k.snap_device_slots = 1;
         k.cuda.capture_slab_mb = Some(160);
         k.vram_activation_reserve = 256;
     }

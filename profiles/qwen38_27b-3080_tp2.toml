@@ -4,7 +4,7 @@
 # 形状：W4A8 主干 · INT8 KV · TP2 + 词表切分 · eager prefill + FI 图 decode。
 #
 # 满池姿态（2026-11-18 现场实测）：
-#   · max_concurrency=2 / snap_max=6：池按 cap−prefill 瞬态拉满，
+#   · max_concurrency=2 / snap_device_slots=8：池按 cap−prefill 瞬态拉满，
 #     双会话共享；单请求上限仍是模型 native 262144。
 #   · prefill_chunk = 1024：2048 的 Marlin 工作区 + 图像 scatter 会把
 #     20G 卡压到 vram-guard 拒绝（PoolExhausted）。
@@ -24,6 +24,7 @@ extends = [
 
 [server]
 bind = "0.0.0.0:8135"
+request_dump_dir = "/tmp/owl_dump"
 
 [parallel]
 mode = "tensor"
@@ -75,10 +76,13 @@ ram_pool_size = 13312
 vram_activation_reserve = 1024
 
 [store.gdn]
-snap_max = 6
+# Tail 必须全部落在设备槽：旧值（旧名 snap_tail=12 / snap_max=6） 会让 image_evict
+# 的恢复点在宿主/设备之间抖动，2.8s swap 进入 TTFT 关键路径。
+# 8 槽 ≈ 594MiB，覆盖 3 图 + 最近消息边界；历史点仍由宿主层承载。
+snap_device_slots = 8
 snap_msg_delim = ""
 snap_session_cap = 30
-snap_tail = 12
+snap_tail_keep = 8
 
 [vision]
 image_evict = true

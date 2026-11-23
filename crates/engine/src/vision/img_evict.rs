@@ -836,7 +836,7 @@ pub fn block_tags_pos(
 ///   的点没有可复用前缀 / 不在链内，直接丢弃；
 /// - 稳态成本 ≈ **本轮新进 prompt 的可删图数**：旧图的锚点键是内容身份，
 ///   前缀命中时 prefill 不会跨过那些 offset ⇒ 同键 Touch，不占新槽；
-/// - 设备/宿主/盘的快照预算仍由 `admit_snap`（`snap_max`/`snap_session_cap`/
+/// - 设备/宿主/盘的快照预算仍由 `admit_snap`（`snap_device_slots`/`snap_session_cap`/
 ///   `SnapRole`）兜底 —— 满了就跳过，不会静默错值。
 pub fn evict_snap_points(spans: &[ImgSpan], prompt_len: usize, page: usize) -> Vec<usize> {
     if page == 0 || spans.is_empty() || prompt_len <= page {

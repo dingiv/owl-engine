@@ -72,7 +72,7 @@ pub fn run(args: Args) -> i32 {
                 "[workload] 8135 图像无感删除测试档示例:\n\
                  ./target/release/server -p profiles/qwen38_27b-3080_tp2.toml \\\n\
                    --set vision.image_evict=true \\\n\
-                   --set store.prefix_cache=true --set store.gdn.snap_max=2 \\\n\
+                   --set store.prefix_cache=true --set store.gdn.snap_device_slots=2 \\\n\
                    --set store.ram_pool_size=11264 --set runtime.max_context_length=131072 \\\n\
                    --log-level info\n\
                  或直接:tools/run-agent-workload.sh gui"

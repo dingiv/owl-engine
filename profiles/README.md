@@ -27,7 +27,7 @@ extends = [
     引擎活跃 turn 上限、GDN 状态格数都从它派生；`gdn_slots = N`，
     `max_batch = min(N, 8)`（合批上限，不再是 TOML 键）。
   - **0 = 拒启**；>8 时 `max_batch` 封顶 8，其余活跃 turn 串行 decode。
-  - `[store.gdn] snap_max`：**N=2 时用 6**（2026-11-06 双会话门实测：3 会丢空闲会话的尾锚点，
+  - `[store.gdn] snap_device_slots`：**N=2 时用 6**（2026-11-06 双会话门实测：3 会丢空闲会话的尾锚点，
     下一轮命中 71.6% vs 期望 86%；4 仍偶发，6 稳定）。单并发 N=1 用 2。
   - 合批与 `[kvmem].select_decode` 互斥；超卖档自动压回 `max_concurrency=1`。
 
@@ -53,7 +53,7 @@ extends = [
 | 文件 | 端口 | 形状 |
 |---|---|---|
 | `qwen38_27b-3090.toml` | 8137 | 单 3090 Ti / 27B AWQ-INT4 + 视觉 / DFlash2 d7 / FI+图 / **INT8 KV（30 系默认）** / 前缀缓存 / image_evict / **max_context_length 57344（a8 版全特性稳定点）** / chunk 2048 |
-| `qwen38_27b-3080_tp2.toml` | 8135 | 2×3080 20G TP2 / 27B AWQ-INT4 + 视觉 / DFlash2 d7 / **INT8 KV（30 系默认）** / 前缀缓存 / image_evict / **max_context_length 262144** / chunk 1024（20G 稳定点）/ **满池双活跃（`max_concurrency=2` · `snap_max=6` · `vram_activation_reserve=1024` · `snap_session_cap=30`/`snap_tail=12`）** |
+| `qwen38_27b-3080_tp2.toml` | 8135 | 2×3080 20G TP2 / 27B AWQ-INT4 + 视觉 / DFlash2 d7 / **INT8 KV（30 系默认）** / 前缀缓存 / image_evict / **max_context_length 262144** / chunk 1024（20G 稳定点）/ **满池双活跃（`max_concurrency=2` · `snap_device_slots=8` · `vram_activation_reserve=1024` · `snap_session_cap=30`/`snap_tail_keep=8`）** |
 | `qwen38_27b-3080_tp2-150k.toml` | 8135 | 150k follow-up 档：同卡同 draft，目标切回 **W4A16**，**F16 KV**（int8 长 ctx verify 慢 30%），单并发；147k/320tok 实测 78.7 t/s（主档 60.5） |
 | `qwen38_27b-gguf_3090.toml` | 8137 | 单 3090 Ti / 27B **GGUF UD-IQ4_XS**（14.3GB）+ **mmproj-F16 视觉塔** / DFlash2 d7 / fp8 KV / 前缀缓存 / **max_context_length 172032（168k）** / chunk 2048。prefill 1633–1681 t/s、decode 127–135、128k prompt 零拒发；代价 = prefill 比 a8 档(同端口)慢 ~24% |
 | `qwen38_27b-gguf-iq3_3090.toml` | 8137 | 单 3090 Ti / 27B **GGUF UD-IQ3_S**（12.0GB）+ mmproj-F16 / DFlash2 d7 / **FP8 KV（例外：3-bit 主干对 INT8 KV 的 1k needle 敏感）** / **max_context_length 229376（224k，逼近 native 262144）** / chunk 2048。prefill 1409–1509 t/s、decode 97–121；**与 8137 上的其它单卡 3090 档互斥**（同一张卡二选一），速度慢 ~13%、3bit 质量低一档 |
@@ -87,14 +87,14 @@ extends = [
   2026-11-16 原始算法；旧 `implicit_session` 键已删）；
 - `image_evict=true`（最终方案 = **leave-gap**：删后不转 K、保留位置洞，
   可无限次丢弃旧图片缓存；旧的 rebase/K 旋转路径已删除）；
-- 3090：`max_context_length=57344 / snap_max=2 / ram_pool_size=13312`（宿主总池，KV+快照共享）；
-- 3080 TP2：`max_context_length=262144 / max_concurrency=2 / snap_max=6 / vram_activation_reserve=1024M / snap_session_cap=30 / snap_tail=12 / ram_pool_size=13312`（宿主总池，KV+快照共享）/ `ttft_on_expire=warn`（TTFT 超期只告警、不强停）。
+- 3090：`max_context_length=57344 / snap_device_slots=2 / ram_pool_size=13312`（宿主总池，KV+快照共享）；
+- 3080 TP2：`max_context_length=262144 / max_concurrency=2 / snap_device_slots=8 / vram_activation_reserve=1024M / snap_session_cap=30 / snap_tail_keep=8 / ram_pool_size=13312`（宿主总池，KV+快照共享）/ `ttft_on_expire=warn`（TTFT 超期只告警、不强停）。
 
 pi 实测工具跟进 cached 95.6% / TTFT 149ms，手动新消息 96.2% / 97ms，
 新会话 98.3% / 116ms；8135 的 `image-evict` 5/5、GUI 窗口 PASS。
 详见 `docs/devlog/serving/agent-surface.md` §9.4。
 
-`max_context_length=57344 / snap_max=2` 是 **2026-10-27 a8 版单 3090 全特性稳定点**：
+`max_context_length=57344 / snap_device_slots=2` 是 **2026-10-27 a8 版单 3090 全特性稳定点**：
 24G 上同时开视觉塔 + DFlash2 d7 + fp8 KV + 前缀缓存 + image_evict。
 fresh boot 驱动余量高于 1GiB；前缀缓存饱和后可能短暂出现 N6 压力 WARN，
 `image_delete_marked` 与 GUI 三图窗口实测仍通过。更大的 79872/snap1 虽然 ctx 更大，但驱动余量贴地板，
@@ -111,7 +111,7 @@ image_evict 的前缀块会被下沉到 host（`前缀有宿主占位 ⇒ 不吸
 # 临时变体（不再建文件；超过 ctx_max 会被 boot 响亮拒，不会静默夹）
 --set spec.depth=0 --set spec.lookup=false     # 关投机对照臂
 --set runtime.max_context_length=63456                    # 全特性稳定点（默认）
---set runtime.max_context_length=79872 --set store.gdn.snap_max=1  # 更大 ctx 但 image_evict 可能失效
+--set runtime.max_context_length=79872 --set store.gdn.snap_device_slots=1  # 更大 ctx 但 image_evict 可能失效
 --set model.vision=false                       # 关视觉可换回更大 ctx（~104k）
 ```
 

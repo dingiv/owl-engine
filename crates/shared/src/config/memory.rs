@@ -4,7 +4,7 @@
 //!
 //! ```text
 //! target_total = total × vram_budget
-//! fixed        = gdn_row × (gdn_slots + snap_max) + 图 slab 640MiB + warmup 138MiB
+//! fixed        = gdn_row × (gdn_slots + snap_device_slots) + 图 slab 640MiB + warmup 138MiB
 //! budget       = target_total − reserve − fixed − live(权重/运行底价)
 //! cap          = budget / per_tok                （治理器会夹池到这个上限）
 //! usable       = budget − activation − stability_margin
@@ -62,7 +62,7 @@ pub struct MemoryInputs {
     /// 主 KV 池每元素字节数(f16=2;fp8/int8=1)。**不用布尔表达格式**。
     pub kv_bytes_per_elem: usize,
     pub gdn_slots: usize,
-    pub snap_max: usize,
+    pub snap_device_slots: usize,
     /// 并发会话数(非超卖档池 = 上下文 × sessions;每会话一份整上下文预算)
     pub sessions: usize,
     /// TP world(1/2;2 = 权/KV/GDN 按卡摊,视觉塔每 rank 全量)
@@ -193,7 +193,7 @@ pub fn budget_parts(inp: &MemoryInputs) -> (FixedParts, u64, u64, usize) {
     let gdn_row = inp.model.gdn_row_bytes() / world;
     let fixed = FixedParts {
         gdn_grid: gdn_row * inp.gdn_slots as u64,
-        gdn_snap: gdn_row * inp.snap_max as u64,
+        gdn_snap: gdn_row * inp.snap_device_slots as u64,
     };
     let target_total = (inp.total_bytes as f64 * inp.vram_budget) as u64;
     let weights = weights_bytes(inp);
@@ -349,7 +349,7 @@ mod tests {
     use super::*;
     use crate::config::intent::{QWEN38_27B_AWQ, RTX_3090TI_24G};
 
-    fn inputs(kv_1byte: bool, chunk: usize, tail: usize, snap_max: usize) -> MemoryInputs {
+    fn inputs(kv_1byte: bool, chunk: usize, tail: usize, snap_device_slots: usize) -> MemoryInputs {
         let (act, note) = activation_for(chunk, tail);
         MemoryInputs {
             total_bytes: RTX_3090TI_24G.total_bytes,
@@ -360,7 +360,7 @@ mod tests {
             spec_dflash: false,
             kv_bytes_per_elem: if kv_1byte { 1 } else { 2 },
             gdn_slots: 1,
-            snap_max,
+            snap_device_slots,
             sessions: 1,
             tp_world: 1,
             vision: false,
@@ -451,6 +451,9 @@ mod tests {
         assert_eq!(e.per_tok_draft, 20480);
         assert_eq!(e.per_tok, 53248);
         assert_eq!(e.weights_bytes, (16_650 + 1_290) << 20);
-        assert_eq!(e.fixed.gdn_snap, 155_713_536, "snap_max=1 ⇒ 一条 148.5 MiB");
+        assert_eq!(
+            e.fixed.gdn_snap, 155_713_536,
+            "snap_device_slots=1 ⇒ 一条 148.5 MiB"
+        );
     }
 }

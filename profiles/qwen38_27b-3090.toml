@@ -46,10 +46,11 @@ vram_activation_reserve = 970
 ram_pool_size = 13312
 
 [store.gdn]
-snap_max = 2
+snap_device_slots = 2
 snap_msg_delim = ""
 snap_session_cap = 30
-snap_tail = 12
+# 设备只有 2 槽；tail 不得超过，否则删图恢复点从宿主回灌。
+snap_tail_keep = 2
 
 [vision]
 image_evict = true

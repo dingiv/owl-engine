@@ -66,7 +66,7 @@ pub struct PoolFixedInputs {
     /// GDN 状态元素字节(f32 = 4)。
     pub gdn_elem_bytes: usize,
     /// 前缀快照槽数。
-    pub snap_max: usize,
+    pub snap_device_slots: usize,
     /// 草稿 ring 字节(DFlash2 / MTP ring)。
     pub draft_ring_bytes: usize,
     /// 是否分配 spec 回滚快照。
@@ -104,7 +104,7 @@ impl PoolFixedTerms {
             .saturating_mul(i.gdn_elem_bytes);
         Self {
             gdn_grid: grid,
-            gdn_snap: i.snap_max.saturating_mul(row),
+            gdn_snap: i.snap_device_slots.saturating_mul(row),
             spec_snap: if i.spec_snapshot { row } else { 0 },
             replay_snap: if i.replay_snapshot { row } else { 0 },
             draft_ring: i.draft_ring_bytes,
@@ -290,7 +290,7 @@ mod tests {
             gdn_slots: 3,
             gdn_slot_elems: 5,
             gdn_elem_bytes: 4,
-            snap_max: 2,
+            snap_device_slots: 2,
             draft_ring_bytes: 100,
             spec_snapshot: true,
             replay_snapshot: true,
@@ -318,7 +318,7 @@ mod tests {
             gdn_slots: 3,
             gdn_slot_elems: 5,
             gdn_elem_bytes: 4,
-            snap_max: 2,
+            snap_device_slots: 2,
             draft_ring_bytes: 100,
             spec_snapshot: true,
             replay_snapshot: true,

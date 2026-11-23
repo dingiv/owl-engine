@@ -7,7 +7,7 @@ vram_activation_reserve = 1482
 
 # 超卖档「池外瞬态余量」MiB(池 = cap − 本值/per_tok;缺省 1024 = 旧硬编码值)
 [store.gdn]
-snap_max = 0
+snap_device_slots = 0
 [kvmem]
 select_decode = true
 select_partial = true

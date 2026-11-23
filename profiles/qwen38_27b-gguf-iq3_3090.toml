@@ -37,10 +37,10 @@ vram_activation_reserve = 714
 ram_pool_size = 10240
 
 [store.gdn]
-snap_max = 1
+snap_device_slots = 1
 snap_msg_delim = ""
 snap_session_cap = 4
-snap_tail = 2
+snap_tail_keep = 2
 
 [vision]
 enabled = true

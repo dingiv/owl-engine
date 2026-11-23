@@ -1785,7 +1785,7 @@ impl<D: DeviceClient> RunningEngine<D> {
         }
         let layout = crate::msg_boundary::plan_snap_layout(
             &candidates,
-            self.boot.cfg.knobs.snap_tail,
+            self.boot.cfg.knobs.snap_tail_keep,
             self.boot.cfg.knobs.snap_session_cap,
         );
         let msg_snaps = layout.points;
@@ -2235,7 +2235,7 @@ impl<D: DeviceClient> RunningEngine<D> {
             // `Rel::snap_victim_order` 拿;池只做 key→槽映射。
             let order = self.bank.parts().rel.snap_victim_order(&protect);
             let pick = self.dev.pool.snap_pick_slot(key, &order).ok_or_else(|| {
-                ModelError::Msg("GDN 快照池为空(snap_max = 0):调用方应跳过 capture".into())
+                ModelError::Msg("GDN 快照池为空(snap_device_slots = 0):调用方应跳过 capture".into())
             })?;
             match pick {
                 SnapSlotPick::Hit(slot) | SnapSlotPick::Free(slot) => return Ok(slot),

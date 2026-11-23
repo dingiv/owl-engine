@@ -1870,7 +1870,7 @@ impl<D: DeviceClient> RunningEngine<D> {
         }
         let mut layout = crate::msg_boundary::plan_snap_layout(
             &candidates,
-            self.boot.cfg.knobs.snap_tail,
+            self.boot.cfg.knobs.snap_tail_keep,
             self.boot.cfg.knobs.snap_session_cap,
         );
         // restore 边界是当前 turn 的硬恢复点，不能被均匀选点挤出目标集合。

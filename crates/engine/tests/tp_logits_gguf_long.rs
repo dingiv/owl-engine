@@ -37,7 +37,7 @@ fn cfg_of(ordinal: usize, max_context_length: usize, chunk: usize) -> EngineConf
     knobs.pool_tokens = Some(max_context_length);
     knobs.gdn_slots = 1;
     knobs.ram_pool_size = 32;
-    knobs.snap_max = 0;
+    knobs.snap_device_slots = 0;
     knobs.prefix_cache = false;
     EngineConfig {
         device_ordinal: ordinal,

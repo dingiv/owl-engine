@@ -6,7 +6,7 @@
 //!   cargo test -p cli --test workload_e2e -- --nocapture
 //!
 //! `OWL_WORKLOAD_SUITE` selects the suite (default `core`; `gui` is the
-//! GUI-agent screenshot-window scenario and needs `snap_max>=2`).
+//! GUI-agent screenshot-window scenario and needs `snap_device_slots>=2`).
 
 use std::process::Command;
 

@@ -68,7 +68,7 @@
 //! | model | mtp_dir | Option<String> / None(MTP 头覆盖;None = 检查点自带 / 同 GGUF 文件) |
 //! | model | head_quant | HeadQuant 枚举("off"\|"rtn-int4-g32"\|"rtn-int8-row")/ off |
 //! | store.kv | kv_dtype | KvDtype 枚举 `f16\|fp8\|int8` / f16(主 KV 池存储格式;2026-11-04 由两个布尔合成单键) |
-//! | store.gdn | snap_max / snap_session_cap / snap_tail | usize / 4、30、12 |
+//! | store.gdn | snap_device_slots / snap_session_cap / snap_tail_keep | usize / 4、30、12 |
 //! | store | vram_budget / vram_activation_reserve | f64、u64 / 0.97、714 |
 //! | store | prefix_cache | bool / true(缓存可占整池;逐出到 host/disk) |
 //! | vision | enabled | bool / false(视觉塔开关;GGUF 档另有 `path` 指向 `mmproj-*.gguf`) |
@@ -76,7 +76,7 @@
 //! | vision | image_evict_pad | str / "。"(图像段页对齐 pad 词;必须恰 1 token;空 = 自动) |
 //! | vision | max_pixels / path | usize 0 / Option None(图像预处理像素封顶 / 视觉塔权重路径) |
 //! | ~~store~~ | *(prefill_align_tail / snap_msg_boundary / snap_evict_anchor 2026-11-16 退役：删键**默认开**，门由消费者/几何导出)* |
-//! | ~~store.gdn~~ | *(snap_decode_stride / snap_msg_min_gap / snap_msg_min_span 2026-11-17 退役；snap_msg_recent / snap_structural_reserve 2026-11-18 v4 退役 —— 统一为 `snap_session_cap` + `snap_tail`)* |
+//! | ~~store.gdn~~ | *(snap_decode_stride / snap_msg_min_gap / snap_msg_min_span 2026-11-17 退役；snap_msg_recent / snap_structural_reserve 2026-11-18 v4 退役 —— 统一为 `snap_session_cap` + `snap_tail_keep`)* |
 //! | store | ram_pool_size | usize / 0(**宿主总池**,KV 与快照共享;0 = 关层) |
 //! | store | disk_pool_size | usize / 0(**磁盘总池**,KV 与快照共享;0 = 关层) |
 //! | store | disk_dir | String / ""(磁盘内容目录;**重启扫目录回填账**;空 = 关层) |
@@ -832,7 +832,7 @@ pub struct StoreGdnCfg {
     /// 它决定设备上能同时留住多少条快照资产；容量必须由操作员按卡型给定，
     /// 引擎无法从宿主/磁盘池反推（那是下沉落点，不是设备池）。
     /// 快照拍摄节奏（`snap_decode_stride`）已收为引擎常数，不再与容量混在一个段。
-    pub snap_max: usize,
+    pub snap_device_slots: usize,
     /// 消息开启标记的**文本覆盖**（空 = 用模型的 `ChatFormat.im_open`，
     /// 如 Qwen 系 `<|im_start|>`）。引擎 boot 时把它 tokenize 成 id 序列；
     /// 扫描代码只认参数 `open_ids`，不写死任何字面量。
@@ -840,27 +840,27 @@ pub struct StoreGdnCfg {
     /// **每会话持久快照上限**（Tail + History；0 = 不限 = 旧行为）。
     ///
     /// **不是 LRU 的重复**：全局 LRU 只排序“谁先被逐”，一条活跃长会话仍可
-    /// 吃满 `snap_max` 设备槽与整条宿主腿；本键是单会话资产护栏。只数
+    /// 吃满 `snap_device_slots` 设备槽与整条宿主腿；本键是单会话资产护栏。只数
     /// **非 Transient** 条目（设备 + 宿主 + 盘都算）；`Transient` 是
     /// decode/spec rollback 的页边界快照，设备槽内自限、逐出零成本，不计入。
     /// 超限时先删 History，History 空后才动 Tail。
     pub snap_session_cap: usize,
     /// **尾部连续保留张数**（v4；`0` = 不设连续尾，全部按 History 均匀选）。
     ///
-    /// 最近 `snap_tail` 张快照连续保留，保证 append、浅回撤、工具结果续写的
-    /// TTFT；更早的点按 token 位置均匀选 `snap_session_cap - snap_tail` 张。
-    /// `snap_tail > snap_session_cap` 时 Tail 只保留最后 `snap_session_cap` 张。
-    pub snap_tail: usize,
+    /// 最近 `snap_tail_keep` 张快照连续保留，保证 append、浅回撤、工具结果续写的
+    /// TTFT；更早的点按 token 位置均匀选 `snap_session_cap - snap_tail_keep` 张。
+    /// `snap_tail_keep > snap_session_cap` 时 Tail 只保留最后 `snap_session_cap` 张。
+    pub snap_tail_keep: usize,
 }
 
 impl Default for StoreGdnCfg {
     fn default() -> Self {
         Self {
             gdn_slots: 1,
-            snap_max: 4,
+            snap_device_slots: 4,
             snap_msg_delim: String::new(),
             snap_session_cap: 30,
-            snap_tail: 12,
+            snap_tail_keep: 12,
         }
     }
 }
@@ -2481,6 +2481,19 @@ fn reject_retired_keys(v: &toml::Value) -> Result<(), String> {
             return Err(format!("[{module}] {key} 退役键:{hint}"));
         }
     }
+    // **2026-11-23 快照键重命名**：旧名不保留兼容，直接拒并点名新名。
+    if let Some(gdn) = v.get("store").and_then(|s| s.get("gdn")) {
+        for (old, new) in [
+            ("snap_max", "snap_device_slots"),
+            ("snap_tail", "snap_tail_keep"),
+        ] {
+            if gdn.get(old).is_some() {
+                return Err(format!(
+                    "[store.gdn] {old} 已改名为 {new}；旧键不再兼容，请更新配置"
+                ));
+            }
+        }
+    }
     // 嵌套表的两层键(退役键表只支持一层,故单独列)
     if v.get("cuda")
         .and_then(|m| m.get("graph_flags"))
@@ -3762,18 +3775,19 @@ mod retired_pool_keys {
             );
         }
         OwlConfig::from_toml_str("[runtime]\nmax_concurrency = 1\n").expect("健康档");
-        // 消费者门仍在：关 prefix_cache / snap_max=0 即自然退化（不需要开关）
-        let c =
-            OwlConfig::from_toml_str("[store.gdn]\nsnap_max = 0\n[store]\nprefix_cache = false\n")
-                .expect("合法档");
-        assert_eq!(c.store.gdn.snap_max, 0);
+        // 消费者门仍在：关 prefix_cache / snap_device_slots=0 即自然退化（不需要开关）
+        let c = OwlConfig::from_toml_str(
+            "[store.gdn]\nsnap_device_slots = 0\n[store]\nprefix_cache = false\n",
+        )
+        .expect("合法档");
+        assert_eq!(c.store.gdn.snap_device_slots, 0);
         assert!(!c.store.prefix_cache);
     }
 
     /// **2026-11-18 v4 退役键**（`[store.gdn]`）：拍摄节流 / 消息间距 /
     /// 切块最小步长 / 旧“最近 K 条 + 结构保留位”。旧键必须 unknown-field
-    /// 拒启，不能留成静默 no-op。容量/角色键 `snap_max` /
-    /// `snap_session_cap` / `snap_tail` 保留。
+    /// 拒启，不能留成静默 no-op。容量/角色键 `snap_device_slots` /
+    /// `snap_session_cap` / `snap_tail_keep` 保留。
     #[test]
     fn snapshot_policy_knobs_are_retired() {
         for k in [
@@ -3791,15 +3805,28 @@ mod retired_pool_keys {
             );
         }
         let c = OwlConfig::from_toml_str(
-            "[store.gdn]\nsnap_max = 4\nsnap_session_cap = 30\nsnap_tail = 12\n",
+            "[store.gdn]\nsnap_device_slots = 4\nsnap_session_cap = 30\nsnap_tail_keep = 12\n",
         )
         .expect("容量/角色键仍是合法档");
-        assert_eq!(c.store.gdn.snap_max, 4);
+        assert_eq!(c.store.gdn.snap_device_slots, 4);
         assert_eq!(c.store.gdn.snap_session_cap, 30);
-        assert_eq!(c.store.gdn.snap_tail, 12);
-        let d = OwlConfig::from_toml_str("[store.gdn]\nsnap_max = 4\n").expect("默认档");
+        assert_eq!(c.store.gdn.snap_tail_keep, 12);
+        let d = OwlConfig::from_toml_str("[store.gdn]\nsnap_device_slots = 4\n").expect("默认档");
         assert_eq!(d.store.gdn.snap_session_cap, 30);
-        assert_eq!(d.store.gdn.snap_tail, 12);
+        assert_eq!(d.store.gdn.snap_tail_keep, 12);
+    }
+
+    /// **2026-11-23 重命名**：旧键不保留兼容，直接拒并点名新名。
+    #[test]
+    fn old_snapshot_knobs_are_rejected() {
+        for (old, new) in [
+            ("snap_max", "snap_device_slots"),
+            ("snap_tail", "snap_tail_keep"),
+        ] {
+            let src = format!("[store.gdn]\n{old} = 6\n");
+            let e = OwlConfig::from_toml_str(&src).expect_err("旧键必须拒");
+            assert!(e.contains(old) && e.contains(new), "{old} 拒语: {e}");
+        }
     }
 
     #[test]
@@ -3906,11 +3933,11 @@ mod extends_tests {
         let d = tmp_dir("array");
         write(
             &d.join("a.toml"),
-            "[runtime]\nmax_context_length = 111\n[store.gdn]\nsnap_max = 1\n",
+            "[runtime]\nmax_context_length = 111\n[store.gdn]\nsnap_device_slots = 1\n",
         );
         write(
             &d.join("b.toml"),
-            "[runtime]\nmax_context_length = 222\n[store.gdn]\nsnap_max = 2\n",
+            "[runtime]\nmax_context_length = 222\n[store.gdn]\nsnap_device_slots = 2\n",
         );
         let child = d.join("child.toml");
         write(
@@ -3919,7 +3946,7 @@ mod extends_tests {
         );
         let c = OwlConfig::load(None, Some(&child)).expect("load");
         assert_eq!(c.runtime.max_context_length, 222, "后列覆盖前列");
-        assert_eq!(c.store.gdn.snap_max, 2, "后列覆盖前列");
+        assert_eq!(c.store.gdn.snap_device_slots, 2, "后列覆盖前列");
         assert_eq!(c.store.gdn.gdn_slots, 1, "自身键生效");
         let _ = std::fs::remove_dir_all(&d);
     }
@@ -3989,7 +4016,7 @@ mod extends_tests {
         let site = d.join("site.toml");
         write(
             &site,
-            "[runtime]\nmax_context_length = 12345\n[store.gdn]\nsnap_max = 2\n",
+            "[runtime]\nmax_context_length = 12345\n[store.gdn]\nsnap_device_slots = 2\n",
         );
         let child = d.join("child.toml");
         write(&child, "extends = \"site.toml\"\n\n[spec]\ndepth = 5\n");
@@ -4000,7 +4027,7 @@ mod extends_tests {
             c.runtime.max_context_length, 12345,
             "父档提供、基准未写者生效"
         );
-        assert_eq!(c.store.gdn.snap_max, 2, "父档覆盖基准");
+        assert_eq!(c.store.gdn.snap_device_slots, 2, "父档覆盖基准");
         assert_eq!(
             c.sampling.mode,
             SamplerMode::Greedy,
@@ -4024,11 +4051,14 @@ mod extends_tests {
             "extends = \"../grand.toml\"\n[spec]\ndepth = 4\n",
         );
         let leaf = sub.join("leaf.toml");
-        write(&leaf, "extends = \"mid.toml\"\n[store.gdn]\nsnap_max = 3\n");
+        write(
+            &leaf,
+            "extends = \"mid.toml\"\n[store.gdn]\nsnap_device_slots = 3\n",
+        );
         let c = OwlConfig::load(None, Some(&leaf)).expect("load");
         assert_eq!(c.runtime.max_context_length, 777, "祖父档向上传递");
         assert_eq!(c.spec.depth, 4, "子档在链中保留");
-        assert_eq!(c.store.gdn.snap_max, 3, "孙档自己的键在最上层");
+        assert_eq!(c.store.gdn.snap_device_slots, 3, "孙档自己的键在最上层");
         let _ = std::fs::remove_dir_all(&d);
     }
 

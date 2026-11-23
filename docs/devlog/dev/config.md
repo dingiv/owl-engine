@@ -169,7 +169,7 @@ TP 档。降级后仍保留普通 decode 图,但 FI 臂/桶关。
 
 ```text
 target_total = total × vram_budget
-fixed        = gdn_row × (gdn_slots + snap_max) + 图 slab 640M + warmup 138M
+fixed        = gdn_row × (gdn_slots + snap_device_slots) + 图 slab 640M + warmup 138M
 budget       = target_total − reserve − fixed − live(权重/运行底价)
 usable       = budget − activation − stability_margin
 max_context_length      = usable / per_tok(向下取 4k)

@@ -190,9 +190,9 @@ server --profile awq27b-3090-max --site ~/owl-site.toml \
 | `kvmem=overcommit` | 四键全开 + `ram_pool_size/disk_pool_size` 共享总池 | 需虚拟化两扇门 |
 | `graphs=auto` | `no_graph=false`；`fi_cuda_graph=true`；`fi_plan_bake=0`；`fi_plan_restore=false`；`decode_fi/verify_fi=true`；`verify_v2=false`（有 spec） | 需 `kv=fp8` + 单卡 + 非 select_decode；否则自动降级并**打印原因** |
 | `graphs=off` | `no_graph=true`；FI 臂 off | 诊断/对照 |
-| `reuse=off` | `prefix_cache=false`；`snap_max=0`；`ram_pool_size=0` | 单会话最大 ctx 的默认 |
-| `reuse=session` | `prefix_cache=true`；`snap_max=1`；`ram_pool_size=1GiB`（可选） | 同会话续写 |
-| `reuse=global` | `prefix_cache=true`；`snap_max=4`；`ram_pool_size=7GiB` | 跨会话前缀 |
+| `reuse=off` | `prefix_cache=false`；`snap_device_slots=0`；`ram_pool_size=0` | 单会话最大 ctx 的默认 |
+| `reuse=session` | `prefix_cache=true`；`snap_device_slots=1`；`ram_pool_size=1GiB`（可选） | 同会话续写 |
+| `reuse=global` | `prefix_cache=true`；`snap_device_slots=4`；`ram_pool_size=7GiB` | 跨会话前缀 |
 
 **不派生、必须显式/高级**：`allowed_ops`（改为派生，见 §8）、`cuda.*` 诊断、
 `probes.*`、`tp_*`（TP 另案）、`log.*`、`agent.*`、`load.*`。
@@ -255,7 +255,7 @@ context_max = min(model_max, floor(pool_tokens_max / page) * page)
 ```
 
 - `weights`：模型注册表按 checkpoint 张量精确求和（AWQ/FP8/头量化分别算）；
-- `fixed`：GDN 格（concurrency × row）、快照池（snap_max × 152MiB）、图 slab
+- `fixed`：GDN 格（concurrency × row）、快照池（snap_device_slots × 152MiB）、图 slab
   （按臂/桶族实测或 `GRAPH_SLAB_BUDGET`）、warmup/杂项；
 - `activation`：按 `(chunk, tail, graph, model)` 的**实测表**（本次：512 档
   ≈0.4–0.6GiB，1024 档 ≈0.8–1.2GiB，2048 无桶 ≈1.6GiB）；先查表，缺省用保守
@@ -344,7 +344,7 @@ server --migrate-config old.toml --to profile > new.toml
 |---|---|
 | 旧 `flavors/*.toml` | 原样可解析；`--flavor` 保留；P2 机械迁移到 `profiles/` |
 | 低层键 | 全部保留；profile 里写低层键 = advanced 覆盖（provenance=Profile） |
-| 改名（`gdn_slots` 类） | `#[serde(alias = "旧名")]` 收一个版本 + 弃用警告；P2 移除 |
+| 改名（`snap_max` 类） | **不保留 alias**：旧键被 `deny_unknown_fields`/退役键门直接拒，报错点名新键（2026-11-23 用户裁决） |
 | `fi_plan_bake = 0` | 新枚举 `auto`（0 继续兼容） |
 | env 残留 | ✅ engine 面已解（2026-11-05，见 `engine-crate-导读.md` §12）；入口运行器 env 另计 |
 | `deny_unknown` | 保留；`--check` 的报错附"你是不是想写 X" |

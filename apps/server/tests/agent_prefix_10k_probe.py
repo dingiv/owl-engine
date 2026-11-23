@@ -20,8 +20,8 @@ This probe fixes a ~10K background/system prefix and drives:
   T7  session D, same system prefix but a *different* user task (branch point)
 
 T2/T4/T5/T6 require a boundary GDN snapshot to exist at the last matched block.
-If `snap_max=0`, the engine structurally cannot reuse the prefix and all of
-these are 0.  If `snap_max=1` and `ram_pool_size=0`, a long decode can evict the
+If `snap_device_slots=0`, the engine structurally cannot reuse the prefix and all of
+these are 0.  If `snap_device_slots=1` and `ram_pool_size=0`, a long decode can evict the
 durable prefill snapshot; same-session T2 may still hit via the newest decode
 snapshot, while cross-session T4 falls to 0.
 

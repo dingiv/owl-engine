@@ -111,15 +111,16 @@ kv_dtype = "fp8"
 draft_kv_dtype = "bf16"
 
 [store.gdn]
-# 同时推进的 turn 上限；也是服务面 permit 数的唯一真源
-# GDN 快照设备槽数（0 = 关闭快照池）
-snap_max = 0
+# GDN 快照设备槽数（0 = 关闭快照池；prefix_cache=true 时命中率会结构性下降）
+snap_device_slots = 0
 # 消息开启标记覆盖（空 = 模型 ChatFormat.im_open）
 snap_msg_delim = ""
 # 每会话持久快照上限（Tail + History；必须 >=1；0 不再合法）
 snap_session_cap = 30
-# 最近 snap_tail 张连续保留；更早的点按 token 位置均匀选 History
-snap_tail = 12
+# 最近 snap_tail_keep 张连续保留；更早的点按 token 位置均匀选 History。
+# ⚠️ image_evict=true 时必须 snap_tail_keep <= snap_device_slots：否则 Tail 落宿主，
+# image_evict 的恢复点会在首 token 前回灌（实测 2.7s swap / TTFT 8s）。
+snap_tail_keep = 12
 
 # ---------------------------------------------------------------------------
 # [spec] —— 投机解码

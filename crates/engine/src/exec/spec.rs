@@ -828,7 +828,7 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
                 // ⇒ 下面的「卷到边界 + 拍 + 卷回」三段是**纯浪费**(实测
                 // `spec.bnd.fold1` 1.17ms + `spec.snap` 0.90ms ≈ 2.1ms/边界)。
                 // 注:拍摄节流 = 引擎常数 `DECODE_SNAP_STRIDE`;关层走
-                // `snap_max = 0`（两处门同向）。
+                // `snap_device_slots = 0`（两处门同向）。
                 let snap_consumer =
                     self.boot.cfg.knobs.prefix_cache && self.dev.pool.snap_capacity() > 0;
                 if let Some(b) = snap_consumer
@@ -848,7 +848,7 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
                     let t_fold1 = t_b.elapsed();
                     // 尾 token = 本轮已提交、尚未进 `act.out` 的那几枚
                     let tail = &toks[..b - 1 - pos];
-                    owl_shared::log_debug!("spec-round", "边界:snap_tail 起 b={b}");
+                    owl_shared::log_debug!("spec-round", "边界:snap_tail_keep 起 b={b}");
                     self.capture_gdn_snap_tail(
                         sid,
                         b,
@@ -859,7 +859,7 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
                         owl_store::SnapRole::History,
                     )
                     .await?;
-                    owl_shared::log_debug!("spec-round", "边界:snap_tail 完");
+                    owl_shared::log_debug!("spec-round", "边界:snap_tail_keep 完");
                     let t_snap = t_b.elapsed() - t_fold1;
                     // 分相计时(2026-10-19;判"轮内边界值不值"的账:
                     // 卷/拍/回卷三段与 prefill 边界同粒度)
@@ -2000,7 +2000,7 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
     /// 槽位选择/LRU 覆盖写在 StatePool::capture_snap(state.rs)。
     /// **块边界事件**(唯一入口;一次算身份、三件事共用)。
     ///
-    /// 三件(2026-10-19 解耦;原先全被 `snap_max == 0` 一起门掉 —— **语义错**):
+    /// 三件(2026-10-19 解耦;原先全被 `snap_device_slots == 0` 一起门掉 —— **语义错**):
     /// ① **链推进 + 逐块身份哈希**(总是;身份是索引与缓存树的共同键);
     /// ② **增量登记进缓存树**(`select_partial`;不登记 ⇒ 块永远 refs==1 ⇒
     ///    结构性不可沉,超卖档直接失效);
@@ -2008,8 +2008,8 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
     /// ④ **GDN 快照拍摄**(仅 `pool.snap_capacity() > 0`;前缀复用面)。
     ///
     /// 为什么必须解耦:①③ 是**超卖机制的必需品**,② 是下沉的必需品 ——
-    /// 它们与"要不要拍快照"无关。旧实现把四件塞在一个 `snap_max == 0 ⇒ return`
-    /// 之后:关快照面 ⇒ **索引不采 + 块不入树 ⇒ 静默不沉**(实测 `snap_max = 0`
+    /// 它们与"要不要拍快照"无关。旧实现把四件塞在一个 `snap_device_slots == 0 ⇒ return`
+    /// 之后:关快照面 ⇒ **索引不采 + 块不入树 ⇒ 静默不沉**(实测 `snap_device_slots = 0`
     /// 档:下沉 0 块 / 不可沉 1680 块;prefill 假快 942 tok/s)。
     pub(crate) async fn capture_gdn_snap(
         &mut self,
@@ -2277,7 +2277,7 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
         //    ⇒ 每块 152MiB 的 GDN 快照(= 192 片 copy_batch,槽满还要 DtoH 下沉)
         //    是**纯浪费**,实测 67ms/块(8k 请求 ≈ 1.0s ≈ prefill 的 17%:
         //    `prefill.bnd` 3039ms → 0)。
-        // ② **容量门**(本线):`snap_max = 0` ⇒ 池结构上无槽(调用方已先行跳过)。
+        // ② **容量门**(本线):`snap_device_slots = 0` ⇒ 池结构上无槽(调用方已先行跳过)。
         let snap_on =
             snap_keep && self.dev.pool.snap_capacity() > 0 && self.boot.cfg.knobs.prefix_cache;
         let page = self.dev.pool.geom.page;

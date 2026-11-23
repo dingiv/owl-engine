@@ -164,7 +164,7 @@ TP2 的不变量：
 |---|---|---|---|---|---|
 | F-01 | S1 | `engine.rs:2684` | `boot_kvmem_check` 对 `select_partial && !select_decode` 调 `std::process::exit(2)`；其余门全是 `Result` | ① 检查发生在 `boot_env_and_spec` 之后（草稿权重已装载）；② `exit` 绕开 Drop/设备收尾；③ 测试/嵌入无法捕获 | 改 `Err(ModelError::Msg)`；纯配置门前移到 `boot_knobs_check` |
 | F-02 | S1 | `engine.rs:788-790` | `from_config` 对坏 `OWL_ADMIT_ON_FULL` 直接 `exit(2)`（`from_config -> Self` 无 Result） | 同上；且 `from_config` 是唯一入口构造器，库调用者被强杀 | `from_config -> Result<Self>`（或解析上移到 config loader）；`admission_on_full` 进 `OwlConfig` |
-| F-03 | S1 | `engine.rs:754,755,757,809,833,362`；`running.rs:96` | 生产 `from_config` / `StepProbes::from_config` / `Default` 仍读 `OWL_SCHEME_PROBE` / `OWL_SCHEME_MIN_CTX` / `OWL_COV_ANALYZE_EVERY` / `OWL_ADMIT_ON_FULL` / `OWL_MAX_ACTIVE_TURNS` / `OWL_SNAP_MAX` / `OWL_DEBUG`；`snap_max`/`gdn_slots` 有配置键却被 env 覆盖 | 违反「配置单一来源 / 生产零 env」；两份来源静默打架（已知债见 `docs/devlog/serving/config-ux.md` 第 13/349 行） | 全部登记进 config loader；引擎侧只读 `OwlConfig`；诊断 env 至少收进 `probes` 配置 |
+| F-03 | S1 | `engine.rs:754,755,757,809,833,362`；`running.rs:96` | 生产 `from_config` / `StepProbes::from_config` / `Default` 仍读 `OWL_SCHEME_PROBE` / `OWL_SCHEME_MIN_CTX` / `OWL_COV_ANALYZE_EVERY` / `OWL_ADMIT_ON_FULL` / `OWL_MAX_ACTIVE_TURNS` / `OWL_SNAP_MAX` / `OWL_DEBUG`；`snap_device_slots`/`gdn_slots` 有配置键却被 env 覆盖 | 违反「配置单一来源 / 生产零 env」；两份来源静默打架（已知债见 `docs/devlog/serving/config-ux.md` 第 13/349 行） | 全部登记进 config loader；引擎侧只读 `OwlConfig`；诊断 env 至少收进 `probes` 配置 |
 | F-04 | S1 | `tp.rs:565-566,598-601`；`tp.rs:650-651,668-671` | `assemble_with` / `assemble_same_device` 重装 rank1 引擎壳时传入 `cfg.clone()` 与 **`boot0`**，丢弃 `_cfg1/_boot1`；随后 `assemble_with_staging` 用 `boot1 = engines[1].boot_vram()` 算 `weights1` | rank1 的 per-card 权重基线用了 rank0 的 `live_at_new`；两卡 baseline 不同时预算错位（且 `device_ordinal` 也被覆盖） | rank1 传 `cfg1` / `boot1`（先 clone）；账本单元仍用 `cell0` |
 | F-05 | S1 | `engine.rs:1356`、`1413-1420`、`tp.rs:380-420` | boot/装配失败路径只 drop `RankDev`：无 `graphs.close()`、无 `PeerRelease`；`Engine::run` 的 prewarm 失败也整机 drop | 设备分配/staging 只能等进程退出回收；测试或嵌入调用会累积泄漏；优雅收摊契约缺失 | 加 `retire_rank` 的错误路径调用（或 `TpEngine::assemble*` 的 guard）；把「boot 失败 ⇒ 进程退出」写成显式契约 |
 | F-06 | S2 | `tp.rs:~930-960` vs `~840-900` | `handshake_staging` 的 host 分支逐步回滚；P2P 分支 `peer_alloc×2 + peer_import×2` 任一步失败直接 `?` | 半握手泄漏 VMM 块/导入别名；测试反复装配会累积 | P2P 分支补与 host 对称的回滚（`peer_release` 已分配块） |
@@ -274,7 +274,7 @@ apps/server/src/openai.rs/chat()
 per_tok = n_full·2·hkv·hd·kv_elem        // 主池（+INT8 的 36·hkv/层/ token 的 scale）
         + draft_pool                     // DFlash2 已改固定 ring ⇒ 0
         + mtp_chain                      // MTP 线性档（ring 档走固定项）
-fixed_after = gdn_grid(gdn_slots) + gdn_snap(snap_max) + spec_snap + replay_snap
+fixed_after = gdn_grid(gdn_slots) + gdn_snap(snap_device_slots) + spec_snap + replay_snap
             + GRAPH_SLAB_BUDGET(320MiB) + WARMUP_MISC_BUDGET(138MiB) + draft_ring
 base  = min(free, free − total·(1−target))        // 驱动 free；target 只作上限
 cap   = (base − reserve − fixed_after) / per_tok

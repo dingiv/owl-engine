@@ -170,10 +170,10 @@ async fn cpu_construct_and_load(cfg: &OwlConfig) {
     );
 }
 
-/// **状态腿 mock 引擎**(§30 两门共用):snap_max 可调 + 状态腿宿主 64MiB。
+/// **状态腿 mock 引擎**(§30 两门共用):snap_device_slots 可调 + 状态腿宿主 64MiB。
 #[cfg(test)] // 只被单元档用例消费(e2e 档不编)
 async fn mock_snap_engine(
-    snap_max: usize,
+    snap_device_slots: usize,
 ) -> RunningEngine<owl_iface::handle::DeviceHandle<owl_cpu::CpuFace>> {
     let mut knobs = EngineKnobs {
         sampler_enabled: false,
@@ -181,7 +181,7 @@ async fn mock_snap_engine(
     };
     knobs.pool_tokens = Some(256);
     knobs.ram_pool_size = 72;
-    knobs.snap_max = snap_max;
+    knobs.snap_device_slots = snap_device_slots;
     let cfg = EngineConfig {
         device_ordinal: 0,
         max_context_length_tokens: 256,
@@ -224,7 +224,7 @@ async fn multi_active_decode_uses_selected_turn_gdn_row() {
     };
     knobs.pool_tokens = Some(256);
     knobs.ram_pool_size = 72;
-    knobs.snap_max = 1;
+    knobs.snap_device_slots = 1;
     let cfg = EngineConfig {
         device_ordinal: 0,
         max_context_length_tokens: 256,
@@ -444,7 +444,7 @@ async fn pressure_evicts_cold_sessions_whole() {
     };
     knobs.pool_tokens = Some(256);
     knobs.ram_pool_size = 72;
-    knobs.snap_max = 1;
+    knobs.snap_device_slots = 1;
     let mut running = mock_engine_with(knobs).await;
 
     // 三条互不共享前缀的会话（首 token 就分叉 ⇒ 不会被内容身份合并）
@@ -506,7 +506,7 @@ async fn admission_evicts_cold_sessions_instead_of_rejecting_single_request() {
     };
     knobs.pool_tokens = Some(256);
     knobs.ram_pool_size = 72;
-    knobs.snap_max = 1;
+    knobs.snap_device_slots = 1;
     let mut running = mock_engine_with(knobs).await;
 
     for i in 0..3u32 {
@@ -565,7 +565,7 @@ async fn submit_reserves_request_max_new() {
     };
     knobs.pool_tokens = Some(256);
     knobs.ram_pool_size = 72;
-    knobs.snap_max = 1;
+    knobs.snap_device_slots = 1;
     let mut running = mock_engine_with(knobs).await;
 
     // 短 prompt：预留 = 请求值 8（不再预留整档 cap 64）
@@ -668,6 +668,33 @@ fn boot_kvmem_check_rejects_partial_without_decode() {
     assert!(err.to_string().contains("select_decode"), "{err}");
 }
 
+/// **TTFT 现场门（2026-11-23）**：`snap_tail_keep > snap_device_slots` 必须拒启。
+/// 否则 image_evict 的 Tail 恢复点会落在宿主层，`snap_ensure_resident`
+/// 在首 token 前回灌，实测 `srv.seg.swap` 2.7s/turn。
+#[cfg(test)]
+#[test]
+fn boot_kvmem_check_rejects_tail_over_device_snap_slots() {
+    let cfg = EngineConfig {
+        device_ordinal: 0,
+        max_context_length_tokens: 256,
+        prefill_chunk: 32,
+        knobs: EngineKnobs {
+            prefix_cache: true,
+            image_evict: true,
+            snap_device_slots: 6,
+            snap_session_cap: 30,
+            snap_tail_keep: 12,
+            ..Default::default()
+        },
+    };
+    let err = match crate::engine::boot_kvmem_check(&cfg) {
+        Ok(()) => panic!("snap_tail_keep > snap_device_slots 必须拒"),
+        Err(e) => e,
+    };
+    assert!(err.to_string().contains("snap_tail_keep=12"), "{err}");
+    assert!(err.to_string().contains("snap_device_slots=6"), "{err}");
+}
+
 /// **F-02 回归门**：`[runtime] admission_on_full` 坏值必须在 `from_config`
 /// 就拒（旧实现读 env 并 `process::exit(2)`）。
 #[cfg(test)]
@@ -707,7 +734,7 @@ async fn failed_start_returns_gdn_row() {
     };
     knobs.pool_tokens = Some(256);
     knobs.ram_pool_size = 72;
-    knobs.snap_max = 1;
+    knobs.snap_device_slots = 1;
     let cfg = EngineConfig {
         device_ordinal: 0,
         max_context_length_tokens: 256,
@@ -805,7 +832,7 @@ async fn failed_start_does_not_kill_active_turn() {
     };
     knobs.pool_tokens = Some(512);
     knobs.ram_pool_size = 72;
-    knobs.snap_max = 2;
+    knobs.snap_device_slots = 2;
     let mut running = mock_engine_with(knobs).await;
 
     // A：长 prompt（40 段 ≈ 157 tok），chunk=32 ⇒ 起 B 时仍在 prefill。
@@ -879,7 +906,7 @@ async fn position_consolidation_resets_high_water() {
     };
     knobs.pool_tokens = Some(256);
     knobs.ram_pool_size = 72;
-    knobs.snap_max = 2;
+    knobs.snap_device_slots = 2;
     let mut running = mock_engine_with(knobs).await;
 
     // 暖一轮：建立会话 + 紧凑位置账 + 前缀链（进缓存）。
@@ -1000,7 +1027,10 @@ async fn idle_node_offloads_device_snapshot_via_store_plan() {
 
     // boot 已注册状态腿布局 ⇒ "一条快照的字节" > 0;宿主分片 64MiB 留位
     let bytes = running.bank.parts().rel.snap_bytes();
-    assert!(bytes > 0, "状态腿布局应在 boot 注册(snap_max>0 + paged)");
+    assert!(
+        bytes > 0,
+        "状态腿布局应在 boot 注册(snap_device_slots>0 + paged)"
+    );
     assert!(
         running.bank.parts().rel.snap_host_free_slots() > 0,
         "宿主分片应留位"
@@ -1103,7 +1133,7 @@ async fn disk_spill_and_fill_roundtrip() {
     };
     knobs.pool_tokens = Some(256);
     knobs.ram_pool_size = 24;
-    knobs.snap_max = 2;
+    knobs.snap_device_slots = 2;
     knobs.disk_pool_size = 32;
     knobs.disk_dir = dir.display().to_string();
     let cfg = EngineConfig {
@@ -1250,7 +1280,7 @@ async fn state_slot_spills_host_snapshot_to_disk_before_drop() {
     };
     knobs.pool_tokens = Some(256);
     knobs.ram_pool_size = 24;
-    knobs.snap_max = 2;
+    knobs.snap_device_slots = 2;
     knobs.disk_pool_size = 32;
     knobs.disk_dir = dir.display().to_string();
     let cfg = EngineConfig {
@@ -1477,7 +1507,7 @@ async fn disk_checkpoint_survives_restart_without_host_pressure() {
             };
             knobs.pool_tokens = Some(64); // 2 页：prompt 4 块 ⇒ 必须下沉到宿主
             knobs.ram_pool_size = 8; // 宿主够装整链 ⇒ **永不产生磁盘压力**
-            knobs.snap_max = 0;
+            knobs.snap_device_slots = 0;
             knobs.disk_pool_size = 8;
             knobs.disk_dir = dir.display().to_string();
             // 本门的主角：主动 checkpoint（对照组 = 0 = 测试关闭；生产自动）
@@ -1597,7 +1627,7 @@ async fn disk_chain_index_enables_cross_restart_reuse() {
         };
         knobs.pool_tokens = Some(96); // 3 页(短池:容易满)
         knobs.ram_pool_size = 1; // 宿主只装得下 ~2 块(0.8B 块 ≈384KiB)
-        knobs.snap_max = 0;
+        knobs.snap_device_slots = 0;
         knobs.disk_pool_size = 8;
         knobs.disk_dir = dir.display().to_string();
         EngineConfig {
@@ -1733,7 +1763,7 @@ async fn disk_adopt_on_boot_restores_ledger() {
         };
         knobs.pool_tokens = Some(256);
         knobs.ram_pool_size = 24;
-        knobs.snap_max = 2;
+        knobs.snap_device_slots = 2;
         knobs.disk_pool_size = 32;
         knobs.disk_dir = dir.display().to_string();
         EngineConfig {
@@ -2118,7 +2148,7 @@ pub async fn cpu_mock_offload_probe() {
 /// `snap_leg.rs` 的 CpuFace 门兜底;真机复用由 GPU 三门口兜底)。
 async fn state_leg_probe_scenario<D: DeviceClient>(running: &mut RunningEngine<D>) {
     // 跑一个 turn:页边界会拍快照(生成段足够长 ⇒ 跨多个 32 边界);
-    // snap_max=1 ⇒ churn ⇒ 冷的被挤到宿主。
+    // snap_device_slots=1 ⇒ churn ⇒ 冷的被挤到宿主。
     // ⚠️ prompt 要短:CPU mock 档只吃单 prefill chunk(§18.5.1 的 dtype 缺口),
     // 靠**decode 的页边界**出快照(与真机同一条路)。
     let (_, tid) = running
@@ -2146,7 +2176,7 @@ async fn state_leg_probe_scenario<D: DeviceClient>(running: &mut RunningEngine<D
     );
     assert!(
         rep.state.snap_host.0 > 0,
-        "snap_max=1 + churn ⇒ 冷快照应**下沉宿主**(而不是被静默覆盖)"
+        "snap_device_slots=1 + churn ⇒ 冷快照应**下沉宿主**(而不是被静默覆盖)"
     );
 
     // ② 宿主 → 设备回灌:找一条宿主层快照,就位到设备槽
@@ -2216,7 +2246,7 @@ async fn state_leg_probe_scenario<D: DeviceClient>(running: &mut RunningEngine<D
 }
 
 /// 状态腿三层化探针(自装载;按需开:`OWL_STATE_LEG_PROBE=1`)。
-/// 档位:snap_max=1(逼出 churn)+ 状态腿宿主分片 64MiB(0.8B 一条快照 ≈19.3MiB)。
+/// 档位:snap_device_slots=1(逼出 churn)+ 状态腿宿主分片 64MiB(0.8B 一条快照 ≈19.3MiB)。
 pub async fn gpu_08b_state_leg_probe() {
     if !owl_shared::env_reader::flag("OWL_STATE_LEG_PROBE") {
         owl_shared::testkit::report::skip("OWL_STATE_LEG_PROBE 未设(S2 状态腿探针按需开)");
@@ -2233,7 +2263,7 @@ pub async fn gpu_08b_state_leg_probe() {
     state_leg_probe_scenario(&mut running).await;
 }
 
-/// 状态腿探针档(snap_max=1 + 状态腿宿主分片;池小 ⇒ 快照 churn 快)
+/// 状态腿探针档(snap_device_slots=1 + 状态腿宿主分片;池小 ⇒ 快照 churn 快)
 fn state_leg_probe_config(ordinal: usize) -> EngineConfig {
     let mut knobs = EngineKnobs {
         sampler_enabled: false,
@@ -2241,7 +2271,7 @@ fn state_leg_probe_config(ordinal: usize) -> EngineConfig {
     };
     knobs.pool_tokens = Some(256);
     knobs.ram_pool_size = 72;
-    knobs.snap_max = 1;
+    knobs.snap_device_slots = 1;
     EngineConfig {
         device_ordinal: ordinal,
         max_context_length_tokens: 256,
@@ -3168,7 +3198,7 @@ fn stage_in_config(ordinal: usize) -> EngineConfig {
     knobs.pool_tokens = Some(512);
     // 宿主总池（KV + 边界快照共享；2026-11-18 裁决）
     knobs.ram_pool_size = 64;
-    knobs.snap_max = 8;
+    knobs.snap_device_slots = 8;
     knobs.gdn_slots = 8;
     EngineConfig {
         device_ordinal: ordinal,
@@ -3432,7 +3462,7 @@ fn offload_probe_config(ordinal: usize) -> EngineConfig {
     };
     knobs.pool_tokens = Some(256); // 单会话容量下限 = 256/32 = 8 页 ⇒ nb = **8 槽**
     knobs.ram_pool_size = 8; // 宿主面开(8MiB ⇒ 可容 ~21 块)
-    knobs.snap_max = 16; // 快照别被 LRU 冲掉(前缀复用要求边界快照在场)
+    knobs.snap_device_slots = 16; // 快照别被 LRU 冲掉(前缀复用要求边界快照在场)
     EngineConfig {
         device_ordinal: ordinal,
         max_context_length_tokens: 256, // 8 页(池下限 = 单会话容量;要造压力就得同时压它)
@@ -5305,7 +5335,7 @@ pub async fn gpu_spec_identity_gate_27b() {
         };
         // 24G 贴顶三旋钮(单会话门不需要多格/多快照/前缀缓存)
         knobs.gdn_slots = 1;
-        knobs.snap_max = 1;
+        knobs.snap_device_slots = 1;
         knobs.prefix_cache = false;
         // 草稿档一律按投机配置 boot;baseline 轮靠运行时 spec_depth=0 回落
         knobs.draft.depth = gate_depth;
@@ -5440,7 +5470,7 @@ pub async fn gpu_dflash2_identity_gate_27b() {
             ..Default::default()
         };
         knobs.gdn_slots = 1;
-        knobs.snap_max = 1;
+        knobs.snap_device_slots = 1;
         knobs.prefix_cache = false;
         // 草稿档一律按**投机**配置 boot(深度 + verify 捕获档);
         // 不投机的 baseline 轮靠运行时 `spec_depth = 0` 回落,不重载。
@@ -5761,7 +5791,7 @@ pub async fn gpu_decode_marginal_bench() {
             ..Default::default()
         };
         knobs.gdn_slots = 1;
-        knobs.snap_max = 1;
+        knobs.snap_device_slots = 1;
         knobs.prefix_cache = false;
         let mut engine = Engine::new(EngineConfig {
             device_ordinal: ordinal,
@@ -5905,7 +5935,7 @@ pub async fn gpu_head_int8_gate() {
             ..Default::default()
         };
         knobs.gdn_slots = 1;
-        knobs.snap_max = 1;
+        knobs.snap_device_slots = 1;
         knobs.prefix_cache = false;
         let mut engine = Engine::new(EngineConfig {
             device_ordinal: ordinal,
@@ -5957,7 +5987,7 @@ pub async fn gpu_head_int8_gate() {
             ..Default::default()
         };
         knobs.gdn_slots = 1;
-        knobs.snap_max = 1;
+        knobs.snap_device_slots = 1;
         knobs.prefix_cache = false;
         let mut engine = Engine::new(EngineConfig {
             device_ordinal: ordinal,
@@ -6499,7 +6529,7 @@ async fn abort_publishes_written_prompt_prefix() {
     };
     knobs.pool_tokens = Some(2048); // 64 页(页 32)⇒ 前缀面够放
     knobs.ram_pool_size = 72;
-    knobs.snap_max = 64;
+    knobs.snap_device_slots = 64;
     let cfg = EngineConfig {
         device_ordinal: 0,
         max_context_length_tokens: 2048,
@@ -6612,7 +6642,7 @@ async fn same_session_queues_instead_of_rejecting() {
         gdn_slots: 2,
         pool_tokens: Some(512),
         ram_pool_size: 72,
-        snap_max: 1,
+        snap_device_slots: 1,
         ..Default::default()
     };
     let cfg = EngineConfig {
@@ -7133,7 +7163,7 @@ pub async fn gpu_image_evict_gate() {
             // **每请求一张快照**（2026-11-15）后，门里多条臂共享快照池：
             // 4 槽会把当前臂的“图前锚点”当最冷 Extra 挤掉（机制门不该被
             // 预算淘汰干扰）⇒ 给足槽位；淘汰顺序本身由 store 门单独锁死。
-            snap_max: 16,
+            snap_device_slots: 16,
             ..Default::default()
         },
     })
@@ -7717,7 +7747,7 @@ pub async fn gpu_image_evict_anchor_gate() {
             // 三条臂共享快照池；锚点/尾锚点都是可淘汰 Extra/Dense（不是 pin）
             // ⇒ 机制门给足槽位，避免当前臂的锚点被后续快照挤出
             // （淘汰顺序由 store 门 evict_anchor_snapshot_is_extra_and_evictable 锁）。
-            snap_max: 16,
+            snap_device_slots: 16,
             ..Default::default()
         },
     })
@@ -8237,7 +8267,7 @@ pub async fn gpu_image_evict_multi_gate() {
             pool_tokens: Some(2048),
             // 三条臂共享快照池；锚点是 Extra（不是 pin）⇒ 给足槽位避免
             // 当前臂的锚点被后续快照挤出（淘汰顺序由 store 门单独验证）。
-            snap_max: 16,
+            snap_device_slots: 16,
             ..Default::default()
         },
     })
@@ -9290,7 +9320,7 @@ pub async fn gpu_mtp_kv_parity() {
         ..Default::default()
     };
     knobs.gdn_slots = 1;
-    knobs.snap_max = 1;
+    knobs.snap_device_slots = 1;
     knobs.prefix_cache = false;
     knobs.draft.depth = 3;
     knobs.cuda.capture_slab_mb = Some(160);

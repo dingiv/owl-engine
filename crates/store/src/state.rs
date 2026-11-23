@@ -59,7 +59,7 @@ pub enum SnapDurability {
 ///
 /// 淘汰顺序（小 = 先走）：
 /// 1. `History` —— Tail 之前的均匀历史点；
-/// 2. `Tail` —— 最近 `snap_tail` 张连续尾快照，最后才动。
+/// 2. `Tail` —— 最近 `snap_tail_keep` 张连续尾快照，最后才动。
 ///
 /// `Transient` 不再作为 role：生成段 rollback 由
 /// [`SnapDurability::Transient`] 表达，逐出即丢且不计入会话配额。

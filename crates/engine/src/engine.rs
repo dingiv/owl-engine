@@ -56,7 +56,7 @@ pub const PREFILL_TAIL_MERGE: usize = 0;
 /// **生成相位页边界快照的页步长**（1 = 每个页边界一拍）。
 ///
 /// 2026-11-17：`[store.gdn] snap_decode_stride` 键退休。它是拍摄节流，
-/// 不是容量；唯一消费者是前缀复用（`prefix_cache && snap_max > 0`），
+/// 不是容量；唯一消费者是前缀复用（`prefix_cache && snap_device_slots > 0`），
 /// 没有按档调节的真实需求。保留常数是为了让 `decode_boundary_in` 的
 /// 节流语义仍有单一产地。
 pub const DECODE_SNAP_STRIDE: usize = 1;
@@ -323,22 +323,24 @@ pub struct EngineKnobs {
     /// **跨会话合批上限**(B5.1;缺省 1 = 串行,逐字节现状)。
     /// >1 = 调度面拼 T=N 裸 decode(M1;spec off / 单卡 / 无选择层)。
     pub max_batch: usize,
-    /// spec 快照轮回滚缓冲槽数(缺省 4;原 OWL_SNAP_MAX)
-    pub snap_max: usize,
+    /// **GDN 快照设备槽数**(缺省 4;原 OWL_SNAP_MAX)。
+    /// 注意:历史注释曾写成 "spec 快照轮回滚缓冲",那是旧义;现在
+    /// `memory.rs` 用它算 `gdn_snap = gdn_row × snap_device_slots`,与 spec 无关。
+    pub snap_device_slots: usize,
     /// 消息边界快照**恒开**（2026-11-16 键退休）：门 = 消费者存在
-    /// （`prefix_cache && snap_max>0`）+ 分隔串可解析；否则自动回退粗锚点。
+    /// （`prefix_cache && snap_device_slots>0`）+ 分隔串可解析；否则自动回退粗锚点。
     /// **可删图前锚点快照恒开**（2026-11-16 键退休）：截图在 prompt 尾部时，
     /// 预填充末快照的键落在被删页上 ⇒ 删除发生时幸存页没有边界快照，只能
     /// 退回 fresh。锚点 = **每张可删图段起点**（同游程也各拍）；预填充必须在
     /// 这些边界**强制切块**才能拍出 GDN 态（见 `prefill_step_chunk_msg` 的
     /// `hard_snaps`）。旧图的锚点键是内容身份，前缀命中时不会重拍。
-    /// 门 = **消费者存在**（`image_evict && prefix_cache && snap_max>0`）。
+    /// 门 = **消费者存在**（`image_evict && prefix_cache && snap_device_slots>0`）。
     /// 消息开启标记文本覆盖(空 = 模型 `ChatFormat.im_open`)
     pub snap_msg_delim: String,
     /// **每会话持久快照上限**（Tail + History；`[store.gdn].snap_session_cap`；必须 >= 1）
     pub snap_session_cap: usize,
-    /// **尾部连续保留张数**（`[store.gdn].snap_tail`）
-    pub snap_tail: usize,
+    /// **尾部连续保留张数**（`[store.gdn].snap_tail_keep`）
+    pub snap_tail_keep: usize,
     /// **显存治理占比**(`[store].vram_budget`;缺省 0.97;0 = 治理禁用)
     pub vram_budget: f64,
     /// **单值总预留 MiB**(缺省 714;含图执行/warmup/碎片)。
@@ -419,10 +421,10 @@ impl Default for EngineKnobs {
             ts_probe: false,
             gdn_slots: 8,
             max_batch: 1,
-            snap_max: 4,
+            snap_device_slots: 4,
             snap_msg_delim: String::new(),
             snap_session_cap: 30,
-            snap_tail: 12,
+            snap_tail_keep: 12,
             vram_budget: 0.97,
             vram_activation_reserve: 714,
             raw_completion: false,
@@ -586,10 +588,10 @@ impl EngineKnobs {
             }
         };
         format!(
-            "pool={:?} turns={} snap_max={} ttft={:?} host={}M disk={}M dir={:?} prefix_cache={} align_tail={} bnd_stride={} | kvmem={}[idx={} gpu={} cov={} view={} part={} ws={}tok(sink{}+recent{}+topk{}@{}tok/page) every={} evict={} floor={}] | fi={} gdn_chunked={} kv={} graph_off={}",
+            "pool={:?} turns={} snap_device_slots={} ttft={:?} host={}M disk={}M dir={:?} prefix_cache={} align_tail={} bnd_stride={} | kvmem={}[idx={} gpu={} cov={} view={} part={} ws={}tok(sink{}+recent{}+topk{}@{}tok/page) every={} evict={} floor={}] | fi={} gdn_chunked={} kv={} graph_off={}",
             self.pool_tokens,
             self.gdn_slots,
-            self.snap_max,
+            self.snap_device_slots,
             self.ttft_on_expire,
             self.ram_pool_size,
             self.disk_pool_size,
@@ -778,10 +780,10 @@ impl EngineKnobs {
             max_batch: cfg.runtime.max_batch,
             max_generation_length: cfg.runtime.max_generation_length,
             // 快照池容量 = 配置单源（F-03；不再读 `OWL_SNAP_MAX`）
-            snap_max: cfg.store.gdn.snap_max,
+            snap_device_slots: cfg.store.gdn.snap_device_slots,
             snap_msg_delim: cfg.store.gdn.snap_msg_delim.clone(),
             snap_session_cap: cfg.store.gdn.snap_session_cap,
-            snap_tail: cfg.store.gdn.snap_tail,
+            snap_tail_keep: cfg.store.gdn.snap_tail_keep,
             vram_budget: cfg.store.vram_budget,
             vram_activation_reserve: cfg.store.vram_activation_reserve,
             raw_completion: cfg.probes.raw_completion,
@@ -1732,11 +1734,11 @@ pub(crate) fn into_running<D: DeviceClient>(
     // 代码里不写死 `<|im_start|>`;优先用显式 `[store].snap_msg_delim`,
     // 空串则回退模型声明 `ChatFormat.im_open`。这里 boot 期只 tokenize 一次,
     // 运行期扫 prompt_ids 时只传 `&[u32]`。
-    let msg_snap_on = cfg.knobs.prefix_cache && cfg.knobs.snap_max > 0;
+    let msg_snap_on = cfg.knobs.prefix_cache && cfg.knobs.snap_device_slots > 0;
     if !msg_snap_on {
         owl_shared::log_info!(
             "boot",
-            "消息边界快照：无消费者（prefix_cache/snap_max=0）⇒ 不切块、不拍快照"
+            "消息边界快照：无消费者（prefix_cache/snap_device_slots=0）⇒ 不切块、不拍快照"
         );
     }
     let msg_open_ids = if msg_snap_on {
@@ -1767,10 +1769,10 @@ pub(crate) fn into_running<D: DeviceClient>(
             } else {
                 owl_shared::log_info!(
                     "boot",
-                    "消息边界快照:开 · delim={delim:?} → {} token {:?} · snap_tail={} · min_span={}",
+                    "消息边界快照:开 · delim={delim:?} → {} token {:?} · snap_tail_keep={} · min_span={}",
                     ids.len(),
                     ids,
-                    cfg.knobs.snap_tail,
+                    cfg.knobs.snap_tail_keep,
                     SNAP_MSG_MIN_SPAN
                 );
             }
@@ -1784,7 +1786,7 @@ pub(crate) fn into_running<D: DeviceClient>(
         "boot",
         "快照准入:每会话上限 {} 张(Tail {} + History;设备+宿主+盘;Transient 不计)",
         cfg.knobs.snap_session_cap,
-        cfg.knobs.snap_tail
+        cfg.knobs.snap_tail_keep
     );
 
     let disk = crate::mem::disk_runtime::DiskRuntime::new();
@@ -2612,7 +2614,7 @@ fn boot_pool_plan(
         ) && !cfg.knobs.select_partial,
         gdn_slots: cfg.knobs.gdn_slots,
         max_batch: cfg.knobs.max_batch,
-        snap_max: cfg.knobs.snap_max,
+        snap_device_slots: cfg.knobs.snap_device_slots,
         vram_budget: cfg.knobs.vram_budget,
         vram_activation_reserve: cfg.knobs.vram_activation_reserve,
         // prefill 瞬态 = 代码派生;旧档显式值仅作兼容覆盖。
@@ -2634,34 +2636,56 @@ pub(crate) fn boot_kvmem_check(cfg: &EngineConfig) -> Result<()> {
                 .into(),
         ));
     }
-    if cfg.knobs.snap_session_cap < cfg.knobs.snap_tail {
+    if cfg.knobs.snap_session_cap < cfg.knobs.snap_tail_keep {
         return Err(owl_iface::contract::ModelError::Msg(format!(
-            "[store.gdn] snap_session_cap={} < snap_tail={} \
+            "[store.gdn] snap_session_cap={} < snap_tail_keep={} \
              —— Tail 连续保留不能超过单会话快照总名额",
-            cfg.knobs.snap_session_cap, cfg.knobs.snap_tail
+            cfg.knobs.snap_session_cap, cfg.knobs.snap_tail_keep
+        ))
+        .into());
+    }
+    // **Tail 必须能全部落在设备槽（2026-11-23 现场门；仅 image_evict 档硬拒）**：
+    // `snap_tail_keep` 是“最近连续保留”的语义；设备槽只有 `snap_device_slots` 个。
+    // tail > snap_device_slots 时，每轮 image_evict 删除旧图后，恢复点会落在被逐到
+    // 宿主的 Tail 上 ⇒ `snap_ensure_resident` 在首 token 前回灌，实测
+    // `srv.seg.swap` 2.7s/turn（1k 新增 token 的 TTFT 被抬到 8s）。
+    // 这不是可接受的配置，必须响亮拒；要保留 N 张 Tail 就把 snap_device_slots 提到 >= N。
+    if cfg.knobs.image_evict
+        && cfg.knobs.prefix_cache
+        && cfg.knobs.snap_device_slots > 0
+        && cfg.knobs.snap_tail_keep > cfg.knobs.snap_device_slots
+    {
+        return Err(owl_iface::contract::ModelError::Msg(format!(
+            "[store.gdn] snap_tail_keep={} > snap_device_slots={} —— Tail 连续快照必须全部落在设备槽；\
+             否则 image_evict 后恢复点会从宿主回灌，2.8s 级 swap 进入 TTFT 关键路径。\
+             把 snap_device_slots 提到 >= snap_tail_keep（或把 snap_tail_keep 降到 <= snap_device_slots）",
+            cfg.knobs.snap_tail_keep, cfg.knobs.snap_device_slots
         ))
         .into());
     }
     // **前缀复用的快照面自洽门(2026-10-24)**:
     // `reuse_face` 的可复用边界必须有一张 GDN 快照;混合模型(Qwen3.8 的
     // GDN 层)不能从 KV 反推这个递推态。因此 `prefix_cache=true` 却让
-    // `snap_max=0` 不是"省显存",而是**结构性命中率 0**(实测 10K 多轮
-    // `cached_tokens=0`,而同 prompt 在 snap_max=4 下 99.7%)。
+    // `snap_device_slots=0` 不是"省显存",而是**结构性命中率 0**(实测 10K 多轮
+    // `cached_tokens=0`,而同 prompt 在 snap_device_slots=4 下 99.7%)。
     // 不硬拒:纯 attention 档没有 GDN 快照消费方,仍可合法复用 KV;
     // 但必须响亮告警,不能再静默白跑。
-    if cfg.knobs.prefix_cache && cfg.knobs.snap_max == 0 {
+    if cfg.knobs.prefix_cache && cfg.knobs.snap_device_slots == 0 {
         owl_shared::log_warn!(
             "boot",
-            "prefix_cache=true 但 snap_max=0:混合/GDN 模型的边界快照不存在 \
+            "prefix_cache=true 但 snap_device_slots=0:混合/GDN 模型的边界快照不存在 \
              ⇒ reuse_face 会被裁到 0 ⇒ cached_tokens 结构性恒 0。\
-             要前缀复用请设 snap_max>=1(agent 10K 建议 4 + ram_pool_size>0)"
+             要前缀复用请设 snap_device_slots>=1(agent 10K 建议 4 + ram_pool_size>0)"
         );
-    } else if cfg.knobs.prefix_cache && cfg.knobs.snap_max == 1 && cfg.knobs.ram_pool_size == 0 {
+    } else if cfg.knobs.prefix_cache
+        && cfg.knobs.snap_device_slots == 1
+        && cfg.knobs.ram_pool_size == 0
+    {
         owl_shared::log_warn!(
             "boot",
-            "snap_max=1 且 ram_pool_size=0:生成段 Transient 快照会顶掉唯一的 \
+            "snap_device_slots=1 且 ram_pool_size=0:生成段 Transient 快照会顶掉唯一的 \
              durable 前缀边界(无宿主可下沉)⇒ 同会话续写可能仍命中最新尾快照, \
-             但跨会话固定前缀会掉到 0。agent 档建议 snap_max>=4 或 ram_pool_size>0"
+             但跨会话固定前缀会掉到 0。agent 档建议 snap_device_slots>=4 或 ram_pool_size>0"
         );
     }
     // **B-3e-2 前置校验**(响亮拒,不许静默):

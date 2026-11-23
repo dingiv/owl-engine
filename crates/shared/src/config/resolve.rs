@@ -412,13 +412,17 @@ pub fn apply(value: &mut Value, origins: &mut Origins) -> Result<Option<ResolveM
                 false.into(),
                 "reuse=off:单会话最大上下文档",
             );
-            b.set("store.gdn.snap_max", 0i64.into(), "reuse=off:无消费方");
+            b.set(
+                "store.gdn.snap_device_slots",
+                0i64.into(),
+                "reuse=off:无消费方",
+            );
             b.set("store.ram_pool_size", 0i64.into(), "reuse=off");
         }
         ReuseIntent::Session => {
             b.set("store.prefix_cache", true.into(), "reuse=session");
             b.set(
-                "store.gdn.snap_max",
+                "store.gdn.snap_device_slots",
                 1i64.into(),
                 "reuse=session:1 条边界快照",
             );
@@ -431,7 +435,7 @@ pub fn apply(value: &mut Value, origins: &mut Origins) -> Result<Option<ResolveM
         ReuseIntent::Global => {
             b.set("store.prefix_cache", true.into(), "reuse=global");
             b.set(
-                "store.gdn.snap_max",
+                "store.gdn.snap_device_slots",
                 4i64.into(),
                 "reuse=global:4 条快照(跨会话)",
             );
@@ -451,9 +455,9 @@ pub fn apply(value: &mut Value, origins: &mut Origins) -> Result<Option<ResolveM
                 "kvmem=overcommit:虚拟化前提",
             );
         }
-        if get_usize(value, "store.gdn.snap_max").unwrap_or(0) == 0 {
+        if get_usize(value, "store.gdn.snap_device_slots").unwrap_or(0) == 0 {
             b.set(
-                "store.gdn.snap_max",
+                "store.gdn.snap_device_slots",
                 1i64.into(),
                 "kvmem=overcommit:前缀复用需要快照",
             );
@@ -488,7 +492,7 @@ pub fn apply(value: &mut Value, origins: &mut Origins) -> Result<Option<ResolveM
             _ => 2,
         },
         gdn_slots: get_usize(&out, "runtime.max_concurrency").unwrap_or(1),
-        snap_max: get_usize(&out, "store.gdn.snap_max").unwrap_or(4),
+        snap_device_slots: get_usize(&out, "store.gdn.snap_device_slots").unwrap_or(4),
         sessions: c,
         tp_world: if tp { 2 } else { 1 },
         vision: get_bool(&out, "vision.enabled").unwrap_or(false),
@@ -826,7 +830,7 @@ mode = "greedy"
         assert_eq!(c.runtime.prefill_chunk, 512);
 
         // 复用关(reuse=off ⇒ 快照/宿主/前缀缓存全零)
-        assert_eq!(c.store.gdn.snap_max, 0, "reuse=off ⇒ 快照池关");
+        assert_eq!(c.store.gdn.snap_device_slots, 0, "reuse=off ⇒ 快照池关");
         assert_eq!(c.store.ram_pool_size, 0, "reuse=off ⇒ KV 宿主层关");
         assert!(!c.store.prefix_cache, "reuse=off ⇒ 前缀缓存关");
         assert_eq!(c.store.gdn.gdn_slots, 1);

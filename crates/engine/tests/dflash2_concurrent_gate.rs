@@ -34,7 +34,7 @@ async fn boot(dir: &str, ddir: &str) -> RunningEngine<owl_engine::GpuFace> {
     };
     knobs.draft.depth = 7;
     knobs.draft.dflash2_dir = Some(ddir.to_string());
-    knobs.snap_max = 1;
+    knobs.snap_device_slots = 1;
     knobs.pool_tokens = Some(2048);
     let mut engine = Engine::new(EngineConfig {
         device_ordinal: gpu_ordinal().expect("OWL_TEST_DEVICE"),

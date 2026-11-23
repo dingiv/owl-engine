@@ -589,7 +589,7 @@ pub fn summary_line(r: &ResolvedConfig) -> Option<String> {
         gib(e.total_bytes),
         gib(e.total_bytes.saturating_sub(e.used_bytes())),
         if c.store.prefix_cache {
-            format!("snap{}", c.store.gdn.snap_max)
+            format!("snap{}", c.store.gdn.snap_device_slots)
         } else {
             "off".into()
         },
@@ -840,7 +840,7 @@ pub fn check_report(r: &ResolvedConfig) -> Result<CheckReport, String> {
         if c.kernel.gdn_chunked { "chunked" } else { "scalar" },
         c.spec.depth,
         c.spec.draft,
-        if c.store.prefix_cache { format!("snap{}", c.store.gdn.snap_max) } else { "off".into() },
+        if c.store.prefix_cache { format!("snap{}", c.store.gdn.snap_device_slots) } else { "off".into() },
         c.runtime.max_batch,
         if c.vision.enabled { "on" } else { "off" },
     ));

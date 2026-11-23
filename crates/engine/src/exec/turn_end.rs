@@ -46,7 +46,7 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
         };
         let layout = crate::msg_boundary::plan_snap_layout(
             &old_points,
-            self.boot.cfg.knobs.snap_tail,
+            self.boot.cfg.knobs.snap_tail_keep,
             self.boot.cfg.knobs.snap_session_cap,
         );
         let mut new_keys =
