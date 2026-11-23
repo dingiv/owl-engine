@@ -215,6 +215,10 @@ select_query_tokens = 64
 score_mode = "cosine-max"
 select_graph_alpha = 0.0
 recall_every = 1
+# 仅前缀命中的追加 turn：过去 KV 只留 sink + 最近 N token；冷 prefill 不裁。
+# 0 = 关。与 select_partial 不共存。sink 用于系统提示 / tools schema。
+prefill_window_tokens = 0
+prefill_window_sink_tokens = 8192
 prefill_view = "on-hole"
 prefill_select = "topk"
 evict_policy = "lru"

@@ -1188,6 +1188,20 @@ pub struct KvmemCfg {
     /// 其余边界**只采索引、不干预驻留**(驻留交给 A 轴,下一次完整召回时对齐)。
     /// **末个边界永远是完整召回**(decode 消费的视图取自它)。
     pub recall_every: usize,
+    /// **prefill 窗口(仅追加 turn;0 = 关)**。
+    ///
+    /// 只在**前缀命中**的 turn 生效(`cached_start > 0`):把本 chunk 的过去
+    /// KV 视图裁成 `sink + 最近 window` 两段,attention 从 O(ctx) 降到
+    /// O(window);冷 prefill(`cached_start == 0`)不受影响,仍走全量链。
+    ///
+    /// 语义边界:被裁掉的中间 KV **不参与全注意力层**,但 GDN 递归状态仍带
+    /// 全历史;只改 prefill 的过去视图,不改 decode、不搬块、不改前缀缓存。
+    /// 按页向上/向下取整(页宽 32)。与 `select_partial` 不共存(后者已有自己
+    /// 的稀疏视图与宿主占位符语义)。
+    pub prefill_window_tokens: usize,
+    /// 窗口前保留的 sink token 数(系统提示 / tools schema;按页向上取整)。
+    /// 只有 `prefill_window_tokens > 0` 时有意义。
+    pub prefill_window_sink_tokens: usize,
     /// **prefill 的过去视图口径**(2026-10-27)。
     ///
     /// - `on-hole`(缺省,= 旧行为):只在链上出现占位符(已下沉)时才换视图表。
@@ -2058,6 +2072,8 @@ impl Default for KvmemCfg {
         Self {
             select_decode: false,
             select_partial: false,
+            prefill_window_tokens: 0,
+            prefill_window_sink_tokens: 8192,
             prefill_view: PrefillViewMode::default(),
             prefill_select: PrefillSelectMode::default(),
             index: false,
@@ -3326,6 +3342,22 @@ impl OwlConfig {
         // **W5 意图配套门**（2026-10-18）：FI 臂只有"图内臂"一种承载（核留图内 +
         // `ctx_total` 烘上界 + 表由 `fi_plan_sync` 窗外刷）。缺上界 ⇒ 捕获期会拿
         // **占位 ctx** 烘表（文本连贯但错，历史踩过）⇒ 响亮拒绝，不给静默错值。
+        // **prefill 窗口**：只服务“前缀命中后的追加 turn”，且不能与
+        // `select_partial` 的宿主占位符视图混用（两套过去视图语义）。
+        if self.kvmem.prefill_window_tokens > 0 {
+            if self.kvmem.select_partial {
+                return Err("[kvmem] prefill_window_tokens 与 select_partial 不共存：\
+                     后者已有自己的稀疏视图/宿主占位符语义。请二选一。"
+                    .to_string());
+            }
+            if !self.store.prefix_cache {
+                return Err(
+                    "[kvmem] prefill_window_tokens > 0 需要 [store] prefix_cache = true\
+                     （窗口只对前缀命中的追加 turn 生效，冷 prefill 不裁）。"
+                        .to_string(),
+                );
+            }
+        }
         // **部分驻留 × 投机 = 视图化 verify 档**(2026-10-23):
         // `select_partial` 下沉过的块在会话链上是宿主占位符;verify 必须走
         // **逐行视图页表**(`exec/spec.rs::verify_view_tables`)。第一版只实现

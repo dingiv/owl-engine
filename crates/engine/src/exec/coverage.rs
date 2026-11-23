@@ -650,6 +650,65 @@ fn rec_count(tag: &'static str, n: u64) {
     owl_shared::metrics::with_metrics_store(|s| s.counter_add(tag, n, file!(), line!()));
 }
 
+/// **prefill 时间窗视图（纯算术）**：`sink 页 ++ 最近 window 页`。
+///
+/// 只在 `base` 已被窗口覆盖时返回；`base < recent_start` 说明本 chunk
+/// 起点早于窗口，调用方应退回 dense（本函数的调用点还会再按
+/// `cached_start > 0` 门控，冷 prefill 永远不走这里）。
+pub(crate) fn plan_prefill_window(
+    chain: &[u32],
+    page: usize,
+    base: usize,
+    t: usize,
+    window_tokens: usize,
+    sink_tokens: usize,
+) -> Result<Option<(Vec<u32>, usize)>> {
+    if window_tokens == 0 || t == 0 {
+        return Ok(None);
+    }
+    let page = page.max(1);
+    let end = base
+        .checked_add(t)
+        .ok_or_else(|| ModelError::EngineInvariant {
+            what: format!("prefill 窗口:base={base} + t={t} 溢出"),
+        })?;
+    let last_page = end.saturating_sub(1) / page;
+    if last_page >= chain.len() {
+        return Err(ModelError::EngineInvariant {
+            what: format!(
+                "prefill 窗口页链失守:需要页 {last_page}，链只有 {} 页 \
+                 (base={base} t={t} page={page})",
+                chain.len()
+            ),
+        });
+    }
+    let recent_start = end.saturating_sub(window_tokens) / page * page;
+    if base < recent_start {
+        return Ok(None);
+    }
+    let recent_page = recent_start / page;
+    // sink 与 recent 重叠时自动收成 recent（窗口小于 sink 预算）。
+    let sink_pages = sink_tokens.min(recent_start).div_ceil(page);
+    let mut pages = Vec::with_capacity(sink_pages + last_page - recent_page + 1);
+    pages.extend_from_slice(&chain[..sink_pages]);
+    pages.extend_from_slice(&chain[recent_page..=last_page]);
+    if let Some(i) = pages
+        .iter()
+        .position(|p| owl_store::is_host_placeholder(*p))
+    {
+        return Err(ModelError::EngineInvariant {
+            what: format!(
+                "prefill 窗口页链第 {i} 项是宿主占位符；窗口档不得与 \
+                 select_partial 混用（base={base} t={t}）"
+            ),
+        });
+    }
+    // `tokens` = 本 chunk 起点可见的 key 数；`build_view` 会把第 i 行
+    // 扩成 `tokens + i + 1`，与页链长度（取整后）自洽。
+    let tokens = sink_pages * page + (base - recent_start);
+    Ok(Some((pages, tokens)))
+}
+
 /// 选择预算(环境旋钮;缺省 64 块 + sink 2 / recent 4)。
 impl<D: DeviceClient> RunningEngine<D> {
     /// 召回预算(`OWL_SELECT_BLOCKS` / `OWL_SELECT_SINK` / `OWL_SELECT_RECENT`;
@@ -923,6 +982,34 @@ impl<D: DeviceClient> RunningEngine<D> {
         base: usize,
         t: usize,
     ) -> Result<Option<(Vec<u32>, usize)>> {
+        // **TTFT 窗口**：只裁前缀命中的追加 turn；冷 prefill 保持全量。
+        if self.boot.cfg.knobs.prefill_window_tokens > 0 {
+            let (cached_start, chain) = {
+                let act = self.turns.active()?;
+                let session = self
+                    .bank
+                    .parts()
+                    .sessions
+                    .get(act.session_id)
+                    .ok_or_else(|| ModelError::Msg("prefill 窗口:会话账不在场".into()))?;
+                (act.cached_start, session.block_table.clone())
+            };
+            // 只有“前缀已覆盖至少一个窗口”的追加 turn 才裁；系统提示只命中
+            // 一小段的新会话仍走全量，避免把首轮长 prompt 的正文裁掉。
+            if cached_start >= self.boot.cfg.knobs.prefill_window_tokens {
+                if let Some(v) = plan_prefill_window(
+                    &chain,
+                    self.dev.pool.geom.page,
+                    base,
+                    t,
+                    self.boot.cfg.knobs.prefill_window_tokens,
+                    self.boot.cfg.knobs.prefill_window_sink_tokens,
+                )? {
+                    owl_shared::counter_inc!("prefill.window.used");
+                    return Ok(Some(v));
+                }
+            }
+        }
         if !self.boot.cfg.knobs.select_partial {
             return Ok(None);
         }
@@ -2509,7 +2596,35 @@ impl<D: DeviceClient> crate::engine::RankDev<D> {
 
 #[cfg(test)]
 mod view_tests {
-    use super::view_pages_at;
+    use super::{plan_prefill_window, view_pages_at};
+
+    #[test]
+    fn prefill_window_keeps_sink_and_recent() {
+        let chain: Vec<u32> = (0..11).collect();
+        // end=352，窗口 128 ⇒ recent_start=224（页 7）；sink=64 ⇒ 页 0..2
+        let (pages, tokens) = plan_prefill_window(&chain, 32, 320, 32, 128, 64)
+            .expect("window plan")
+            .expect("window covered");
+        assert_eq!(pages, vec![0, 1, 7, 8, 9, 10]);
+        assert_eq!(tokens, 64 + (320 - 224));
+    }
+
+    #[test]
+    fn prefill_window_falls_back_when_chunk_starts_before_window() {
+        let chain: Vec<u32> = (0..11).collect();
+        // chunk 长 160 > 窗口 32 ⇒ 起点 32 早于 recent_start=160
+        assert_eq!(
+            plan_prefill_window(&chain, 32, 32, 160, 32, 0).expect("plan"),
+            None
+        );
+    }
+
+    #[test]
+    fn prefill_window_rejects_host_hole() {
+        let mut chain: Vec<u32> = (0..11).collect();
+        chain[8] = owl_store::HOST_PLACEHOLDER;
+        assert!(plan_prefill_window(&chain, 32, 320, 32, 128, 64).is_err());
+    }
 
     #[test]
     fn view_pages_at_selected_plus_tail() {

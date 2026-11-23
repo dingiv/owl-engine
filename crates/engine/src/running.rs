@@ -2265,7 +2265,9 @@ impl<D: DeviceClient> RunningEngine<D> {
                                     <= crate::ttft_gate::PREFILL_SNAP_OFFLOAD_GUARD_MS
                         })
                         .unwrap_or(false);
-                    if tight_prefill && !self.bank.parts().rel.snap_disk_enabled() {
+                    // 盘层不是豁免条件：首 token 前同步写盘/回灌会把
+                    // 80MB×2 的冷分配/缺页直接塞进 TTFT。
+                    if tight_prefill {
                         owl_shared::metrics::with_metrics_store(|m| {
                             m.counter_add("store.snap.prefill_drop", 1, file!(), line!());
                         });
