@@ -800,11 +800,15 @@ impl GpuServer {
 
     fn swap_in(
         &mut self,
-        pieces: Vec<owl_iface::contract::SwapPiece>,
+        mut pieces: Vec<owl_iface::contract::SwapPiece>,
         conn: Box<dyn owl_iface::contract::Connector + Send>,
         ack: Ack<Result<Box<dyn owl_iface::contract::Connector + Send>, ModelError>>,
     ) {
         let total: usize = pieces.iter().map(|p| p.len).sum();
+        // **按设备块/偏移排序**：同一层的连续页可以合并成一次 H2D。
+        // 400k 个 8KiB 小拷贝的命令开销就是 1.4s；合并后按层约 64 发。
+        // 连接器侧各片仍按自己的 slot/off 取，排序只改 staging 顺序。
+        pieces.sort_by_key(|p| (p.block, p.dev_off));
         // **落 COMPUTE 流**(2026-10-17):写入的内容**就是下一步计算要读的状态**
         // —— 放 H2D 流 = 与消费核无跨流序(回执只证明"主机侧知道已落地",
         // 不证明消费流的核排在它之后)。与参数面同律:同流 FIFO 即结构性有序。
@@ -861,19 +865,36 @@ impl GpuServer {
                     }
                     cursor += p.len;
                 }
-                // ② staging → 设备(本段;COMPUTE 流序逐片)
+                // ② staging → 设备(本段;COMPUTE 流序按**连续设备 run** 合并)
                 let t_dma = std::time::Instant::now();
                 let mut cursor = 0usize;
-                for (k, p) in pieces[lo..hi].iter().enumerate() {
-                    if let Err(e) = self.ctx().check_range(p.block, p.dev_off, p.len, "swap-in") {
+                let mut j = lo;
+                while j < hi {
+                    let p0 = pieces[j];
+                    let run_start = cursor;
+                    let mut run_len = 0usize;
+                    let mut k = j;
+                    while k < hi
+                        && pieces[k].block == p0.block
+                        && (k == j
+                            || pieces[k].dev_off == pieces[k - 1].dev_off + pieces[k - 1].len)
+                    {
+                        run_len += pieces[k].len;
+                        cursor += pieces[k].len;
+                        k += 1;
+                    }
+                    if let Err(e) = self
+                        .ctx()
+                        .check_range(p0.block, p0.dev_off, run_len, "swap-in")
+                    {
                         self.pool.put(staging);
                         return ack.send(Err(e));
                     }
-                    if let Err(e) = self.ctx_mut().wait_zeroing(p.block, STREAM_COMPUTE) {
+                    if let Err(e) = self.ctx_mut().wait_zeroing(p0.block, STREAM_COMPUTE) {
                         self.pool.put(staging);
                         return ack.send(Err(e));
                     }
-                    let (dptr, _) = match self.ctx().block_ptr(p.block, &stream) {
+                    let (dptr, _) = match self.ctx().block_ptr(p0.block, &stream) {
                         Ok(x) => x,
                         Err(e) => {
                             self.pool.put(staging);
@@ -882,18 +903,18 @@ impl GpuServer {
                     };
                     let r = unsafe {
                         memcpy_htod_async(
-                            dptr + p.dev_off as u64,
-                            &staging.as_bytes()[cursor..cursor + p.len],
+                            dptr + p0.dev_off as u64,
+                            &staging.as_bytes()[run_start..run_start + run_len],
                             stream.cu_stream(),
                         )
                     };
                     if let Err(e) = r {
                         self.pool.put(staging);
                         return ack.send(Err(owl_iface::contract::ModelError::Msg(format!(
-                            "swap_in async(段内第 {k} 片): {e:?}"
+                            "swap_in async(段内 run @{j}): {e:?}"
                         ))));
                     }
-                    cursor += p.len;
+                    j = k;
                 }
                 // ③ 本段 DMA 落地后才能把缓冲回池(否则被下一段覆写)。
                 if let Err(e) = stream.synchronize() {

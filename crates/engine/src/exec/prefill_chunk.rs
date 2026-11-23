@@ -401,6 +401,13 @@ impl<D: DeviceClient> crate::engine::RankDev<D> {
         // **B-3e-2 第 3 项**:子集档 ⇒ 把本 chunk 的"过去表"写进池里的视图块,
         // 并把它当作 `block_tables`(eager prefill 无图,块叶直接可用)。
         let bt_leaf = match past_view.as_ref() {
+            // **TTFT 窗口**：视图页链是临时的，不占 `select_view` 持久槽
+            // （窗口档不搬块、不产生宿主占位符，故不需要选择层的池槽）。
+            Some((pages, _)) if host.knobs.prefill_window_tokens > 0 => {
+                let chain: Vec<f32> = pages.iter().map(|b| *b as f32).collect();
+                let n = chain.len().max(1);
+                TensorOps::from_host(Dtype::F32, vec![1, n], &f32b(&chain))
+            }
             Some((pages, _)) => {
                 {
                     let face = self.graphs.session.face_mut();

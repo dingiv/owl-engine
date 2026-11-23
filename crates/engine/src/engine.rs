@@ -170,6 +170,11 @@ pub struct EngineKnobs {
     /// 这正是**低显存档位**(池 < ctx)成立的那一件 —— 不开它,
     /// 链无法超出池容量。
     pub select_partial: bool,
+    /// **prefill 窗口(仅前缀命中的追加 turn)**;0 = 关。
+    /// 过去视图 = sink + 最近 window,attention ∝ window;冷 prefill 不裁。
+    pub prefill_window_tokens: usize,
+    /// 窗口前的 sink token 数(系统提示 / tools schema)。
+    pub prefill_window_sink_tokens: usize,
     /// **prefill 过去视图口径**(`[kvmem].prefill_view`;缺省 `OnHole` = 旧行为)。
     ///
     /// `Always` = prefill 与 decode 同源稀疏视图 ⇒ attention ∝ 工作集
@@ -390,6 +395,8 @@ impl Default for EngineKnobs {
             coverage_analyze_every: None,
             select_decode: false,
             select_partial: false,
+            prefill_window_tokens: 0,
+            prefill_window_sink_tokens: 8192,
             prefill_view: owl_shared::config::PrefillViewMode::default(),
             prefill_select: owl_shared::config::PrefillSelectMode::default(),
             evict_policy: owl_store::EvictPolicyKind::Lru,
@@ -724,6 +731,8 @@ impl EngineKnobs {
                 .then_some(cfg.kvmem.coverage_analyze_every),
             select_decode: cfg.kvmem.select_decode,
             select_partial: cfg.kvmem.select_partial,
+            prefill_window_tokens: cfg.kvmem.prefill_window_tokens,
+            prefill_window_sink_tokens: cfg.kvmem.prefill_window_sink_tokens,
             prefill_view: cfg.kvmem.prefill_view,
             prefill_select: cfg.kvmem.prefill_select,
             evict_policy: Self::evict_policy_of(&cfg.kvmem),
