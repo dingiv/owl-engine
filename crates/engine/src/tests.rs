@@ -1267,6 +1267,91 @@ async fn disk_spill_and_fill_roundtrip() {
 
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+/// **盘层逐出与状态账同源（2026-11-24 现场回归）**：第二张快照写入时
+/// 盘池装不下，`spill_snap` 会按 LRU 逐出第一张；第一张的 state tier 是
+/// `Disk`（盘上即最后一份内容），逐出后必须从状态账消失，否则后续
+/// img-evict 会把已不存在的键当盘上快照重挂。
+#[cfg(test)]
+#[tokio::test]
+async fn snap_disk_spill_eviction_forgets_state_of_disk_only_snapshot() {
+    let dir = std::env::temp_dir().join(format!("owl-snap-disk-evict-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    let mut knobs = EngineKnobs {
+        sampler_enabled: false,
+        ..Default::default()
+    };
+    knobs.pool_tokens = Some(256);
+    knobs.ram_pool_size = 64;
+    knobs.snap_device_slots = 2;
+    knobs.disk_pool_size = 32;
+    knobs.disk_dir = dir.display().to_string();
+    let cfg = EngineConfig {
+        device_ordinal: 0,
+        max_context_length_tokens: 256,
+        prefill_chunk: 32,
+        knobs,
+    };
+    let face = owl_cpu::CpuFace::mock(owl_cpu::MockLimits {
+        null_kernels: true,
+        graph_capture: true,
+        ..Default::default()
+    });
+    let mut engine = Engine::on(cfg, face).expect("构造(CPU mock)");
+    let loaded = engine
+        .loader()
+        .load_qwen35_0_8b(&asset_dir())
+        .await
+        .expect("装载");
+    let mut running = engine.run(loaded).await.expect("装配");
+
+    let bytes = running.bank.parts().rel.snap_bytes();
+    assert!(bytes > 0);
+    let k_old = owl_store::SnapKey::at_boundary(owl_store::ChainHash::new(0xE11));
+    let k_new = owl_store::SnapKey::at_boundary(owl_store::ChainHash::new(0xE22));
+    for k in [k_old, k_new] {
+        running.bank.parts_mut().rel.register_snap_account(
+            k,
+            bytes,
+            owl_store::Tier::Host,
+            owl_store::SnapDurability::Durable,
+        );
+        running
+            .bank
+            .parts_mut()
+            .rel
+            .snap_host_put(k, owl_store::HostBlock::from_bytes(vec![0u8; bytes]))
+            .expect("快照入宿主");
+    }
+
+    let rel = running.bank.parts_mut().rel;
+    assert!(running
+        .disk
+        .spill_snap(rel, k_old, &[])
+        .await
+        .expect("第一张落盘"));
+    assert_eq!(
+        running.bank.parts().rel.state_locate(k_old),
+        Some(owl_store::Tier::Disk)
+    );
+    let rel = running.bank.parts_mut().rel;
+    assert!(running
+        .disk
+        .spill_snap(rel, k_new, &[])
+        .await
+        .expect("第二张落盘(触发 LRU)"));
+    assert!(
+        running.bank.parts().rel.state_locate(k_old).is_none(),
+        "盘上最后一份内容被逐出后，状态账不得继续报 Disk"
+    );
+    assert_eq!(
+        running.bank.parts().rel.state_locate(k_new),
+        Some(owl_store::Tier::Disk)
+    );
+    assert_eq!(running.bank.parts().rel.snap_disk_resident_count(), 1);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 /// **P0-2 状态腿磁盘门**:`Acquire(State::Slot)` 在宿主满时不直接 drop,
 /// 必须先经 `plan_capacity` 把宿主冷快照溢写到磁盘，再腾出设备槽。
 #[cfg(test)]
@@ -9429,4 +9514,23 @@ pub async fn gpu_mtp_kv_parity() {
     eprintln!("[mtp-kv-parity] PASS n={n} page={page} t=1 vs 多行 draft 一致");
     drop(running);
     std::thread::sleep(std::time::Duration::from_secs(10));
+}
+
+/// **盘文件 unlink 队列**:store 已出账的路径必须真的删掉；队列不能在
+/// 引擎里静默丢失（2026-11-24 盘泄漏修复）。
+#[cfg(test)]
+#[tokio::test]
+async fn disk_runtime_flush_unlinks_removes_queued_files() {
+    let dir = std::env::temp_dir().join(format!("owl-unlink-queue-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).expect("目录");
+    let path = dir.join("snap-00000000000000aa.bin");
+    std::fs::write(&path, b"dead").expect("写测试文件");
+    let mut disk = crate::mem::disk_runtime::DiskRuntime::new();
+    disk.enqueue_unlink(path.clone());
+    assert_eq!(disk.pending_unlinks(), 1);
+    assert_eq!(disk.flush_unlinks().await, 1);
+    assert!(!path.exists(), "已出账路径必须被删除");
+    assert_eq!(disk.pending_unlinks(), 0);
+    let _ = std::fs::remove_dir_all(&dir);
 }

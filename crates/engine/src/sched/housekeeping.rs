@@ -14,6 +14,8 @@ const IDLE_HK_EVERY: u64 = 16;
 /// 池缓存回收节拍(墙钟):server 泵循环 `Idle` 即断,`StoreHook::idle` 到不了,
 /// 所以在空转出口按时间节流清一次(§23.9)。
 const IDLE_TRIM_EVERY: Duration = Duration::from_millis(500);
+/// 盘上未入账死文件的清点节拍（只在 Idle 拍跑；避免每个空转拍扫目录）。
+const DISK_SWEEP_EVERY: Duration = Duration::from_secs(300);
 
 /// 保洁 / 遥测账(跨 turn 累计;纯数据,Default = 冷启动)。
 #[derive(Default)]
@@ -33,6 +35,8 @@ pub(crate) struct Housekeeping {
     last_host_pressure: Option<Instant>,
     /// **合批 decode 已执行步数**(B5.1 事实位;门用它证明批路径真被走到)
     batch_steps: u64,
+    /// 上次 **盘上死文件清点**时刻（Idle 拍；`None` = 从未）。
+    last_disk_sweep: Option<Instant>,
     /// 上次 **KV 磁盘 checkpoint** 时刻(S6.2 墙钟节拍;`None` = 从未)
     last_kv_checkpoint: Option<Instant>,
     /// **待执行的 checkpoint**(T9 收尾:turn 收口只**登记**,真正落盘挪到空转拍
@@ -116,6 +120,17 @@ impl Housekeeping {
     /// 记一次回收节拍(`trim_due` 判真后立刻调)。
     pub(crate) fn mark_trim(&mut self) {
         self.last_trim = Some(Instant::now());
+    }
+
+    /// 盘上死文件清点到点?(首拍 / 距上次 ≥ `DISK_SWEEP_EVERY`)
+    pub(crate) fn disk_sweep_due(&self) -> bool {
+        self.last_disk_sweep
+            .is_none_or(|t| t.elapsed() >= DISK_SWEEP_EVERY)
+    }
+
+    /// 记一次盘上死文件清点。
+    pub(crate) fn mark_disk_sweep(&mut self) {
+        self.last_disk_sweep = Some(Instant::now());
     }
 
     /// **作废节拍**:turn 收尾路径里还有一批大额临时块要在 TurnEnd 之后才

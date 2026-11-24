@@ -2075,7 +2075,13 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
     /// store 只持账,不持设备句柄 ⇒ 设备槽的清理留在引擎(两 rank 镜像)。
     /// 账在设备层但池内无槽 = 账/槽不平,响亮拒(不静默丢)。
     pub(crate) fn drop_snap_asset_for_admit(&mut self, key: owl_store::SnapKey) -> Result<()> {
-        let (tier, bytes) = self.bank.parts_mut().rel.drop_snap_asset(key)?;
+        let drop = self.bank.parts_mut().rel.drop_snap_asset(key)?;
+        if let Some(path) = drop.disk_path {
+            // store 已出账；文件删除归磁盘 I/O 面，下个安全点统一 unlink。
+            self.disk.enqueue_unlink(path);
+        }
+        let tier = drop.tier;
+        let bytes = drop.bytes;
         if tier == owl_store::Tier::Gpu {
             let slot = self.dev.pool.snap_slot_of(key).ok_or_else(|| {
                 ModelError::Msg(format!("快照 {key:?} 在设备层但池内无槽(账/槽不平)"))
@@ -2174,11 +2180,16 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
         // **记账单元 = 一条快照的总字节**(单 rank 平面 × world;2026-11-01):
         // 与盘上文件/宿主块/下沉检查同一口径 —— 按单 rank 记会让 TP2 的
         // `plan_snap_offload` 报「账 79MB ≠ 布局 159MB」而弃置整个 turn。
-        let bank = self.bank.parts_mut();
-        let snap_bytes = bank.rel.snap_file_bytes();
-        let ghosts =
+        let (ghosts, disk_ghost) = {
+            let bank = self.bank.parts_mut();
+            let snap_bytes = bank.rel.snap_file_bytes();
             bank.rel
-                .register_snap_captured(key, snap_bytes, durability, sid, full_blocks, role)?;
+                .register_snap_captured(key, snap_bytes, durability, sid, full_blocks, role)?
+        };
+        if let Some(path) = disk_ghost {
+            // 同键重拍：旧盘文件已出账，但文件必须删；否则盘上留尸。
+            self.disk.enqueue_unlink(path);
+        }
         if ghosts > 0 {
             owl_shared::metrics::with_metrics_store(|m| {
                 m.counter_add(

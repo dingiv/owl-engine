@@ -238,6 +238,9 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
     /// turn 启动执行(设备侧照办):GDN 格重置 / 边界快照恢复 + 持久
     /// 块表重写(write_bt;图烘焙 bt 指针,内容重写指针稳定图不重捕)
     pub(crate) async fn execute_begin(&mut self, mut b: BeginPlan) -> Result<()> {
+        // schedule 里出账的死文件必须在任何盘上重挂/回灌之前删掉
+        // （同名路径可能马上被复用；旧文件残留还会让盘账/物理对不上）。
+        self.disk.flush_unlinks().await;
         // **上一 turn 的池缓存**(§23.9):turn 收尾之后才 free 的大额临时块
         // (`RELEASE_THRESHOLD=∞` 下不主动清就永远占着)在新 turn 起点一并回收。
         // 放在 begin 之前:此时设备已空闲,连同步一起做代价最小(ms 级)。

@@ -25,13 +25,56 @@ pub(crate) struct SpillStats {
     pub host_blocks: usize,
 }
 
-/// 磁盘 I/O 运行器（boot 一次装配配额，运行期只读）。
-pub(crate) struct DiskRuntime;
+/// 磁盘 I/O 运行器（boot 一次装配配额；运行期只持“待删文件”队列）。
+pub(crate) struct DiskRuntime {
+    /// store 已出账、但文件删除必须由引擎做的路径。
+    ///
+    /// `owl-store` 零 I/O：`drop_snap_asset` / `register_snap_captured`
+    /// 这类纯 host 面只能把盘路径交出来；引擎在下一个异步安全点统一
+    /// `unlink`。队列不能直接丢掉，否则就是盘上死文件。
+    pending_unlinks: Vec<PathBuf>,
+}
 
 impl DiskRuntime {
-    /// 装配（无本地状态；配额/计划/记账都归 `owl-store`）。
+    /// 装配（配额/计划/记账都归 `owl-store`）。
     pub(crate) fn new() -> Self {
-        Self
+        Self {
+            pending_unlinks: Vec::new(),
+        }
+    }
+
+    /// 登记一条**已经出账**、但尚未从盘上删除的文件。
+    pub(crate) fn enqueue_unlink(&mut self, path: PathBuf) {
+        self.pending_unlinks.push(path);
+    }
+
+    /// 待删文件数（测试）。
+    #[cfg(test)]
+    pub(crate) fn pending_unlinks(&self) -> usize {
+        self.pending_unlinks.len()
+    }
+
+    /// 删除所有已出账的盘文件。返回值 = 实际/视为删除的文件数。
+    ///
+    /// 必须在**任何可能写同一路径的盘操作之前**调用：同名快照重拍时，
+    /// 旧文件还没 unlink 就被新 `write+rename` 覆盖，再删就会误删新文件。
+    pub(crate) async fn flush_unlinks(&mut self) -> usize {
+        if self.pending_unlinks.is_empty() {
+            return 0;
+        }
+        let paths = std::mem::take(&mut self.pending_unlinks);
+        let want = paths.len();
+        let n = disk_io::remove_files(paths).await;
+        if n < want {
+            owl_shared::log_warn!(
+                "store",
+                "盘上死文件清理未完成:计划 {want} / 完成 {n}(文件仍在,下轮再试)"
+            );
+        }
+        owl_shared::metrics::with_metrics_store(|m| {
+            m.counter_add("store.disk.unlink", n as u64, file!(), line!());
+        });
+        n
     }
 
     /// **KV 溢写**（宿主 → 磁盘；内容移动）。返回 `true` = 真搬了。
@@ -176,11 +219,13 @@ impl DiskRuntime {
 
     /// **快照溢写**（状态腿宿主 → 磁盘）。语义同 [`Self::spill_kv`]。
     pub(crate) async fn spill_snap(
-        &self,
+        &mut self,
         rel: &mut Rel,
         key: SnapKey,
         active_sessions: &[u64],
     ) -> Result<bool> {
+        // 先清掉旧身份的死文件：同一路径可能马上被本次写入复用。
+        self.flush_unlinks().await;
         if !rel.snap_disk_enabled() || rel.snap_disk_contains(key) {
             return Ok(false);
         }
@@ -232,7 +277,7 @@ impl DiskRuntime {
                     let paths: Vec<PathBuf> = evp.victims.iter().map(|(_, p)| p.clone()).collect();
                     let keys: Vec<SnapKey> = evp.victims.iter().map(|(k, _)| *k).collect();
                     disk_io::remove_files(paths).await;
-                    rel.snap_disk_commit_evict(&keys);
+                    rel.snap_disk_commit_evict(&keys)?;
                 }
                 Err(_) => break,
             }

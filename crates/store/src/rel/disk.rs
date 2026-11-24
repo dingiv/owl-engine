@@ -332,8 +332,26 @@ impl Rel {
     }
 
     /// 快照盘层逐出记账/删账（返回释放字节；未接线 = 0）。
-    pub fn snap_disk_commit_evict(&mut self, keys: &[SnapKey]) -> usize {
-        self.snap_disk.as_mut().map_or(0, |d| d.commit_evict(keys))
+    ///
+    /// **盘层是最后一份内容时，必须连状态账一起摘**：`Tier::Disk` 的含义
+    /// 就是"内容只在盘上"；只出盘账会让 `state_locate` 继续报 `Disk`，
+    /// 后续 img-evict 的 `plan_rekey_snap_disk` 便会把一条已不存在的条目
+    /// 当盘上快照去重挂（现场：`身份未登记:盘层重挂 ... 不在账`）。
+    /// `Tier::Host/Gpu` 的盘副本只是冗余副本，逐出盘副本不动状态账。
+    pub fn snap_disk_commit_evict(&mut self, keys: &[SnapKey]) -> StoreResult<usize> {
+        let freed = self.snap_disk.as_mut().map_or(0, |d| d.commit_evict(keys));
+        let mut forgotten = 0usize;
+        for key in keys {
+            if self.state.locate(*key) != Some(Tier::Disk) {
+                continue;
+            }
+            self.state.drop_snap(*key)?;
+            forgotten += 1;
+        }
+        if forgotten > 0 {
+            owl_shared::log_debug!("store", "盘层逐出:{} 张快照随最后一份内容出账", forgotten);
+        }
+        Ok(freed)
     }
 
     /// 快照盘层触达。

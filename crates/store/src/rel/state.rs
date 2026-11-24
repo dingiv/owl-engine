@@ -5,6 +5,19 @@
 
 use super::*;
 
+/// **整体丢弃一条快照资产的结果**。
+///
+/// store 只出账/给路径，真删文件由 engine 的阻塞池做（盘层零 I/O 纪律）。
+/// `disk_path = Some` 时，调用方**必须**在安全点 `unlink`，否则盘上留下死文件。
+pub struct SnapAssetDrop {
+    /// 丢弃前所在层（设备槽由 engine 清）。
+    pub tier: Tier,
+    /// 状态账字节。
+    pub bytes: usize,
+    /// 盘上副本路径（若该键曾在盘层）。
+    pub disk_path: Option<std::path::PathBuf>,
+}
+
 impl Rel {
     // ---------------------------------------------------------------------
     // 状态腿语义面（快照/行；engine 不直接拿 StateStore）
@@ -486,18 +499,31 @@ impl Rel {
         Ok(())
     }
 
-    /// **快照回灌回滚**(搬运失败):台子已随失败的 connector 移出(内容丢)
-    /// ⇒ 条目一并删(不留假账;与 KV 腿 `abort_offload` 同律)。
+    /// **快照回灌回滚**(搬运失败):
+    /// - 盘上副本仍在 ⇒ 层账退回 `Disk`（盘是权威副本，条目不能删）；
+    /// - 盘上没有 ⇒ 内容确实丢了，条目一并删（不留假账；与 KV 腿
+    ///   `abort_offload` 同律）。
     pub fn abort_snap_onload(&mut self, key: SnapKey) {
+        let disk_has = self.snap_disk.as_ref().is_some_and(|d| d.contains(key));
+        if disk_has {
+            if let Err(e) = self.state.set_tier(key, Tier::Disk) {
+                owl_shared::log_warn!(
+                    "store",
+                    "回灌回滚:盘副本仍在但层账无法退回 Disk({key:?}):{e}"
+                );
+            }
+            return;
+        }
         let _ = self.state.drop_snap(key);
     }
 
     /// **整体丢弃一条快照资产**(准入替换路径;2026-11-12)。
     ///
     /// 与 `drop_snap_host` 的区别:本函数同时清**宿主 + 盘 + 状态账**,
-    /// 并返回丢弃前所在层 —— 设备层的槽必须由引擎的池清(store 不持句柄)。
+    /// 并返回丢弃前所在层 + 盘路径 —— 设备层的槽由引擎的池清(store 不持
+    /// 句柄),盘文件也必须由引擎在阻塞池 unlink(store 零 I/O)。
     /// 不在账 = 响亮拒(账/槽不平不允许静默)。
-    pub fn drop_snap_asset(&mut self, key: SnapKey) -> StoreResult<(crate::tier::Tier, usize)> {
+    pub fn drop_snap_asset(&mut self, key: SnapKey) -> StoreResult<SnapAssetDrop> {
         let tier = self
             .state
             .locate(key)
@@ -505,6 +531,11 @@ impl Rel {
         if self.snap_host.get(key).is_some() {
             self.snap_host.evict(key)?;
         }
+        let disk_path = self
+            .snap_disk
+            .as_ref()
+            .filter(|d| d.contains(key))
+            .and_then(|d| d.path_of(key).map(|p| p.to_path_buf()));
         if let Some(d) = self.snap_disk.as_mut() {
             if d.contains(key) {
                 d.commit_evict(&[key]);
@@ -513,9 +544,14 @@ impl Rel {
         let bytes = self.state.drop_snap(key)?;
         owl_shared::log_debug!(
             "snap-trace",
-            "drop-asset {key:?} tier={tier:?} bytes={bytes}"
+            "drop-asset {key:?} tier={tier:?} bytes={bytes} disk={}",
+            disk_path.is_some()
         );
-        Ok((tier, bytes))
+        Ok(SnapAssetDrop {
+            tier,
+            bytes,
+            disk_path,
+        })
     }
 
     /// 丢弃一条快照的宿主副本(内容整体淘汰时;不在宿主 = 幂等)。
@@ -603,8 +639,11 @@ impl Rel {
     /// 判据与 KV 腿的 `drop_host_chains` 同律:**同身份重绑到设备新槽 ⇒
     /// 旧的宿主/盘副本是幽灵,必须当场丢**。
     ///
-    /// 返回被丢掉的幽灵数(宿主 + 盘各至多 1;非零 = 上游重算了同一身份,
-    /// 属正常事件但要看得见)。
+    /// 返回 `(幽灵数, 盘上旧路径)`：宿主 + 盘各至多 1；非零 = 上游重算了
+    /// 同一身份，属正常事件但要看得见。盘路径由 engine 在安全点 unlink。
+    ///
+    /// 注意：**不能只出盘账不删文件**——那会让同一路径在下次 capture/spill
+    /// 时留下永远不可达的死文件。
     pub fn register_snap_captured(
         &mut self,
         key: SnapKey,
@@ -613,14 +652,16 @@ impl Rel {
         session: u64,
         depth: usize,
         role: crate::state::SnapRole,
-    ) -> StoreResult<usize> {
+    ) -> StoreResult<(usize, Option<std::path::PathBuf>)> {
         let mut ghosts = 0usize;
         if self.snap_host.get(key).is_some() {
             self.snap_host.evict(key)?;
             ghosts += 1;
         }
+        let mut disk_ghost = None;
         if let Some(d) = self.snap_disk.as_mut() {
             if d.contains(key) {
+                disk_ghost = d.path_of(key).map(|p| p.to_path_buf());
                 d.commit_evict(&[key]);
                 ghosts += 1;
             }
@@ -640,7 +681,7 @@ impl Rel {
                 "重拍同名边界快照 {key:?} ⇒ 丢掉旧副本 {ghosts} 份(宿主/盘)"
             );
         }
-        Ok(ghosts)
+        Ok((ghosts, disk_ghost))
     }
 
     /// **快照准入(纯账;不搬内容)** —— 引擎在 `snap_ensure_slot` 之前调用。

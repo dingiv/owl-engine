@@ -603,3 +603,180 @@ fn adopt_disk_chains_truncates_at_missing_content() {
     let (hit, _) = r.match_prefix(&tokens).expect("命中");
     assert_eq!(hit.matched_blocks, 2);
 }
+
+/// **盘层逐出必须与状态账同源**（2026-11-24 现场回归）：
+/// 盘层是最后一份内容（state tier = Disk）时，逐出盘条目必须同时摘状态账；
+/// 否则 `state_locate` 继续报 Disk，img-evict 重挂会撞
+/// `身份未登记:盘层重挂 ... 不在账`。
+/// Host/Gpu 的盘副本只是冗余副本，逐出盘副本不得误删状态账。
+#[test]
+fn snap_disk_evict_forgets_state_only_when_disk_was_last_copy() {
+    let mut i = inputs();
+    i.disk_bytes = 2 * BLOCK_BYTES;
+    let dir = std::env::temp_dir().join(format!("owl-disk-snap-evict-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    let mut r = Rel::open(
+        i,
+        AdmissionPolicy::new(2, QueuePolicy::Reject),
+        kv_cfg(8, 8),
+        cell_for(&i),
+    )
+    .expect("装配");
+    r.attach_snap_layout(crate::leg::PoolLayout {
+        class: crate::leg::BlockClass::GdnRow,
+        epoch: 1,
+        pieces: vec![crate::leg::PieceSpec {
+            buf: owl_iface::contract::Bytes::new(0, 1, owl_iface::contract::Dtype::F32, 1),
+            stride_bytes: BLOCK_BYTES,
+        }],
+    })
+    .expect("状态腿布局");
+    r.attach_disk(&dir).expect("接盘");
+
+    let k_disk = SnapKey::at_boundary(ChainHash::new(0xE1));
+    let k_host = SnapKey::at_boundary(ChainHash::new(0xE2));
+    r.state
+        .register_snap(k_disk, BLOCK_BYTES, Tier::Disk, SnapDurability::Durable);
+    r.state
+        .register_snap(k_host, BLOCK_BYTES, Tier::Host, SnapDurability::Durable);
+    for k in [k_disk, k_host] {
+        let plan = r.snap_disk_plan_spill(k).expect("盘层计划");
+        r.snap_disk_commit_spill(&plan).expect("盘层落账");
+    }
+    assert_eq!(r.snap_disk_resident_count(), 2);
+
+    let freed = r
+        .snap_disk_commit_evict(&[k_disk, k_host])
+        .expect("盘层逐出");
+    assert_eq!(freed, 2 * BLOCK_BYTES);
+    assert_eq!(
+        r.state.locate(k_disk),
+        None,
+        "最后一份内容在盘上 ⇒ 逐出后状态账必须一起消失"
+    );
+    assert_eq!(
+        r.state.locate(k_host),
+        Some(Tier::Host),
+        "盘上只是冗余副本 ⇒ 逐出不得误删宿主状态账"
+    );
+    assert_eq!(r.snap_disk_resident_count(), 0);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// **出账必须把盘路径交出来**（2026-11-24 盘泄漏修复）：
+/// store 零 I/O，`drop_snap_asset` / `register_snap_captured` 只能出账；
+/// 若连路径都不返回，engine 就永远不知道该删哪个文件。
+#[test]
+fn snap_disk_drop_paths_are_handed_to_engine() {
+    let mut i = inputs();
+    i.disk_bytes = 4 * BLOCK_BYTES;
+    let dir = std::env::temp_dir().join(format!("owl-disk-drop-path-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    let mut r = Rel::open(
+        i,
+        AdmissionPolicy::new(2, QueuePolicy::Reject),
+        kv_cfg(8, 8),
+        cell_for(&i),
+    )
+    .expect("装配");
+    r.attach_snap_layout(crate::leg::PoolLayout {
+        class: crate::leg::BlockClass::GdnRow,
+        epoch: 1,
+        pieces: vec![crate::leg::PieceSpec {
+            buf: owl_iface::contract::Bytes::new(0, 1, owl_iface::contract::Dtype::F32, 1),
+            stride_bytes: BLOCK_BYTES,
+        }],
+    })
+    .expect("状态腿布局");
+    r.attach_disk(&dir).expect("接盘");
+
+    // ① 整体丢弃：Disk 条目必须返回 path，且盘/状态账都清。
+    let k_drop = SnapKey::at_boundary(ChainHash::new(0xF1));
+    r.state
+        .register_snap(k_drop, BLOCK_BYTES, Tier::Disk, SnapDurability::Durable);
+    let plan = r.snap_disk_plan_spill(k_drop).expect("盘层计划");
+    r.snap_disk_commit_spill(&plan).expect("盘层落账");
+    let dropped = r.drop_snap_asset(k_drop).expect("整体丢弃");
+    assert_eq!(dropped.tier, Tier::Disk);
+    assert!(
+        dropped
+            .disk_path
+            .as_ref()
+            .is_some_and(|p| p.ends_with("snap-00000000000000f1.bin")),
+        "必须交出真实盘路径，实际 {:?}",
+        dropped.disk_path
+    );
+    assert!(!r.snap_disk_contains(k_drop));
+    assert!(r.state.locate(k_drop).is_none());
+
+    // ② 同键重拍：旧盘副本是幽灵，也必须交 path 给 engine。
+    let k_ghost = SnapKey::at_boundary(ChainHash::new(0xF2));
+    r.state
+        .register_snap(k_ghost, BLOCK_BYTES, Tier::Disk, SnapDurability::Durable);
+    let plan = r.snap_disk_plan_spill(k_ghost).expect("盘层计划");
+    r.snap_disk_commit_spill(&plan).expect("盘层落账");
+    let (ghosts, ghost_path) = r
+        .register_snap_captured(
+            k_ghost,
+            BLOCK_BYTES,
+            SnapDurability::Durable,
+            7,
+            1,
+            crate::state::SnapRole::History,
+        )
+        .expect("同键重拍");
+    assert_eq!(ghosts, 1);
+    assert!(ghost_path.is_some(), "旧盘副本路径必须交出来");
+    assert!(!r.snap_disk_contains(k_ghost));
+    assert_eq!(r.state.locate(k_ghost), Some(Tier::Gpu));
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// **回灌失败时盘副本仍是权威**:不能把状态账删掉留一个盘上死文件。
+#[test]
+fn abort_snap_onload_keeps_disk_tier_when_disk_copy_exists() {
+    let mut i = inputs();
+    i.disk_bytes = 2 * BLOCK_BYTES;
+    let dir = std::env::temp_dir().join(format!("owl-disk-abort-onload-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    let mut r = Rel::open(
+        i,
+        AdmissionPolicy::new(2, QueuePolicy::Reject),
+        kv_cfg(8, 8),
+        cell_for(&i),
+    )
+    .expect("装配");
+    r.attach_snap_layout(crate::leg::PoolLayout {
+        class: crate::leg::BlockClass::GdnRow,
+        epoch: 1,
+        pieces: vec![crate::leg::PieceSpec {
+            buf: owl_iface::contract::Bytes::new(0, 1, owl_iface::contract::Dtype::F32, 1),
+            stride_bytes: BLOCK_BYTES,
+        }],
+    })
+    .expect("状态腿布局");
+    r.attach_disk(&dir).expect("接盘");
+
+    let with_disk = SnapKey::at_boundary(ChainHash::new(0xAB1));
+    let no_disk = SnapKey::at_boundary(ChainHash::new(0xAB2));
+    for k in [with_disk, no_disk] {
+        r.state
+            .register_snap(k, BLOCK_BYTES, Tier::Host, SnapDurability::Durable);
+    }
+    let plan = r.snap_disk_plan_spill(with_disk).expect("盘层计划");
+    r.snap_disk_commit_spill(&plan).expect("盘层落账");
+    r.abort_snap_onload(with_disk);
+    assert_eq!(
+        r.state.locate(with_disk),
+        Some(Tier::Disk),
+        "盘副本仍在 ⇒ 层账必须回 Disk"
+    );
+    assert!(r.snap_disk_contains(with_disk), "盘副本不能被丢");
+    r.abort_snap_onload(no_disk);
+    assert!(
+        r.state.locate(no_disk).is_none(),
+        "无盘副本 ⇒ 内容确实丢了，条目要删"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}

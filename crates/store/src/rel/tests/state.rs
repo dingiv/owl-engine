@@ -31,9 +31,14 @@ fn drop_snap_asset_clears_host_and_state() {
     r.snap_host.put(key, buf).expect("驻留");
     assert_eq!(r.snap_host.used_bytes(), BLOCK_BYTES);
 
-    let (tier, bytes) = r.drop_snap_asset(key).expect("整体丢弃");
-    assert_eq!(tier, Tier::Host, "丢弃前所在层要报出来(设备槽由引擎清)");
-    assert_eq!(bytes, BLOCK_BYTES);
+    let drop = r.drop_snap_asset(key).expect("整体丢弃");
+    assert_eq!(
+        drop.tier,
+        Tier::Host,
+        "丢弃前所在层要报出来(设备槽由引擎清)"
+    );
+    assert_eq!(drop.bytes, BLOCK_BYTES);
+    assert!(drop.disk_path.is_none(), "宿主快照没有盘副本");
     assert!(r.state.locate(key).is_none(), "状态账已消");
     assert!(r.snap_host.get(key).is_none(), "宿主内容已消");
     assert_eq!(r.snap_host.used_bytes(), 0);

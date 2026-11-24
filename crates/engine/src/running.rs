@@ -3097,6 +3097,103 @@ impl<D: DeviceClient> RunningEngine<D> {
         out
     }
 
+    /// **盘上快照超预算回收**（Idle 拍；2026-11-24）。
+    ///
+    /// 正常写盘由 `spill_snap` 保证不超预算；但历史 bug/启动 `adopt`
+    /// 可能把 `used > budget` 带进来（adopt 故意不按预算裁，避免砍掉链根）。
+    /// 这里按盘层 LRU 逐到预算内，文件和状态账一起出账。
+    async fn enforce_snap_disk_budget(&mut self) -> Result<()> {
+        let (used, budget) = {
+            let rel = self.bank.parts().rel;
+            (rel.snap_disk_used_bytes(), rel.snap_disk_budget_bytes())
+        };
+        if used <= budget {
+            return Ok(());
+        }
+        let over = used.saturating_sub(budget);
+        let evp = self
+            .bank
+            .parts()
+            .rel
+            .snap_disk_plan_evict_sessions(over, &[], &[]);
+        if evp.victims.is_empty() {
+            owl_shared::log_warn!(
+                "store",
+                "盘账超预算 {:.1} MiB 但 LRU 无可逐条目",
+                over as f64 / 1048576.0
+            );
+            return Ok(());
+        }
+        let paths: Vec<std::path::PathBuf> = evp.victims.iter().map(|(_, p)| p.clone()).collect();
+        let keys: Vec<owl_store::SnapKey> = evp.victims.iter().map(|(k, _)| *k).collect();
+        let n = crate::disk_io::remove_files(paths).await;
+        let freed = self.bank.parts_mut().rel.snap_disk_commit_evict(&keys)?;
+        owl_shared::log_warn!(
+            "store",
+            "盘账超预算 {:.1} MiB ⇒ LRU 回收 {} 条 / {} 文件 / 出账 {:.1} MiB",
+            over as f64 / 1048576.0,
+            keys.len(),
+            n,
+            freed as f64 / 1048576.0
+        );
+        Ok(())
+    }
+
+    /// **盘上快照死文件清点**(Idle 拍;2026-11-24)。
+    ///
+    /// store 的账只能保证"账上条目有路径"；历史 bug/崩溃可能留下**不在
+    /// 盘账里**的 `.bin`。这些文件对引擎永远不可达，却会占满 `disk_dir`。
+    /// 这里只扫**快照根**：`keep` = 盘账当前所有活路径，其余 `.bin` 删除。
+    /// 不碰 KV 根（KV 有索引重建/链根语义，不能按"不在账"贸然删）。
+    async fn sweep_snap_disk_orphans(&mut self) -> Result<()> {
+        let (root, keep) = {
+            let rel = self.bank.parts().rel;
+            if !rel.snap_disk_enabled() {
+                return Ok(());
+            }
+            let Some(root) = rel.snap_disk_root().map(|p| p.to_path_buf()) else {
+                return Ok(());
+            };
+            (root, rel.snap_disk_live_paths())
+        };
+        let state_snaps = self.bank.parts().rel.state_stats().snaps;
+        if keep.is_empty() && state_snaps > 0 {
+            owl_shared::log_warn!(
+                "store",
+                "盘死文件清点跳过:盘账为空但状态账仍有 {state_snaps} 条 —— 不删未知文件（先查账/盘对账）"
+            );
+            return Ok(());
+        }
+        let rep =
+            tokio::task::spawn_blocking(move || crate::disk_io::sweep_unaccounted(&root, &keep))
+                .await
+                .map_err(|e| ModelError::Msg(format!("盘死文件清点任务 join 失败:{e}")))?;
+        if rep.removed > 0 {
+            owl_shared::metrics::with_metrics_store(|m| {
+                m.counter_add(
+                    "store.disk.snap.orphan_removed",
+                    rep.removed as u64,
+                    file!(),
+                    line!(),
+                );
+            });
+            owl_shared::log_warn!(
+                "store",
+                "盘死文件清点:删除未入账快照 {} 个 / {} MiB（不在盘账 = 引擎不可达）",
+                rep.removed,
+                rep.bytes_freed >> 20
+            );
+        }
+        if rep.remaining_bytes > 0 {
+            owl_shared::log_warn!(
+                "store",
+                "盘死文件清点:仍有 {} MiB 删不掉（权限/忙），下轮再试",
+                rep.remaining_bytes >> 20
+            );
+        }
+        Ok(())
+    }
+
     /// **块账房快照(逐 rank)**:`/debug/vram` 与事件账做**全等门**的右值。
     ///
     /// 返回逐 rank 的 `Result`(不合并成败):"后端不支持"与"真出错"都如实带出文本,
@@ -4452,6 +4549,9 @@ impl<D: DeviceClient> RunningEngine<D> {
     }
 
     pub async fn pump(&mut self) -> Result<TurnEvent> {
+        // store 已出账的死文件在这里统一 unlink（尤其在 submit/schedule 里
+        // 经 `drop_snap_asset_for_admit` 登记、但当时不能做 I/O 的路径）。
+        self.disk.flush_unlinks().await;
         // E5-M2:spec 轮多 token 事件队列优先排空(schedule 前 —— 事件序
         // 不可与下一轮调度交织)
         if let Some(ev) = self.turns.pending_events.pop_front() {
@@ -4567,6 +4667,17 @@ impl<D: DeviceClient> RunningEngine<D> {
                         if let Err(e) = r {
                             owl_shared::log_warn!("store", "空转池缓存回收失败(rank{rank}): {e}");
                         }
+                    }
+                }
+                // 盘上未入账死文件（旧 bug/崩溃残留）在 Idle 拍清点；只扫
+                // 快照根，不动 KV 根（KV 有索引重建语义）。
+                if self.hk.disk_sweep_due() {
+                    self.hk.mark_disk_sweep();
+                    if let Err(e) = self.enforce_snap_disk_budget().await {
+                        owl_shared::log_warn!("store", "盘超预算回收失败: {e}");
+                    }
+                    if let Err(e) = self.sweep_snap_disk_orphans().await {
+                        owl_shared::log_warn!("store", "盘死文件清点失败: {e}");
                     }
                 }
                 if let Some((slots, host_kv, host_snap)) = self.idle_tick() {
